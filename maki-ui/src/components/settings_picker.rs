@@ -8,12 +8,28 @@ use ratatui::layout::Rect;
 const TITLE: &str = " Settings ";
 const MAX_VISIBLE: u16 = 10;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+fn default_history_period() -> f64 {
+    60.0
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserSettings {
     #[serde(default)]
     pub show_system_prompt: bool,
     #[serde(default)]
     pub api_logging: bool,
+    #[serde(default = "default_history_period")]
+    pub history_period_seconds: f64,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            show_system_prompt: false,
+            api_logging: false,
+            history_period_seconds: 60.0,
+        }
+    }
 }
 
 impl UserSettings {
@@ -42,17 +58,18 @@ pub enum SettingsPickerAction {
     Consumed,
     ToggleShowSystemPrompt(bool),
     ToggleApiLogging(bool),
+    AdjustHistoryPeriod(bool),
     Closed,
 }
 
 #[derive(Clone)]
 struct SettingItem {
-    name: &'static str,
+    name: String,
 }
 
 impl PickerItem for SettingItem {
     fn label(&self) -> &str {
-        self.name
+        &self.name
     }
 }
 
@@ -67,16 +84,19 @@ impl SettingsPicker {
         }
     }
 
-    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool) {
+    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool, history_period: f64) {
         let items = vec![
             SettingItem {
-                name: "show-system-prompt",
+                name: "show-system-prompt".to_string(),
             },
             SettingItem {
-                name: "api-logging",
+                name: "api-logging".to_string(),
+            },
+            SettingItem {
+                name: format!("history-period ({}s)", history_period),
             },
         ];
-        let enabled = vec![show_system_prompt, api_logging];
+        let enabled = vec![show_system_prompt, api_logging, false];
         self.picker.open_toggleable(items, enabled, TITLE);
     }
 
@@ -89,6 +109,18 @@ impl SettingsPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsPickerAction {
+        if self.picker.selected_index() == Some(2) {
+            match key.code {
+                crossterm::event::KeyCode::Left => {
+                    return SettingsPickerAction::AdjustHistoryPeriod(false);
+                }
+                crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Enter => {
+                    return SettingsPickerAction::AdjustHistoryPeriod(true);
+                }
+                _ => {}
+            }
+        }
+
         match self.picker.handle_key(key) {
             PickerAction::Toggle(idx, val) => match idx {
                 0 => SettingsPickerAction::ToggleShowSystemPrompt(val),

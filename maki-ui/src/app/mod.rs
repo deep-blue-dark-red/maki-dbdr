@@ -159,6 +159,7 @@ pub struct App {
     pub(super) timeline: Vec<TimelineEvent>,
     pub(super) last_timeline_shift: Instant,
     pub(super) active_run_duration: Option<Duration>,
+    pub(super) history_period_seconds: f64,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -257,6 +258,7 @@ impl App {
             timeline: vec![TimelineEvent::None; 40],
             last_timeline_shift: Instant::now(),
             active_run_duration: None,
+            history_period_seconds: user_settings.history_period_seconds,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -297,7 +299,8 @@ impl App {
     }
 
     pub fn tick_timeline(&mut self) {
-        if self.status == Status::Streaming && self.last_timeline_shift.elapsed() >= std::time::Duration::from_millis(200) {
+        let interval_ms = (self.history_period_seconds / 40.0 * 1000.0) as u64;
+        if self.status == Status::Streaming && self.last_timeline_shift.elapsed() >= std::time::Duration::from_millis(interval_ms) {
             self.last_timeline_shift = std::time::Instant::now();
             let tool_running = self.chats.iter().any(|c| !c.in_progress_tools().is_empty());
             let ev = if tool_running {
@@ -690,6 +693,25 @@ impl App {
 
                     maki_config::LOG_API.store(val, std::sync::atomic::Ordering::Relaxed);
                     self.save_session();
+                    vec![]
+                }
+                SettingsPickerAction::AdjustHistoryPeriod(increment) => {
+                    let mut settings = UserSettings::load();
+                    if increment {
+                        settings.history_period_seconds *= 1.5;
+                    } else {
+                        settings.history_period_seconds *= 0.5;
+                    }
+                    settings.history_period_seconds = settings.history_period_seconds.clamp(1.0, 3600.0);
+                    settings.save();
+
+                    self.history_period_seconds = settings.history_period_seconds;
+
+                    self.settings_picker.open(
+                        settings.show_system_prompt,
+                        settings.api_logging,
+                        settings.history_period_seconds,
+                    );
                     vec![]
                 }
                 SettingsPickerAction::Closed => vec![],
@@ -1290,7 +1312,11 @@ impl App {
             }
             "/settings" => {
                 let settings = UserSettings::load();
-                self.settings_picker.open(settings.show_system_prompt, settings.api_logging);
+                self.settings_picker.open(
+                    settings.show_system_prompt,
+                    settings.api_logging,
+                    settings.history_period_seconds,
+                );
                 vec![]
             }
             "/mcp" => {
