@@ -156,6 +156,9 @@ pub struct App {
     pub(super) active_run_start: Option<Instant>,
     pub(super) active_run_input_tokens: u32,
     pub(super) active_run_output_chars: u32,
+    pub(super) last_api_send: Option<Instant>,
+    pub(super) last_api_receive: Option<Instant>,
+    pub(super) last_tool_call: Option<Instant>,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -251,6 +254,9 @@ impl App {
             active_run_start: None,
             active_run_input_tokens: 0,
             active_run_output_chars: 0,
+            last_api_send: None,
+            last_api_receive: None,
+            last_tool_call: None,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -1018,6 +1024,9 @@ impl App {
         }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
+            if chat_idx == 0 {
+                self.last_tool_call = Some(Instant::now());
+            }
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
@@ -1062,6 +1071,7 @@ impl App {
             AgentEvent::ThinkingDelta { text } | AgentEvent::TextDelta { text } => {
                 if chat_idx == 0 {
                     self.active_run_output_chars += text.chars().count() as u32;
+                    self.last_api_receive = Some(Instant::now());
                 }
             }
             AgentEvent::ToolResultsSubmitted { .. } => {
@@ -1069,11 +1079,13 @@ impl App {
                     self.active_run_start = Some(Instant::now());
                     self.active_run_input_tokens = self.chats[0].context_size;
                     self.active_run_output_chars = 0;
+                    self.last_api_send = Some(Instant::now());
                 }
             }
             AgentEvent::ToolStart(_) => {
                 if chat_idx == 0 {
                     self.active_run_start = Some(Instant::now());
+                    self.last_tool_call = Some(Instant::now());
                 }
             }
             AgentEvent::Done { .. } | AgentEvent::Error { .. } if chat_idx == 0 => {
@@ -1211,6 +1223,7 @@ impl App {
                 self.active_run_start = Some(Instant::now());
                 self.active_run_input_tokens = self.main_chat().context_size;
                 self.active_run_output_chars = 0;
+                self.last_api_send = Some(Instant::now());
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1358,6 +1371,7 @@ impl App {
             self.active_run_start = Some(Instant::now());
             self.active_run_input_tokens = self.main_chat().context_size;
             self.active_run_output_chars = 0;
+            self.last_api_send = Some(Instant::now());
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }

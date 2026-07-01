@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -14,9 +14,16 @@ use std::mem;
 use maki_providers::ImageSource;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+
+#[derive(Debug, Clone, Default)]
+pub struct ActivityTracker {
+    pub last_api_send: Option<Instant>,
+    pub last_api_receive: Option<Instant>,
+    pub last_tool_call: Option<Instant>,
+}
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::{apply_scroll_delta, visual_line_count};
@@ -309,7 +316,42 @@ impl InputBox {
 
         lines_above + wrap_row
     }
+}
 
+fn decay(last_time: Option<Instant>, duration: std::time::Duration) -> f64 {
+    if let Some(t) = last_time {
+        let elapsed = t.elapsed();
+        if elapsed < duration {
+            1.0 - elapsed.as_secs_f64() / duration.as_secs_f64()
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
+}
+
+fn get_rgb(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => (15, 15, 20),
+    }
+}
+
+fn get_decay_style(last_time: Option<Instant>, duration: std::time::Duration, base_rgb: (u8, u8, u8), bg_rgb: (u8, u8, u8)) -> Style {
+    let f = decay(last_time, duration);
+    if f > 0.01 {
+        let r = (bg_rgb.0 as f64 + (base_rgb.0 as f64 - bg_rgb.0 as f64) * f).round() as u8;
+        let g = (bg_rgb.1 as f64 + (base_rgb.1 as f64 - bg_rgb.1 as f64) * f).round() as u8;
+        let b = (bg_rgb.2 as f64 + (base_rgb.2 as f64 - bg_rgb.2 as f64) * f).round() as u8;
+        Style::default().fg(Color::Rgb(r, g, b))
+    } else {
+        Style::default().fg(Color::Rgb(bg_rgb.0, bg_rgb.1, bg_rgb.2))
+    }
+}
+
+impl InputBox {
+    #[allow(clippy::too_many_arguments)]
     pub fn view(
         &mut self,
         frame: &mut Frame,
@@ -318,6 +360,7 @@ impl InputBox {
         border_style: Style,
         focused: bool,
         top_right_hint: Option<Line<'_>>,
+        activity: &ActivityTracker,
     ) {
         let content_height = area.height.saturating_sub(2);
         let ew = effective_width(area.width as usize);
@@ -406,18 +449,82 @@ impl InputBox {
         }
 
         let text = Text::from(styled_lines);
+
+        let f_send = decay(activity.last_api_send, std::time::Duration::from_secs(5));
+        let f_recv = decay(activity.last_api_receive, std::time::Duration::from_millis(800));
+        let f_tool = decay(activity.last_tool_call, std::time::Duration::from_secs(5));
+
+        let active_border_style = if f_recv > 0.01 {
+            let bg = get_rgb(theme::current().background);
+            let green = (80, 250, 123);
+            let r = (bg.0 as f64 + (green.0 as f64 - bg.0 as f64) * f_recv).round() as u8;
+            let g = (bg.1 as f64 + (green.1 as f64 - bg.1 as f64) * f_recv).round() as u8;
+            let b = (bg.2 as f64 + (green.2 as f64 - bg.2 as f64) * f_recv).round() as u8;
+            Style::default().fg(Color::Rgb(r, g, b))
+        } else if f_tool > f_send && f_tool > 0.01 {
+            let bg = get_rgb(theme::current().background);
+            let magenta = (255, 121, 198);
+            let r = (bg.0 as f64 + (magenta.0 as f64 - bg.0 as f64) * f_tool).round() as u8;
+            let g = (bg.1 as f64 + (magenta.1 as f64 - bg.1 as f64) * f_tool).round() as u8;
+            let b = (bg.2 as f64 + (magenta.2 as f64 - bg.2 as f64) * f_tool).round() as u8;
+            Style::default().fg(Color::Rgb(r, g, b))
+        } else if f_send > f_recv && f_send > 0.01 {
+            let bg = get_rgb(theme::current().background);
+            let cyan = (139, 233, 253);
+            let r = (bg.0 as f64 + (cyan.0 as f64 - bg.0 as f64) * f_send).round() as u8;
+            let g = (bg.1 as f64 + (cyan.1 as f64 - bg.1 as f64) * f_send).round() as u8;
+            let b = (bg.2 as f64 + (cyan.2 as f64 - bg.2 as f64) * f_send).round() as u8;
+            Style::default().fg(Color::Rgb(r, g, b))
+        } else {
+            border_style
+        };
+
         let mut block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
-            .border_style(border_style);
-        if let Some(hint) = top_right_hint {
-            block = block.title_top(hint.right_aligned());
+            .border_style(active_border_style);
+        if let Some(hint) = &top_right_hint {
+            block = block.title_top(hint.clone().right_aligned());
         }
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
             .scroll((self.scroll_y, 0))
             .block(block);
         frame.render_widget(paragraph, area);
+
+        // Draw the custom top border activity strip overlapping the block's top border
+        let bg = get_rgb(theme::current().background);
+        let s_send = get_decay_style(activity.last_api_send, std::time::Duration::from_secs(5), (139, 233, 253), bg);
+        let s_recv = get_decay_style(activity.last_api_receive, std::time::Duration::from_millis(800), (80, 250, 123), bg);
+        let s_tool = get_decay_style(activity.last_tool_call, std::time::Duration::from_secs(5), (255, 121, 198), bg);
+
+        let mut spans = vec![
+            Span::styled("─[ ", active_border_style),
+            Span::styled("● API SEND ", s_send),
+            Span::styled("● API RECV ", s_recv),
+            Span::styled("● TOOL/TASK ", s_tool),
+            Span::styled("]", active_border_style),
+        ];
+
+        let remaining_width = (area.width as usize).saturating_sub(38);
+        if remaining_width > 0 {
+            let hint_len = if let Some(ref hint) = top_right_hint {
+                hint.width()
+            } else {
+                0
+            };
+            let line_len = remaining_width.saturating_sub(hint_len);
+            if line_len > 0 {
+                spans.push(Span::styled("─".repeat(line_len), active_border_style));
+            }
+            if let Some(ref hint) = top_right_hint {
+                spans.extend(hint.spans.clone());
+            }
+        }
+        let top_border_line = Line::from(spans);
+        let top_border_paragraph = Paragraph::new(top_border_line);
+        let top_border_area = Rect::new(area.x, area.y, area.width, 1);
+        frame.render_widget(top_border_paragraph, top_border_area);
 
         if max_scroll > 0 {
             let inner = area.inner(ratatui::layout::Margin::new(0, 1));
@@ -777,7 +884,15 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                input.view(frame, area, streaming, border_style, true, None);
+                input.view(
+                    frame,
+                    area,
+                    streaming,
+                    border_style,
+                    true,
+                    None,
+                    &ActivityTracker::default(),
+                );
             })
             .unwrap();
         terminal

@@ -145,6 +145,7 @@ impl App {
         self.active_run_start = Some(std::time::Instant::now());
         self.active_run_input_tokens = self.main_chat().context_size;
         self.active_run_output_chars = 0;
+        self.last_api_send = Some(std::time::Instant::now());
         if let Some(ref handle) = self.lua_event_handle {
             handle.fire_autocmd("TurnStart", serde_json::json!({}));
         }

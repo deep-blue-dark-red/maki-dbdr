@@ -6,6 +6,7 @@ use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats, StreamingInfo};
+use crate::components::input::ActivityTracker;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -199,6 +200,11 @@ impl App {
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
+            let activity = ActivityTracker {
+                last_api_send: self.last_api_send,
+                last_api_receive: self.last_api_receive,
+                last_tool_call: self.last_tool_call,
+            };
             self.input_box.view(
                 frame,
                 layout.input_area,
@@ -206,6 +212,7 @@ impl App {
                 self.separator_style(),
                 !self.any_overlay_open(),
                 panel_hint,
+                &activity,
             );
             self.command_palette.view(frame, layout.input_area);
         }
