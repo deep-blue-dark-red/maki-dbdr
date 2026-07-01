@@ -73,9 +73,7 @@ end)
 
 case("build_skill_list_empty", function()
   local result = build_skill_list({})
-  assert(result:find("No skills available"), "empty list should say no skills available")
-  assert(result:find("<available_skills>"), "should have opening tag")
-  assert(result:find("</available_skills>"), "should have closing tag")
+  eq(result, "", "empty list should return empty string")
 end)
 
 case("build_skill_list_single_skill", function()
@@ -84,8 +82,7 @@ case("build_skill_list_single_skill", function()
   }
   local result = build_skill_list(skills)
   assert(result:find("test%-skill"), "should contain skill name")
-  assert(result:find("A test skill"), "should contain description")
-  assert(not result:find("No skills available"), "should not say no skills")
+  eq(result, " Available: test-skill.", "should match the formatted string")
 end)
 
 case("build_skill_list_sorted_alphabetically", function()

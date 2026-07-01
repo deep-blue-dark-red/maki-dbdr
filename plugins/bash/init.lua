@@ -231,16 +231,7 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
-
-- **DO NOT** use for file ops! Only git, builds, tests, and system commands.
-- Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
-- Do NOT use to communicate text to the user.
-- Chain dependent commands with `&&`. Use batch for independent ones.
-- Provide a short `description` (3-5 words).
-- Output truncated beyond 2000 lines or 50KB.
-- Interactive commands (sudo, ssh prompts) fail immediately.]]
+local description = [[Run git, build, test, and system commands. Not for reading or writing files. Use workdir instead of `cd &&`. Chain dependent commands with &&; use batch for independent ones. Output truncates past ~2000 lines.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",

@@ -61,6 +61,10 @@ pub struct SessionMeta {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_system_prompt: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

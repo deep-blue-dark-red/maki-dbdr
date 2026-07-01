@@ -504,6 +504,9 @@ pub enum AgentEvent {
         message: String,
         delay_ms: u64,
     },
+    SystemPrompt {
+        text: String,
+    },
     Error {
         message: String,
     },

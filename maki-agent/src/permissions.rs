@@ -886,10 +886,10 @@ mod tests {
 
     #[test]
     fn generalize_edit_uses_parent_dir() {
-        let result = generalize_scope("edit", "/home/user/project/src/main.rs");
+        let result = generalize_scope("edit", "/project/src/main.rs");
         let expected = format!(
             "{}/**",
-            Path::new("/home/user/project/src/main.rs")
+            Path::new("/project/src/main.rs")
                 .parent()
                 .unwrap()
                 .display()
@@ -913,7 +913,7 @@ mod tests {
     #[test_case("bash", "pwd" ; "bash_bare_command")]
     #[test_case("bash", "cargo test" ; "bash_command_with_args")]
     #[test_case("bash", "git status --short" ; "bash_command_with_flags")]
-    #[test_case("edit", "/home/user/project/src/main.rs" ; "edit_path")]
+    #[test_case("edit", "/project/src/main.rs" ; "edit_path")]
     #[test_case("webfetch", "https://example.com" ; "unknown_tool_exact")]
     #[test_case("mcp:fetch", "{\"url\":\"https://a\"}" ; "mcp_tool_call")]
     fn command_matches_its_own_generalized_rule(tool: &str, scope: &str) {

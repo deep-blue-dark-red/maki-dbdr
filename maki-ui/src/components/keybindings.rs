@@ -167,6 +167,7 @@ pub enum KeybindContext {
     SessionPicker,
     RewindPicker,
     ThemePicker,
+    SettingsPicker,
     ModelPicker,
     QueueFocus,
     CommandPalette,
@@ -186,6 +187,7 @@ impl KeybindContext {
             Self::SessionPicker => "Session Picker",
             Self::RewindPicker => "Rewind Picker",
             Self::ThemePicker => "Theme Picker",
+            Self::SettingsPicker => "Settings Picker",
             Self::ModelPicker => "Model Picker",
             Self::QueueFocus => "Queue",
             Self::CommandPalette => "Commands",
@@ -200,6 +202,7 @@ impl KeybindContext {
             | Self::SessionPicker
             | Self::RewindPicker
             | Self::ThemePicker
+            | Self::SettingsPicker
             | Self::ModelPicker
             | Self::QueueFocus
             | Self::CommandPalette

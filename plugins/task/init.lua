@@ -1,15 +1,4 @@
-local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
-
-Subagent types (set via `subagent_type`):
-- `research` (default): Read-only tools. For codebase exploration or gathering context.
-- `general`: Full tool access. For delegating implementation work.
-
-Notes:
-1. Launch multiple tasks concurrently when possible.
-2. The agent's result is not visible to the user. Summarize it in your response.
-3. Each invocation starts fresh - inline any needed context into the prompt.
-4. Tell it to return concise summaries with file:line refs, not full file contents.
-]]
+local description = [[Delegate a self-contained subgoal to a subagent; combine with batch to run several at once. subagent_type: research (read-only, for exploration) or general (can edit). Each starts fresh — inline all context. Ask it for a short summary with file:line refs. Its output isn't shown to the user; relay it.]]
 
 local schema = {
   type = "object",

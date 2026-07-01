@@ -256,6 +256,7 @@ impl App {
 
         render_if_open!(self.rewind_picker);
         render_if_open!(self.theme_picker);
+        render_if_open!(self.settings_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
@@ -431,6 +432,8 @@ impl App {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
+        } else if self.settings_picker.is_open() {
+            contexts.push(KeybindContext::SettingsPicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
         } else if self.command_palette.is_active() {

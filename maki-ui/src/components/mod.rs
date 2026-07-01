@@ -25,6 +25,7 @@ pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
+pub(crate) mod settings_picker;
 pub(crate) mod tool_display;
 
 use std::collections::HashMap;
@@ -351,6 +352,7 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    System,
 }
 
 impl DisplayRole {

@@ -2,25 +2,9 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 
-local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
+local EDIT_DESCRIPTION = [[Replace an exact string in a file. old_string must be unique (or set replace_all). Read the file first; exclude the line-number prefix from read output when copying. Cheaper than write for targeted changes.]]
 
-- The old_string must appear exactly once unless replace_all is true.
-- Read the file first to get exact content.
-- When copying text from read output, do NOT include the line number prefix (e.g. `42: `) - only the content after it.
-- Prefer this over write for targeted changes - it uses far fewer tokens.
-- Use replace_all for renaming across a file.
-]]
-
-local MULTIEDIT_DESCRIPTION = [[Make multiple find-and-replace edits to a single file atomically.
-Prefer this over edit when making multiple changes to the same file.
-
-- Read the file first to get exact content.
-- old_string must match the file contents exactly, including all whitespace and indentation.
-- Each edit must match exactly once unless replace_all is true. Use replace_all for renaming across a file.
-- Edits are applied in sequence - each operates on the result of the previous.
-- If any edit fails, none are written.
-- Ensure earlier edits don't affect text that later edits need to find.
-]]
+local MULTIEDIT_DESCRIPTION = [[Several exact-string replacements in one file, applied in order, all-or-nothing. Read the file first. Order edits so an earlier one doesn't alter text a later one matches on.]]
 
 local function edit_header(input)
   local buf = maki.ui.buf()

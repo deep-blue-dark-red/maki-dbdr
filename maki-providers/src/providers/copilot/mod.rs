@@ -165,9 +165,9 @@ impl Copilot {
             &auth,
             None,
         )
-        .body(())?;
+        .body(Vec::new())?;
 
-        let mut response = self.client.send_async(request).await?;
+        let mut response = super::send_request(&self.client, request).await?;
         if !response.status().is_success() {
             return Err(AgentError::from_response(response).await);
         }
@@ -225,7 +225,7 @@ impl Copilot {
                 &body,
             )?
             .body(serde_json::to_vec(&body)?)?;
-        let response = self.client.send_async(request).await?;
+        let response = super::send_request(&self.client, request).await?;
         if response.status().is_success() {
             openai_compat::parse_sse(
                 BufReader::new(response.into_body()),
@@ -287,7 +287,7 @@ impl Copilot {
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
             .body(serde_json::to_vec(&body)?)?;
-        let response = self.client.send_async(request).await?;
+        let response = super::send_request(&self.client, request).await?;
         if response.status().is_success() {
             super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
         } else {
@@ -433,7 +433,7 @@ async fn try_discover_api_endpoint(client: &HttpClient, token: &str) -> Result<S
         .header("user-agent", super::user_agent())
         .body(serde_json::to_vec(&body)?)?;
 
-    let mut response = client.send_async(request).await?;
+    let mut response = super::send_request(client, request).await?;
     if !response.status().is_success() {
         return Err(AgentError::from_response(response).await);
     }

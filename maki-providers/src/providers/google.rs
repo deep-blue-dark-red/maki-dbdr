@@ -214,7 +214,7 @@ impl Google {
             .header("content-type", "application/json")
             .body(json_body)?;
 
-        let response = self.client.send_async(request).await?;
+        let response = super::send_request(&self.client, request).await?;
         let status = response.status().as_u16();
 
         if status == 200 {
@@ -241,10 +241,10 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request("GET", &url).body(()).unwrap();
+        let request = self.build_request("GET", &url).body(Vec::new()).unwrap();
         let client = self.client.clone();
         Box::pin(async move {
-            let mut response = client.send_async(request).await?;
+            let mut response = super::send_request(&client, request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
             }

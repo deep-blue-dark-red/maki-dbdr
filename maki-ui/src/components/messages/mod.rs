@@ -13,7 +13,7 @@ use super::tool_display::{
     BatchChildState, RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
     build_batch_entry_lines, build_instructions_lines, build_tool_lines, done_style, error_style,
     format_timestamp_now, output_limits_from_hints, thinking_style, tool_output_annotation,
-    truncate_to_header, user_style,
+    truncate_to_header, user_style, system_style,
 };
 use super::{
     DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
@@ -81,6 +81,8 @@ pub struct MessagesPanel {
     /// Deduplicates re-bake requests: we only fire one per tool per
     /// generation, and `snapshot_theme_gen` only updates when colors land.
     rebake_requested: HashMap<String, u64>,
+    pub show_system_prompt: bool,
+    pub system_prompt: Option<String>,
 }
 
 impl MessagesPanel {
@@ -122,6 +124,8 @@ impl MessagesPanel {
             lua_event_handle: None,
             restore_event_tx: None,
             rebake_requested: HashMap::new(),
+            show_system_prompt: false,
+            system_prompt: None,
         }
     }
 
@@ -132,6 +136,10 @@ impl MessagesPanel {
     ) {
         self.lua_event_handle = event_handle;
         self.restore_event_tx = event_tx;
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
     }
 
     pub fn push(&mut self, msg: DisplayMessage) {
@@ -1219,6 +1227,14 @@ impl MessagesPanel {
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
         }
+        if let Some(prompt) = self.system_prompt.as_ref().filter(|_| self.cache.msg_count() == 0 && self.show_system_prompt) {
+            let style = system_style();
+            let prefix = style.prefix;
+            let lines = plain_lines(prompt, prefix, style.text_style, style.prefix_style);
+            let search_text = format!("{prefix}{prompt}");
+            self.cache.push(Segment::with_lines(lines, search_text, None));
+            self.cache.push_spacer_if_needed();
+        }
         for i in self.cache.msg_count()..self.messages.len() {
             let msg = &self.messages[i];
 
@@ -1283,6 +1299,7 @@ impl MessagesPanel {
                     DisplayRole::Thinking => thinking_style(),
                     DisplayRole::Error => error_style(),
                     DisplayRole::Done => done_style(),
+                    DisplayRole::System => system_style(),
                     DisplayRole::Tool(_) => unreachable!(),
                 };
                 let prefix = if msg.plan_path.is_some() {

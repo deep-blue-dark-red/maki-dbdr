@@ -214,6 +214,7 @@ impl AgentLoop {
             &prompt_slots,
             &slot.model,
         );
+        let _ = event_tx.send(AgentEvent::SystemPrompt { text: system.clone() });
         self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);

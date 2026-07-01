@@ -58,9 +58,9 @@ pub fn build_system_prompt(
     model: &Model,
 ) -> String {
     let env = vars.apply(
-        "\n\nEnvironment:\n- Working directory: {cwd}\n- Platform: {platform}\n- Date: {date}",
+        "\n\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}",
     );
-    let env = format!("{env}\n- Model: {}", model.spec());
+    let env = format!("{env}\nModel: {}", model.spec());
     let instructions = format!("{env}{instructions}");
     let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
 

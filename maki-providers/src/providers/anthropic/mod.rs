@@ -135,7 +135,7 @@ impl Anthropic {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
         let request = builder.body(json_body)?;
-        let response = self.client.send_async(request).await?;
+        let response = super::send_request(&self.client, request).await?;
         let status = response.status().as_u16();
 
         if status == 200 {
@@ -155,8 +155,8 @@ impl Anthropic {
                 url.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request("GET", Some(&url)).body(())?;
-            let mut response = self.client.send_async(request).await?;
+            let request = self.build_request("GET", Some(&url)).body(Vec::new())?;
+            let mut response = super::send_request(&self.client, request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
             }

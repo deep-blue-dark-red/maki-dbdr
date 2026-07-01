@@ -58,8 +58,8 @@ impl OpenAiCompatProvider {
         for (key, value) in &auth.headers {
             builder = builder.header(key.as_str(), value.as_str());
         }
-        let request = builder.body(())?;
-        let mut response = self.client.send_async(request).await?;
+        let request = builder.body(Vec::new())?;
+        let mut response = super::send_request(&self.client, request).await?;
         if response.status().as_u16() != 200 {
             return Err(AgentError::from_response(response).await);
         }
@@ -80,7 +80,7 @@ impl OpenAiCompatProvider {
         let request = builder
             .header("content-type", content_type)
             .body(body.to_vec())?;
-        let mut response = self.client.send_async(request).await?;
+        let mut response = super::send_request(&self.client, request).await?;
         if response.status().as_u16() != 200 {
             return Err(AgentError::from_response(response).await);
         }
@@ -155,7 +155,7 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        let response = self.client.send_async(request).await?;
+        let response = super::send_request(&self.client, request).await?;
         let status = response.status().as_u16();
 
         if status == 200 {
@@ -174,8 +174,8 @@ impl OpenAiCompatProvider {
         &self,
         auth: &ResolvedAuth,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        let request = self.build_request("GET", "/models", auth).body(())?;
-        let mut response = self.client.send_async(request).await?;
+        let request = self.build_request("GET", "/models", auth).body(Vec::new())?;
+        let mut response = super::send_request(&self.client, request).await?;
         if response.status().as_u16() != 200 {
             return Err(AgentError::from_response(response).await);
         }

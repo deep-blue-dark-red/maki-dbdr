@@ -1,12 +1,7 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
-local DESCRIPTION = [[Write content to a file, replacing existing content.
-
-- Creates parent directories if needed.
-- Always read the file first before writing.
-- NEVER create files unless absolutely necessary - prefer editing existing files.
-- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.]]
+local DESCRIPTION = [[Write a full file, overwriting existing content; creates parent dirs. Prefer edit/multiedit on files that already exist. Don't create README or *.md docs unless asked.]]
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()

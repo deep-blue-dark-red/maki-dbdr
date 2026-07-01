@@ -19,15 +19,12 @@ pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
 
-pub const DEFAULT_IDENTITY: &str = r#"You are Maki, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
+pub const DEFAULT_IDENTITY: &str = r#"You are Maki, a CLI coding agent. Complete software engineering tasks by using tools directly in the repo. Do work yourself rather than telling the user how to do it."#;
 
-You must NEVER generate or guess URLs unless they are for helping the user with programming."#;
-
-pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CLI rendered in monospace. Use GitHub-flavored markdown.
-- Only use emojis if explicitly requested.
-- Do not add comments to code unless asked.
-- Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
-- NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
+pub const DEFAULT_TONE: &str = r#"- Response text renders in a monospace CLI (GitHub-flavored markdown). Your reasoning is shown separately — put only actions and results in response text, never a restatement of your reasoning.
+- State what you did, not what you're about to do. Keep it short.
+- Code gets no comments and no emojis unless asked.
+- To show the user anything, write it in response text. bash is never a communication channel."#;
 
 const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "code_execution", "task"];
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
@@ -283,7 +280,7 @@ mod tests {
         let out = assemble(PromptId::System, &s, "");
         let hint = at(&out, HINT);
         assert!(
-            at(&out, "# Tool usage") < hint,
+            at(&out, "# Tool selection") < hint,
             "hint before its section:\n{out}"
         );
         assert!(
@@ -463,7 +460,7 @@ mod tests {
             },
         );
         let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains("Never assume a library is available"));
+        assert!(out.contains("Confirm a library exists"));
         assert!(out.contains("- Extra rule"));
     }
 }

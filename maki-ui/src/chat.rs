@@ -160,6 +160,7 @@ impl Chat {
                     .tool_header_snapshot(&id, snapshot, theme_gen);
             }
             AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::SystemPrompt { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -253,6 +254,12 @@ impl Chat {
     ) {
         self.messages_panel
             .tool_header_snapshot(tool_id, snapshot, theme_gen);
+    }
+
+    pub fn set_system_prompt(&mut self, show: bool, prompt: Option<String>) {
+        self.messages_panel.show_system_prompt = show;
+        self.messages_panel.system_prompt = prompt;
+        self.messages_panel.clear_cache();
     }
 
     pub fn register_live_buf(&mut self, id: String, buf: Arc<SharedBuf>) {

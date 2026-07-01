@@ -165,7 +165,7 @@ pub(crate) async fn do_stream(
         "sending Responses API request"
     );
 
-    let response = client.send_async(request).await?;
+    let response = super::super::send_request(client, request).await?;
     let status = response.status().as_u16();
 
     if status == 200 {

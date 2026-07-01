@@ -35,6 +35,7 @@ impl App {
             &self.shared_tool_outputs,
             &self.permissions,
         );
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
         self.sync_ephemeral_state();
         if !self.has_content() {
             return;
@@ -100,6 +101,9 @@ impl App {
             &self.state.session.tool_outputs,
             &self.ui_config.tool_output_lines,
         );
+        let show_prompt = self.state.session.meta.show_system_prompt;
+        let system_prompt = self.state.session.meta.system_prompt.clone();
+        self.main_chat().set_system_prompt(show_prompt, system_prompt);
         self.main_chat().load_messages(display_msgs);
         self.main_chat().token_usage = self.state.token_usage;
         self.main_chat().context_size = self.state.context_size;
@@ -173,6 +177,8 @@ impl App {
             self.enter_plan();
         }
         self.state.session = AppSession::new(&self.state.session.model, &self.state.session.cwd);
+        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(self.state.session.id.clone());
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
         vec![Action::NewSession]
     }
 
@@ -232,6 +238,8 @@ impl App {
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
         self.state = SessionState::from_session(session, fallback_model, &self.storage);
+        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(self.state.session.id.clone());
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }

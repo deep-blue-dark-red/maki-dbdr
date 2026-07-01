@@ -43,6 +43,7 @@ use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
 use crate::components::tool_display::format_turn_usage;
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
@@ -137,6 +138,7 @@ pub struct App {
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) theme_picker: ThemePicker,
+    pub(super) settings_picker: SettingsPicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
@@ -202,9 +204,21 @@ impl App {
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage);
+        let mut state = SessionState::from_session(session, model, &storage);
+        let user_settings = UserSettings::load();
+        state.session.meta.show_system_prompt = user_settings.show_system_prompt;
+        maki_config::LOG_API.store(user_settings.api_logging, std::sync::atomic::Ordering::Relaxed);
+        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(state.session.id.clone());
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(state.session.title.clone());
+
+        let mut main_chat = Chat::new("Main".into(), ui_config);
+        main_chat.set_system_prompt(
+            user_settings.show_system_prompt,
+            state.session.meta.system_prompt.clone(),
+        );
+
         Self {
-            chats: vec![Chat::new("Main".into(), ui_config)],
+            chats: vec![main_chat],
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
@@ -216,6 +230,7 @@ impl App {
             task_picker: ListPicker::new(),
             task_picker_original: None,
             theme_picker: ThemePicker::new(),
+            settings_picker: SettingsPicker::new(),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
@@ -617,6 +632,34 @@ impl App {
             });
         }
 
+        if self.settings_picker.is_open() {
+            return Some(match self.settings_picker.handle_key(key) {
+                SettingsPickerAction::Consumed => vec![],
+                SettingsPickerAction::ToggleShowSystemPrompt(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_system_prompt = val;
+                    settings.save();
+
+                    self.state.session.meta.show_system_prompt = val;
+                    for chat in &mut self.chats {
+                        chat.set_system_prompt(val, self.state.session.meta.system_prompt.clone());
+                    }
+                    self.save_session();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleApiLogging(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.api_logging = val;
+                    settings.save();
+
+                    maki_config::LOG_API.store(val, std::sync::atomic::Ordering::Relaxed);
+                    self.save_session();
+                    vec![]
+                }
+                SettingsPickerAction::Closed => vec![],
+            });
+        }
+
         if self.model_picker.is_open() {
             return Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
@@ -949,15 +992,24 @@ impl App {
             return vec![];
         }
 
+        let chat_idx = match envelope.subagent {
+            Some(ref subagent) => self.resolve_or_create_chat(subagent),
+            None => 0,
+        };
+
         let subagent_id = envelope
             .subagent
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
-        let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent),
-            None => 0,
-        };
+        if let AgentEvent::SystemPrompt { text } = envelope.event {
+            self.state.session.meta.system_prompt = Some(text.clone());
+            self.chats[chat_idx].set_system_prompt(
+                self.state.session.meta.show_system_prompt,
+                Some(text),
+            );
+            return vec![];
+        }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -1155,6 +1207,11 @@ impl App {
                 self.theme_picker.open();
                 vec![]
             }
+            "/settings" => {
+                let settings = UserSettings::load();
+                self.settings_picker.open(settings.show_system_prompt, settings.api_logging);
+                vec![]
+            }
             "/mcp" => {
                 self.mcp_picker.open();
                 vec![]
@@ -1204,7 +1261,7 @@ impl App {
                 );
                 vec![]
             }
-            "/exit" => self.quit(),
+            "/exit" | "/q" => self.quit(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1342,7 +1399,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 13] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
             &self.btw_modal,
@@ -1353,6 +1410,7 @@ impl App {
             &self.session_picker,
             &self.rewind_picker,
             &self.theme_picker,
+            &self.settings_picker,
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
@@ -1360,7 +1418,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 13] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
             &mut self.btw_modal,
@@ -1371,6 +1429,7 @@ impl App {
             &mut self.session_picker,
             &mut self.rewind_picker,
             &mut self.theme_picker,
+            &mut self.settings_picker,
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
@@ -1447,6 +1506,7 @@ impl App {
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.theme_picker);
+        try_picker!(self.settings_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);

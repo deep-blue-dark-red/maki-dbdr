@@ -78,6 +78,10 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "write",
 ];
 
+pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
     Bool(bool),
@@ -228,6 +232,7 @@ impl RawConfig {
             .filter(|(_, cfg)| cfg.enabled == Some(false))
             .map(|(name, _)| name.clone())
             .collect();
+        LOG_API.store(self.provider.log_api.unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
@@ -354,6 +359,7 @@ pub struct ProviderFileConfig {
     pub connect_timeout_secs: Option<u64>,
     pub low_speed_timeout_secs: Option<u64>,
     pub stream_timeout_secs: Option<u64>,
+    pub log_api: Option<bool>,
 }
 
 impl ProviderFileConfig {
@@ -364,7 +370,8 @@ impl ProviderFileConfig {
             default_model,
             connect_timeout_secs,
             low_speed_timeout_secs,
-            stream_timeout_secs
+            stream_timeout_secs,
+            log_api
         );
     }
 }
@@ -762,6 +769,9 @@ pub struct ProviderConfig {
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
              desc = "Streaming response timeout (seconds)")]
     pub stream_timeout: Duration,
+
+    #[config(default = false, desc = "Log all outbound and inbound API text for auditing")]
+    pub log_api: bool,
 }
 
 impl Default for ProviderConfig {
@@ -771,6 +781,7 @@ impl Default for ProviderConfig {
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
+            log_api: false,
         }
     }
 }
@@ -790,6 +801,7 @@ impl ProviderConfig {
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
             ),
+            log_api: f.log_api.unwrap_or(false),
         }
     }
 }

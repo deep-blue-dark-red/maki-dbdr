@@ -890,6 +890,7 @@ impl EventPump {
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
+            | AgentEvent::SystemPrompt { .. }
             | AgentEvent::LiveToolBuf { .. } => {}
             AgentEvent::Retry {
                 attempt,

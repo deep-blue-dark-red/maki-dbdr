@@ -102,6 +102,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Exit the application",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/q",
+        description: "Exit the application (shortcut for /exit)",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/settings",
+        description: "Show settings menu",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {

@@ -229,6 +229,16 @@ pub fn done_style() -> RoleStyle {
     }
 }
 
+pub fn system_style() -> RoleStyle {
+    RoleStyle {
+        prefix: "system> ",
+        text_style: theme::current().tool_dim,
+        prefix_style: theme::current().tool_dim,
+        use_markdown: false,
+        max_line_bytes: None,
+    }
+}
+
 pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
     pub search_text: String,
