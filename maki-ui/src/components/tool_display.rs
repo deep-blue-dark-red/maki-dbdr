@@ -552,7 +552,7 @@ impl ToolLineBuilder {
         self.search_text.push_str(text);
     }
 
-    fn prepend_indicator(&mut self, indicator: Indicator, started_at: Instant) {
+    fn prepend_indicator(&mut self, indicator: Indicator, _started_at: Instant) {
         let (text, style): (String, Style) = match indicator {
             Indicator::Pending => ("○ ".to_string(), theme::current().tool_dim),
             Indicator::InProgress => ("✻ ".to_string(), theme::current().spinner),

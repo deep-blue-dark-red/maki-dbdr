@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
 
-use crate::animation::spinner_frame;
+
 use crate::theme;
 
 use maki_providers::{ModelPricing, TokenUsage};
@@ -58,7 +58,6 @@ pub struct StatusBarContext<'a> {
 
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
-    started_at: Instant,
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
@@ -68,7 +67,6 @@ impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
         Self {
             flash: None,
-            started_at: Instant::now(),
             cwd_branch: cwd_branch_label(),
             flash_duration,
             branch_update_rx: spawn_branch_watcher(),
@@ -145,14 +143,12 @@ impl StatusBar {
                 ));
             }
         } else if *ctx.status == Status::Streaming {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
-            left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
+            left_spans.push(Span::styled(" ✻", theme::current().spinner));
         }
 
         if ctx.restoring {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(
-                format!(" {ch}"),
+                " ✻",
                 theme::current().status_notice,
             ));
         }

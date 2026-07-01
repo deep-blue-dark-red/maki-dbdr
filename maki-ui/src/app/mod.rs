@@ -1076,10 +1076,8 @@ impl App {
                     self.active_run_start = Some(Instant::now());
                 }
             }
-            AgentEvent::Done { .. } | AgentEvent::Error { .. } => {
-                if chat_idx == 0 {
-                    self.active_run_start = None;
-                }
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } if chat_idx == 0 => {
+                self.active_run_start = None;
             }
             _ => {}
         }

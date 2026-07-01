@@ -527,13 +527,9 @@ impl MessagesPanel {
     pub fn in_progress_tools(&self) -> Vec<String> {
         self.messages
             .iter()
-            .filter_map(|m| {
-                if let DisplayRole::Tool(t) = &m.role {
-                    if t.status == ToolStatus::InProgress {
-                        return Some(t.name.to_string());
-                    }
-                }
-                None
+            .filter_map(|m| match &m.role {
+                DisplayRole::Tool(t) if t.status == ToolStatus::InProgress => Some(t.name.to_string()),
+                _ => None,
             })
             .collect()
     }
