@@ -291,6 +291,7 @@ impl<'t> EventLoop<'t> {
     fn tick(&mut self) {
         self.app.tick_edge_scroll();
         self.app.tick_error_expiry();
+        self.app.tick_timeline();
         self.app.poll_image_paste();
         self.app.btw_modal.poll();
         self.app.status_bar.poll_branch_update();

@@ -201,9 +201,7 @@ impl App {
                 .flatten()
                 .or_else(|| self.lua_hint_line());
             let activity = ActivityTracker {
-                last_api_send: self.last_api_send,
-                last_api_receive: self.last_api_receive,
-                last_tool_call: self.last_tool_call,
+                timeline: self.timeline.clone(),
             };
             self.input_box.view(
                 frame,
@@ -292,11 +290,20 @@ impl App {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
-        let streaming_info = if self.status == Status::Streaming {
-            let duration = self.active_run_start.map(|t| t.elapsed()).unwrap_or(std::time::Duration::ZERO);
+        let is_streaming = self.status == Status::Streaming;
+        let streaming_info = if is_streaming || self.active_run_duration.is_some() {
+            let duration = if is_streaming {
+                self.active_run_start.map(|t| t.elapsed()).unwrap_or(std::time::Duration::ZERO)
+            } else {
+                self.active_run_duration.unwrap_or(std::time::Duration::ZERO)
+            };
             let input_tokens = self.active_run_input_tokens;
             let output_tokens = self.active_run_output_chars / 4;
-            let active_tools = chat.in_progress_tools();
+            let active_tools = if is_streaming {
+                chat.in_progress_tools()
+            } else {
+                Vec::new()
+            };
             Some(StreamingInfo {
                 duration,
                 input_tokens,
@@ -330,6 +337,7 @@ impl App {
             fast: self.state.fast,
             restoring: self.restoring.load(Ordering::Relaxed),
             streaming_info,
+            streaming_active: is_streaming,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

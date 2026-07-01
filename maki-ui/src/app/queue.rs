@@ -143,9 +143,12 @@ impl App {
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
         self.status = super::Status::Streaming;
         self.active_run_start = Some(std::time::Instant::now());
+        self.active_run_duration = None;
         self.active_run_input_tokens = self.main_chat().context_size;
         self.active_run_output_chars = 0;
-        self.last_api_send = Some(std::time::Instant::now());
+        self.timeline = vec![super::TimelineEvent::None; 40];
+        self.push_timeline_event(super::TimelineEvent::ApiSend);
+        self.push_timeline_event(super::TimelineEvent::ApiSend);
         if let Some(ref handle) = self.lua_event_handle {
             handle.fire_autocmd("TurnStart", serde_json::json!({}));
         }

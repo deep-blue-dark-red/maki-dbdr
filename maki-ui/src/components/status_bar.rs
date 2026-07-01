@@ -54,6 +54,7 @@ pub struct StatusBarContext<'a> {
     pub fast: bool,
     pub restoring: bool,
     pub streaming_info: Option<StreamingInfo>,
+    pub streaming_active: bool,
 }
 
 pub struct StatusBar {
@@ -113,12 +114,17 @@ impl StatusBar {
         let mut left_spans = Vec::new();
 
         if let Some(info) = &ctx.streaming_info {
+            let info_style = if ctx.streaming_active {
+                theme::current().spinner
+            } else {
+                theme::current().status_dim
+            };
             if !info.active_tools.is_empty() {
                 let tool_list = info.active_tools.join(", ");
                 let duration_secs = info.duration.as_secs();
                 left_spans.push(Span::styled(
                     format!(" ✻ running {tool_list} ({duration_secs}s)"),
-                    theme::current().spinner,
+                    info_style,
                 ));
             } else {
                 let duration_secs = info.duration.as_secs();
@@ -139,7 +145,7 @@ impl StatusBar {
                 };
                 left_spans.push(Span::styled(
                     format!(" ✻ {status_label} {stats_str}"),
-                    theme::current().spinner,
+                    info_style,
                 ));
             }
         } else if *ctx.status == Status::Streaming {

@@ -28,7 +28,7 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
-use crate::components::input::{InputAction, InputBox, Submission};
+use crate::components::input::{InputAction, InputBox, Submission, TimelineEvent};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
@@ -156,9 +156,9 @@ pub struct App {
     pub(super) active_run_start: Option<Instant>,
     pub(super) active_run_input_tokens: u32,
     pub(super) active_run_output_chars: u32,
-    pub(super) last_api_send: Option<Instant>,
-    pub(super) last_api_receive: Option<Instant>,
-    pub(super) last_tool_call: Option<Instant>,
+    pub(super) timeline: Vec<TimelineEvent>,
+    pub(super) last_timeline_shift: Instant,
+    pub(super) active_run_duration: Option<Duration>,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -254,9 +254,9 @@ impl App {
             active_run_start: None,
             active_run_input_tokens: 0,
             active_run_output_chars: 0,
-            last_api_send: None,
-            last_api_receive: None,
-            last_tool_call: None,
+            timeline: vec![TimelineEvent::None; 40],
+            last_timeline_shift: Instant::now(),
+            active_run_duration: None,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -287,6 +287,30 @@ impl App {
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
         }
+    }
+
+    pub(super) fn push_timeline_event(&mut self, ev: TimelineEvent) {
+        if !self.timeline.is_empty() {
+            self.timeline.remove(0);
+        }
+        self.timeline.push(ev);
+    }
+
+    pub fn tick_timeline(&mut self) {
+        if self.status == Status::Streaming && self.last_timeline_shift.elapsed() >= std::time::Duration::from_millis(200) {
+            self.last_timeline_shift = std::time::Instant::now();
+            let tool_running = self.chats.iter().any(|c| !c.in_progress_tools().is_empty());
+            let ev = if tool_running {
+                TimelineEvent::ToolUse
+            } else {
+                TimelineEvent::None
+            };
+            self.push_timeline_event(ev);
+        }
+    }
+
+    pub fn timeline_has_recent_activity(&self) -> bool {
+        self.timeline.iter().any(|&ev| ev != TimelineEvent::None)
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -1025,7 +1049,7 @@ impl App {
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if chat_idx == 0 {
-                self.last_tool_call = Some(Instant::now());
+                self.push_timeline_event(TimelineEvent::ToolUse);
             }
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
@@ -1070,8 +1094,12 @@ impl App {
         match &envelope.event {
             AgentEvent::ThinkingDelta { text } | AgentEvent::TextDelta { text } => {
                 if chat_idx == 0 {
-                    self.active_run_output_chars += text.chars().count() as u32;
-                    self.last_api_receive = Some(Instant::now());
+                    let chars = text.chars().count();
+                    self.active_run_output_chars += chars as u32;
+                    let tokens = (chars / 4).max(1);
+                    for _ in 0..tokens {
+                        self.push_timeline_event(TimelineEvent::ApiReceive { tokens: 1 });
+                    }
                 }
             }
             AgentEvent::ToolResultsSubmitted { .. } => {
@@ -1079,16 +1107,20 @@ impl App {
                     self.active_run_start = Some(Instant::now());
                     self.active_run_input_tokens = self.chats[0].context_size;
                     self.active_run_output_chars = 0;
-                    self.last_api_send = Some(Instant::now());
+                    self.push_timeline_event(TimelineEvent::ApiSend);
+                    self.push_timeline_event(TimelineEvent::ApiSend);
                 }
             }
             AgentEvent::ToolStart(_) => {
                 if chat_idx == 0 {
                     self.active_run_start = Some(Instant::now());
-                    self.last_tool_call = Some(Instant::now());
+                    self.push_timeline_event(TimelineEvent::ToolUse);
                 }
             }
             AgentEvent::Done { .. } | AgentEvent::Error { .. } if chat_idx == 0 => {
+                if let Some(start) = self.active_run_start {
+                    self.active_run_duration = Some(start.elapsed());
+                }
                 self.active_run_start = None;
             }
             _ => {}
@@ -1221,9 +1253,12 @@ impl App {
                 }
                 self.status = Status::Streaming;
                 self.active_run_start = Some(Instant::now());
+                self.active_run_duration = None;
                 self.active_run_input_tokens = self.main_chat().context_size;
                 self.active_run_output_chars = 0;
-                self.last_api_send = Some(Instant::now());
+                self.timeline = vec![TimelineEvent::None; 40];
+                self.push_timeline_event(TimelineEvent::ApiSend);
+                self.push_timeline_event(TimelineEvent::ApiSend);
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1369,9 +1404,12 @@ impl App {
             self.run_id += 1;
             self.status = Status::Streaming;
             self.active_run_start = Some(Instant::now());
+            self.active_run_duration = None;
             self.active_run_input_tokens = self.main_chat().context_size;
             self.active_run_output_chars = 0;
-            self.last_api_send = Some(Instant::now());
+            self.timeline = vec![TimelineEvent::None; 40];
+            self.push_timeline_event(TimelineEvent::ApiSend);
+            self.push_timeline_event(TimelineEvent::ApiSend);
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
@@ -1510,6 +1548,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|s| s.is_edge_scrolling())
             || self.restoring.load(Ordering::Relaxed)
+            || self.status == Status::Streaming
             || self.chats.iter().any(|c| c.is_animating())
     }
 

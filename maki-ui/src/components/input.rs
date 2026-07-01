@@ -1,4 +1,4 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -18,11 +18,17 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TimelineEvent {
+    None,
+    ApiSend,
+    ApiReceive { tokens: u32 },
+    ToolUse,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ActivityTracker {
-    pub last_api_send: Option<Instant>,
-    pub last_api_receive: Option<Instant>,
-    pub last_tool_call: Option<Instant>,
+    pub timeline: Vec<TimelineEvent>,
 }
 
 use super::scrollbar::render_vertical_scrollbar;
@@ -318,19 +324,6 @@ impl InputBox {
     }
 }
 
-fn decay(last_time: Option<Instant>, duration: std::time::Duration) -> f64 {
-    if let Some(t) = last_time {
-        let elapsed = t.elapsed();
-        if elapsed < duration {
-            1.0 - elapsed.as_secs_f64() / duration.as_secs_f64()
-        } else {
-            0.0
-        }
-    } else {
-        0.0
-    }
-}
-
 fn get_rgb(color: Color) -> (u8, u8, u8) {
     match color {
         Color::Rgb(r, g, b) => (r, g, b),
@@ -338,16 +331,11 @@ fn get_rgb(color: Color) -> (u8, u8, u8) {
     }
 }
 
-fn get_decay_style(last_time: Option<Instant>, duration: std::time::Duration, base_rgb: (u8, u8, u8), bg_rgb: (u8, u8, u8)) -> Style {
-    let f = decay(last_time, duration);
-    if f > 0.01 {
-        let r = (bg_rgb.0 as f64 + (base_rgb.0 as f64 - bg_rgb.0 as f64) * f).round() as u8;
-        let g = (bg_rgb.1 as f64 + (base_rgb.1 as f64 - bg_rgb.1 as f64) * f).round() as u8;
-        let b = (bg_rgb.2 as f64 + (base_rgb.2 as f64 - bg_rgb.2 as f64) * f).round() as u8;
-        Style::default().fg(Color::Rgb(r, g, b))
-    } else {
-        Style::default().fg(Color::Rgb(bg_rgb.0, bg_rgb.1, bg_rgb.2))
-    }
+fn fade_color(base_rgb: (u8, u8, u8), bg_rgb: (u8, u8, u8), factor: f64) -> Color {
+    let r = (bg_rgb.0 as f64 + (base_rgb.0 as f64 - bg_rgb.0 as f64) * factor).round() as u8;
+    let g = (bg_rgb.1 as f64 + (base_rgb.1 as f64 - bg_rgb.1 as f64) * factor).round() as u8;
+    let b = (bg_rgb.2 as f64 + (base_rgb.2 as f64 - bg_rgb.2 as f64) * factor).round() as u8;
+    Color::Rgb(r, g, b)
 }
 
 impl InputBox {
@@ -450,39 +438,34 @@ impl InputBox {
 
         let text = Text::from(styled_lines);
 
-        let f_send = decay(activity.last_api_send, std::time::Duration::from_secs(5));
-        let f_recv = decay(activity.last_api_receive, std::time::Duration::from_millis(800));
-        let f_tool = decay(activity.last_tool_call, std::time::Duration::from_secs(5));
-
-        let active_border_style = if f_recv > 0.01 {
-            let bg = get_rgb(theme::current().background);
-            let green = (80, 250, 123);
-            let r = (bg.0 as f64 + (green.0 as f64 - bg.0 as f64) * f_recv).round() as u8;
-            let g = (bg.1 as f64 + (green.1 as f64 - bg.1 as f64) * f_recv).round() as u8;
-            let b = (bg.2 as f64 + (green.2 as f64 - bg.2 as f64) * f_recv).round() as u8;
-            Style::default().fg(Color::Rgb(r, g, b))
-        } else if f_tool > f_send && f_tool > 0.01 {
-            let bg = get_rgb(theme::current().background);
-            let magenta = (255, 121, 198);
-            let r = (bg.0 as f64 + (magenta.0 as f64 - bg.0 as f64) * f_tool).round() as u8;
-            let g = (bg.1 as f64 + (magenta.1 as f64 - bg.1 as f64) * f_tool).round() as u8;
-            let b = (bg.2 as f64 + (magenta.2 as f64 - bg.2 as f64) * f_tool).round() as u8;
-            Style::default().fg(Color::Rgb(r, g, b))
-        } else if f_send > f_recv && f_send > 0.01 {
-            let bg = get_rgb(theme::current().background);
-            let cyan = (139, 233, 253);
-            let r = (bg.0 as f64 + (cyan.0 as f64 - bg.0 as f64) * f_send).round() as u8;
-            let g = (bg.1 as f64 + (cyan.1 as f64 - bg.1 as f64) * f_send).round() as u8;
-            let b = (bg.2 as f64 + (cyan.2 as f64 - bg.2 as f64) * f_send).round() as u8;
-            Style::default().fg(Color::Rgb(r, g, b))
-        } else {
-            border_style
-        };
+        let bg = get_rgb(theme::current().background);
+        
+        let mut spans = vec![Span::styled("─[ ", border_style)];
+        for (i, &ev) in activity.timeline.iter().enumerate() {
+            let factor = i as f64 / 39.0;
+            let span = match ev {
+                TimelineEvent::None => Span::styled("─", border_style),
+                TimelineEvent::ApiSend => {
+                    let c = fade_color((98, 139, 250), bg, factor);
+                    Span::styled("█", Style::default().fg(c))
+                }
+                TimelineEvent::ApiReceive { .. } => {
+                    let c = fade_color((80, 250, 123), bg, factor);
+                    Span::styled("█", Style::default().fg(c))
+                }
+                TimelineEvent::ToolUse => {
+                    let c = fade_color((241, 250, 140), bg, factor);
+                    Span::styled("█", Style::default().fg(c))
+                }
+            };
+            spans.push(span);
+        }
+        spans.push(Span::styled(" ]", border_style));
 
         let mut block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
-            .border_style(active_border_style);
+            .border_style(border_style);
         if let Some(hint) = &top_right_hint {
             block = block.title_top(hint.clone().right_aligned());
         }
@@ -492,21 +475,8 @@ impl InputBox {
             .block(block);
         frame.render_widget(paragraph, area);
 
-        // Draw the custom top border activity strip overlapping the block's top border
-        let bg = get_rgb(theme::current().background);
-        let s_send = get_decay_style(activity.last_api_send, std::time::Duration::from_secs(5), (139, 233, 253), bg);
-        let s_recv = get_decay_style(activity.last_api_receive, std::time::Duration::from_millis(800), (80, 250, 123), bg);
-        let s_tool = get_decay_style(activity.last_tool_call, std::time::Duration::from_secs(5), (255, 121, 198), bg);
-
-        let mut spans = vec![
-            Span::styled("─[ ", active_border_style),
-            Span::styled("● API SEND ", s_send),
-            Span::styled("● API RECV ", s_recv),
-            Span::styled("● TOOL/TASK ", s_tool),
-            Span::styled("]", active_border_style),
-        ];
-
-        let remaining_width = (area.width as usize).saturating_sub(38);
+        // Draw the top border timeline row on top of the block's top border
+        let remaining_width = (area.width as usize).saturating_sub(45);
         if remaining_width > 0 {
             let hint_len = if let Some(ref hint) = top_right_hint {
                 hint.width()
@@ -515,7 +485,7 @@ impl InputBox {
             };
             let line_len = remaining_width.saturating_sub(hint_len);
             if line_len > 0 {
-                spans.push(Span::styled("─".repeat(line_len), active_border_style));
+                spans.push(Span::styled("─".repeat(line_len), border_style));
             }
             if let Some(ref hint) = top_right_hint {
                 spans.extend(hint.spans.clone());
