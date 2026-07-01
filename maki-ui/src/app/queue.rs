@@ -146,9 +146,10 @@ impl App {
         self.active_run_duration = None;
         self.active_run_input_tokens = self.main_chat().context_size;
         self.active_run_output_chars = 0;
-        self.timeline = vec![super::TimelineEvent::None; 40];
-        self.push_timeline_event(super::TimelineEvent::ApiSend);
-        self.push_timeline_event(super::TimelineEvent::ApiSend);
+        self.timeline_events.clear();
+        self.last_api_send = Some(std::time::Instant::now());
+        self.last_api_receive = None;
+        self.push_timeline_event(crate::components::input::TimelineEventKind::ApiSend);
         if let Some(ref handle) = self.lua_event_handle {
             handle.fire_autocmd("TurnStart", serde_json::json!({}));
         }

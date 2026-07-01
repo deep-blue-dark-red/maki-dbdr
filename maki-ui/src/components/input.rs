@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -19,16 +19,23 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum TimelineEvent {
-    None,
+pub enum TimelineEventKind {
     ApiSend,
-    ApiReceive { tokens: u32 },
+    ApiReceive,
     ToolUse,
+}
+
+#[derive(Clone, Debug)]
+pub struct TimelineEventInfo {
+    pub timestamp: Instant,
+    pub kind: TimelineEventKind,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ActivityTracker {
-    pub timeline: Vec<TimelineEvent>,
+    pub timeline_events: Vec<TimelineEventInfo>,
+    pub starved: bool,
+    pub history_period_seconds: f64,
 }
 
 use super::scrollbar::render_vertical_scrollbar;
@@ -439,58 +446,80 @@ impl InputBox {
         let text = Text::from(styled_lines);
 
         let bg = get_rgb(theme::current().background);
-        
-        let mut spans = vec![Span::styled("─[ ", border_style)];
-        for (i, &ev) in activity.timeline.iter().enumerate() {
-            let factor = i as f64 / 39.0;
-            let span = match ev {
-                TimelineEvent::None => Span::styled("─", border_style),
-                TimelineEvent::ApiSend => {
-                    let c = fade_color((98, 139, 250), bg, factor);
-                    Span::styled("█", Style::default().fg(c))
-                }
-                TimelineEvent::ApiReceive { .. } => {
-                    let c = fade_color((80, 250, 123), bg, factor);
-                    Span::styled("█", Style::default().fg(c))
-                }
-                TimelineEvent::ToolUse => {
-                    let c = fade_color((241, 250, 140), bg, factor);
-                    Span::styled("█", Style::default().fg(c))
-                }
-            };
-            spans.push(span);
-        }
-        spans.push(Span::styled(" ]", border_style));
+        let w = area.width as usize;
+        let hint_len = top_right_hint.as_ref().map(|h| h.width()).unwrap_or(0);
+        let available_width = w.saturating_sub(hint_len + 2);
 
-        let mut block = Block::default()
+        let border_color_style = if activity.starved {
+            Style::default().fg(Color::Rgb(255, 85, 85))
+        } else {
+            border_style
+        };
+
+        let mut timeline_chars = vec!['─'; available_width];
+        let mut timeline_styles = vec![border_color_style; available_width];
+        let h_period = activity.history_period_seconds;
+
+        for ev in &activity.timeline_events {
+            let elapsed = ev.timestamp.elapsed().as_secs_f64();
+            if elapsed >= h_period || elapsed < 0.0 {
+                continue;
+            }
+
+            let u = elapsed / h_period;
+            let fraction = u * u;
+
+            let col = if available_width > 0 {
+                let max_idx = available_width - 1;
+                max_idx.saturating_sub((fraction * max_idx as f64).round() as usize)
+            } else {
+                0
+            };
+
+            if col < available_width {
+                let base_rgb = match ev.kind {
+                    TimelineEventKind::ApiSend => (80, 250, 123),
+                    TimelineEventKind::ApiReceive => (139, 233, 253),
+                    TimelineEventKind::ToolUse => (241, 250, 140),
+                };
+
+                let factor = if available_width > 1 {
+                    col as f64 / (available_width - 1) as f64
+                } else {
+                    1.0
+                };
+
+                let c = fade_color(base_rgb, bg, factor);
+                timeline_chars[col] = '│';
+                timeline_styles[col] = Style::default().fg(c);
+            }
+        }
+
+        let mut spans = Vec::with_capacity(w);
+        for i in 0..available_width {
+            spans.push(Span::styled(timeline_chars[i].to_string(), timeline_styles[i]));
+        }
+
+        let spacer_len = w.saturating_sub(available_width + hint_len);
+        if spacer_len > 0 {
+            spans.push(Span::styled("─".repeat(spacer_len), border_color_style));
+        }
+
+        if let Some(ref hint) = top_right_hint {
+            spans.extend(hint.spans.clone());
+        }
+
+        let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
-            .border_style(border_style);
-        if let Some(hint) = &top_right_hint {
-            block = block.title_top(hint.clone().right_aligned());
-        }
+            .border_style(border_color_style);
+
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
             .scroll((self.scroll_y, 0))
             .block(block);
         frame.render_widget(paragraph, area);
 
-        // Draw the top border timeline row on top of the block's top border
-        let remaining_width = (area.width as usize).saturating_sub(45);
-        if remaining_width > 0 {
-            let hint_len = if let Some(ref hint) = top_right_hint {
-                hint.width()
-            } else {
-                0
-            };
-            let line_len = remaining_width.saturating_sub(hint_len);
-            if line_len > 0 {
-                spans.push(Span::styled("─".repeat(line_len), border_style));
-            }
-            if let Some(ref hint) = top_right_hint {
-                spans.extend(hint.spans.clone());
-            }
-        }
         let top_border_line = Line::from(spans);
         let top_border_paragraph = Paragraph::new(top_border_line);
         let top_border_area = Rect::new(area.x, area.y, area.width, 1);
