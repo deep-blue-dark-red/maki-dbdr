@@ -200,24 +200,8 @@ impl App {
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
-            let starved = if self.status == Status::Streaming {
-                if let Some(send_time) = self.last_api_send {
-                    if self.active_run_output_chars == 0 {
-                        send_time.elapsed().as_secs_f64() > 2.0
-                    } else if let Some(recv_time) = self.last_api_receive {
-                        recv_time.elapsed().as_secs_f64() > 2.0
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
             let activity = ActivityTracker {
                 timeline_events: self.timeline_events.clone(),
-                starved,
                 history_period_seconds: self.history_period_seconds,
             };
             self.input_box.view(
