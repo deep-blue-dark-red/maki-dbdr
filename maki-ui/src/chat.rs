@@ -266,6 +266,17 @@ impl Chat {
         self.messages_panel.clear_cache();
     }
 
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.messages_panel.verbose = verbose;
+        self.messages_panel.clear_expanded_tools();
+        self.messages_panel.clear_cache();
+    }
+
+    pub fn set_show_reasoning(&mut self, show: bool) {
+        self.messages_panel.show_reasoning = show;
+        self.messages_panel.clear_cache();
+    }
+
     pub fn register_live_buf(&mut self, id: String, buf: Arc<SharedBuf>) {
         self.messages_panel.register_live_buf(id, buf);
     }

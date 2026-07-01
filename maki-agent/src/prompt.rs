@@ -239,13 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_slots_emit_template_and_native_efficient_line() {
+    fn empty_slots_emit_template_without_unfilled_markers() {
         let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
         assert!(out.starts_with("You are Maki"));
         assert!(
             !out.contains("{{"),
             "unfilled marker left in output:\n{out}"
         );
+    }
+
+    #[test]
+    fn research_template_emits_native_efficient_line() {
+        let out = assemble(PromptId::Research, &ResolvedSlots::default(), "");
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}.")));
     }
 
@@ -257,13 +262,12 @@ mod tests {
             PromptId::System,
             &[
                 (Slot::ToolUsage, "TOOL_USAGE"),
-                (Slot::EfficientTools, "EXTRA_TOOL"),
                 (Slot::Conventions, "CONVENTIONS"),
                 (Slot::AfterInstructions, "AFTER"),
             ],
         );
         let out = assemble(PromptId::System, &s, "INSTR");
-        let positions = ["TOOL_USAGE", "EXTRA_TOOL", "CONVENTIONS", "INSTR", "AFTER"]
+        let positions = ["TOOL_USAGE", "CONVENTIONS", "INSTR", "AFTER"]
             .map(|needle| at(&out, needle));
         assert!(
             positions.is_sorted(),
@@ -292,13 +296,13 @@ mod tests {
     #[test]
     fn efficient_tools_extras_join_native_list() {
         let s = slots(
-            PromptId::System,
+            PromptId::Research,
             &[
                 (Slot::EfficientTools, "index"),
                 (Slot::EfficientTools, "foo"),
             ],
         );
-        let out = assemble(PromptId::System, &s, "");
+        let out = assemble(PromptId::Research, &s, "");
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index, foo.")));
     }
 
@@ -347,7 +351,7 @@ mod tests {
     }
 
     #[test_case(PromptId::System, Slot::ToolUsage, true ; "system_tool_usage")]
-    #[test_case(PromptId::System, Slot::EfficientTools, true ; "system_efficient")]
+    #[test_case(PromptId::System, Slot::EfficientTools, false ; "system_efficient")]
     #[test_case(PromptId::System, Slot::Conventions, true ; "system_conventions")]
     #[test_case(PromptId::System, Slot::AfterInstructions, true ; "system_after")]
     #[test_case(PromptId::System, Slot::Identity, true ; "system_identity")]

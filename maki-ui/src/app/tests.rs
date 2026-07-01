@@ -2230,7 +2230,7 @@ fn bash_prefix_overrides_mode() {
     let mut app = test_app();
 
     app.input_box.set_input("! ls".into());
-    assert_eq!(&*app.mode_label().0, "[BASH]");
+    assert_eq!(&*app.mode_label().0, "[bash]");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
@@ -2240,7 +2240,7 @@ fn bash_prefix_overrides_mode() {
     );
 
     app.input_box.set_input("ls".into());
-    assert_eq!(&*app.mode_label().0, "[BUILD]");
+    assert_eq!(&*app.mode_label().0, "[build]");
 }
 
 #[test]

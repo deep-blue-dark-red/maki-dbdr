@@ -545,7 +545,12 @@ mod tests {
             "#,
         );
         for &pid in PromptId::ALL {
-            assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
+            let expected = if pid == PromptId::System {
+                vec![]
+            } else {
+                vec!["index"]
+            };
+            assert_eq!(contents(&slots, pid, Slot::EfficientTools), expected);
         }
     }
 

@@ -109,7 +109,11 @@ pub struct Bind {
 
 impl Bind {
     pub fn matches(&self, key: KeyEvent) -> bool {
-        key.code == self.code && key.modifiers == self.modifiers
+        let code_match = match (self.code, key.code) {
+            (KeyCode::Char(c1), KeyCode::Char(c2)) => c1.eq_ignore_ascii_case(&c2),
+            (a, b) => a == b,
+        };
+        code_match && key.modifiers == self.modifiers
     }
 
     #[cfg(test)]
@@ -141,7 +145,12 @@ pub mod key {
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
-    pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
+    pub const TOGGLE_VERBOSE: Bind = ctrl_bind!('o');
+    pub const OPEN_EDITOR: Bind = Bind {
+        code: KeyCode::Char('p'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+P",
+    };
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
     pub const TASKS: Bind = ctrl_bind!('x');
     pub const SUSPEND: Bind = ctrl_bind!('z');
@@ -335,6 +344,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::FILE_PICKER.label),
         description: "File picker",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::TOGGLE_VERBOSE.label),
+        description: "Toggle verbose mode",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -610,7 +625,7 @@ mod tests {
 
     #[test]
     fn bind_requires_exact_modifiers() {
-        let bind = key::OPEN_EDITOR; // Ctrl+O
+        let bind = key::TOGGLE_VERBOSE; // Ctrl+O
         let exact = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
         let extra = KeyEvent::new(
             KeyCode::Char('o'),

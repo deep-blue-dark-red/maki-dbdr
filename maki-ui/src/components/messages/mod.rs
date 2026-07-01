@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ratatui::style::Style;
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::{
@@ -83,6 +84,8 @@ pub struct MessagesPanel {
     rebake_requested: HashMap<String, u64>,
     pub show_system_prompt: bool,
     pub system_prompt: Option<String>,
+    pub verbose: bool,
+    pub show_reasoning: bool,
 }
 
 impl MessagesPanel {
@@ -126,6 +129,8 @@ impl MessagesPanel {
             rebake_requested: HashMap::new(),
             show_system_prompt: false,
             system_prompt: None,
+            verbose: false,
+            show_reasoning: false,
         }
     }
 
@@ -140,6 +145,10 @@ impl MessagesPanel {
 
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+    }
+
+    pub fn clear_expanded_tools(&mut self) {
+        self.expanded_tools.clear();
     }
 
     pub fn push(&mut self, msg: DisplayMessage) {
@@ -673,15 +682,25 @@ impl MessagesPanel {
             .expanded_tools
             .get(tool_id)
             .copied()
-            .unwrap_or_default();
-        if !seg.truncation.any() && !exp.any() {
+            .unwrap_or_else(|| {
+                if self.verbose {
+                    SectionFlags { script: true, output: true }
+                } else {
+                    SectionFlags::default()
+                }
+            });
+        let is_thinking = tool_id.starts_with("msg_") && tool_id.ends_with("_thinking");
+        if !is_thinking && !seg.truncation.any() && !exp.any() {
             return ClickResult::Nothing;
         }
         let tool_id = tool_id.to_owned();
         let truncation = seg.truncation;
 
-        let entry = self.expanded_tools.entry(tool_id.clone()).or_default();
-        if truncation.output || entry.output {
+        let entry = self.expanded_tools.entry(tool_id.clone()).or_insert(exp);
+        if is_thinking {
+            entry.output = !entry.output;
+            entry.script = !entry.script;
+        } else if truncation.output || entry.output {
             entry.output = !entry.output;
         } else if truncation.script || entry.script {
             entry.script = !entry.script;
@@ -1233,6 +1252,38 @@ impl MessagesPanel {
         }
     }
 
+    fn build_thinking_lines(
+        thinking_text: &str,
+        exp: bool,
+        has_next_text: bool,
+        prefix: &str,
+        prefix_style: Style,
+    ) -> Vec<Line<'static>> {
+        let tokens = thinking_text.len() / 4;
+        let lines_count = thinking_text.lines().count();
+        if !exp {
+            let label = format!("(reasoning {tokens} tokens, +{lines_count} lines)");
+            let line = Line::from(vec![
+                Span::styled(format!("{prefix} "), prefix_style),
+                Span::styled(label, theme::current().tool_dim),
+            ]);
+            vec![line]
+        } else {
+            let mut lines = Vec::new();
+            lines.push(Line::from(Span::styled(prefix.to_owned(), prefix_style)));
+            for line in thinking_text.lines() {
+                lines.push(Line::from(vec![
+                    Span::styled("│ ", theme::current().tool_dim),
+                    Span::styled(line.to_owned(), theme::current().tool_dim),
+                ]));
+            }
+            if !has_next_text {
+                lines.push(Line::from(Span::styled("│", theme::current().tool_dim)));
+            }
+            lines
+        }
+    }
+
     fn rebuild_line_cache(&mut self) {
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
@@ -1248,8 +1299,42 @@ impl MessagesPanel {
         for i in self.cache.msg_count()..self.messages.len() {
             let msg = &self.messages[i];
 
+            if msg.role == DisplayRole::Thinking && !self.show_reasoning {
+                continue;
+            }
+            if let DisplayRole::Thinking = &msg.role {
+                let has_next_assistant = i + 1 < self.messages.len()
+                    && self.messages[i + 1].role == DisplayRole::Assistant;
+                if has_next_assistant {
+                    continue;
+                }
+                let thinking_id = format!("msg_{i}_thinking");
+                let exp = self.expanded_tools.get(&thinking_id).copied().unwrap_or_else(|| {
+                    if self.verbose {
+                        SectionFlags { script: true, output: true }
+                    } else {
+                        SectionFlags::default()
+                    }
+                });
+                let style = thinking_style();
+                let prefix_style = style.prefix_style;
+                let lines = Self::build_thinking_lines(&msg.text, exp.any(), false, "thinking>", prefix_style);
+                let search_text = format!("thinking> {}", msg.text);
+                self.cache.push_spacer_if_needed();
+                let mut seg = Segment::with_lines(lines, search_text, Some(i));
+                seg.tool_id = Some(thinking_id);
+                self.cache.push(seg);
+                continue;
+            }
+
             if let DisplayRole::Tool(t) = &msg.role {
-                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
+                let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_else(|| {
+                    if self.verbose {
+                        SectionFlags { script: true, output: true }
+                    } else {
+                        SectionFlags::default()
+                    }
+                });
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
@@ -1270,7 +1355,13 @@ impl MessagesPanel {
                                 .expanded_tools
                                 .get(&child_id)
                                 .copied()
-                                .unwrap_or_default();
+                                .unwrap_or_else(|| {
+                                    if self.verbose {
+                                        SectionFlags { script: true, output: true }
+                                    } else {
+                                        SectionFlags::default()
+                                    }
+                                });
                             let tl = build_batch_entry_lines(
                                 entry,
                                 j,
@@ -1303,6 +1394,106 @@ impl MessagesPanel {
                     }
                 }
             } else {
+                let prev_thinking = if i > 0 && self.show_reasoning && self.messages[i - 1].role == DisplayRole::Thinking {
+                    Some(&self.messages[i - 1])
+                } else {
+                    None
+                };
+
+                if let DisplayRole::Assistant = &msg.role
+                    && let Some(thinking_msg) = prev_thinking
+                {
+                    let thinking_id = format!("msg_{}_thinking", i - 1);
+                    let exp = self.expanded_tools.get(&thinking_id).copied().unwrap_or_else(|| {
+                        if self.verbose {
+                            SectionFlags { script: true, output: true }
+                        } else {
+                            SectionFlags::default()
+                        }
+                    });
+                    let style = assistant_style();
+                    let prefix_style = style.prefix_style;
+                    let mut lines;
+                    if !exp.any() {
+                        let tokens = thinking_msg.text.len() / 4;
+                        let lines_count = thinking_msg.text.lines().count();
+                        let collapsed_label = format!("(reasoning {tokens} tokens, +{lines_count} lines) ");
+                        
+                        let mut assistant_lines = if style.use_markdown {
+                            text_to_lines(
+                                &msg.text,
+                                style.prefix,
+                                style.text_style,
+                                style.prefix_style,
+                                self.viewport_width,
+                                style.max_line_bytes,
+                            )
+                        } else {
+                            plain_lines(&msg.text, style.prefix, style.text_style, style.prefix_style)
+                        };
+                        
+                        if let Some(first_line) = assistant_lines.first_mut() {
+                            let label_span = Span::styled(
+                                collapsed_label,
+                                theme::current().tool_dim,
+                            );
+                            if first_line.spans.len() > 1 {
+                                first_line.spans.insert(1, label_span);
+                            } else {
+                                first_line.spans.push(label_span);
+                            }
+                        }
+                        lines = assistant_lines;
+                    } else {
+                        let mut thinking_lines = Self::build_thinking_lines(&thinking_msg.text, true, true, "maki>", prefix_style);
+                        let assistant_lines = if style.use_markdown {
+                            text_to_lines(
+                                &msg.text,
+                                "",
+                                style.text_style,
+                                style.prefix_style,
+                                self.viewport_width,
+                                style.max_line_bytes,
+                            )
+                        } else {
+                            plain_lines(&msg.text, "", style.text_style, style.prefix_style)
+                        };
+                        thinking_lines.extend(assistant_lines);
+                        lines = thinking_lines;
+                    }
+
+                    if let Some(pp) = &msg.plan_path {
+                        if !msg.text.is_empty() {
+                            let rule = hr_line(self.viewport_width, theme::current().plan_rule);
+                            lines.insert(0, rule.clone());
+                            lines.push(rule);
+                        } else {
+                            lines.clear();
+                        }
+                        if !msg.text.is_empty() {
+                            lines.push(Line::from(""));
+                        }
+                        lines.push(Line::from(Span::styled(
+                            pp.to_owned(),
+                            theme::current().plan_path,
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "{} to open in editor ($VISUAL / $EDITOR)",
+                                key::OPEN_EDITOR.label
+                            ),
+                            theme::current().tool_dim,
+                        )));
+                    }
+
+                    let search_text = format!("{} {}", thinking_msg.text, msg.text);
+                    self.cache.push_spacer_if_needed();
+                    let mut seg = Segment::with_lines(lines, search_text, Some(i));
+                    seg.tool_id = Some(thinking_id);
+                    self.cache.push(seg);
+                    continue;
+                }
+
                 let style = match &msg.role {
                     DisplayRole::User => user_style(),
                     DisplayRole::Assistant => assistant_style(),

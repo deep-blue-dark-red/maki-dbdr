@@ -55,6 +55,7 @@ pub struct StatusBarContext<'a> {
     pub restoring: bool,
     pub streaming_info: Option<StreamingInfo>,
     pub streaming_active: bool,
+    pub verbose: bool,
 }
 
 pub struct StatusBar {
@@ -130,7 +131,13 @@ impl StatusBar {
                 let duration_secs = info.duration.as_secs();
                 let mut stats = Vec::new();
                 let is_working = info.output_tokens > 0;
-                let status_label = if is_working { "Working" } else { "Waiting" };
+                let status_label = if !ctx.streaming_active {
+                    "Done   "
+                } else if is_working {
+                    "Working"
+                } else {
+                    "Waiting"
+                };
 
                 if !is_working && info.input_tokens > 0 {
                     stats.push(format!("↑ {} tokens", format_tokens(info.input_tokens)));
@@ -158,8 +165,6 @@ impl StatusBar {
                 theme::current().status_notice,
             ));
         }
-
-        left_spans.push(Span::styled(format!(" {}", ctx.mode_label), ctx.mode_style));
 
         if let Some(name) = ctx.chat_name {
             left_spans.push(Span::styled(
@@ -202,6 +207,11 @@ impl StatusBar {
                 } else {
                     0
                 };
+
+                if ctx.verbose {
+                    right_spans.push(Span::styled("[verbose] ", theme::current().status_dim));
+                }
+                right_spans.push(Span::styled(format!("{}  ", ctx.mode_label), ctx.mode_style));
 
                 right_spans.push(Span::styled(
                     self.cwd_branch.clone(),

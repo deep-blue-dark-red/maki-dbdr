@@ -78,6 +78,8 @@ impl App {
         self.chats.clear();
         let mut main = Chat::new("Main".into(), self.ui_config);
         main.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        main.set_show_reasoning(self.state.session.meta.show_reasoning);
+        main.set_verbose(self.verbose);
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
@@ -103,7 +105,11 @@ impl App {
         );
         let show_prompt = self.state.session.meta.show_system_prompt;
         let system_prompt = self.state.session.meta.system_prompt.clone();
+        let show_reasoning = self.state.session.meta.show_reasoning;
+        let verbose = self.verbose;
         self.main_chat().set_system_prompt(show_prompt, system_prompt);
+        self.main_chat().set_show_reasoning(show_reasoning);
+        self.main_chat().set_verbose(verbose);
         self.main_chat().load_messages(display_msgs);
         self.main_chat().token_usage = self.state.token_usage;
         self.main_chat().context_size = self.state.context_size;
@@ -128,6 +134,8 @@ impl App {
             let mut chat = Chat::new(sa.name, self.ui_config);
             chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
             chat.model_id = sa.model;
+            chat.set_show_reasoning(self.state.session.meta.show_reasoning);
+            chat.set_verbose(self.verbose);
             if let Some(messages) = self.state.session.subagent_messages.get(&sa.tool_use_id) {
                 let (display, items) = history_to_display(
                     messages,

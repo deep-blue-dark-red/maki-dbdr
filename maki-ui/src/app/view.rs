@@ -355,6 +355,7 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             streaming_info,
             streaming_active: is_streaming,
+            verbose: self.verbose,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

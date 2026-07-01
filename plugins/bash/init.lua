@@ -233,11 +233,6 @@ end
 
 local description = [[Run git, build, test, and system commands. Not for reading or writing files. Use workdir instead of `cd &&`. Chain dependent commands with &&; use batch for independent ones. Output truncates past ~2000 lines.]]
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
-})
-
 maki.api.register_tool({
   name = "bash",
   kind = "execute",

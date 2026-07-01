@@ -13,8 +13,6 @@
 - memory: record a non-obvious project fact the moment you learn it.
 {{tool_usage}}
 
-{{efficient_tools}}
-
 # Conventions
 - Confirm a library exists in the project's dependency files before using it.
 - Match the surrounding code's style, naming, and imports.

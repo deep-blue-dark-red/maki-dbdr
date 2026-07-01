@@ -133,11 +133,11 @@ impl App {
 
     pub(super) fn mode_label(&self) -> (Cow<'static, str>, Style) {
         let label: Cow<'static, str> = if self.is_bash_input() {
-            "[BASH]".into()
+            "[bash]".into()
         } else {
             match self.state.mode {
-                Mode::Build => "[BUILD]".into(),
-                Mode::Plan => "[PLAN]".into(),
+                Mode::Build => "[build]".into(),
+                Mode::Plan => "[plan]".into(),
             }
         };
         let style = Style::new()

@@ -75,10 +75,6 @@ local function render_panel(visible)
   end
 end
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = "- Use todo_write to plan and track multi-step tasks (must be 3+ steps). Update after EACH step, not only all at once.",
-})
 
 maki.api.register_tool({
   name = "todo_write",

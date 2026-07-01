@@ -58,7 +58,7 @@ pub fn build_system_prompt(
     model: &Model,
 ) -> String {
     let env = vars.apply(
-        "\n\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}",
+        "\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}",
     );
     let env = format!("{env}\nModel: {}", model.spec());
     let instructions = format!("{env}{instructions}");

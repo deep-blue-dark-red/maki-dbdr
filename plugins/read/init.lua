@@ -218,13 +218,6 @@ local function list_dir(path, ctx)
   return result
 end
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = [[
-- When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
-})
-
 maki.api.register_tool({
   name = "read",
   kind = "read",

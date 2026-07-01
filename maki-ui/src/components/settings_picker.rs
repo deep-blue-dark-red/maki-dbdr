@@ -20,6 +20,8 @@ pub struct UserSettings {
     pub api_logging: bool,
     #[serde(default = "default_history_period")]
     pub history_period_seconds: f64,
+    #[serde(default)]
+    pub show_reasoning: bool,
 }
 
 impl Default for UserSettings {
@@ -28,6 +30,7 @@ impl Default for UserSettings {
             show_system_prompt: false,
             api_logging: false,
             history_period_seconds: 60.0,
+            show_reasoning: false,
         }
     }
 }
@@ -59,6 +62,7 @@ pub enum SettingsPickerAction {
     ToggleShowSystemPrompt(bool),
     ToggleApiLogging(bool),
     AdjustHistoryPeriod(bool),
+    ToggleShowReasoning(bool),
     Closed,
 }
 
@@ -84,7 +88,7 @@ impl SettingsPicker {
         }
     }
 
-    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool, history_period: f64) {
+    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool, history_period: f64, show_reasoning: bool) {
         let items = vec![
             SettingItem {
                 name: "show-system-prompt".to_string(),
@@ -95,8 +99,11 @@ impl SettingsPicker {
             SettingItem {
                 name: format!("history-period ({}s)", history_period),
             },
+            SettingItem {
+                name: "show-reasoning".to_string(),
+            },
         ];
-        let enabled = vec![show_system_prompt, api_logging, false];
+        let enabled = vec![show_system_prompt, api_logging, false, show_reasoning];
         self.picker.open_toggleable(items, enabled, TITLE);
     }
 
@@ -125,6 +132,7 @@ impl SettingsPicker {
             PickerAction::Toggle(idx, val) => match idx {
                 0 => SettingsPickerAction::ToggleShowSystemPrompt(val),
                 1 => SettingsPickerAction::ToggleApiLogging(val),
+                3 => SettingsPickerAction::ToggleShowReasoning(val),
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,

@@ -510,6 +510,7 @@ fn search_text_bash_with_code_input() {
 fn search_text_includes_role_prefix() {
     let md = "# Heading\n\nSome **bold** text";
     let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.show_reasoning = true;
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, md.into()));
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
@@ -518,6 +519,18 @@ fn search_text_includes_role_prefix() {
     assert_eq!(texts[0], "you> hello");
     assert_eq!(texts[2], format!("maki> {md}"));
     assert_eq!(texts[4], "thinking> hmm");
+}
+
+#[test]
+fn test_combined_reasoning() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.show_reasoning = true;
+    panel.push(DisplayMessage::new(DisplayRole::Thinking, "reasoning block\nline two".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "assistant answer".into()));
+    rebuild(&mut panel);
+    let texts = panel.segment_search_texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0], "reasoning block\nline two assistant answer");
 }
 
 #[test_case(&["short", &"x".repeat(200)], 80, 4 ; "long_line_wraps")]

@@ -161,6 +161,7 @@ pub struct App {
     pub(super) last_api_receive: Option<Instant>,
     pub(super) active_run_duration: Option<Duration>,
     pub(super) history_period_seconds: f64,
+    pub verbose: bool,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -215,6 +216,7 @@ impl App {
         let mut state = SessionState::from_session(session, model, &storage);
         let user_settings = UserSettings::load();
         state.session.meta.show_system_prompt = user_settings.show_system_prompt;
+        state.session.meta.show_reasoning = user_settings.show_reasoning;
         maki_config::LOG_API.store(user_settings.api_logging, std::sync::atomic::Ordering::Relaxed);
         *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(state.session.id.clone());
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(state.session.title.clone());
@@ -224,6 +226,7 @@ impl App {
             user_settings.show_system_prompt,
             state.session.meta.system_prompt.clone(),
         );
+        main_chat.set_show_reasoning(user_settings.show_reasoning);
 
         Self {
             chats: vec![main_chat],
@@ -261,6 +264,7 @@ impl App {
             last_api_receive: None,
             active_run_duration: None,
             history_period_seconds: user_settings.history_period_seconds,
+            verbose: false,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -474,6 +478,14 @@ impl App {
         }
         if key::HELP.matches(key) {
             self.help_modal.toggle();
+            return Some(vec![]);
+        }
+        if key::TOGGLE_VERBOSE.matches(key) {
+            self.verbose = !self.verbose;
+            let verbose = self.verbose;
+            for chat in &mut self.chats {
+                chat.set_verbose(verbose);
+            }
             return Some(vec![]);
         }
         if key::TASKS.matches(key) {
@@ -691,6 +703,18 @@ impl App {
                     self.save_session();
                     vec![]
                 }
+                SettingsPickerAction::ToggleShowReasoning(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_reasoning = val;
+                    settings.save();
+
+                    self.state.session.meta.show_reasoning = val;
+                    self.save_session();
+                    for chat in &mut self.chats {
+                        chat.set_show_reasoning(val);
+                    }
+                    vec![]
+                }
                 SettingsPickerAction::AdjustHistoryPeriod(increment) => {
                     let mut settings = UserSettings::load();
                     if increment {
@@ -707,6 +731,7 @@ impl App {
                         settings.show_system_prompt,
                         settings.api_logging,
                         settings.history_period_seconds,
+                        settings.show_reasoning,
                     );
                     vec![]
                 }
@@ -816,17 +841,18 @@ impl App {
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
         }
+        if key::OPEN_EDITOR.matches(key) {
+            return match self.state.plan.path() {
+                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                None => {
+                    self.flash(FLASH_NO_PLAN.into());
+                    vec![]
+                }
+            };
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);
-            } else if key::OPEN_EDITOR.matches(key) {
-                return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                    None => {
-                        self.flash(FLASH_NO_PLAN.into());
-                        vec![]
-                    }
-                };
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
@@ -1252,6 +1278,8 @@ impl App {
         let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
         chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
+        chat.set_show_reasoning(self.state.session.meta.show_reasoning);
+        chat.set_verbose(self.verbose);
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -1315,6 +1343,7 @@ impl App {
                     settings.show_system_prompt,
                     settings.api_logging,
                     settings.history_period_seconds,
+                    settings.show_reasoning,
                 );
                 vec![]
             }
