@@ -8,20 +8,16 @@ use ratatui::layout::Rect;
 const TITLE: &str = " Settings ";
 const MAX_VISIBLE: u16 = 10;
 
-fn default_history_period() -> f64 {
-    60.0
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserSettings {
     #[serde(default)]
     pub show_system_prompt: bool,
     #[serde(default)]
     pub api_logging: bool,
-    #[serde(default = "default_history_period")]
-    pub history_period_seconds: f64,
     #[serde(default)]
     pub show_reasoning: bool,
+    #[serde(default)]
+    pub show_token_stats: bool,
 }
 
 impl Default for UserSettings {
@@ -29,8 +25,8 @@ impl Default for UserSettings {
         Self {
             show_system_prompt: false,
             api_logging: false,
-            history_period_seconds: 60.0,
             show_reasoning: false,
+            show_token_stats: false,
         }
     }
 }
@@ -61,8 +57,8 @@ pub enum SettingsPickerAction {
     Consumed,
     ToggleShowSystemPrompt(bool),
     ToggleApiLogging(bool),
-    AdjustHistoryPeriod(bool),
     ToggleShowReasoning(bool),
+    ToggleShowTokenStats(bool),
     Closed,
 }
 
@@ -88,7 +84,7 @@ impl SettingsPicker {
         }
     }
 
-    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool, history_period: f64, show_reasoning: bool) {
+    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool, show_reasoning: bool, show_token_stats: bool) {
         let items = vec![
             SettingItem {
                 name: "show-system-prompt".to_string(),
@@ -97,13 +93,13 @@ impl SettingsPicker {
                 name: "api-logging".to_string(),
             },
             SettingItem {
-                name: format!("history-period ({}s)", history_period),
-            },
-            SettingItem {
                 name: "show-reasoning".to_string(),
             },
+            SettingItem {
+                name: "show-token-stats".to_string(),
+            },
         ];
-        let enabled = vec![show_system_prompt, api_logging, false, show_reasoning];
+        let enabled = vec![show_system_prompt, api_logging, show_reasoning, show_token_stats];
         self.picker.open_toggleable(items, enabled, TITLE);
     }
 
@@ -116,23 +112,12 @@ impl SettingsPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsPickerAction {
-        if self.picker.selected_index() == Some(2) {
-            match key.code {
-                crossterm::event::KeyCode::Left => {
-                    return SettingsPickerAction::AdjustHistoryPeriod(false);
-                }
-                crossterm::event::KeyCode::Right | crossterm::event::KeyCode::Enter => {
-                    return SettingsPickerAction::AdjustHistoryPeriod(true);
-                }
-                _ => {}
-            }
-        }
-
         match self.picker.handle_key(key) {
             PickerAction::Toggle(idx, val) => match idx {
                 0 => SettingsPickerAction::ToggleShowSystemPrompt(val),
                 1 => SettingsPickerAction::ToggleApiLogging(val),
-                3 => SettingsPickerAction::ToggleShowReasoning(val),
+                2 => SettingsPickerAction::ToggleShowReasoning(val),
+                3 => SettingsPickerAction::ToggleShowTokenStats(val),
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,

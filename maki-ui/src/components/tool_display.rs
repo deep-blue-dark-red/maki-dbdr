@@ -218,12 +218,11 @@ pub fn error_style() -> RoleStyle {
 }
 
 pub fn done_style() -> RoleStyle {
+    let s = Style::default().fg(theme::current().mode_build);
     RoleStyle {
         prefix: "",
-        text_style: theme::current()
-            .tool_success
-            .add_modifier(ratatui::style::Modifier::BOLD),
-        prefix_style: theme::current().tool_success,
+        text_style: s.add_modifier(ratatui::style::Modifier::BOLD),
+        prefix_style: s,
         use_markdown: false,
         max_line_bytes: None,
     }
@@ -556,7 +555,7 @@ impl ToolLineBuilder {
         let (text, style): (String, Style) = match indicator {
             Indicator::Pending => ("○ ".to_string(), theme::current().tool_dim),
             Indicator::InProgress => ("✻ ".to_string(), theme::current().spinner),
-            Indicator::Success => (TOOL_INDICATOR.to_string(), theme::current().tool_success),
+            Indicator::Success => (TOOL_INDICATOR.to_string(), Style::default().fg(theme::current().mode_build)),
             Indicator::Error => (TOOL_INDICATOR.to_string(), theme::current().tool_error),
         };
         if self.lines.is_empty() {

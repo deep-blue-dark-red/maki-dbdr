@@ -1,4 +1,4 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -14,28 +14,9 @@ use std::mem;
 use maki_providers::ImageSource;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum TimelineEventKind {
-    ApiSend,
-    ApiReceive,
-    ToolUse,
-}
-
-#[derive(Clone, Debug)]
-pub struct TimelineEventInfo {
-    pub timestamp: Instant,
-    pub kind: TimelineEventKind,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ActivityTracker {
-    pub timeline_events: Vec<TimelineEventInfo>,
-    pub history_period_seconds: f64,
-}
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::{apply_scroll_delta, visual_line_count};
@@ -330,22 +311,7 @@ impl InputBox {
     }
 }
 
-fn get_rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (15, 15, 20),
-    }
-}
-
-fn fade_color(base_rgb: (u8, u8, u8), bg_rgb: (u8, u8, u8), factor: f64) -> Color {
-    let r = (bg_rgb.0 as f64 + (base_rgb.0 as f64 - bg_rgb.0 as f64) * factor).round() as u8;
-    let g = (bg_rgb.1 as f64 + (base_rgb.1 as f64 - bg_rgb.1 as f64) * factor).round() as u8;
-    let b = (bg_rgb.2 as f64 + (base_rgb.2 as f64 - bg_rgb.2 as f64) * factor).round() as u8;
-    Color::Rgb(r, g, b)
-}
-
 impl InputBox {
-    #[allow(clippy::too_many_arguments)]
     pub fn view(
         &mut self,
         frame: &mut Frame,
@@ -354,7 +320,6 @@ impl InputBox {
         border_style: Style,
         focused: bool,
         top_right_hint: Option<Line<'_>>,
-        activity: &ActivityTracker,
     ) {
         let content_height = area.height.saturating_sub(2);
         let ew = effective_width(area.width as usize);
@@ -444,62 +409,10 @@ impl InputBox {
 
         let text = Text::from(styled_lines);
 
-        let bg = get_rgb(theme::current().background);
         let w = area.width as usize;
         let hint_len = top_right_hint.as_ref().map(|h| h.width()).unwrap_or(0);
-        let available_width = w.saturating_sub(hint_len + 2);
-
-        let border_color_style = border_style;
-
-        let mut timeline_chars = vec!['─'; available_width];
-        let mut timeline_styles = vec![border_color_style; available_width];
-        let h_period = activity.history_period_seconds;
-
-        for ev in &activity.timeline_events {
-            let elapsed = ev.timestamp.elapsed().as_secs_f64();
-            if elapsed >= h_period || elapsed < 0.0 {
-                continue;
-            }
-
-            let u = elapsed / h_period;
-            let fraction = u * u;
-
-            let col = if available_width > 0 {
-                let max_idx = available_width - 1;
-                max_idx.saturating_sub((fraction * max_idx as f64).round() as usize)
-            } else {
-                0
-            };
-
-            if col < available_width {
-                let base_rgb = match ev.kind {
-                    TimelineEventKind::ApiSend => (80, 250, 123),
-                    TimelineEventKind::ApiReceive => (139, 233, 253),
-                    TimelineEventKind::ToolUse => (241, 250, 140),
-                };
-
-                let factor = if available_width > 1 {
-                    col as f64 / (available_width - 1) as f64
-                } else {
-                    1.0
-                };
-
-                let c = fade_color(base_rgb, bg, factor);
-                timeline_chars[col] = '│';
-                timeline_styles[col] = Style::default().fg(c);
-            }
-        }
-
-        let mut spans = Vec::with_capacity(w);
-        for i in 0..available_width {
-            spans.push(Span::styled(timeline_chars[i].to_string(), timeline_styles[i]));
-        }
-
-        let spacer_len = w.saturating_sub(available_width + hint_len);
-        if spacer_len > 0 {
-            spans.push(Span::styled("─".repeat(spacer_len), border_color_style));
-        }
-
+        let dash_len = w.saturating_sub(hint_len);
+        let mut spans = vec![Span::styled("─".repeat(dash_len), border_style)];
         if let Some(ref hint) = top_right_hint {
             spans.extend(hint.spans.clone());
         }
@@ -507,7 +420,7 @@ impl InputBox {
         let block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
-            .border_style(border_color_style);
+            .border_style(border_style);
 
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
@@ -525,46 +438,7 @@ impl InputBox {
             render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y);
         }
 
-        // Activity dots inside the content area: right-aligned in the last content
-        // row, only visible when streaming with an empty input box.
-        if streaming && is_empty && area.height >= 3 && h_period > 0.0 {
-            let dw = (area.width as usize / 3).clamp(4, 28);
-            let last_y = area.y + area.height - 2;
-            let dot_area = Rect::new(
-                area.x + area.width.saturating_sub(dw as u16),
-                last_y,
-                dw as u16,
-                1,
-            );
-
-            let mut dot_chars = vec![' '; dw];
-            let mut dot_styles: Vec<Style> = vec![Style::default(); dw];
-
-            for ev in &activity.timeline_events {
-                let elapsed = ev.timestamp.elapsed().as_secs_f64();
-                if elapsed >= h_period || elapsed < 0.0 {
-                    continue;
-                }
-                let fraction = (elapsed / h_period).powi(2);
-                let col =
-                    (dw - 1).saturating_sub((fraction * (dw - 1) as f64).round() as usize);
-                if col < dw {
-                    let base_rgb = match ev.kind {
-                        TimelineEventKind::ApiSend => (80, 250, 123),
-                        TimelineEventKind::ApiReceive => (139, 233, 253),
-                        TimelineEventKind::ToolUse => (241, 250, 140),
-                    };
-                    let factor = col as f64 / (dw - 1).max(1) as f64;
-                    dot_chars[col] = '•';
-                    dot_styles[col] = Style::default().fg(fade_color(base_rgb, bg, factor));
-                }
-            }
-
-            let dot_spans: Vec<Span> = (0..dw)
-                .map(|i| Span::styled(dot_chars[i].to_string(), dot_styles[i]))
-                .collect();
-            frame.render_widget(Paragraph::new(Line::from(dot_spans)), dot_area);
-        }
+        let _ = streaming;
     }
 
     pub fn scroll_y(&self) -> u16 {
