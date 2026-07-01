@@ -5,7 +5,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
-use crate::components::status_bar::{StatusBarContext, UsageStats};
+use crate::components::status_bar::{StatusBarContext, UsageStats, StreamingInfo};
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -285,6 +285,21 @@ impl App {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
+        let streaming_info = if self.status == Status::Streaming {
+            let duration = self.active_run_start.map(|t| t.elapsed()).unwrap_or(std::time::Duration::ZERO);
+            let input_tokens = self.active_run_input_tokens;
+            let output_tokens = self.active_run_output_chars / 4;
+            let active_tools = chat.in_progress_tools();
+            Some(StreamingInfo {
+                duration,
+                input_tokens,
+                output_tokens,
+                active_tools,
+            })
+        } else {
+            None
+        };
+
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
@@ -307,6 +322,7 @@ impl App {
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
             restoring: self.restoring.load(Ordering::Relaxed),
+            streaming_info,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

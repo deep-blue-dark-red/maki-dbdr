@@ -3,7 +3,7 @@ use super::status_bar::format_tokens;
 use super::{DisplayMessage, ToolStatus};
 
 use super::code_view;
-use crate::animation::spinner_frame;
+
 use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
@@ -553,15 +553,11 @@ impl ToolLineBuilder {
     }
 
     fn prepend_indicator(&mut self, indicator: Indicator, started_at: Instant) {
-        let (text, style) = match indicator {
-            Indicator::Pending => ("○ ".into(), theme::current().tool_dim),
-            Indicator::InProgress => {
-                self.spinner_lines.push(0);
-                let ch = spinner_frame(started_at.elapsed().as_millis());
-                (format!("{ch} "), theme::current().spinner)
-            }
-            Indicator::Success => (TOOL_INDICATOR.into(), theme::current().tool_success),
-            Indicator::Error => (TOOL_INDICATOR.into(), theme::current().tool_error),
+        let (text, style): (String, Style) = match indicator {
+            Indicator::Pending => ("○ ".to_string(), theme::current().tool_dim),
+            Indicator::InProgress => ("✻ ".to_string(), theme::current().spinner),
+            Indicator::Success => (TOOL_INDICATOR.to_string(), theme::current().tool_success),
+            Indicator::Error => (TOOL_INDICATOR.to_string(), theme::current().tool_error),
         };
         if self.lines.is_empty() {
             return;
@@ -1223,7 +1219,7 @@ mod tests {
         assert!(lines_text(&tl).contains("echo hi"));
     }
 
-    #[test_case(BatchToolStatus::InProgress, &[0]    ; "in_progress_has_spinner")]
+    #[test_case(BatchToolStatus::InProgress, &[]     ; "in_progress_no_spinner")]
     #[test_case(BatchToolStatus::Pending,    &[]     ; "pending_no_spinner")]
     #[test_case(BatchToolStatus::Success,    &[]     ; "success_no_spinner")]
     fn batch_entry_spinner(status: BatchToolStatus, expected: &[usize]) {

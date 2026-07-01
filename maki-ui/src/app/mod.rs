@@ -153,6 +153,9 @@ pub struct App {
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub status: Status,
+    pub(super) active_run_start: Option<Instant>,
+    pub(super) active_run_input_tokens: u32,
+    pub(super) active_run_output_chars: u32,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -245,6 +248,9 @@ impl App {
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
             status: Status::Idle,
+            active_run_start: None,
+            active_run_input_tokens: 0,
+            active_run_output_chars: 0,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -1052,6 +1058,32 @@ impl App {
 
         self.retry_info = None;
 
+        match &envelope.event {
+            AgentEvent::ThinkingDelta { text } | AgentEvent::TextDelta { text } => {
+                if chat_idx == 0 {
+                    self.active_run_output_chars += text.chars().count() as u32;
+                }
+            }
+            AgentEvent::ToolResultsSubmitted { .. } => {
+                if chat_idx == 0 {
+                    self.active_run_start = Some(Instant::now());
+                    self.active_run_input_tokens = self.chats[0].context_size;
+                    self.active_run_output_chars = 0;
+                }
+            }
+            AgentEvent::ToolStart(_) => {
+                if chat_idx == 0 {
+                    self.active_run_start = Some(Instant::now());
+                }
+            }
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } => {
+                if chat_idx == 0 {
+                    self.active_run_start = None;
+                }
+            }
+            _ => {}
+        }
+
         let plan_path = if self.state.mode == Mode::Plan {
             self.state.plan.path()
         } else {
@@ -1178,6 +1210,9 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
+                self.active_run_start = Some(Instant::now());
+                self.active_run_input_tokens = self.main_chat().context_size;
+                self.active_run_output_chars = 0;
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1322,6 +1357,9 @@ impl App {
         } else {
             self.run_id += 1;
             self.status = Status::Streaming;
+            self.active_run_start = Some(Instant::now());
+            self.active_run_input_tokens = self.main_chat().context_size;
+            self.active_run_output_chars = 0;
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }

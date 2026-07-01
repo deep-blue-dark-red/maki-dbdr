@@ -72,6 +72,10 @@ impl Chat {
         self.pending_turn_usage = Some(usage);
     }
 
+    pub fn in_progress_tools(&self) -> Vec<String> {
+        self.messages_panel.in_progress_tools()
+    }
+
     pub(crate) fn set_restore_channel(
         &mut self,
         event_handle: Option<maki_lua::EventHandle>,

@@ -524,6 +524,20 @@ impl MessagesPanel {
             .count()
     }
 
+    pub fn in_progress_tools(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|m| {
+                if let DisplayRole::Tool(t) = &m.role {
+                    if t.status == ToolStatus::InProgress {
+                        return Some(t.name.to_string());
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub fn toggle_expansion(&mut self, tool_id: &str) -> bool {
         let Some(seg) = self

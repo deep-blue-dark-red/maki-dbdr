@@ -34,6 +34,13 @@ pub struct UsageStats<'a> {
     pub show_global: bool,
 }
 
+pub struct StreamingInfo {
+    pub duration: Duration,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub active_tools: Vec<String>,
+}
+
 pub struct StatusBarContext<'a> {
     pub status: &'a Status,
     pub mode_label: Cow<'static, str>,
@@ -46,6 +53,7 @@ pub struct StatusBarContext<'a> {
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub restoring: bool,
+    pub streaming_info: Option<StreamingInfo>,
 }
 
 pub struct StatusBar {
@@ -106,7 +114,37 @@ impl StatusBar {
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
         let mut left_spans = Vec::new();
 
-        if *ctx.status == Status::Streaming {
+        if let Some(info) = &ctx.streaming_info {
+            if !info.active_tools.is_empty() {
+                let tool_list = info.active_tools.join(", ");
+                let duration_secs = info.duration.as_secs();
+                left_spans.push(Span::styled(
+                    format!(" ✻ running {tool_list} ({duration_secs}s)"),
+                    theme::current().spinner,
+                ));
+            } else {
+                let duration_secs = info.duration.as_secs();
+                let mut stats = Vec::new();
+                let is_working = info.output_tokens > 0;
+                let status_label = if is_working { "Working" } else { "Waiting" };
+
+                if !is_working && info.input_tokens > 0 {
+                    stats.push(format!("↑ {} tokens", format_tokens(info.input_tokens)));
+                } else if is_working && info.output_tokens > 0 {
+                    stats.push(format!("↓ {} tokens", format_tokens(info.output_tokens)));
+                }
+
+                let stats_str = if stats.is_empty() {
+                    format!("({duration_secs}s)")
+                } else {
+                    format!("({duration_secs}s · {})", stats.join(" · "))
+                };
+                left_spans.push(Span::styled(
+                    format!(" ✻ {status_label} {stats_str}"),
+                    theme::current().spinner,
+                ));
+            }
+        } else if *ctx.status == Status::Streaming {
             let ch = spinner_frame(self.started_at.elapsed().as_millis());
             left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
         }
