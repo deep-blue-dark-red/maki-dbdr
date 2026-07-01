@@ -6,7 +6,6 @@ use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
 use crate::components::status_bar::{StatusBarContext, UsageStats, StreamingInfo};
-use crate::components::input::ActivityTracker;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -200,10 +199,6 @@ impl App {
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
-            let activity = ActivityTracker {
-                timeline_events: self.timeline_events.clone(),
-                history_period_seconds: self.history_period_seconds,
-            };
             self.input_box.view(
                 frame,
                 layout.input_area,
@@ -211,7 +206,6 @@ impl App {
                 self.separator_style(),
                 !self.any_overlay_open(),
                 panel_hint,
-                &activity,
             );
             self.command_palette.view(frame, layout.input_area);
         }
@@ -340,6 +334,8 @@ impl App {
             streaming_info,
             streaming_active: is_streaming,
             verbose: self.verbose,
+            last_turn_stats: self.last_turn_stats.as_ref(),
+            show_token_stats: self.show_token_stats,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

@@ -156,11 +156,11 @@ pub struct App {
     pub(super) active_run_start: Option<Instant>,
     pub(super) active_run_input_tokens: u32,
     pub(super) active_run_output_chars: u32,
-    pub(super) timeline_events: Vec<crate::components::input::TimelineEventInfo>,
-    pub(super) last_api_send: Option<Instant>,
-    pub(super) last_api_receive: Option<Instant>,
     pub(super) active_run_duration: Option<Duration>,
-    pub(super) history_period_seconds: f64,
+    pub(super) turn_api_sent_at: Option<Instant>,
+    pub(super) turn_first_token_at: Option<Instant>,
+    pub(super) last_turn_stats: Option<crate::components::status_bar::TurnStats>,
+    pub(super) show_token_stats: bool,
     pub verbose: bool,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
@@ -259,11 +259,11 @@ impl App {
             active_run_start: None,
             active_run_input_tokens: 0,
             active_run_output_chars: 0,
-            timeline_events: Vec::new(),
-            last_api_send: None,
-            last_api_receive: None,
             active_run_duration: None,
-            history_period_seconds: user_settings.history_period_seconds,
+            turn_api_sent_at: None,
+            turn_first_token_at: None,
+            last_turn_stats: None,
+            show_token_stats: user_settings.show_token_stats,
             verbose: false,
             state,
             exit_request: ExitRequest::None,
@@ -294,25 +294,6 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
-        }
-    }
-
-    pub(super) fn push_timeline_event(&mut self, kind: crate::components::input::TimelineEventKind) {
-        self.timeline_events.push(crate::components::input::TimelineEventInfo {
-            timestamp: Instant::now(),
-            kind,
-        });
-        let limit = self.history_period_seconds;
-        self.timeline_events.retain(|ev| ev.timestamp.elapsed().as_secs_f64() <= limit);
-    }
-
-    pub fn tick_timeline(&mut self) {
-        if self.status == Status::Streaming {
-            if self.chats.iter().any(|c| !c.in_progress_tools().is_empty()) {
-                self.push_timeline_event(crate::components::input::TimelineEventKind::ToolUse);
-            }
-            let limit = self.history_period_seconds;
-            self.timeline_events.retain(|ev| ev.timestamp.elapsed().as_secs_f64() <= limit);
         }
     }
 
@@ -715,24 +696,11 @@ impl App {
                     }
                     vec![]
                 }
-                SettingsPickerAction::AdjustHistoryPeriod(increment) => {
+                SettingsPickerAction::ToggleShowTokenStats(val) => {
                     let mut settings = UserSettings::load();
-                    if increment {
-                        settings.history_period_seconds *= 1.5;
-                    } else {
-                        settings.history_period_seconds *= 0.5;
-                    }
-                    settings.history_period_seconds = settings.history_period_seconds.clamp(1.0, 3600.0);
+                    settings.show_token_stats = val;
                     settings.save();
-
-                    self.history_period_seconds = settings.history_period_seconds;
-
-                    self.settings_picker.open(
-                        settings.show_system_prompt,
-                        settings.api_logging,
-                        settings.history_period_seconds,
-                        settings.show_reasoning,
-                    );
+                    self.show_token_stats = val;
                     vec![]
                 }
                 SettingsPickerAction::Closed => vec![],
@@ -1092,9 +1060,6 @@ impl App {
         }
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
-            if chat_idx == 0 {
-                self.push_timeline_event(crate::components::input::TimelineEventKind::ToolUse);
-            }
             if self.state.mode == Mode::Plan
                 && self.state.plan.path().is_some_and(|pp| e.wrote_to(pp))
             {
@@ -1140,10 +1105,8 @@ impl App {
                 if chat_idx == 0 {
                     let chars = text.chars().count();
                     self.active_run_output_chars += chars as u32;
-                    self.last_api_receive = Some(Instant::now());
-                    let tokens = (chars / 4).max(1);
-                    for _ in 0..tokens {
-                        self.push_timeline_event(crate::components::input::TimelineEventKind::ApiReceive);
+                    if self.turn_first_token_at.is_none() {
+                        self.turn_first_token_at = Some(Instant::now());
                     }
                 }
             }
@@ -1152,15 +1115,13 @@ impl App {
                     self.active_run_start = Some(Instant::now());
                     self.active_run_input_tokens = self.chats[0].context_size;
                     self.active_run_output_chars = 0;
-                    self.last_api_send = Some(Instant::now());
-                    self.last_api_receive = None;
-                    self.push_timeline_event(crate::components::input::TimelineEventKind::ApiSend);
+                    self.turn_api_sent_at = Some(Instant::now());
+                    self.turn_first_token_at = None;
                 }
             }
             AgentEvent::ToolStart(_) => {
                 if chat_idx == 0 {
                     self.active_run_start = Some(Instant::now());
-                    self.push_timeline_event(crate::components::input::TimelineEventKind::ToolUse);
                 }
             }
             AgentEvent::Done { .. } | AgentEvent::Error { .. } if chat_idx == 0 => {
@@ -1185,6 +1146,37 @@ impl App {
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
+                if let (Some(sent_at), Some(first_token_at)) =
+                    (self.turn_api_sent_at, self.turn_first_token_at)
+                {
+                    let now = Instant::now();
+                    let ttft = first_token_at.duration_since(sent_at).as_secs_f64();
+                    let gen_time = now.duration_since(first_token_at).as_secs_f64();
+                    let total_input =
+                        tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
+                    let pp_tps = if ttft > 0.0 {
+                        total_input as f64 / ttft
+                    } else {
+                        0.0
+                    };
+                    let tg_tps = if gen_time > 0.0 {
+                        tc.usage.output as f64 / gen_time
+                    } else {
+                        0.0
+                    };
+                    let cache_rate = if total_input > 0 {
+                        tc.usage.cache_read as f64 / total_input as f64
+                    } else {
+                        0.0
+                    };
+                    self.last_turn_stats = Some(crate::components::status_bar::TurnStats {
+                        pp_tps,
+                        tg_tps,
+                        cache_rate,
+                    });
+                }
+                self.turn_api_sent_at = None;
+                self.turn_first_token_at = None;
             }
             let formatted =
                 format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
@@ -1304,10 +1296,8 @@ impl App {
                 self.active_run_duration = None;
                 self.active_run_input_tokens = self.main_chat().context_size;
                 self.active_run_output_chars = 0;
-                self.timeline_events.clear();
-                self.last_api_send = Some(Instant::now());
-                self.last_api_receive = None;
-                self.push_timeline_event(crate::components::input::TimelineEventKind::ApiSend);
+                self.turn_api_sent_at = Some(Instant::now());
+                self.turn_first_token_at = None;
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1342,8 +1332,8 @@ impl App {
                 self.settings_picker.open(
                     settings.show_system_prompt,
                     settings.api_logging,
-                    settings.history_period_seconds,
                     settings.show_reasoning,
+                    settings.show_token_stats,
                 );
                 vec![]
             }
@@ -1461,10 +1451,8 @@ impl App {
             self.active_run_duration = None;
             self.active_run_input_tokens = self.main_chat().context_size;
             self.active_run_output_chars = 0;
-            self.timeline_events.clear();
-            self.last_api_send = Some(Instant::now());
-            self.last_api_receive = None;
-            self.push_timeline_event(crate::components::input::TimelineEventKind::ApiSend);
+            self.turn_api_sent_at = Some(Instant::now());
+            self.turn_first_token_at = None;
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }

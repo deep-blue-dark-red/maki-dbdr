@@ -437,8 +437,6 @@ impl InputBox {
             let inner = area.inner(ratatui::layout::Margin::new(0, 1));
             render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y);
         }
-
-        let _ = streaming;
     }
 
     pub fn scroll_y(&self) -> u16 {
@@ -800,7 +798,6 @@ mod tests {
                     border_style,
                     true,
                     None,
-                    &ActivityTracker::default(),
                 );
             })
             .unwrap();
