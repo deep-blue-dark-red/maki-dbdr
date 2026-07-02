@@ -132,6 +132,15 @@ impl App {
         });
     }
 
+    pub(super) fn queue_checkpoint(&mut self) {
+        let Some(ref shared) = self.queue.shared else {
+            return;
+        };
+        shared.push(QueueItem::Checkpoint {
+            run_id: self.run_id,
+        });
+    }
+
     /// Agent reached a deferred message: time to draw the bubble.
     /// Immediate-dispatch items skip this event, so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {

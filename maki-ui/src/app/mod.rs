@@ -1335,6 +1335,20 @@ impl App {
                 self.turn_first_token_at = None;
                 vec![Action::Compact(target)]
             }
+            "/checkpoint" => {
+                if self.status == Status::Streaming {
+                    self.queue_checkpoint();
+                    return vec![];
+                }
+                self.status = Status::Streaming;
+                self.active_run_start = Some(Instant::now());
+                self.active_run_duration = None;
+                self.active_run_input_tokens = self.main_chat().context_size;
+                self.active_run_output_chars = 0;
+                self.turn_api_sent_at = Some(Instant::now());
+                self.turn_first_token_at = None;
+                vec![Action::Checkpoint]
+            }
             "/help" => {
                 self.help_modal.toggle();
                 vec![]

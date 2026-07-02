@@ -67,10 +67,14 @@ impl SessionPicker {
                     summaries
                         .into_iter()
                         .filter(|s| s.id != current_session_id)
-                        .map(|s| SessionEntry {
-                            id: s.id,
-                            title: s.title,
-                            relative_time: format_relative_time(s.updated_at),
+                        .map(|s| {
+                            let time_str = format_relative_time(s.updated_at);
+                            let ctx_str = format_context_size(s.context_size);
+                            SessionEntry {
+                                id: s.id,
+                                title: s.title,
+                                relative_time: format!("ctx: {ctx_str} · {time_str}"),
+                            }
                         })
                         .collect()
                 })
@@ -199,6 +203,16 @@ fn format_relative_time(epoch_secs: u64) -> String {
     humanize_secs(secs)
 }
 
+fn format_context_size(tokens: u32) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn humanize_secs(secs: u64) -> String {
     const MINUTE: u64 = 60;
     const HOUR: u64 = 3600;
@@ -232,5 +246,15 @@ mod tests {
     #[test_case(31536000, "1y ago" ; "year_boundary")]
     fn relative_time_formatting(secs: u64, expected: &str) {
         assert_eq!(humanize_secs(secs), expected);
+    }
+
+    #[test_case(0, "0" ; "zero")]
+    #[test_case(999, "999" ; "triple_digit")]
+    #[test_case(1000, "1.0K" ; "kilo_boundary")]
+    #[test_case(34400, "34.4K" ; "kilo_fractional")]
+    #[test_case(1000000, "1.0M" ; "mega_boundary")]
+    #[test_case(1500000, "1.5M" ; "mega_fractional")]
+    fn context_size_formatting(tokens: u32, expected: &str) {
+        assert_eq!(format_context_size(tokens), expected);
     }
 }

@@ -238,6 +238,16 @@ pub fn system_style() -> RoleStyle {
     }
 }
 
+pub fn compaction_style(checkpoint: bool) -> RoleStyle {
+    RoleStyle {
+        prefix: if checkpoint { "summary> " } else { "compact> " },
+        text_style: theme::current().tool_dim,
+        prefix_style: Style::default().fg(theme::current().mode_build),
+        use_markdown: true,
+        max_line_bytes: None,
+    }
+}
+
 pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
     pub search_text: String,

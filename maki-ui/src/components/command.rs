@@ -33,6 +33,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/checkpoint",
+        description: "Insert a summary checkpoint without discarding history",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,

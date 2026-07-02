@@ -18,6 +18,7 @@ pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
+pub const CHECKPOINT_USER: &str = include_str!("prompts/checkpoint_user.md");
 
 pub const DEFAULT_IDENTITY: &str = r#"You are Maki, a CLI coding agent. Complete software engineering tasks by using tools directly in the repo. Do work yourself rather than telling the user how to do it."#;
 

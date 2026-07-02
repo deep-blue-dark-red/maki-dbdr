@@ -204,6 +204,7 @@ pub enum Action {
     UnassignTier(String, ModelTier),
     RefreshModels,
     Compact(Option<usize>),
+    Checkpoint,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
@@ -356,6 +357,11 @@ pub enum DisplayRole {
     Error,
     Done,
     System,
+    /// A manual `/compact` (checkpoint=false) or `/checkpoint` (checkpoint=true)
+    /// summary block, labeled distinctly in the transcript.
+    Compaction {
+        checkpoint: bool,
+    },
 }
 
 impl DisplayRole {

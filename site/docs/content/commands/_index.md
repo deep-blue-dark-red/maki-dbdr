@@ -15,6 +15,7 @@ Type `/` in the input box to open the command palette.
 |---------|-------------|
 | `/tasks` | Browse and search tasks |
 | `/compact` | Summarize and compact conversation history |
+| `/checkpoint` | Insert a summary checkpoint without discarding history |
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
 | `/queue` | Remove items from queue |

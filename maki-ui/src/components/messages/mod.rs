@@ -13,7 +13,7 @@ use super::tool_display::{
     BatchChildState, RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
     build_batch_entry_lines, build_instructions_lines, build_tool_lines, done_style, error_style,
     format_timestamp_now, output_limits_from_hints, thinking_style, tool_output_annotation,
-    truncate_to_header, user_style, system_style,
+    truncate_to_header, user_style, system_style, compaction_style,
 };
 use super::{
     DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
@@ -60,6 +60,9 @@ pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
     streaming_thinking: StreamingContent,
     streaming_text: StreamingContent,
+    /// When set, the next `flush()` mints the streamed text under this role
+    /// instead of `Assistant` (used to label `/compact` and `/checkpoint` output).
+    streaming_role: Option<DisplayRole>,
     started_at: Instant,
     scroll_top: u16,
     auto_scroll: bool,
@@ -107,6 +110,7 @@ impl MessagesPanel {
                 assistant.prefix_style,
                 ms,
             ),
+            streaming_role: None,
             started_at: Instant::now(),
             scroll_top: u16::MAX,
             auto_scroll: true,
@@ -601,12 +605,19 @@ impl MessagesPanel {
 
     pub fn flush(&mut self) {
         self.flush_thinking();
+        // Reset unconditionally: if a compaction streamed nothing, the role must
+        // not linger and mislabel the next real assistant turn.
+        let role = self.streaming_role.take().unwrap_or(DisplayRole::Assistant);
         if !self.streaming_text.is_empty() {
-            self.messages.push(DisplayMessage::new(
-                DisplayRole::Assistant,
-                self.streaming_text.take_all(),
-            ));
+            self.messages
+                .push(DisplayMessage::new(role, self.streaming_text.take_all()));
         }
+    }
+
+    /// Label the next streamed block as a `/compact` or `/checkpoint` summary.
+    pub fn begin_compaction(&mut self, checkpoint: bool) {
+        self.flush();
+        self.streaming_role = Some(DisplayRole::Compaction { checkpoint });
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -1501,6 +1512,7 @@ impl MessagesPanel {
                     DisplayRole::Error => error_style(),
                     DisplayRole::Done => done_style(),
                     DisplayRole::System => system_style(),
+                    DisplayRole::Compaction { checkpoint } => compaction_style(*checkpoint),
                     DisplayRole::Tool(_) => unreachable!(),
                 };
                 let prefix = if msg.plan_path.is_some() {

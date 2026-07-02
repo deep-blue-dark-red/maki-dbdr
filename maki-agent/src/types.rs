@@ -499,6 +499,11 @@ pub enum AgentEvent {
         stop_reason: Option<StopReason>,
     },
     AutoCompacting,
+    /// Emitted before a manual `/compact` or `/checkpoint` streams its summary,
+    /// so the UI can label the resulting block. `checkpoint` selects the label.
+    CompactionStart {
+        checkpoint: bool,
+    },
     Retry {
         attempt: u32,
         message: String,

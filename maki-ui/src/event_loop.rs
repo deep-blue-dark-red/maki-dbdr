@@ -505,6 +505,11 @@ impl<'t> EventLoop<'t> {
                     target_tokens: target,
                 });
             }
+            Action::Checkpoint => {
+                self.handles.queue.push(QueueItem::Checkpoint {
+                    run_id: self.app.run_id,
+                });
+            }
             Action::ToggleMcp(server_name, enabled) => {
                 self.handles.send_mcp(McpCommand::Toggle {
                     server: server_name,

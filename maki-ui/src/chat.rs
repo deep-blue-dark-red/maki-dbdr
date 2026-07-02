@@ -130,6 +130,9 @@ impl Chat {
                     "Auto-compacting conversation...".into(),
                 ));
             }
+            AgentEvent::CompactionStart { checkpoint } => {
+                self.messages_panel.begin_compaction(checkpoint);
+            }
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }

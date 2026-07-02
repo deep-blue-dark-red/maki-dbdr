@@ -92,6 +92,7 @@ pub struct SessionSummary {
     pub id: String,
     pub title: String,
     pub updated_at: u64,
+    pub context_size: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +164,8 @@ struct LegacyHeader {
     title: String,
     cwd: String,
     updated_at: u64,
+    #[serde(default)]
+    context_size: u32,
 }
 
 pub trait TitleSource {
@@ -638,6 +641,8 @@ enum ScanRecord {
     Meta {
         title: String,
         updated_at: u64,
+        #[serde(default)]
+        context_size: u32,
     },
     #[serde(other)]
     Other,
@@ -678,17 +683,18 @@ fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
         return None;
     }
 
-    let (title, updated_at) =
-        read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0));
+    let (title, updated_at, context_size) =
+        read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0, 0));
 
     Some(SessionSummary {
         id: header.id,
         title,
         updated_at,
+        context_size,
     })
 }
 
-fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
+fn read_last_meta(file: &mut File) -> Option<(String, u64, u32)> {
     let len = file.seek(SeekFrom::End(0)).ok()?;
     let mut tail = TAIL_BUF.min(len);
     loop {
@@ -699,8 +705,8 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
         let content = buf.strip_suffix(b"\n").unwrap_or(&buf);
         if let Some(nl) = content.iter().rposition(|&b| b == b'\n') {
             let last_line = &content[nl + 1..];
-            if let Ok(ScanRecord::Meta { title, updated_at }) = serde_json::from_slice(last_line) {
-                return Some((title, updated_at));
+            if let Ok(ScanRecord::Meta { title, updated_at, context_size }) = serde_json::from_slice(last_line) {
+                return Some((title, updated_at, context_size));
             }
             return None;
         }
@@ -722,6 +728,7 @@ fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
         id: h.id,
         title: h.title,
         updated_at: h.updated_at,
+        context_size: h.context_size,
     })
 }
 
