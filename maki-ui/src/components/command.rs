@@ -137,6 +137,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Manage global and project AI agent skills",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/rewind",
+        description: "Show rewind menu to delete turns",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/goto",
+        description: "Scroll to a specific turn",
+        max_args: 1,
+    },
 ];
 
 pub struct ParsedCommand {

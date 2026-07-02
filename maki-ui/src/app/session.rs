@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::RewindEntry;
+use crate::components::rewind_picker::display_msg_index_for_turn;
 use crate::components::{Action, LoadedSession};
 use maki_agent::ToolOutput;
 use maki_providers::{ContentBlock, Message, Model, Role, TokenUsage};
@@ -229,6 +230,52 @@ impl App {
         vec![Action::LoadSession(Box::new(
             self.loaded_session_snapshot(),
         ))]
+    }
+
+    pub(super) fn open_goto_picker(&mut self) -> Vec<Action> {
+        self.save_session();
+        match self.goto_picker.open(&self.state.session.messages) {
+            Ok(()) => vec![],
+            Err(msg) => {
+                self.status_bar.flash(msg);
+                vec![]
+            }
+        }
+    }
+
+    pub(super) fn scroll_to_turn(&mut self, entry: RewindEntry) -> Vec<Action> {
+        let segment_idx = entry.segment_index;
+        self.main_chat().scroll_to_segment(segment_idx);
+        self.main_chat().set_highlight_segment(Some(segment_idx));
+        vec![]
+    }
+
+    pub(super) fn goto_turn(&mut self, turn_str: &str) -> Vec<Action> {
+        let turn_num: usize = match turn_str.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                self.status_bar.flash("Usage: /goto <turn number>".into());
+                return vec![];
+            }
+        };
+        let mut user_count = 0usize;
+        for (msg_idx, msg) in self.state.session.messages.iter().enumerate() {
+            if matches!(msg.role, Role::User) {
+                user_count += 1;
+                if user_count == turn_num {
+                    let display_idx = display_msg_index_for_turn(
+                        &self.state.session.messages,
+                        msg_idx,
+                    );
+                    self.main_chat().scroll_to_segment(display_idx);
+                    self.main_chat().set_highlight_segment(Some(display_idx));
+                    self.save_session();
+                    return vec![];
+                }
+            }
+        }
+        self.status_bar.flash(format!("Turn {turn_num} not found").into());
+        vec![]
     }
 
     pub(super) fn open_session_picker(&mut self) -> Vec<Action> {

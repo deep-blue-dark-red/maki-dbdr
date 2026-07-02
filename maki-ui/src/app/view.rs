@@ -255,6 +255,7 @@ impl App {
         }
 
         render_if_open!(self.rewind_picker);
+        render_if_open!(self.goto_picker);
         render_if_open!(self.theme_picker);
         render_if_open!(self.settings_picker);
         render_if_open!(self.model_picker);
@@ -461,6 +462,8 @@ impl App {
             contexts.push(KeybindContext::SessionPicker);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
+        } else if self.goto_picker.is_open() {
+            contexts.push(KeybindContext::GotoPicker);
         } else if self.task_picker.is_open() {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {

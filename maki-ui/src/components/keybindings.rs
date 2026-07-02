@@ -181,6 +181,7 @@ pub enum KeybindContext {
     TaskPicker,
     SessionPicker,
     RewindPicker,
+    GotoPicker,
     ThemePicker,
     SettingsPicker,
     ModelPicker,
@@ -201,6 +202,7 @@ impl KeybindContext {
             Self::TaskPicker => "Task Picker",
             Self::SessionPicker => "Session Picker",
             Self::RewindPicker => "Rewind Picker",
+            Self::GotoPicker => "Goto Picker",
             Self::ThemePicker => "Theme Picker",
             Self::SettingsPicker => "Settings Picker",
             Self::ModelPicker => "Model Picker",
@@ -216,6 +218,7 @@ impl KeybindContext {
             Self::TaskPicker
             | Self::SessionPicker
             | Self::RewindPicker
+            | Self::GotoPicker
             | Self::ThemePicker
             | Self::SettingsPicker
             | Self::ModelPicker

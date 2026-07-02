@@ -18,6 +18,7 @@ pub(crate) mod plan_form;
 pub mod queue_panel;
 pub(crate) mod render_hints;
 pub(crate) mod rewind_picker;
+pub(crate) mod goto_picker;
 pub(crate) mod skills_modal;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;

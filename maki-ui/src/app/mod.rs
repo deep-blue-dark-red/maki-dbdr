@@ -38,6 +38,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
 use crate::components::skills_modal::{SkillsModal, SkillsAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -145,6 +146,7 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
+    pub(super) goto_picker: GotoPicker,
     pub(super) help_modal: HelpModal,
     pub(super) skills_modal: SkillsModal,
     pub(super) btw_modal: BtwModal,
@@ -249,6 +251,7 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
+            goto_picker: GotoPicker::new(),
             help_modal: HelpModal::new(),
             skills_modal: SkillsModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
@@ -420,6 +423,7 @@ impl App {
         }
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
+        try_picker!(self.goto_picker);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
@@ -667,6 +671,14 @@ impl App {
                 RewindPickerAction::Consumed => vec![],
                 RewindPickerAction::Select(entry) => self.rewind_to(entry),
                 RewindPickerAction::Close => vec![],
+            });
+        }
+
+        if self.goto_picker.is_open() {
+            return Some(match self.goto_picker.handle_key(key) {
+                GotoPickerAction::Consumed => vec![],
+                GotoPickerAction::Select(entry) => self.scroll_to_turn(entry),
+                GotoPickerAction::Close => vec![],
             });
         }
 
@@ -1395,6 +1407,14 @@ impl App {
                 self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
                 vec![]
             }
+            "/rewind" => self.open_rewind_picker(),
+            "/goto" => {
+                if cmd.args.trim().is_empty() {
+                    self.open_goto_picker()
+                } else {
+                    self.goto_turn(cmd.args.trim())
+                }
+            }
             "/mcp" => {
                 self.mcp_picker.open();
                 vec![]
@@ -1604,7 +1624,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 15] {
+    fn overlays(&self) -> [&dyn Overlay; 16] {
         [
             &self.help_modal,
             &self.skills_modal,
@@ -1615,6 +1635,7 @@ impl App {
             &self.task_picker,
             &self.session_picker,
             &self.rewind_picker,
+            &self.goto_picker,
             &self.theme_picker,
             &self.settings_picker,
             &self.model_picker,
@@ -1624,7 +1645,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 16] {
         [
             &mut self.help_modal,
             &mut self.skills_modal,
@@ -1635,6 +1656,7 @@ impl App {
             &mut self.task_picker,
             &mut self.session_picker,
             &mut self.rewind_picker,
+            &mut self.goto_picker,
             &mut self.theme_picker,
             &mut self.settings_picker,
             &mut self.model_picker,
@@ -1713,6 +1735,7 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
+        try_picker!(self.goto_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.settings_picker);
         try_picker!(self.model_picker);

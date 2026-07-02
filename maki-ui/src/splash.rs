@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use std::time::Instant;
 
-const LOGO: &str = "maki";
+const LOGO: &str = "maki (mcp fork)";
 const TAGLINE: &str = "the efficient coder";
 const HELP_SEGMENTS: &[(&str, bool)] = &[
     (key::HELP.label, true),

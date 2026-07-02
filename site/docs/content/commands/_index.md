@@ -36,6 +36,8 @@ Type `/` in the input box to open the command palette.
 | `/settings` | Show settings menu |
 | `/system_prompt` | Edit the system prompt template in default editor |
 | `/skills` | Manage global and project AI agent skills |
+| `/rewind` | Show rewind menu to delete turns |
+| `/goto` | Scroll to a specific turn |
 | `/memory` | View, edit, and delete memory files |
 
 ## Custom commands
