@@ -1038,6 +1038,17 @@ fn double_esc_idle_no_user_turns_flashes_error() {
 }
 
 #[test]
+fn reload_config_command_updates_options() {
+    let mut app = test_app();
+    app.status_bar.clear_flash();
+    app.execute_command(crate::components::command::ParsedCommand {
+        name: "/reload".to_string(),
+        args: String::new(),
+    });
+    assert_eq!(app.status_bar.flash_text(), Some("Configuration reloaded"));
+}
+
+#[test]
 fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     let mut app = test_app();
     app.status = Status::Streaming;

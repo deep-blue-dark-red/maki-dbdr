@@ -960,6 +960,22 @@ impl App {
         vec![Action::Quit]
     }
 
+    pub fn reload_config(&mut self) {
+        let user_settings = UserSettings::load();
+        self.state.session.meta.show_system_prompt = user_settings.show_system_prompt;
+        self.state.session.meta.show_reasoning = user_settings.show_reasoning;
+        maki_config::LOG_API.store(user_settings.api_logging, std::sync::atomic::Ordering::Relaxed);
+        for chat in &mut self.chats {
+            chat.set_system_prompt(
+                user_settings.show_system_prompt,
+                self.state.session.meta.system_prompt.clone(),
+            );
+            chat.set_show_reasoning(user_settings.show_reasoning);
+        }
+        self.show_token_stats = user_settings.show_token_stats;
+        self.status_bar.flash("Configuration reloaded".to_string());
+    }
+
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { subagent_id } => {
@@ -1487,6 +1503,10 @@ impl App {
             }
             "/logs" => {
                 vec![Action::RunLogsCommand]
+            }
+            "/reload" | "/reload_config" => {
+                self.reload_config();
+                vec![]
             }
             "/exit" | "/q" => self.quit(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {

@@ -147,6 +147,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Scroll to a specific turn",
         max_args: 1,
     },
+    BuiltinCommand {
+        name: "/reload",
+        description: "Reload user configuration file (maki.config) and update keybindings",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {
