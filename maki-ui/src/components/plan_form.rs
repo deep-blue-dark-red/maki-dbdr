@@ -11,11 +11,10 @@ use ratatui::text::{Line, Span};
 
 const FORM_LABEL: &str = " Plan complete ";
 
-const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
-    "⌃T/Esc"
-} else {
-    "Ctrl+T/Esc"
-};
+fn dismiss_keys() -> String {
+    let plan_toggle_label = key::PLAN_TOGGLE.label();
+    format!("{plan_toggle_label}/Esc")
+}
 
 struct MenuItem {
     label: &'static str,
@@ -187,7 +186,7 @@ impl PlanForm {
             ("Space".to_string(), "toggle parallel".to_string()),
             ("Enter".to_string(), "confirm".to_string()),
             (key::OPEN_EDITOR.label().to_string(), "edit plan".to_string()),
-            (DISMISS_KEYS.to_string(), "dismiss".to_string()),
+            (dismiss_keys(), "dismiss".to_string()),
         ];
         lines.push(hint_line(&hint_pairs));
 
