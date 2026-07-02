@@ -137,6 +137,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/carbonfox.toml"),
     },
     ThemeEntry {
+        name: "dark_daltonized",
+        toml: include_str!("themes/dark_daltonized.toml"),
+    },
+    ThemeEntry {
+        name: "dark_daltonized_v2",
+        toml: include_str!("themes/dark_daltonized_v2.toml"),
+    },
+    ThemeEntry {
         name: "catppuccin_frappe",
         toml: include_str!("themes/catppuccin_frappe.toml"),
     },
@@ -181,6 +189,30 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/kanagawa.toml"),
     },
     ThemeEntry {
+        name: "kanagawa_maki",
+        toml: include_str!("themes/kanagawa_maki.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_maki_ink",
+        toml: include_str!("themes/kanagawa_maki_ink.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_maki_storm",
+        toml: include_str!("themes/kanagawa_maki_storm.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_maki_lotus",
+        toml: include_str!("themes/kanagawa_maki_lotus.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_maki_slate",
+        toml: include_str!("themes/kanagawa_maki_slate.toml"),
+    },
+    ThemeEntry {
+        name: "kanagawa_maki_wave",
+        toml: include_str!("themes/kanagawa_maki_wave.toml"),
+    },
+    ThemeEntry {
         name: "material_darker",
         toml: include_str!("themes/material_darker.toml"),
     },
@@ -207,6 +239,30 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "rose_pine",
         toml: include_str!("themes/rose_pine.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_maki",
+        toml: include_str!("themes/rose_pine_maki.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_maki_dusk",
+        toml: include_str!("themes/rose_pine_maki_dusk.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_maki_bloom",
+        toml: include_str!("themes/rose_pine_maki_bloom.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_maki_slate",
+        toml: include_str!("themes/rose_pine_maki_slate.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_maki_midnight",
+        toml: include_str!("themes/rose_pine_maki_midnight.toml"),
+    },
+    ThemeEntry {
+        name: "rose_pine_maki_haze",
+        toml: include_str!("themes/rose_pine_maki_haze.toml"),
     },
     ThemeEntry {
         name: "solarized_dark",
@@ -329,6 +385,7 @@ pub struct Theme {
     pub tool_path: Style,
     pub tool_annotation: Style,
     pub tool_prefix: Style,
+    #[allow(dead_code)]
     pub tool_success: Style,
     pub tool_error: Style,
     pub tool_dim: Style,

@@ -167,18 +167,18 @@ impl StatusBar {
             left_spans.push(Span::styled(" ✻", theme::current().spinner));
         }
 
-        if ctx.show_token_stats {
-            if let Some(stats) = ctx.last_turn_stats {
-                left_spans.push(Span::styled(
-                    format!(
-                        " PP {:.1} t/s | TG {:.1} t/s | CR {:.1}%",
-                        stats.pp_tps,
-                        stats.tg_tps,
-                        stats.cache_rate * 100.0,
-                    ),
-                    theme::current().status_dim,
-                ));
-            }
+        if ctx.show_token_stats
+            && let Some(stats) = ctx.last_turn_stats
+        {
+            left_spans.push(Span::styled(
+                format!(
+                    " PP {:.1} t/s | TG {:.1} t/s | CR {:.1}%",
+                    stats.pp_tps,
+                    stats.tg_tps,
+                    stats.cache_rate * 100.0,
+                ),
+                theme::current().status_dim,
+            ));
         }
 
         if ctx.restoring {

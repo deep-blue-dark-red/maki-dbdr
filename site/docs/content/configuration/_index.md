@@ -107,6 +107,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
+| `log_api` | bool | `false` | - | Log all outbound and inbound API text for auditing |
 
 ### `storage`
 

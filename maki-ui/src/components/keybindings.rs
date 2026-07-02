@@ -151,6 +151,12 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+P",
     };
+    pub const EDIT_SYSTEM_PROMPT: Bind = Bind {
+        code: KeyCode::Char('p'),
+        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+        label: "Alt+Shift+P",
+    };
+
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
     pub const TASKS: Bind = ctrl_bind!('x');
     pub const SUSPEND: Bind = ctrl_bind!('z');

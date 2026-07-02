@@ -136,11 +136,19 @@ impl ResolvedSlots {
 }
 
 impl PromptId {
-    fn template(self) -> &'static str {
+    fn template(self) -> String {
         match self {
-            PromptId::System => SYSTEM_PROMPT,
-            PromptId::Research => RESEARCH_PROMPT,
-            PromptId::General => GENERAL_PROMPT,
+            PromptId::System => {
+                if let Ok(config_dir) = maki_storage::paths::config_dir() {
+                    let path = config_dir.join("system.md");
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        return content;
+                    }
+                }
+                SYSTEM_PROMPT.to_string()
+            }
+            PromptId::Research => RESEARCH_PROMPT.to_string(),
+            PromptId::General => GENERAL_PROMPT.to_string(),
         }
     }
 
@@ -192,7 +200,7 @@ fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
 /// Fill each `{{slot}}` marker in the template with its rendered content and
 /// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
 pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
-    let mut out = id.template().to_string();
+    let mut out = id.template();
     for slot in Slot::iter() {
         out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
     }

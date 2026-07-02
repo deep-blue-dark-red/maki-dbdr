@@ -2609,3 +2609,101 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
 }
+
+#[test]
+fn copy_transcript_command() {
+    let mut app = test_app();
+    app.state.session.title = "Test Session".into();
+    app.state.session.model = "test-model".into();
+    app.state.session.cwd = "/tmp/test".into();
+
+    app.state.session.messages = vec![
+        Message::user("Hello agent".into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "I should greet back".into(),
+                    signature: None,
+                },
+                ContentBlock::Text {
+                    text: "Hello user!".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({"command": "echo 1"}),
+                },
+            ],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tool-1".into(),
+                content: "1".into(),
+                is_error: false,
+            }],
+            ..Default::default()
+        },
+    ];
+
+    app.state.session.tool_outputs.insert(
+        "tool-1".into(),
+        ToolOutput::Plain("1".into()),
+    );
+
+    let markdown = app.export_session_to_markdown();
+    let expected = "\
+# Session: Test Session
+- **Model:** `test-model`
+- **CWD:** `/tmp/test`
+
+---
+
+### User
+
+Hello agent
+
+### Assistant
+
+<details>
+<summary>Thinking</summary>
+
+I should greet back
+</details>
+
+Hello user!
+
+**Tool Call:** `bash`
+```json
+{
+  \"command\": \"echo 1\"
+}
+```
+**Output:**
+```
+1
+```
+";
+    assert_eq!(markdown, expected);
+
+    app.execute_command(cmd("/copy_transcript"));
+    assert_eq!(app.status_bar.flash_text(), Some("Copied transcript to clipboard"));
+}
+
+#[test]
+fn logs_command_yields_action() {
+    let mut app = test_app();
+    let actions = app.execute_command(cmd("/logs"));
+    assert!(matches!(&actions[..], [Action::RunLogsCommand]));
+}
+
+#[test]
+fn skills_command_opens_modal() {
+    let mut app = test_app();
+    assert!(!app.skills_modal.is_open());
+
+    app.execute_command(cmd("/skills"));
+    assert!(app.skills_modal.is_open());
+}

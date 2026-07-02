@@ -18,7 +18,8 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+N` / `Ctrl+P` | Next / previous task chat |
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
-| `Ctrl+O` | Open plan in editor |
+| `Ctrl+O` | Toggle verbose mode |
+| `Alt+P` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
 
@@ -88,4 +89,4 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Session Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Session Picker, Rewind Picker, Theme Picker, Settings Picker, Model Picker, Queue, Commands, Search, File Picker

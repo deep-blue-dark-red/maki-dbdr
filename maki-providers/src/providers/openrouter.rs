@@ -135,17 +135,20 @@ impl Provider for OpenRouter {
                             let pricing = m["pricing"]
                                 .as_object()
                                 .and_then(|p| {
+                                    let per_million = 1_000_000.0;
                                     Some(crate::model::ModelPricing {
-                                        input: p.get("prompt")?.as_str()?.parse().ok()?,
-                                        output: p.get("completion")?.as_str()?.parse().ok()?,
+                                        input: p.get("prompt")?.as_str()?.parse::<f64>().ok()? * per_million,
+                                        output: p.get("completion")?.as_str()?.parse::<f64>().ok()? * per_million,
                                         cache_write: p
                                             .get("input_cache_write")
-                                            .and_then(|p| p.as_str()?.parse().ok())
-                                            .unwrap_or(0.0),
+                                            .and_then(|p| p.as_str()?.parse::<f64>().ok())
+                                            .unwrap_or(0.0)
+                                            * per_million,
                                         cache_read: p
                                             .get("input_cache_read")
-                                            .and_then(|p| p.as_str()?.parse().ok())
-                                            .unwrap_or(0.0),
+                                            .and_then(|p| p.as_str()?.parse::<f64>().ok())
+                                            .unwrap_or(0.0)
+                                            * per_million,
                                         fast: None,
                                     })
                                 })

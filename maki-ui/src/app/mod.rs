@@ -38,6 +38,7 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::skills_modal::{SkillsModal, SkillsAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
@@ -145,6 +146,7 @@ pub struct App {
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
+    pub(super) skills_modal: SkillsModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -248,6 +250,7 @@ impl App {
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
+            skills_modal: SkillsModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -536,6 +539,20 @@ impl App {
             return Some(vec![]);
         }
 
+        if self.skills_modal.is_open() {
+            match self.skills_modal.handle_key(key) {
+                SkillsAction::CreateSkill(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                SkillsAction::EditSkillsJson(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                SkillsAction::None => {
+                    return Some(vec![]);
+                }
+            }
+        }
+
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
             return Some(vec![]);
@@ -703,6 +720,15 @@ impl App {
                     self.show_token_stats = val;
                     vec![]
                 }
+                SettingsPickerAction::EditLogCommand => {
+                    self.settings_picker.close();
+                    if let Ok(config_dir) = maki_storage::paths::config_dir() {
+                        let path = config_dir.join("settings.json");
+                        vec![Action::OpenEditor(path)]
+                    } else {
+                        vec![]
+                    }
+                }
                 SettingsPickerAction::Closed => vec![],
             });
         }
@@ -817,6 +843,9 @@ impl App {
                     vec![]
                 }
             };
+        }
+        if key::EDIT_SYSTEM_PROMPT.matches(key) {
+            return vec![Action::EditSystemPrompt];
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
@@ -1334,7 +1363,15 @@ impl App {
                     settings.api_logging,
                     settings.show_reasoning,
                     settings.show_token_stats,
+                    settings.log_command,
                 );
+                vec![]
+            }
+            "/system_prompt" => {
+                vec![Action::EditSystemPrompt]
+            }
+            "/skills" => {
+                self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
                 vec![]
             }
             "/mcp" => {
@@ -1385,6 +1422,22 @@ impl App {
                     .into(),
                 );
                 vec![]
+            }
+            "/copy_transcript" => {
+                let markdown = self.export_session_to_markdown();
+                match self.clipboard.copy_text(&markdown) {
+                    Ok(crate::clipboard::CopyResult::Noop) => {}
+                    Ok(crate::clipboard::CopyResult::Copied) => {
+                        self.flash("Copied transcript to clipboard".into());
+                    }
+                    Err(e) => {
+                        self.flash(format!("Copy failed: {e}"));
+                    }
+                }
+                vec![]
+            }
+            "/logs" => {
+                vec![Action::RunLogsCommand]
             }
             "/exit" | "/q" => self.quit(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
@@ -1530,9 +1583,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 15] {
         [
             &self.help_modal,
+            &self.skills_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -1549,9 +1603,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 15] {
         [
             &mut self.help_modal,
+            &mut self.skills_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,

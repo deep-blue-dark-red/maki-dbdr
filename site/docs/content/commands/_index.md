@@ -28,7 +28,13 @@ Type `/` in the input box to open the command palette.
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |
 | `/thinking` | Toggle extended thinking (off, adaptive, or budget) |
 | `/fast` | Toggle Anthropic fast mode (Opus only) |
+| `/copy_transcript` | Copy session transcript to clipboard as markdown |
+| `/logs` | Show last 30 lines of application logs |
 | `/exit` | Exit the application |
+| `/q` | Exit the application (shortcut for /exit) |
+| `/settings` | Show settings menu |
+| `/system_prompt` | Edit the system prompt template in default editor |
+| `/skills` | Manage global and project AI agent skills |
 | `/memory` | View, edit, and delete memory files |
 
 ## Custom commands

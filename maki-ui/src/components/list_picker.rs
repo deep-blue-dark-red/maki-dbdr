@@ -102,6 +102,7 @@ pub struct ListPicker<T> {
 enum FooterSpec {
     Pairs(&'static [(&'static str, &'static str)]),
     Builder(fn() -> Line<'static>),
+    Static(Line<'static>),
 }
 
 impl FooterSpec {
@@ -109,6 +110,7 @@ impl FooterSpec {
         match self {
             Self::Pairs(hints) => hint_line(hints),
             Self::Builder(b) => b(),
+            Self::Static(line) => line.clone(),
         }
     }
 }
@@ -276,6 +278,12 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
         self.footer = Some(FooterSpec::Builder(builder));
         self
+    }
+
+
+
+    pub fn set_static_footer(&mut self, line: Line<'static>) {
+        self.footer = Some(FooterSpec::Static(line));
     }
 
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
@@ -816,7 +824,8 @@ fn render_list<T: PickerItem>(
 
         let highlighted = item.is_highlighted();
         let t = theme::current();
-        let (style, detail_style) = match (i == selected, highlighted) {
+        let is_enabled = enabled.is_some_and(|en| en[item_idx]);
+        let (mut style, mut detail_style) = match (i == selected, highlighted) {
             (true, true) => {
                 let s = t.item_selected.fg(t.accent.fg.unwrap_or_default());
                 (s, theme::dim_style(s, 0.4))
@@ -825,20 +834,19 @@ fn render_list<T: PickerItem>(
             (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
             (false, false) => (t.item, t.item_desc),
         };
-        let checkbox = enabled.map(|en| {
-            let sym = if en[item_idx] { "✓ " } else { "✗ " };
-            let sty = if i == selected {
-                style
-            } else if en[item_idx] {
-                theme::current().item
-            } else {
-                theme::current().item_desc
-            };
-            Span::styled(sym, sty)
-        });
+        if is_enabled {
+            style = style.add_modifier(ratatui::style::Modifier::BOLD);
+        }
+        if enabled.is_some() {
+            detail_style = detail_style.add_modifier(ratatui::style::Modifier::BOLD);
+        }
         let label = format!("  {}", item.label());
+        let detail_str: Option<String>;
         let detail: Option<&str> = if item.is_spinning() {
             Some(spinner_str(animation_elapsed_ms()))
+        } else if enabled.is_some() {
+            detail_str = Some(if is_enabled { "true".to_string() } else { "false".to_string() });
+            detail_str.as_deref()
         } else {
             item.detail()
         };
@@ -846,22 +854,16 @@ fn render_list<T: PickerItem>(
             Some(detail) => {
                 let label = truncate_label(&label, max_label_width(detail, area.width));
                 let pad = detail_padding(&label, detail, area.width);
-                let mut spans = Vec::with_capacity(5);
-                if let Some(cb) = checkbox {
-                    spans.push(cb);
-                }
-                spans.push(Span::styled(label, style));
-                spans.push(Span::styled(" ".repeat(pad), style));
-                spans.push(Span::styled(detail.to_string(), detail_style));
-                spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
+                let spans = vec![
+                    Span::styled(label, style),
+                    Span::styled(" ".repeat(pad), style),
+                    Span::styled(detail.to_string(), detail_style),
+                    Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style),
+                ];
                 Line::from(spans)
             }
             None => {
-                if let Some(cb) = checkbox {
-                    Line::from(vec![cb, Span::styled(label, style)])
-                } else {
-                    Line::from(Span::styled(label, style))
-                }
+                Line::from(Span::styled(label, style))
             }
         };
         lines.push(line);

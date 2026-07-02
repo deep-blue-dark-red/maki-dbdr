@@ -4,11 +4,13 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
+use crate::theme;
 
 const TITLE: &str = " Settings ";
 const MAX_VISIBLE: u16 = 10;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserSettings {
     #[serde(default)]
     pub show_system_prompt: bool,
@@ -18,17 +20,8 @@ pub struct UserSettings {
     pub show_reasoning: bool,
     #[serde(default)]
     pub show_token_stats: bool,
-}
-
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self {
-            show_system_prompt: false,
-            api_logging: false,
-            show_reasoning: false,
-            show_token_stats: false,
-        }
-    }
+    #[serde(default)]
+    pub log_command: Option<String>,
 }
 
 impl UserSettings {
@@ -59,6 +52,7 @@ pub enum SettingsPickerAction {
     ToggleApiLogging(bool),
     ToggleShowReasoning(bool),
     ToggleShowTokenStats(bool),
+    EditLogCommand,
     Closed,
 }
 
@@ -84,7 +78,14 @@ impl SettingsPicker {
         }
     }
 
-    pub fn open(&mut self, show_system_prompt: bool, api_logging: bool, show_reasoning: bool, show_token_stats: bool) {
+    pub fn open(
+        &mut self,
+        show_system_prompt: bool,
+        api_logging: bool,
+        show_reasoning: bool,
+        show_token_stats: bool,
+        log_command: Option<String>,
+    ) {
         let items = vec![
             SettingItem {
                 name: "show-system-prompt".to_string(),
@@ -98,8 +99,30 @@ impl SettingsPicker {
             SettingItem {
                 name: "show-token-stats".to_string(),
             },
+            SettingItem {
+                name: format!("log-command: {}", log_command.as_deref().unwrap_or("less +G {}")),
+            },
         ];
-        let enabled = vec![show_system_prompt, api_logging, show_reasoning, show_token_stats];
+        let enabled = vec![
+            show_system_prompt,
+            api_logging,
+            show_reasoning,
+            show_token_stats,
+            false,
+        ];
+
+        let path_str = if let Ok(config_dir) = maki_storage::paths::config_dir() {
+            let path = config_dir.join("settings.json");
+            path.to_string_lossy().to_string()
+        } else {
+            "settings.json".to_string()
+        };
+        let t = theme::current();
+        let mut spans = crate::components::hint_line(&[("Enter", "toggle/edit")]).spans;
+        spans.push(Span::styled(", settings.json at ", t.tool_dim));
+        spans.push(Span::styled(path_str, t.item_desc));
+        self.picker.set_static_footer(Line::from(spans));
+
         self.picker.open_toggleable(items, enabled, TITLE);
     }
 
@@ -118,6 +141,7 @@ impl SettingsPicker {
                 1 => SettingsPickerAction::ToggleApiLogging(val),
                 2 => SettingsPickerAction::ToggleShowReasoning(val),
                 3 => SettingsPickerAction::ToggleShowTokenStats(val),
+                4 => SettingsPickerAction::EditLogCommand,
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,

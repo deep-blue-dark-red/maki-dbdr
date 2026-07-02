@@ -538,6 +538,40 @@ impl<'t> EventLoop<'t> {
                     Err(e) => self.app.flash(e),
                 }
             }
+            Action::EditSystemPrompt => {
+                match maki_storage::paths::config_dir() {
+                    Ok(config_dir) => {
+                        let path = config_dir.join("system.md");
+                        if !path.exists()
+                            && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
+                        {
+                            self.app.flash(format!("Failed to create system.md: {e}"));
+                            return;
+                        }
+                        if let Err(e) = terminal::open_in_editor(&path, self.terminal) {
+                            self.app.flash(e);
+                        }
+                    }
+                    Err(e) => self.app.flash(format!("Failed to get config directory: {e}")),
+                }
+            }
+            Action::RunLogsCommand => {
+                let settings = crate::components::settings_picker::UserSettings::load();
+                let log_path = self.app.storage.path().join("maki.log");
+                let log_path_str = log_path.to_string_lossy();
+                let cmd_string = match &settings.log_command {
+                    Some(cmd) if !cmd.trim().is_empty() => cmd.clone(),
+                    _ => "less +G {}".to_string(),
+                };
+                let cmd_string = cmd_string
+                    .replace("<path>", &log_path_str)
+                    .replace("alog", &log_path_str)
+                    .replace("{}", &log_path_str);
+
+                if let Err(e) = terminal::run_view_log_command(&cmd_string, self.terminal) {
+                    self.app.flash(e);
+                }
+            }
             Action::Btw(question) => {
                 let slot = self.model_slot.load();
                 self.app

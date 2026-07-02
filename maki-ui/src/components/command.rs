@@ -98,6 +98,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/copy_transcript",
+        description: "Copy session transcript to clipboard as markdown",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/logs",
+        description: "Show last 30 lines of application logs",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,
@@ -110,6 +120,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/settings",
         description: "Show settings menu",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/system_prompt",
+        description: "Edit the system prompt template in default editor",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/skills",
+        description: "Manage global and project AI agent skills",
         max_args: 0,
     },
 ];
@@ -332,6 +352,13 @@ impl CommandPalette {
 
         // Tick to get matches
         self.tick();
+
+        let input_cmd = format!("/{}", cmd_word);
+        if let Some(exact_idx) = self.filtered.iter().position(|m| {
+            self.item_name(m).eq_ignore_ascii_case(&input_cmd)
+        }) {
+            self.selected = exact_idx;
+        }
     }
 
     fn tick(&mut self) {
@@ -605,6 +632,14 @@ mod tests {
                 accepts_args: false,
             },
         ])
+    }
+
+    #[test]
+    fn exact_match_takes_precedence() {
+        let p = synced("/q");
+        assert!(p.is_active());
+        let selected_name = p.item_name(&p.filtered[p.selected]);
+        assert_eq!(selected_name, "/q");
     }
 
     #[test]
