@@ -1316,8 +1316,14 @@ impl App {
                 vec![]
             }
             "/compact" => {
+                let target = if cmd.args.trim().is_empty() {
+                    let settings = UserSettings::load();
+                    settings.compact_tokens
+                } else {
+                    cmd.args.trim().parse::<usize>().ok()
+                };
                 if self.status == Status::Streaming {
-                    self.queue_compact();
+                    self.queue_compact(target);
                     return vec![];
                 }
                 self.status = Status::Streaming;
@@ -1327,7 +1333,7 @@ impl App {
                 self.active_run_output_chars = 0;
                 self.turn_api_sent_at = Some(Instant::now());
                 self.turn_first_token_at = None;
-                vec![Action::Compact]
+                vec![Action::Compact(target)]
             }
             "/help" => {
                 self.help_modal.toggle();
@@ -1364,6 +1370,7 @@ impl App {
                     settings.show_reasoning,
                     settings.show_token_stats,
                     settings.log_command,
+                    settings.compact_tokens,
                 );
                 vec![]
             }

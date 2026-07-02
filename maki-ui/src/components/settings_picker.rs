@@ -22,6 +22,8 @@ pub struct UserSettings {
     pub show_token_stats: bool,
     #[serde(default)]
     pub log_command: Option<String>,
+    #[serde(default)]
+    pub compact_tokens: Option<usize>,
 }
 
 impl UserSettings {
@@ -85,6 +87,7 @@ impl SettingsPicker {
         show_reasoning: bool,
         show_token_stats: bool,
         log_command: Option<String>,
+        compact_tokens: Option<usize>,
     ) {
         let items = vec![
             SettingItem {
@@ -102,12 +105,21 @@ impl SettingsPicker {
             SettingItem {
                 name: format!("log-command: {}", log_command.as_deref().unwrap_or("less +G {}")),
             },
+            SettingItem {
+                name: format!(
+                    "compact-tokens: {}",
+                    compact_tokens
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string())
+                ),
+            },
         ];
         let enabled = vec![
             show_system_prompt,
             api_logging,
             show_reasoning,
             show_token_stats,
+            false,
             false,
         ];
 
@@ -142,6 +154,7 @@ impl SettingsPicker {
                 2 => SettingsPickerAction::ToggleShowReasoning(val),
                 3 => SettingsPickerAction::ToggleShowTokenStats(val),
                 4 => SettingsPickerAction::EditLogCommand,
+                5 => SettingsPickerAction::EditLogCommand,
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,

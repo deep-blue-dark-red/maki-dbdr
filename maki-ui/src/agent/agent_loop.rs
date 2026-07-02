@@ -124,7 +124,7 @@ impl AgentLoop {
                 }
                 self.do_agent_run(input, event_tx, run_id).await
             }
-            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueItem::Compact { target_tokens, .. } => self.do_compact(&event_tx, target_tokens).await,
         };
 
         if let Err(e) = result {
@@ -149,11 +149,11 @@ impl AgentLoop {
         !self.init_cancel.is_cancelled()
     }
 
-    async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
+    async fn do_compact(&mut self, event_tx: &EventSender, target_tokens: Option<usize>) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::compact(&*provider, &model, &mut self.history, event_tx).await
+        agent::compact(&*provider, &model, &mut self.history, event_tx, target_tokens).await
     }
 
     async fn do_agent_run(

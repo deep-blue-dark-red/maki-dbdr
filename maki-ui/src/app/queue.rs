@@ -122,12 +122,13 @@ impl App {
         });
     }
 
-    pub(super) fn queue_compact(&mut self) {
+    pub(super) fn queue_compact(&mut self, target_tokens: Option<usize>) {
         let Some(ref shared) = self.queue.shared else {
             return;
         };
         shared.push(QueueItem::Compact {
             run_id: self.run_id,
+            target_tokens,
         });
     }
 

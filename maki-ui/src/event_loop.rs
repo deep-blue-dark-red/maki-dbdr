@@ -499,9 +499,10 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.app.storage);
             }
-            Action::Compact => {
+            Action::Compact(target) => {
                 self.handles.queue.push(QueueItem::Compact {
                     run_id: self.app.run_id,
+                    target_tokens: target,
                 });
             }
             Action::ToggleMcp(server_name, enabled) => {

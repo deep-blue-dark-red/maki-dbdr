@@ -830,8 +830,18 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 fn compact_command_sets_streaming() {
     let mut app = test_app();
     let actions = app.execute_command(cmd("/compact"));
-    assert!(matches!(&actions[0], Action::Compact));
+    assert!(matches!(&actions[0], Action::Compact(None)));
     assert_eq!(app.status, Status::Streaming);
+}
+
+#[test]
+fn compact_command_with_value() {
+    let mut app = test_app();
+    let actions = app.execute_command(ParsedCommand {
+        name: "/compact".into(),
+        args: "1234".into(),
+    });
+    assert!(matches!(&actions[0], Action::Compact(Some(1234))));
 }
 
 #[test]

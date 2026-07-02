@@ -19,6 +19,7 @@ pub(super) async fn compact_history(
     history: &mut History,
     event_tx: &EventSender,
     cancel: &CancelToken,
+    target_tokens: Option<usize>,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
@@ -31,12 +32,20 @@ pub(super) async fn compact_history(
     let max_attempts = 3;
     let mut last_error = None;
 
+    let mut system_prompt = crate::prompt::COMPACTION_SYSTEM.to_string();
+    if let Some(target) = target_tokens {
+        system_prompt.push_str(&format!(
+            "\n\nCRITICAL: Make sure the summary is extremely concise and fits within {} tokens.",
+            target
+        ));
+    }
+
     for attempt in 0..max_attempts {
         match stream_with_retry(
             provider,
             model,
             &compaction_history,
-            crate::prompt::COMPACTION_SYSTEM,
+            &system_prompt,
             &empty_tools,
             event_tx,
             cancel,
@@ -104,9 +113,10 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
+    target_tokens: Option<usize>,
 ) -> Result<(), AgentError> {
     let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel).await?;
+    let usage = compact_history(provider, model, history, event_tx, &cancel, target_tokens).await?;
 
     event_tx.send(AgentEvent::Done {
         usage,
@@ -312,6 +322,7 @@ mod tests {
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                None,
             )
             .await
             .unwrap();

@@ -48,13 +48,14 @@ pub(crate) enum QueueItem {
     },
     Compact {
         run_id: u64,
+        target_tokens: Option<usize>,
     },
 }
 
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. } | Self::Compact { run_id } => *run_id,
+            Self::Message { run_id, .. } | Self::Compact { run_id, .. } => *run_id,
         }
     }
 
@@ -77,7 +78,7 @@ impl QueueItem {
     fn into_extracted_command(self) -> ExtractedCommand {
         match self {
             Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
-            Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
+            Self::Compact { run_id, .. } => ExtractedCommand::Compact(run_id),
         }
     }
 
@@ -203,7 +204,7 @@ mod tests {
 
     #[test_case(msg(false),                       true  ; "deferred_message_visible")]
     #[test_case(msg(true),                        false ; "displayed_message_hidden")]
-    #[test_case(QueueItem::Compact { run_id: 0 }, true  ; "compact_visible")]
+    #[test_case(QueueItem::Compact { run_id: 0, target_tokens: None }, true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let (tx, _rx) = queue();
         tx.push(item);

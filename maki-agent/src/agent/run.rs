@@ -398,6 +398,7 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
+            None,
         )
         .await?;
         self.rollback_len = self.history.len();

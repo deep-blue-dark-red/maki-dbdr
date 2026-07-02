@@ -139,6 +139,7 @@ impl PromptId {
     fn template(self) -> String {
         match self {
             PromptId::System => {
+                #[cfg(not(test))]
                 if let Ok(config_dir) = maki_storage::paths::config_dir() {
                     let path = config_dir.join("system.md");
                     if let Ok(content) = std::fs::read_to_string(&path) {
