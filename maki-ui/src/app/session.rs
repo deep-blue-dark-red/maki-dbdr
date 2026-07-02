@@ -246,7 +246,6 @@ impl App {
     pub(super) fn scroll_to_turn(&mut self, entry: RewindEntry) -> Vec<Action> {
         let segment_idx = entry.segment_index;
         self.main_chat().scroll_to_segment(segment_idx);
-        self.main_chat().set_highlight_segment(Some(segment_idx));
         vec![]
     }
 
@@ -268,7 +267,6 @@ impl App {
                         msg_idx,
                     );
                     self.main_chat().scroll_to_segment(display_idx);
-                    self.main_chat().set_highlight_segment(Some(display_idx));
                     self.save_session();
                     return vec![];
                 }
