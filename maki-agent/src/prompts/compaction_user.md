@@ -1,21 +1,18 @@
-Provide a detailed summary for continuing our conversation above.
-Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.
+Generate the conversation summary now. You must adhere strictly to the format below. 
 
-Stick to this template:
----
+<summary>
 ## Goal
-[What goal(s) is the user trying to accomplish?]
+- [What is the user trying to accomplish?]
 
-## Instructions
-- [Important instructions the user gave that are relevant]
-- [If there is a plan or spec, include information about it]
-
-## Discoveries
-[Notable things learned during this conversation]
+## Technical Context & Decisions
+- [Important instructions, specs, constraints, or technical decisions]
 
 ## Accomplished
-[What work has been completed, what is still in progress, what is left?]
+- [What work has been explicitly completed]
 
-## Relevant files / directories
-[Structured list of relevant files that have been read, edited, or created]
----
+## Active Files
+- [File paths and brief note on their current state]
+
+## Next Steps
+- [What needs to be done next / what is left]
+</summary>

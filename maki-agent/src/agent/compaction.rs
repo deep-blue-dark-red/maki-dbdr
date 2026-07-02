@@ -34,9 +34,10 @@ pub(super) async fn compact_history(
 
     let mut system_prompt = crate::prompt::COMPACTION_SYSTEM.to_string();
     if let Some(target) = target_tokens {
+        let approx_words = (target as f64 * 0.75).round() as usize;
         system_prompt.push_str(&format!(
-            "\n\nCRITICAL: Make sure the summary is extremely concise and fits within {} tokens.",
-            target
+            "\n\nCRITICAL LENGTH CONSTRAINT: You must be extremely brief. Limit each section to a maximum of 3 short bullet points. Do not exceed {} words total.",
+            approx_words
         ));
     }
 
