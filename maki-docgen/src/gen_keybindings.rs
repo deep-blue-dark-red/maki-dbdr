@@ -26,6 +26,19 @@ fn label_str(label: KeyLabel) -> String {
             .map(|s| format!("`{s}`"))
             .collect::<Vec<_>>()
             .join(ALT_SEP),
+        KeyLabel::Action(name) => {
+            let label = maki_ui::keybindings::get_bind_label(name);
+            format!("`{label}`")
+        }
+        KeyLabel::ActionAlt(name1, name2) => {
+            let label1 = maki_ui::keybindings::get_bind_label(name1);
+            let label2 = maki_ui::keybindings::get_bind_label(name2);
+            format!("`{label1}`{ALT_SEP}`{label2}`")
+        }
+        KeyLabel::ActionMacAlt(name, _) => {
+            let label = maki_ui::keybindings::get_bind_label(name);
+            format!("`{label}`")
+        }
     }
 }
 

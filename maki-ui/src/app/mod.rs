@@ -657,7 +657,7 @@ impl App {
                 SessionPickerAction::ConfirmDelete => {
                     self.status_bar.flash(format!(
                         "Press {} again to confirm delete",
-                        key::DELETE.label
+                        key::DELETE.label()
                     ));
                     vec![]
                 }
@@ -734,8 +734,7 @@ impl App {
                 }
                 SettingsPickerAction::EditLogCommand => {
                     self.settings_picker.close();
-                    if let Ok(config_dir) = maki_storage::paths::config_dir() {
-                        let path = config_dir.join("settings.json");
+                    if let Ok(path) = crate::config::config_path() {
                         vec![Action::OpenEditor(path)]
                     } else {
                         vec![]

@@ -1491,7 +1491,7 @@ impl MessagesPanel {
                         lines.push(Line::from(Span::styled(
                             format!(
                                 "{} to open in editor ($VISUAL / $EDITOR)",
-                                key::OPEN_EDITOR.label
+                                key::OPEN_EDITOR.label()
                             ),
                             theme::current().tool_dim,
                         )));
@@ -1550,7 +1550,7 @@ impl MessagesPanel {
                     lines.push(Line::from(Span::styled(
                         format!(
                             "{} to open in editor ($VISUAL / $EDITOR)",
-                            key::OPEN_EDITOR.label
+                            key::OPEN_EDITOR.label()
                         ),
                         theme::current().tool_dim,
                     )));

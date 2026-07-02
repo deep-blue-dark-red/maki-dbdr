@@ -634,6 +634,9 @@ impl<'t> EventLoop<'t> {
     }
 
     fn shutdown(mut self) -> (Option<String>, i32) {
+        let settings = crate::components::settings_picker::UserSettings::load();
+        settings.save();
+
         let exit_code = self.app.exit_request.code();
         let session_id = self
             .app

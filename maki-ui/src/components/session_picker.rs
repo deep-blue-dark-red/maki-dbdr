@@ -10,10 +10,11 @@ use jiff::Timestamp;
 use maki_storage::StateDir;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
 
 const TITLE: &str = " Sessions ";
 const NO_SESSIONS_MSG: &str = "No previous sessions";
-const FOOTER_HINTS: &[(&str, &str)] = &[("Enter", "open"), (key::DELETE.label, "delete")];
+
 
 pub enum SessionPickerAction {
     Consumed,
@@ -48,7 +49,7 @@ pub struct SessionPicker {
 impl SessionPicker {
     pub fn new() -> Self {
         Self {
-            picker: ListPicker::new().with_footer(FOOTER_HINTS),
+            picker: ListPicker::new(),
             confirming: None,
             pending_rx: None,
             flash: None,
@@ -56,6 +57,8 @@ impl SessionPicker {
     }
 
     pub fn open(&mut self, cwd: &str, current_session_id: &str, dir: &StateDir) {
+        let footer_spans = crate::components::hint_line(&[("Enter", "open"), (key::DELETE.label(), "delete")]).spans;
+        self.picker.set_static_footer(Line::from(footer_spans));
         self.picker.open_loading(TITLE);
         let cwd = cwd.to_owned();
         let current_session_id = current_session_id.to_owned();

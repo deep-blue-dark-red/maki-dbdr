@@ -28,6 +28,14 @@ pub struct UserSettings {
 
 impl UserSettings {
     pub fn load() -> Self {
+        crate::config::load_config()
+    }
+
+    pub fn save(&self) {
+        crate::config::save_config(self);
+    }
+
+    pub fn load_legacy_json() -> Self {
         if let Ok(config_dir) = maki_storage::paths::config_dir() {
             let path = config_dir.join("settings.json");
             let file_data = std::fs::read(&path).ok();
@@ -36,15 +44,6 @@ impl UserSettings {
             }
         }
         Self::default()
-    }
-
-    pub fn save(&self) {
-        if let Ok(config_dir) = maki_storage::paths::config_dir() {
-            let path = config_dir.join("settings.json");
-            if let Ok(data) = serde_json::to_vec_pretty(self) {
-                let _ = std::fs::write(&path, data);
-            }
-        }
     }
 }
 
@@ -123,15 +122,14 @@ impl SettingsPicker {
             false,
         ];
 
-        let path_str = if let Ok(config_dir) = maki_storage::paths::config_dir() {
-            let path = config_dir.join("settings.json");
+        let path_str = if let Ok(path) = crate::config::config_path() {
             path.to_string_lossy().to_string()
         } else {
-            "settings.json".to_string()
+            "maki.config".to_string()
         };
         let t = theme::current();
         let mut spans = crate::components::hint_line(&[("Enter", "toggle/edit")]).spans;
-        spans.push(Span::styled(", settings.json at ", t.tool_dim));
+        spans.push(Span::styled(", maki.config at ", t.tool_dim));
         spans.push(Span::styled(path_str, t.item_desc));
         self.picker.set_static_footer(Line::from(spans));
 

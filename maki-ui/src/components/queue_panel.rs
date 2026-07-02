@@ -36,12 +36,13 @@ pub fn view(frame: &mut Frame, area: Rect, entries: &[QueueEntry], focus: Option
         .enumerate()
         .map(|(i, entry)| {
             let flat = entry.text.replace('\n', " ");
+            let pop_queue_label = key::POP_QUEUE.label();
             let (style, hint_parts) = if focus == Some(i) {
                 (theme::current().queue_delete, ("", FOCUSED_HINT, ""))
             } else if i == 0 {
                 (
                     Style::new().fg(entry.color),
-                    (" - ", key::POP_QUEUE.label, " to delete"),
+                    (" - ", pop_queue_label, " to delete"),
                 )
             } else {
                 (Style::new().fg(entry.color), ("", "", ""))
@@ -72,7 +73,7 @@ fn truncate_line(
     text: &str,
     max_width: usize,
     style: Style,
-    hint: (&'static str, &'static str, &'static str),
+    hint: (&str, &str, &str),
 ) -> Line<'static> {
     let hint_style = theme::current().tool_dim;
     let hint_len = hint.0.len() + hint.1.len() + hint.2.len();
@@ -91,9 +92,9 @@ fn truncate_line(
     let mut spans = vec![text_span];
     spans.extend(ellipsis);
     if hint_len > 0 {
-        spans.push(Span::styled(hint.0, hint_style));
-        spans.push(Span::styled(hint.1, hint_style));
-        spans.push(Span::styled(hint.2, hint_style));
+        spans.push(Span::styled(hint.0.to_string(), hint_style));
+        spans.push(Span::styled(hint.1.to_string(), hint_style));
+        spans.push(Span::styled(hint.2.to_string(), hint_style));
     }
     Line::from(spans)
 }

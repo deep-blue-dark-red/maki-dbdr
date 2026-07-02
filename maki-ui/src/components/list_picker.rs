@@ -99,6 +99,7 @@ pub struct ListPicker<T> {
     error_text: Option<String>,
 }
 
+#[allow(dead_code)]
 enum FooterSpec {
     Pairs(&'static [(&'static str, &'static str)]),
     Builder(fn() -> Line<'static>),
@@ -270,6 +271,7 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_footer(mut self, hints: &'static [(&'static str, &'static str)]) -> Self {
         self.footer = Some(FooterSpec::Pairs(hints));
         self

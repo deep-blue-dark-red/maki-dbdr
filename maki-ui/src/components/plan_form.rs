@@ -16,13 +16,6 @@ const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
 } else {
     "Ctrl+T/Esc"
 };
-const HINT_PAIRS: &[(&str, &str)] = &[
-    ("↑↓", "select"),
-    ("Space", "toggle parallel"),
-    ("Enter", "confirm"),
-    (key::OPEN_EDITOR.label, "edit plan"),
-    (DISMISS_KEYS, "dismiss"),
-];
 
 struct MenuItem {
     label: &'static str,
@@ -130,7 +123,7 @@ impl PlanForm {
         let t = theme::current();
         Some(Line::from(vec![
             Span::styled(" Plan ", Style::new().fg(t.foreground)),
-            Span::styled(key::PLAN_TOGGLE.label, t.keybind_key),
+            Span::styled(key::PLAN_TOGGLE.label().to_owned(), t.keybind_key),
             Span::raw(" "),
         ]))
     }
@@ -189,7 +182,14 @@ impl PlanForm {
             lines.push(Line::from(spans));
         }
         lines.push(Line::default());
-        lines.push(hint_line(HINT_PAIRS));
+        let hint_pairs = vec![
+            ("↑↓".to_string(), "select".to_string()),
+            ("Space".to_string(), "toggle parallel".to_string()),
+            ("Enter".to_string(), "confirm".to_string()),
+            (key::OPEN_EDITOR.label().to_string(), "edit plan".to_string()),
+            (DISMISS_KEYS.to_string(), "dismiss".to_string()),
+        ];
+        lines.push(hint_line(&hint_pairs));
 
         render_form(&t, FORM_LABEL, frame, area, lines, (0, 0));
     }
