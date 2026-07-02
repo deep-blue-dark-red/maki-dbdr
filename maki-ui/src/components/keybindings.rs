@@ -169,6 +169,21 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
     };
+    pub const SESSIONS: Bind = Bind {
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+S",
+    };
+    pub const SHIFT_SESSION_DOWN: Bind = Bind {
+        code: KeyCode::Char('a'),
+        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+        label: "Alt+Shift+A",
+    };
+    pub const SHIFT_SESSION_UP: Bind = Bind {
+        code: KeyCode::Char('s'),
+        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+        label: "Alt+Shift+S",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -359,6 +374,24 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::TOGGLE_VERBOSE.label),
         description: "Toggle verbose mode",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SESSIONS.label),
+        description: "Open sessions list",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SHIFT_SESSION_DOWN.label),
+        description: "Switch to next session",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SHIFT_SESSION_UP.label),
+        description: "Switch to previous session",
         context: KeybindContext::General,
         platform: Platform::All,
     },

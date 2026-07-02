@@ -285,6 +285,43 @@ impl App {
         vec![]
     }
 
+    pub(super) fn shift_session(&mut self, direction_down: bool) -> Vec<Action> {
+        self.save_session();
+        let summaries = match AppSession::list(&self.state.session.cwd, &self.storage) {
+            Ok(list) => list,
+            Err(e) => {
+                self.status_bar.flash(format!("Failed to list sessions: {e}"));
+                return vec![];
+            }
+        };
+
+        if summaries.len() <= 1 {
+            self.status_bar.flash("No other sessions to switch to".into());
+            return vec![];
+        }
+
+        let current_id = &self.state.session.id;
+        let current_pos = summaries.iter().position(|s| s.id == *current_id);
+
+        let target_idx = match current_pos {
+            Some(pos) => {
+                if direction_down {
+                    (pos + 1) % summaries.len()
+                } else {
+                    (pos + summaries.len() - 1) % summaries.len()
+                }
+            }
+            None => 0,
+        };
+
+        let target_id = summaries[target_idx].id.clone();
+        let target_title = summaries[target_idx].title.clone();
+
+        let actions = self.load_session(target_id);
+        self.status_bar.flash(format!("Switched to session: {target_title}"));
+        actions
+    }
+
     pub(crate) fn apply_loaded_session(
         &mut self,
         session: AppSession,

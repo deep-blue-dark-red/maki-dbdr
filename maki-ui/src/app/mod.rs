@@ -859,6 +859,15 @@ impl App {
         if key::EDIT_SYSTEM_PROMPT.matches(key) {
             return vec![Action::EditSystemPrompt];
         }
+        if key::SESSIONS.matches(key) {
+            return self.open_session_picker();
+        }
+        if key::SHIFT_SESSION_DOWN.matches(key) {
+            return self.shift_session(true);
+        }
+        if key::SHIFT_SESSION_UP.matches(key) {
+            return self.shift_session(false);
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);

@@ -1901,6 +1901,60 @@ fn alt_o_opens_editor_for_input() {
 }
 
 #[test]
+fn alt_s_opens_sessions_list() {
+    let mut app = test_app();
+    assert!(!app.session_picker.is_open());
+    app.update(Msg::Key(kb::SESSIONS.to_key_event()));
+    assert!(app.session_picker.is_open());
+}
+
+#[test]
+fn shift_session_with_keybinds() {
+    let tmp = TempDir::new().unwrap();
+    let storage = StateDir::from_path(tmp.path().to_path_buf());
+
+    let mut s1 = AppSession::new("test-model", "/tmp/test");
+    s1.title = "Session 1".into();
+    s1.updated_at = 1000;
+
+    let mut s2 = AppSession::new("test-model", "/tmp/test");
+    s2.title = "Session 2".into();
+    s2.updated_at = 2000;
+
+    s1.save(&storage).unwrap();
+    s2.save(&storage).unwrap();
+
+    let writer = Arc::new(StorageWriter::new(storage.clone()));
+    let permissions = Arc::new(PermissionManager::new(
+        PermissionsConfig::default(),
+        PathBuf::from("/tmp"),
+    ));
+    let model = test_model();
+    let mut app = App::new(
+        &model,
+        s2.clone(),
+        storage.clone(),
+        Arc::new(ArcSwapOption::empty()),
+        McpSnapshotReader::empty(),
+        McpConfigErrors::new(PathBuf::new()),
+        LuaCommandReader::empty(),
+        KeymapReader::empty(),
+        HintReader::empty(),
+        writer,
+        UiConfig::default(),
+        100,
+        permissions,
+        Arc::from([]),
+    );
+
+    app.update(Msg::Key(kb::SHIFT_SESSION_DOWN.to_key_event()));
+    assert_eq!(app.state.session.title, "Session 1");
+
+    app.update(Msg::Key(kb::SHIFT_SESSION_UP.to_key_event()));
+    assert_eq!(app.state.session.title, "Session 2");
+}
+
+#[test]
 fn btw_empty_flashes_error() {
     let mut app = test_app();
     let actions = app.execute_command(ParsedCommand {

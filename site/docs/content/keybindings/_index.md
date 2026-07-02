@@ -19,6 +19,9 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Ctrl+F` | Search messages |
 | `Ctrl+S` | File picker |
 | `Ctrl+O` | Toggle verbose mode |
+| `Alt+S` | Open sessions list |
+| `Alt+Shift+A` | Switch to next session |
+| `Alt+Shift+S` | Switch to previous session |
 | `Alt+P` | Open plan in editor |
 | `Ctrl+T` | Toggle plan panel |
 | `Ctrl+X` | Open tasks |
