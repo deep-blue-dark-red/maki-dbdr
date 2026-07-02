@@ -140,6 +140,11 @@ local function render_index(skeleton, path, ctx, ext, line_meta)
 end
 
 maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
+})
+
+maki.api.register_prompt_hint({
   slot = "efficient_tools",
   content = "index",
 })

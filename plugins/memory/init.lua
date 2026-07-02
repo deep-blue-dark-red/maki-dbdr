@@ -49,6 +49,11 @@ maki.api.register_prompt_hint({
   end,
 })
 
+maki.api.register_prompt_hint({
+  slot = "tool_usage",
+  content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
+})
+
 local function render_content(content, path, ctx)
   local buf = maki.ui.buf()
   local tol = ctx:tool_output_lines()
