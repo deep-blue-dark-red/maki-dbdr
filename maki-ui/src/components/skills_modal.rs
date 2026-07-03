@@ -593,17 +593,29 @@ fn find_project_ancestors(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 fn determine_folder_tag(path: &std::path::Path, cwd: &std::path::Path) -> FolderTag {
     let path_str = path.to_string_lossy();
+    
+    // Find the project root (the first ancestor containing .git, or cwd if not found)
+    let mut project_root = cwd.to_path_buf();
+    let mut current = cwd;
+    while let Some(parent) = current.parent() {
+        if parent.join(".git").exists() {
+            project_root = parent.to_path_buf();
+            break;
+        }
+        current = parent;
+    }
+
     if path_str.contains(".config/maki/skills") {
         FolderTag::Maki
-    } else if path_str.contains(".agents/skills") && !path.starts_with(cwd) {
+    } else if path.starts_with(&project_root) {
+        FolderTag::Local
+    } else if path_str.contains(".agents/skills") {
         FolderTag::Global
     } else if path_str.contains(".config/opencode/skills")
         || path_str.contains(".gemini/config/skills")
         || path_str.contains(".claude/skills")
     {
         FolderTag::Other
-    } else if path.starts_with(cwd) {
-        FolderTag::Local
     } else {
         FolderTag::Custom
     }
@@ -648,7 +660,7 @@ pub fn discover_skills_and_folders(
     for (i, ancestor) in ancestors.iter().enumerate() {
         for &(rel, display) in &project_dirs {
             let path = ancestor.join(rel);
-            if i == 0 || path.exists() {
+            if path.exists() {
                 let display_path = if i == 0 {
                     display.to_string()
                 } else {
