@@ -516,7 +516,7 @@ fn search_text_includes_role_prefix() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "1 user ∙ hello");
+    assert_eq!(texts[0], "1. user ∙ hello");
     assert_eq!(texts[2], format!("└ maki ∙ {md}"));
     assert_eq!(texts[4], "thinking> hmm");
 }

@@ -1524,7 +1524,7 @@ impl MessagesPanel {
                         .iter()
                         .filter(|m| m.role == DisplayRole::User)
                         .count();
-                    dynamic_prefix = format!("{turn_num} user ∙ ");
+                    dynamic_prefix = format!("{turn_num}. user ∙ ");
                     &dynamic_prefix
                 } else {
                     style.prefix
