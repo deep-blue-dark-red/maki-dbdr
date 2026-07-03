@@ -432,23 +432,62 @@ pub fn discover_skills_and_folders(
     let mut folders = Vec::new();
     let mut skills = Vec::new();
 
-    let global_root = std::path::PathBuf::from("/Users/mcp/.gemini/config");
-    let global_skills = global_root.join("skills");
+    // 1. Global config skills (maki)
+    if let Ok(config_dir) = maki_storage::paths::config_dir() {
+        let path = config_dir.join("skills");
+        folders.push(FolderInfo {
+            path,
+            display_path: "~/.config/maki/skills".to_string(),
+            is_standard: true,
+            is_enabled: true,
+        });
+    }
+
+    // 2. Other global skill directories
+    if let Some(home) = maki_storage::paths::home() {
+        let global_dirs = [
+            (".agents/skills", "~/.agents/skills"),
+            (".claude/skills", "~/.claude/skills"),
+            (".config/opencode/skills", "~/.config/opencode/skills"),
+        ];
+        for (rel, display) in global_dirs {
+            let path = home.join(rel);
+            folders.push(FolderInfo {
+                path,
+                display_path: display.to_string(),
+                is_standard: true,
+                is_enabled: true,
+            });
+        }
+    }
+
+    // 3. Gemini config skills
+    let gemini_config = std::path::PathBuf::from("/Users/mcp/.gemini/config/skills");
     folders.push(FolderInfo {
-        path: global_skills.clone(),
-        display_path: "~/config/skills".to_string(),
+        path: gemini_config,
+        display_path: "~/.gemini/config/skills".to_string(),
         is_standard: true,
         is_enabled: true,
     });
 
+    // 4. Project workspace directories
+    let project_dirs = [
+        (".agents/skills", ".agents/skills"),
+        (".maki/skills", ".maki/skills"),
+        (".claude/skills", ".claude/skills"),
+        (".opencode/skills", ".opencode/skills"),
+    ];
+    for (rel, display) in project_dirs {
+        let path = cwd.join(rel);
+        folders.push(FolderInfo {
+            path,
+            display_path: display.to_string(),
+            is_standard: true,
+            is_enabled: true,
+        });
+    }
+
     let workspace_root = cwd.join(".agents");
-    let workspace_skills = workspace_root.join("skills");
-    folders.push(FolderInfo {
-        path: workspace_skills.clone(),
-        display_path: ".agents/skills".to_string(),
-        is_standard: true,
-        is_enabled: true,
-    });
 
     let skills_json_path = workspace_root.join("skills.json");
     let skills_json = if skills_json_path.exists() {
@@ -508,7 +547,13 @@ pub fn discover_skills_and_folders(
         }
     }
 
-    (skills, folders, skills_json)
+    let mut unique_skills = Vec::new();
+    for s in skills {
+        if !unique_skills.iter().any(|us: &SkillInfo| us.name == s.name) {
+            unique_skills.push(s);
+        }
+    }
+    (unique_skills, folders, skills_json)
 }
 
 pub fn save_skills_json(cwd: &std::path::Path, skills_json: &SkillsJson) -> Result<(), std::io::Error> {
