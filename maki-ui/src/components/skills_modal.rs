@@ -426,6 +426,19 @@ fn parse_skill_md(content: &str) -> Option<(String, String)> {
     Some((name?, description.unwrap_or_default()))
 }
 
+fn find_project_ancestors(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![cwd.to_path_buf()];
+    let mut current = cwd;
+    while let Some(parent) = current.parent() {
+        dirs.push(parent.to_path_buf());
+        if parent.join(".git").exists() {
+            break;
+        }
+        current = parent;
+    }
+    dirs
+}
+
 pub fn discover_skills_and_folders(
     cwd: &std::path::Path,
 ) -> (Vec<SkillInfo>, Vec<FolderInfo>, SkillsJson) {
@@ -477,14 +490,30 @@ pub fn discover_skills_and_folders(
         (".claude/skills", ".claude/skills"),
         (".opencode/skills", ".opencode/skills"),
     ];
-    for (rel, display) in project_dirs {
-        let path = cwd.join(rel);
-        folders.push(FolderInfo {
-            path,
-            display_path: display.to_string(),
-            is_standard: true,
-            is_enabled: true,
-        });
+    let ancestors = find_project_ancestors(cwd);
+    for (i, ancestor) in ancestors.iter().enumerate() {
+        for &(rel, display) in &project_dirs {
+            let path = ancestor.join(rel);
+            if i == 0 || path.exists() {
+                let display_path = if i == 0 {
+                    display.to_string()
+                } else {
+                    let mut parent_steps = String::new();
+                    let mut temp = cwd;
+                    while temp != ancestor && temp.parent().is_some() {
+                        parent_steps.push_str("../");
+                        temp = temp.parent().unwrap();
+                    }
+                    format!("{parent_steps}{rel}")
+                };
+                folders.push(FolderInfo {
+                    path,
+                    display_path,
+                    is_standard: true,
+                    is_enabled: true,
+                });
+            }
+        }
     }
 
     let workspace_root = cwd.join(".agents");
