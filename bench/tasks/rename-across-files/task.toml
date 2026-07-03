@@ -1,0 +1,6 @@
+[task]
+id = "rename-across-files"
+category = "edit"
+prompt = "Rename the function load_cfg to load_config everywhere in this repo, including tests and all call sites. `python3 -m unittest discover -q` must pass afterwards."
+max_turns = 15
+timeout_s = 240

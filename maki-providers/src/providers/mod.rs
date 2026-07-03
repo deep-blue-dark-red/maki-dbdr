@@ -162,176 +162,52 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
         .expect("failed to build HTTP client")
 }
 
-#[derive(serde::Serialize)]
-struct RequestLog {
-    timestamp: String,
-    #[serde(rename = "type")]
-    log_type: &'static str,
-    method: String,
-    uri: String,
-    body: serde_json::Value,
+fn now_ms() -> u64 {
+    jiff::Timestamp::now().as_millisecond().max(0) as u64
 }
 
-#[derive(serde::Serialize)]
-struct ResponseLog {
-    timestamp: String,
-    #[serde(rename = "type")]
-    log_type: &'static str,
-    status: u16,
-    body: serde_json::Value,
-}
+/// Path of the current session's `.mlog` file, or `None` if logs are unavailable.
+fn log_file_path() -> Option<std::path::PathBuf> {
+    let logs_dir = maki_storage::paths::logs_dir().ok()?;
+    let now = jiff::Timestamp::now();
+    let yyyymmdd = now.to_string()[..10].replace('-', "");
 
-fn format_timestamp(ts: jiff::Timestamp) -> String {
-    let s = ts.to_string();
-    if s.len() >= 19 {
-        s[..19].replace('T', " ")
-    } else {
-        s.replace('T', " ")
-    }
-}
+    let session_name = maki_config::CURRENT_SESSION_NAME
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .filter(|name| name != "Main" && !name.is_empty());
+    let session_id = maki_config::CURRENT_SESSION_ID
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .filter(|id| !id.is_empty());
 
-fn parse_body(body: &str) -> serde_json::Value {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
-        val
-    } else {
-        serde_json::Value::String(body.to_string())
-    }
-}
-
-fn simplify_tools(mut body: serde_json::Value) -> serde_json::Value {
-    if let Some(tools) = body.as_object_mut()
-        .and_then(|obj| obj.get_mut("tools"))
-        .and_then(|t| t.as_array_mut())
-    {
-        for tool in tools {
-            if let Some(func) = tool.as_object_mut()
-                .and_then(|tool_obj| tool_obj.get_mut("function"))
-                .and_then(|f| f.as_object_mut())
-            {
-                func.remove("description");
-                func.remove("parameters");
-            }
-        }
-    }
-    body
-}
-
-fn clean_base64_images(val: &mut serde_json::Value) {
-    match val {
-        serde_json::Value::Object(map) => {
-            if let Some(url_val) = map.get_mut("image_url")
-                .and_then(|v| v.as_object_mut())
-                .and_then(|m| m.get_mut("url"))
-            {
-                let is_image_data = url_val.as_str()
-                    .is_some_and(|s| s.starts_with("data:image/"));
-                if is_image_data {
-                    let url_str = url_val.as_str().unwrap();
-                    if let Some(comma_idx) = url_str.find(";base64,") {
-                        let mime = &url_str[11..comma_idx];
-                        let base64_part = &url_str[comma_idx + 8..];
-                        let size_kb = base64_part.len() * 3 / 4 / 1024;
-                        *url_val = serde_json::Value::String(format!("[base64 image: {}KB {}]", size_kb, mime));
+    let name_or_id = match &session_name {
+        Some(name) => {
+            let sanitized: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else if c.is_whitespace() {
+                        '_'
+                    } else {
+                        '\0'
                     }
-                }
-            }
-
-            if let Some(source_val) = map.get_mut("source").and_then(|v| v.as_object_mut()) {
-                let is_base64 = source_val.get("type").and_then(|t| t.as_str()) == Some("base64");
-                if is_base64 {
-                    let media_type = source_val.get("media_type")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    if let Some(data_val) = source_val.get_mut("data").filter(|d| d.is_string()) {
-                        let data_str = data_val.as_str().unwrap();
-                        let size_kb = data_str.len() * 3 / 4 / 1024;
-                        *data_val = serde_json::Value::String(format!("[base64 image: {}KB {}]", size_kb, media_type));
-                    }
-                }
-            }
-
-            for (_, v) in map.iter_mut() {
-                clean_base64_images(v);
+                })
+                .filter(|c| *c != '\0')
+                .collect();
+            if sanitized.is_empty() {
+                session_id.unwrap_or_else(|| "unknown".to_string())
+            } else {
+                sanitized
             }
         }
-        serde_json::Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                clean_base64_images(v);
-            }
-        }
-        _ => {}
-    }
-}
+        None => session_id.unwrap_or_else(|| "unknown".to_string()),
+    };
 
-fn clean_response_body(body_str: &str, content_type: Option<&str>) -> serde_json::Value {
-    let is_sse = content_type.is_some_and(|ct| ct.contains("event-stream"))
-        || body_str.contains("data: ");
-
-    if is_sse {
-        let mut assistant_text = String::new();
-        let mut reasoning_text = String::new();
-        let mut final_usage = serde_json::Value::Null;
-        let mut model = String::new();
-
-        for line in body_str.lines() {
-            let line = line.trim();
-            if let Some(data_str) = line.strip_prefix("data: ") {
-                if data_str.trim() == "[DONE]" {
-                    continue;
-                }
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
-                    if let Some(m) = val["model"].as_str().filter(|_| model.is_empty()) {
-                        model = m.to_string();
-                    }
-                    if let Some(delta) = val["choices"].as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|c| c.get("delta"))
-                    {
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            assistant_text.push_str(content);
-                        }
-                        if let Some(reasoning) = delta.get("reasoning").and_then(|r| r.as_str()) {
-                            reasoning_text.push_str(reasoning);
-                        } else if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
-                            reasoning_text.push_str(reasoning);
-                        }
-                    }
-                    if val.get("usage").is_some() {
-                        final_usage = val["usage"].clone();
-                    }
-                }
-            }
-        }
-
-        let mut res_map = serde_json::Map::new();
-        res_map.insert("stream_reconstructed".to_string(), serde_json::Value::Bool(true));
-        if !model.is_empty() {
-            res_map.insert("model".to_string(), serde_json::Value::String(model));
-        }
-        res_map.insert("content".to_string(), serde_json::Value::String(assistant_text));
-        if !reasoning_text.is_empty() {
-            res_map.insert("reasoning".to_string(), serde_json::Value::String(reasoning_text));
-        }
-        if !final_usage.is_null() {
-            res_map.insert("usage".to_string(), final_usage);
-        }
-        serde_json::Value::Object(res_map)
-    } else {
-        parse_body(body_str)
-    }
-}
-
-fn write_log_line(path: &std::path::Path, line: &str) {
-    use std::io::Write;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path);
-    if let Ok(mut encoder) = file.and_then(|f| zstd::stream::Encoder::new(f, 3)) {
-        let _ = writeln!(encoder, "{}", line);
-        let _ = encoder.finish();
-    }
+    Some(logs_dir.join(format!("{yyyymmdd}-{name_or_id}.mlog")))
 }
 
 fn is_chat_completion_request(method: &str, uri: &str) -> bool {
@@ -348,83 +224,52 @@ pub(crate) async fn send_request(
     client: &isahc::HttpClient,
     request: isahc::Request<Vec<u8>>,
 ) -> Result<isahc::Response<isahc::AsyncBody>, AgentError> {
-    use std::sync::atomic::Ordering;
+    send_request_logged(client, request, None).await
+}
 
+/// Like [`send_request`], but with per-message wire [`Fragments`] for the log so
+/// the request body is deduplicated at message granularity. Fragments are only
+/// used if they reproduce the exact bytes; otherwise the logger byte-diffs.
+pub(crate) async fn send_request_with_fragments(
+    client: &isahc::HttpClient,
+    request: isahc::Request<Vec<u8>>,
+    fragments: Option<crate::wire_log::Fragments>,
+) -> Result<isahc::Response<isahc::AsyncBody>, AgentError> {
+    send_request_logged(client, request, fragments).await
+}
+
+async fn send_request_logged(
+    client: &isahc::HttpClient,
+    request: isahc::Request<Vec<u8>>,
+    fragments: Option<crate::wire_log::Fragments>,
+) -> Result<isahc::Response<isahc::AsyncBody>, AgentError> {
     let method = request.method().to_string();
     let uri = request.uri().to_string();
 
-    if !maki_config::LOG_API.load(Ordering::Relaxed) || !is_chat_completion_request(&method, &uri) {
+    let file_path = (maki_config::LOG_API.load(Ordering::Relaxed)
+        && is_chat_completion_request(&method, &uri))
+    .then(log_file_path)
+    .flatten();
+
+    let Some(file_path) = file_path else {
         let (parts, body) = request.into_parts();
-        let async_body = isahc::AsyncBody::from(body);
-        let req = isahc::Request::from_parts(parts, async_body);
+        let req = isahc::Request::from_parts(parts, isahc::AsyncBody::from(body));
         return client.send_async(req).await.map_err(Into::into);
-    }
-
-    let logs_dir = match maki_storage::paths::logs_dir() {
-        Ok(dir) => dir,
-        Err(_) => {
-            let (parts, body) = request.into_parts();
-            let async_body = isahc::AsyncBody::from(body);
-            let req = isahc::Request::from_parts(parts, async_body);
-            return client.send_async(req).await.map_err(Into::into);
-        }
     };
-    let now = jiff::Timestamp::now();
-    let yyyymmdd = now.to_string()[..10].replace('-', "");
-    let session_name = maki_config::CURRENT_SESSION_NAME.lock().ok()
-        .and_then(|guard| guard.clone())
-        .filter(|name| name != "Main" && !name.is_empty());
-    let session_id = maki_config::CURRENT_SESSION_ID.lock().ok()
-        .and_then(|guard| guard.clone())
-        .filter(|id| !id.is_empty());
-    let name_or_id = if let Some(ref name) = session_name {
-        let mut sanitized = String::new();
-        for c in name.chars() {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                sanitized.push(c);
-            } else if c.is_whitespace() {
-                sanitized.push('_');
-            }
-        }
-        if sanitized.is_empty() {
-            session_id.unwrap_or_else(|| "unknown".to_string())
-        } else {
-            sanitized
-        }
-    } else {
-        session_id.unwrap_or_else(|| "unknown".to_string())
-    };
-    let filename = format!("{}-{}.log.zst", yyyymmdd, name_or_id);
-    let file_path = logs_dir.join(filename);
 
-    let timestamp = format_timestamp(jiff::Timestamp::now());
-    let is_first_request = !file_path.exists();
-    let req_body_str = String::from_utf8_lossy(request.body());
-    let mut req_body_val = parse_body(&req_body_str);
-    if !is_first_request {
-        req_body_val = simplify_tools(req_body_val);
-    }
-    clean_base64_images(&mut req_body_val);
-
-    let req_log = RequestLog {
-        timestamp,
-        log_type: "request",
-        method,
-        uri,
-        body: req_body_val,
-    };
-    if let Ok(log_line) = serde_json::to_string(&req_log) {
-        write_log_line(&file_path, &log_line);
-    }
+    crate::wire_log::log_request(&file_path, now_ms(), &uri, request.body(), fragments);
 
     let (parts, body) = request.into_parts();
-    let async_body = isahc::AsyncBody::from(body);
-    let req = isahc::Request::from_parts(parts, async_body);
-
+    let req = isahc::Request::from_parts(parts, isahc::AsyncBody::from(body));
     let response = client.send_async(req).await?;
 
-    let status = response.status();
-    let content_type = response.headers().get("content-type").and_then(|h| h.to_str().ok().map(|s| s.to_string()));
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
 
     let (res_parts, res_body) = response.into_parts();
     let logged_body = LoggingBody {
@@ -435,15 +280,17 @@ pub(crate) async fn send_request(
         accumulated_body: Vec::new(),
         flushed: false,
     };
-
-    Ok(isahc::Response::from_parts(res_parts, isahc::AsyncBody::from_reader(logged_body)))
+    Ok(isahc::Response::from_parts(
+        res_parts,
+        isahc::AsyncBody::from_reader(logged_body),
+    ))
 }
 
 struct LoggingBody<R> {
     inner: R,
     file_path: std::path::PathBuf,
-    status: isahc::http::StatusCode,
-    content_type: Option<String>,
+    status: u16,
+    content_type: String,
     accumulated_body: Vec<u8>,
     flushed: bool,
 }
@@ -454,19 +301,13 @@ impl<R> LoggingBody<R> {
             return;
         }
         self.flushed = true;
-        let response_body_str = String::from_utf8_lossy(&self.accumulated_body);
-        let res_body_val = clean_response_body(&response_body_str, self.content_type.as_deref());
-        let res_timestamp = format_timestamp(jiff::Timestamp::now());
-
-        let res_log = ResponseLog {
-            timestamp: res_timestamp,
-            log_type: "response",
-            status: self.status.as_u16(),
-            body: res_body_val,
-        };
-        if let Ok(log_line) = serde_json::to_string(&res_log) {
-            write_log_line(&self.file_path, &log_line);
-        }
+        crate::wire_log::log_response(
+            &self.file_path,
+            now_ms(),
+            self.status,
+            &self.content_type,
+            &self.accumulated_body,
+        );
     }
 }
 
@@ -717,11 +558,11 @@ mod tests {
 
     #[test]
     fn test_logging_body_accumulates_and_flushes() {
-        use std::fs;
+        use crate::wire_log::{self, Record};
         use futures_lite::io::AsyncReadExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let log_file = tmp.path().join("api.log");
+        let log_file = tmp.path().join("api.mlog");
 
         let input_data = b"hello world streaming data";
         let reader = futures_lite::io::Cursor::new(input_data);
@@ -729,8 +570,8 @@ mod tests {
         let logged_body = LoggingBody {
             inner: reader,
             file_path: log_file.clone(),
-            status: isahc::http::StatusCode::OK,
-            content_type: None,
+            status: 200,
+            content_type: "application/json".to_string(),
             accumulated_body: Vec::new(),
             flushed: false,
         };
@@ -744,11 +585,12 @@ mod tests {
 
         assert_eq!(buf, input_data);
         assert!(log_file.exists());
-        let compressed_content = fs::read(log_file).unwrap();
-        let log_content = String::from_utf8(zstd::decode_all(&compressed_content[..]).unwrap()).unwrap();
-        let log_val: serde_json::Value = serde_json::from_str(&log_content).unwrap();
-        assert_eq!(log_val["type"], "response");
-        assert_eq!(log_val["status"], 200);
-        assert_eq!(log_val["body"], "hello world streaming data");
+
+        let records = wire_log::read_file(&log_file).unwrap();
+        let Some(Record::Response { status, body, .. }) = records.first() else {
+            panic!("expected a response record");
+        };
+        assert_eq!(*status, 200);
+        assert_eq!(body, input_data);
     }
 }

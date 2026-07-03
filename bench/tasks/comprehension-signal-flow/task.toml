@@ -1,0 +1,6 @@
+[task]
+id = "comprehension-signal-flow"
+category = "comprehension"
+prompt = "When this daemon receives SIGTERM, which functions run as a result, and in what order? List the function names in order."
+max_turns = 10
+timeout_s = 180

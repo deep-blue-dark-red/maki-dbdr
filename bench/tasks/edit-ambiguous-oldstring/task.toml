@@ -1,0 +1,6 @@
+[task]
+id = "edit-ambiguous-oldstring"
+category = "trap"
+prompt = "In svc/client.py, inside the function fetch_with_retry only, change `attempts += 1` to `attempts += 2`. The other functions must stay unchanged."
+max_turns = 12
+timeout_s = 180

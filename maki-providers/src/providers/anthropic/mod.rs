@@ -135,7 +135,15 @@ impl Anthropic {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
         let request = builder.body(json_body)?;
-        let response = super::send_request(&self.client, request).await?;
+        // Hand the logger per-message fragments so the wire body dedups at
+        // message granularity (immune to the sliding cache_control window).
+        // Only computed when API logging is on; the outbound bytes are untouched.
+        let fragments = maki_config::LOG_API
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| crate::wire_log::fragment_body(body, "messages"))
+            .flatten();
+        let response =
+            super::send_request_with_fragments(&self.client, request, fragments).await?;
         let status = response.status().as_u16();
 
         if status == 200 {

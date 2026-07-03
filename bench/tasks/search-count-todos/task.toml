@@ -1,0 +1,6 @@
+[task]
+id = "search-count-todos"
+category = "search"
+prompt = "How many '# TODO:' comments are there in total under src/? Answer with just the number."
+max_turns = 8
+timeout_s = 180

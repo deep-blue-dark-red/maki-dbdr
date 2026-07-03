@@ -107,7 +107,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
-| `log_api` | bool | `false` | - | Log all outbound and inbound API text for auditing |
+| `log_api` | bool | `false` | - | Log all outbound and inbound API traffic (byte-exact) for auditing |
 
 ### `storage`
 
@@ -152,6 +152,21 @@ Maki uses XDG directories on Linux and macOS:
 | State | `~/.local/state/maki/` |
 
 `~/.maki/` is checked as a legacy fallback.
+
+### API logs
+
+With `log_api = true`, each session's outbound requests and inbound responses
+are written to `<logs>/YYYYMMDD-<session>.mlog` — a compact binary format
+(`MLOG`). Because chat APIs re-send the full conversation plus identical tool and
+system blocks every turn, requests are stored deduplicated (repeated messages and
+tool blocks are interned once, or byte-diffed) while remaining **byte-exact**: the
+raw wire message is always recoverable. View a log with the `mlog` tool:
+
+```sh
+mlog session.mlog              # pretty request/response, SSE reconstructed
+mlog --raw session.mlog        # exact bytes, byte-for-byte as sent/received
+mlog --transcript session.mlog # linear conversation (only each turn's new messages)
+```
 
 ### Migrating from ~/.maki/
 

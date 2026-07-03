@@ -1,0 +1,6 @@
+[task]
+id = "search-find-def"
+category = "search"
+prompt = "Report the file and line number where the function resolve_config is *defined* (not called). Answer in the format file_path:line."
+max_turns = 10
+timeout_s = 180

@@ -451,8 +451,8 @@ mod tests {
         );
     }
 
-    #[test_case("maki>", &["you> hello", "maki> world", "thinking> hmm"], 1 ; "maki_prefix")]
-    #[test_case("you>",  &["you> request", "maki> response", "bash> output"], 0 ; "you_prefix")]
+    #[test_case("maki ∙", &["1 user ∙ hello", "└ maki ∙ world", "thinking> hmm"], 1 ; "maki_prefix")]
+    #[test_case("user ∙",  &["1 user ∙ request", "└ maki ∙ response", "bash> output"], 0 ; "user_prefix")]
     fn search_role_prefix_matches(query: &str, texts: &[&str], expected_idx: usize) {
         let modal = modal_with_query(query, texts);
         assert_eq!(modal.matches.len(), 1);

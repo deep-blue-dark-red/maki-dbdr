@@ -1274,8 +1274,9 @@ impl MessagesPanel {
         let lines_count = thinking_text.lines().count();
         if !exp {
             let label = format!("(reasoning {tokens} tokens, +{lines_count} lines)");
+            let prefix_trimmed = prefix.trim_end();
             let line = Line::from(vec![
-                Span::styled(format!("{prefix} "), prefix_style),
+                Span::styled(format!("{prefix_trimmed} "), prefix_style),
                 Span::styled(label, theme::current().tool_dim),
             ]);
             vec![line]
@@ -1456,7 +1457,7 @@ impl MessagesPanel {
                         }
                         lines = assistant_lines;
                     } else {
-                        let mut thinking_lines = Self::build_thinking_lines(&thinking_msg.text, true, true, "maki>", prefix_style);
+                        let mut thinking_lines = Self::build_thinking_lines(&thinking_msg.text, true, true, "└ maki ∙ ", prefix_style);
                         let assistant_lines = if style.use_markdown {
                             text_to_lines(
                                 &msg.text,
@@ -1505,6 +1506,7 @@ impl MessagesPanel {
                     continue;
                 }
 
+                let dynamic_prefix;
                 let style = match &msg.role {
                     DisplayRole::User => user_style(),
                     DisplayRole::Assistant => assistant_style(),
@@ -1517,6 +1519,13 @@ impl MessagesPanel {
                 };
                 let prefix = if msg.plan_path.is_some() {
                     ""
+                } else if msg.role == DisplayRole::User {
+                    let turn_num = self.messages[..=i]
+                        .iter()
+                        .filter(|m| m.role == DisplayRole::User)
+                        .count();
+                    dynamic_prefix = format!("{turn_num} user ∙ ");
+                    &dynamic_prefix
                 } else {
                     style.prefix
                 };

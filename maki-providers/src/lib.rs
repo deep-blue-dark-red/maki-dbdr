@@ -5,6 +5,7 @@ pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
 pub(crate) mod types;
+pub mod wire_log;
 
 pub use error::AgentError;
 pub use model::{

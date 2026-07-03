@@ -1,0 +1,6 @@
+[task]
+id = "edit-makefile-tabs"
+category = "trap"
+prompt = "In the Makefile, the deploy target currently targets server-a. Change both the rsync destination and the ssh restart command to use server-b instead. Recipe lines must stay valid Makefile syntax."
+max_turns = 10
+timeout_s = 180

@@ -1,0 +1,6 @@
+[task]
+id = "gitignored-answer"
+category = "trap"
+prompt = "Somewhere under build/ there is a generated metadata file containing a version stamp. What is the exact stamp string? Answer with just the string."
+max_turns = 12
+timeout_s = 180
