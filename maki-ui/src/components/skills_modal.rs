@@ -325,12 +325,12 @@ impl SkillsModal {
                         SkillsAction::None
                     }
                     Focus::Folders => {
-                        self.close();
-                        let path = self.cwd.join(".agents").join("skills.json");
-                        if !path.exists() {
-                            let _ = save_skills_json(&self.cwd, &self.skills_json);
+                        let path = self.folders.get(self.selected_folder).map(|f| f.path.clone());
+                        if let Some(p) = path {
+                            self.close();
+                            return SkillsAction::EditSkillsJson(p);
                         }
-                        SkillsAction::EditSkillsJson(path)
+                        SkillsAction::None
                     }
                 }
             }
@@ -533,7 +533,7 @@ impl SkillsModal {
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  e          ", t.accent),
-            Span::styled("Open .agents/skills.json in your editor", t.item_desc)
+            Span::styled("Open the selected folder or skill in your editor", t.item_desc)
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  Esc        ", t.accent),
