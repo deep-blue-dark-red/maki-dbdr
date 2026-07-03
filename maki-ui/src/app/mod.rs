@@ -40,6 +40,7 @@ use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
 use crate::components::skills_modal::{SkillsModal, SkillsAction};
+use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
@@ -148,6 +149,7 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) goto_picker: GotoPicker,
     pub(super) help_modal: HelpModal,
+    pub(super) export_picker: ExportPicker,
     pub(super) skills_modal: SkillsModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -253,6 +255,7 @@ impl App {
             rewind_picker: RewindPicker::new(),
             goto_picker: GotoPicker::new(),
             help_modal: HelpModal::new(),
+            export_picker: ExportPicker::new(),
             skills_modal: SkillsModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
@@ -558,6 +561,70 @@ impl App {
                     return Some(vec![]);
                 }
             }
+        }
+
+        if self.export_picker.is_open() {
+            match self.export_picker.handle_key(key) {
+                ExportPickerAction::Select(entry) => {
+                    let settings = UserSettings::load();
+                    let base_path = settings.resolved_export_path(std::path::Path::new(&self.state.session.cwd));
+                    match entry.export_type {
+                        ExportType::MarkdownClipboard => {
+                            let text = self.export_session_to_markdown();
+                            match self.clipboard.copy_text(&text) {
+                                Ok(crate::clipboard::CopyResult::Copied) => {
+                                    self.flash("Copied transcript to clipboard".into());
+                                }
+                                Ok(crate::clipboard::CopyResult::Noop) => {}
+                                Err(e) => {
+                                    self.flash(format!("Copy failed: {e}"));
+                                }
+                            }
+                        }
+                        ExportType::MarkdownSave => {
+                            let text = self.export_session_to_markdown();
+                            let filepath = if base_path.is_file() {
+                                base_path
+                            } else {
+                                let _ = std::fs::create_dir_all(&base_path);
+                                base_path.join(format!("session-{}.md", self.state.session.id))
+                            };
+                            match std::fs::write(&filepath, text) {
+                                Ok(_) => self.flash(format!("Saved transcript to {}", filepath.display())),
+                                Err(e) => self.flash(format!("Failed to save transcript: {e}")),
+                            }
+                        }
+                        ExportType::JsonClipboard => {
+                            let text = self.export_session_to_json();
+                            match self.clipboard.copy_text(&text) {
+                                Ok(crate::clipboard::CopyResult::Copied) => {
+                                    self.flash("Copied JSON session to clipboard".into());
+                                }
+                                Ok(crate::clipboard::CopyResult::Noop) => {}
+                                Err(e) => {
+                                    self.flash(format!("Copy failed: {e}"));
+                                }
+                            }
+                        }
+                        ExportType::JsonSave => {
+                            let text = self.export_session_to_json();
+                            let filepath = if base_path.is_file() {
+                                base_path
+                            } else {
+                                let _ = std::fs::create_dir_all(&base_path);
+                                base_path.join(format!("session-{}.json", self.state.session.id))
+                            };
+                            match std::fs::write(&filepath, text) {
+                                Ok(_) => self.flash(format!("Saved JSON session to {}", filepath.display())),
+                                Err(e) => self.flash(format!("Failed to save JSON session: {e}")),
+                            }
+                        }
+                    }
+                }
+                ExportPickerAction::Consumed => {}
+                ExportPickerAction::Close => {}
+            }
+            return Some(vec![]);
         }
 
         if self.btw_modal.is_open() {
@@ -1491,17 +1558,8 @@ impl App {
                 );
                 vec![]
             }
-            "/copy_transcript" => {
-                let markdown = self.export_session_to_markdown();
-                match self.clipboard.copy_text(&markdown) {
-                    Ok(crate::clipboard::CopyResult::Noop) => {}
-                    Ok(crate::clipboard::CopyResult::Copied) => {
-                        self.flash("Copied transcript to clipboard".into());
-                    }
-                    Err(e) => {
-                        self.flash(format!("Copy failed: {e}"));
-                    }
-                }
+            "/export" => {
+                self.export_picker.open(std::path::Path::new(&self.state.session.cwd));
                 vec![]
             }
             "/logs" => {
@@ -1655,9 +1713,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 16] {
+    fn overlays(&self) -> [&dyn Overlay; 17] {
         [
             &self.help_modal,
+            &self.export_picker,
             &self.skills_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -1676,9 +1735,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 16] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 17] {
         [
             &mut self.help_modal,
+            &mut self.export_picker,
             &mut self.skills_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,

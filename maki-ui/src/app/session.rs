@@ -399,6 +399,10 @@ impl App {
 
         out
     }
+
+    pub(crate) fn export_session_to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.state.session).unwrap_or_default()
+    }
 }
 
 fn format_messages(

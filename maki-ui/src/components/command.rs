@@ -103,8 +103,8 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
-        name: "/copy_transcript",
-        description: "Copy session transcript to clipboard as markdown",
+        name: "/export",
+        description: "Export session transcript as Markdown or JSON",
         max_args: 0,
     },
     BuiltinCommand {

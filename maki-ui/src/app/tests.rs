@@ -2688,7 +2688,7 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
 }
 
 #[test]
-fn copy_transcript_command() {
+fn export_command() {
     let mut app = test_app();
     app.state.session.title = "Test Session".into();
     app.state.session.model = "test-model".into();
@@ -2765,7 +2765,10 @@ Hello user!
 ";
     assert_eq!(markdown, expected);
 
-    app.execute_command(cmd("/copy_transcript"));
+    app.execute_command(cmd("/export"));
+    assert!(app.export_picker.is_open());
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!app.export_picker.is_open());
     assert_eq!(app.status_bar.flash_text(), Some("Copied transcript to clipboard"));
 }
 

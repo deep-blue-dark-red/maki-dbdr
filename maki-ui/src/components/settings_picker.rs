@@ -26,6 +26,8 @@ pub struct UserSettings {
     pub compact_tokens: Option<usize>,
     #[serde(default)]
     pub skills_dirs: Vec<String>,
+    #[serde(default)]
+    pub export_path: Option<String>,
 }
 
 impl UserSettings {
@@ -35,6 +37,24 @@ impl UserSettings {
 
     pub fn save(&self) {
         crate::config::save_config(self);
+    }
+
+    pub fn resolved_export_path(&self, cwd: &std::path::Path) -> std::path::PathBuf {
+        let raw = self.export_path.as_deref().unwrap_or("cwd");
+        if raw == "cwd" {
+            cwd.to_path_buf()
+        } else {
+            let path_str = raw.to_string();
+            if path_str.starts_with("~/") {
+                if let Some(home) = maki_storage::paths::home() {
+                    home.join(&path_str[2..])
+                } else {
+                    std::path::PathBuf::from(path_str)
+                }
+            } else {
+                std::path::PathBuf::from(path_str)
+            }
+        }
     }
 
     pub fn load_legacy_json() -> Self {
