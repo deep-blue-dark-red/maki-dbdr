@@ -12,11 +12,11 @@ Skills can be global (available across all projects) or local (project-specific)
 
 ### Local (Project-specific)
 Create a new directory in:
-`.maki/skills/<skill-name>/`
+`.agents/skills/<skill-name>/`
 
 ### Global
 Create a new directory in:
-`~/.config/maki/skills/<skill-name>/`
+`~/.config/skills/<skill-name>/`
 
 Inside the directory, create:
 * `SKILL.md` (Required): The playbook containing YAML frontmatter and markdown body instructions.
