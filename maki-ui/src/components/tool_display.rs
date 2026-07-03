@@ -189,7 +189,7 @@ pub fn assistant_style() -> RoleStyle {
 
 pub fn user_style() -> RoleStyle {
     RoleStyle {
-        prefix: "user ∙ ",
+        prefix: "you ∙ ",
         text_style: theme::current().assistant,
         prefix_style: theme::current().user,
         use_markdown: true,
