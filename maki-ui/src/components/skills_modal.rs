@@ -342,9 +342,13 @@ impl SkillsModal {
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(inner);
 
+        let folder_height = ((self.folders.len() as u16).saturating_add(2))
+            .min(chunks[0].height.saturating_div(2))
+            .max(4);
+
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(0)])
+            .constraints([Constraint::Length(folder_height), Constraint::Min(0)])
             .split(chunks[0]);
 
         let t = theme::current();
