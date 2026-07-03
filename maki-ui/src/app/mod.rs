@@ -551,6 +551,9 @@ impl App {
                 SkillsAction::EditSkillsJson(path) => {
                     return Some(vec![Action::OpenEditor(path)]);
                 }
+                SkillsAction::EditSkill(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
                 SkillsAction::None => {
                     return Some(vec![]);
                 }

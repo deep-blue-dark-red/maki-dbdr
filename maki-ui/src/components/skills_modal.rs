@@ -78,6 +78,7 @@ pub enum SkillsAction {
     None,
     CreateSkill(std::path::PathBuf),
     EditSkillsJson(std::path::PathBuf),
+    EditSkill(std::path::PathBuf),
 }
 
 pub struct SkillsModal {
@@ -314,12 +315,24 @@ impl SkillsModal {
                 SkillsAction::None
             }
             KeyCode::Char('e') => {
-                self.close();
-                let path = self.cwd.join(".agents").join("skills.json");
-                if !path.exists() {
-                    let _ = save_skills_json(&self.cwd, &self.skills_json);
+                match self.focus {
+                    Focus::Skills => {
+                        let path = self.skills.get(self.selected_skill).map(|s| s.path.clone());
+                        if let Some(p) = path {
+                            self.close();
+                            return SkillsAction::EditSkill(p);
+                        }
+                        SkillsAction::None
+                    }
+                    Focus::Folders => {
+                        self.close();
+                        let path = self.cwd.join(".agents").join("skills.json");
+                        if !path.exists() {
+                            let _ = save_skills_json(&self.cwd, &self.skills_json);
+                        }
+                        SkillsAction::EditSkillsJson(path)
+                    }
                 }
-                SkillsAction::EditSkillsJson(path)
             }
             _ => SkillsAction::None,
         }
