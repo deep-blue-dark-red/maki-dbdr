@@ -24,6 +24,8 @@ pub struct UserSettings {
     pub log_command: Option<String>,
     #[serde(default)]
     pub compact_tokens: Option<usize>,
+    #[serde(default)]
+    pub skills_dirs: Vec<String>,
 }
 
 impl UserSettings {

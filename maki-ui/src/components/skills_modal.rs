@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use crate::components::settings_picker::UserSettings;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SkillsJson {
@@ -38,11 +39,32 @@ pub struct SkillInfo {
     pub source_dir: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderTag {
+    Maki,
+    Global,
+    Other,
+    Local,
+    Custom,
+}
+
+impl FolderTag {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FolderTag::Maki => "[MAKI]",
+            FolderTag::Global => "[GLOBAL]",
+            FolderTag::Other => "[OTHER]",
+            FolderTag::Local => "[LOCAL]",
+            FolderTag::Custom => "",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FolderInfo {
     pub path: std::path::PathBuf,
     pub display_path: String,
-    pub is_standard: bool,
+    pub tag: FolderTag,
     pub is_enabled: bool,
 }
 
@@ -67,6 +89,8 @@ pub struct SkillsModal {
     selected_skill: usize,
     skills_json: SkillsJson,
     cwd: std::path::PathBuf,
+    input_mode: bool,
+    input_buffer: crate::text_buffer::TextBuffer,
 }
 
 impl SkillsModal {
@@ -80,6 +104,8 @@ impl SkillsModal {
             selected_skill: 0,
             skills_json: SkillsJson::default(),
             cwd: std::path::PathBuf::new(),
+            input_mode: false,
+            input_buffer: crate::text_buffer::TextBuffer::new(String::new()),
         }
     }
 
@@ -115,6 +141,49 @@ impl SkillsModal {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SkillsAction {
         if !self.open {
+            return SkillsAction::None;
+        }
+
+        if self.input_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.input_mode = false;
+                    self.input_buffer = crate::text_buffer::TextBuffer::new(String::new());
+                }
+                KeyCode::Enter => {
+                    let path_str = self.input_buffer.value().trim().to_string();
+                    if !path_str.is_empty() {
+                        let path = std::path::Path::new(&path_str);
+                        if path_str.starts_with('~') || path_str.starts_with('/') || path.is_absolute() {
+                            let mut settings = UserSettings::load();
+                            let resolved = if path_str.starts_with("~/") {
+                                if let Some(home) = maki_storage::paths::home() {
+                                    home.join(&path_str[2..]).to_string_lossy().into_owned()
+                                } else {
+                                    path_str.clone()
+                                }
+                            } else {
+                                path_str.clone()
+                            };
+                            if !settings.skills_dirs.contains(&resolved) {
+                                settings.skills_dirs.push(resolved);
+                                settings.save();
+                            }
+                        } else {
+                            if !self.skills_json.entries.iter().any(|e| e.path == path_str) {
+                                self.skills_json.entries.push(SkillEntry { path: path_str });
+                                let _ = save_skills_json(&self.cwd, &self.skills_json);
+                            }
+                        }
+                        self.input_mode = false;
+                        self.input_buffer = crate::text_buffer::TextBuffer::new(String::new());
+                        self.refresh();
+                    }
+                }
+                _ => {
+                    let _ = self.input_buffer.handle_key(key);
+                }
+            }
             return SkillsAction::None;
         }
 
@@ -171,7 +240,7 @@ impl SkillsModal {
             KeyCode::Char(' ') | KeyCode::Enter => {
                 match self.focus {
                     Focus::Folders => {
-                        if let Some(folder) = self.folders.get(self.selected_folder).filter(|f| !f.is_standard) {
+                        if let Some(folder) = self.folders.get(self.selected_folder).filter(|f| f.tag == FolderTag::Custom) {
                             if let Some(pos) = self.skills_json.entries.iter().position(|e| e.path == folder.display_path) {
                                 self.skills_json.entries.remove(pos);
                             } else {
@@ -194,6 +263,32 @@ impl SkillsModal {
                         }
                     }
                 }
+                SkillsAction::None
+            }
+            KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete if self.focus == Focus::Folders => {
+                if let Some(folder) = self.folders.get(self.selected_folder) {
+                    let path_str = folder.path.to_string_lossy().into_owned();
+                    let mut settings = UserSettings::load();
+                    let mut changed = false;
+                    if let Some(pos) = settings.skills_dirs.iter().position(|x| x == &path_str) {
+                        settings.skills_dirs.remove(pos);
+                        settings.save();
+                        changed = true;
+                    }
+                    if let Some(pos) = self.skills_json.entries.iter().position(|e| e.path == folder.display_path) {
+                        self.skills_json.entries.remove(pos);
+                        let _ = save_skills_json(&self.cwd, &self.skills_json);
+                        changed = true;
+                    }
+                    if changed {
+                        self.refresh();
+                    }
+                }
+                SkillsAction::None
+            }
+            KeyCode::Char('a') if self.focus == Focus::Folders => {
+                self.input_mode = true;
+                self.input_buffer = crate::text_buffer::TextBuffer::new(String::new());
                 SkillsAction::None
             }
             KeyCode::Char('c') => {
@@ -263,12 +358,15 @@ impl SkillsModal {
         let mut folder_lines = Vec::new();
         for (i, folder) in self.folders.iter().enumerate() {
             let is_selected = self.focus == Focus::Folders && i == self.selected_folder;
-            let check = if folder.is_standard {
-                "[Standard]"
-            } else if self.skills_json.entries.iter().any(|e| e.path == folder.display_path) {
-                "[x]"
-            } else {
-                "[ ]"
+            let check = match folder.tag {
+                FolderTag::Custom => {
+                    if self.skills_json.entries.iter().any(|e| e.path == folder.display_path) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    }
+                }
+                other => other.label(),
             };
             let style = if is_selected { t.item_selected } else { t.item };
             folder_lines.push(Line::from(vec![
@@ -317,20 +415,49 @@ impl SkillsModal {
         let mut details_lines = Vec::new();
         match self.focus {
             Focus::Folders => {
-                if let Some(folder) = self.folders.get(self.selected_folder) {
+                if self.input_mode {
+                    details_lines.push(Line::from(vec![
+                        Span::styled("Add Skills Folder Path: ", t.accent),
+                    ]));
+                    let value = self.input_buffer.value();
+                    let cursor_byte = crate::text_buffer::TextBuffer::char_to_byte(&value, self.input_buffer.x());
+                    let (before, after) = value.split_at(cursor_byte);
+                    let mut spans = vec![
+                        Span::styled(before.to_string(), t.item),
+                    ];
+                    if let Some(c) = after.chars().next() {
+                        spans.push(Span::styled(c.to_string(), t.item_selected));
+                        spans.push(Span::styled(after[c.len_utf8()..].to_string(), t.item));
+                    } else {
+                        spans.push(Span::styled(" ", t.item_selected));
+                    }
+                    details_lines.push(Line::from(spans));
+                    details_lines.push(Line::default());
+                    details_lines.push(Line::from(vec![
+                        Span::styled("Press Enter to add, Esc to cancel.", t.item_desc)
+                    ]));
+                } else if let Some(folder) = self.folders.get(self.selected_folder) {
                     details_lines.push(Line::from(vec![
                         Span::styled("Path: ", t.tool_dim),
                         Span::styled(folder.path.to_string_lossy().into_owned(), t.item),
                     ]));
                     details_lines.push(Line::default());
-                    if folder.is_standard {
-                        details_lines.push(Line::from(vec![
-                            Span::styled("This is a standard customization root folder. Standard roots are automatically discovered and cannot be toggled or deleted.", t.item_desc)
-                        ]));
-                    } else {
-                        details_lines.push(Line::from(vec![
-                            Span::styled("This is a custom skills folder. Press Space/Enter to toggle inclusion in skills.json entries.", t.item_desc)
-                        ]));
+                    match folder.tag {
+                        FolderTag::Custom => {
+                            details_lines.push(Line::from(vec![
+                                Span::styled("This is a custom workspace skills folder. Press Space/Enter to toggle inclusion in skills.json entries, or 'd' to remove it.", t.item_desc)
+                            ]));
+                        }
+                        FolderTag::Local => {
+                            details_lines.push(Line::from(vec![
+                                Span::styled("This is a local workspace standard skills folder. Workspace-standard folders are automatically discovered and loaded.", t.item_desc)
+                            ]));
+                        }
+                        other => {
+                            details_lines.push(Line::from(vec![
+                                Span::styled(format!("This is a {} standard skills folder. It is defined in your maki.config and can be removed by pressing 'd'.", other.label()), t.item_desc)
+                            ]));
+                        }
                     }
                 }
             }
@@ -373,7 +500,15 @@ impl SkillsModal {
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  Space/Enter", t.accent),
-            Span::styled("Toggle selected item (Exclude/Include)", t.item_desc)
+            Span::styled("Toggle custom folder or exclude skill", t.item_desc)
+        ]));
+        details_lines.push(Line::from(vec![
+            Span::styled("  a          ", t.accent),
+            Span::styled("Add a new skills folder (global config / workspace)", t.item_desc)
+        ]));
+        details_lines.push(Line::from(vec![
+            Span::styled("  d/Backspace", t.accent),
+            Span::styled("Remove selected skills folder", t.item_desc)
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  c          ", t.accent),
@@ -439,51 +574,53 @@ fn find_project_ancestors(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
     dirs
 }
 
+fn determine_folder_tag(path: &std::path::Path, cwd: &std::path::Path) -> FolderTag {
+    let path_str = path.to_string_lossy();
+    if path_str.contains(".config/maki/skills") {
+        FolderTag::Maki
+    } else if path_str.contains(".agents/skills") && !path.starts_with(cwd) {
+        FolderTag::Global
+    } else if path_str.contains(".config/opencode/skills")
+        || path_str.contains(".gemini/config/skills")
+        || path_str.contains(".claude/skills")
+    {
+        FolderTag::Other
+    } else if path.starts_with(cwd) {
+        FolderTag::Local
+    } else {
+        FolderTag::Custom
+    }
+}
+
 pub fn discover_skills_and_folders(
     cwd: &std::path::Path,
 ) -> (Vec<SkillInfo>, Vec<FolderInfo>, SkillsJson) {
     let mut folders = Vec::new();
     let mut skills = Vec::new();
 
-    // 1. Global config skills (maki)
-    if let Ok(config_dir) = maki_storage::paths::config_dir() {
-        let path = config_dir.join("skills");
+    // 1. Global config skills (loaded from maki.config)
+    let settings = UserSettings::load();
+    for dir_str in &settings.skills_dirs {
+        let path = std::path::PathBuf::from(dir_str);
+        let tag = determine_folder_tag(&path, cwd);
+        let display_path = if let Some(home) = maki_storage::paths::home() {
+            if let Ok(rel) = path.strip_prefix(&home) {
+                format!("~/{}", rel.display())
+            } else {
+                dir_str.clone()
+            }
+        } else {
+            dir_str.clone()
+        };
         folders.push(FolderInfo {
             path,
-            display_path: "~/.config/maki/skills".to_string(),
-            is_standard: true,
+            display_path,
+            tag,
             is_enabled: true,
         });
     }
 
-    // 2. Other global skill directories
-    if let Some(home) = maki_storage::paths::home() {
-        let global_dirs = [
-            (".agents/skills", "~/.agents/skills"),
-            (".claude/skills", "~/.claude/skills"),
-            (".config/opencode/skills", "~/.config/opencode/skills"),
-        ];
-        for (rel, display) in global_dirs {
-            let path = home.join(rel);
-            folders.push(FolderInfo {
-                path,
-                display_path: display.to_string(),
-                is_standard: true,
-                is_enabled: true,
-            });
-        }
-    }
-
-    // 3. Gemini config skills
-    let gemini_config = std::path::PathBuf::from("/Users/mcp/.gemini/config/skills");
-    folders.push(FolderInfo {
-        path: gemini_config,
-        display_path: "~/.gemini/config/skills".to_string(),
-        is_standard: true,
-        is_enabled: true,
-    });
-
-    // 4. Project workspace directories
+    // 2. Project workspace directories (local standard folders)
     let project_dirs = [
         (".agents/skills", ".agents/skills"),
         (".maki/skills", ".maki/skills"),
@@ -509,7 +646,7 @@ pub fn discover_skills_and_folders(
                 folders.push(FolderInfo {
                     path,
                     display_path,
-                    is_standard: true,
+                    tag: FolderTag::Local,
                     is_enabled: true,
                 });
             }
@@ -538,7 +675,7 @@ pub fn discover_skills_and_folders(
         folders.push(FolderInfo {
             path: resolved_path,
             display_path: entry.path.clone(),
-            is_standard: false,
+            tag: FolderTag::Custom,
             is_enabled: true,
         });
     }

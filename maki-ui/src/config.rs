@@ -14,6 +14,20 @@ pub fn config_path() -> Result<PathBuf, std::io::Error> {
     Ok(parent.join("maki.config"))
 }
 
+pub fn default_skills_dirs() -> Vec<String> {
+    let mut dirs = Vec::new();
+    if let Ok(config_dir) = maki_storage::paths::config_dir() {
+        dirs.push(config_dir.join("skills").to_string_lossy().into_owned());
+    }
+    if let Some(home) = maki_storage::paths::home() {
+        dirs.push(home.join(".agents/skills").to_string_lossy().into_owned());
+        dirs.push(home.join(".claude/skills").to_string_lossy().into_owned());
+        dirs.push(home.join(".config/opencode/skills").to_string_lossy().into_owned());
+    }
+    dirs.push("/Users/mcp/.gemini/config/skills".to_string());
+    dirs
+}
+
 pub fn load_config() -> UserSettings {
     let path = match config_path() {
         Ok(p) => p,
@@ -34,6 +48,9 @@ pub fn load_config() -> UserSettings {
                 let _ = fs::remove_file(&old_path);
             }
         }
+        if settings.skills_dirs.is_empty() {
+            settings.skills_dirs = default_skills_dirs();
+        }
         save_config(&settings);
         return settings;
     }
@@ -41,7 +58,10 @@ pub fn load_config() -> UserSettings {
     let mut settings = UserSettings::default();
     let content = match fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return settings,
+        Err(_) => {
+            settings.skills_dirs = default_skills_dirs();
+            return settings;
+        }
     };
 
     for line in content.lines() {
@@ -59,6 +79,7 @@ pub fn load_config() -> UserSettings {
                 "show_token_stats" => settings.show_token_stats = val.parse().unwrap_or(false),
                 "log_command" => settings.log_command = Some(val.to_string()),
                 "compact_tokens" => settings.compact_tokens = val.parse().ok(),
+                "skills_dir" => settings.skills_dirs.push(val.to_string()),
                 "keybind" => {
                     if let Some((shortcut, action)) = val.split_once('=') {
                         let shortcut = shortcut.trim();
@@ -69,6 +90,11 @@ pub fn load_config() -> UserSettings {
                 _ => {}
             }
         }
+    }
+
+    if settings.skills_dirs.is_empty() {
+        settings.skills_dirs = default_skills_dirs();
+        save_config(&settings);
     }
 
     settings
@@ -91,6 +117,9 @@ pub fn save_config(settings: &UserSettings) {
     }
     if let Some(tokens) = settings.compact_tokens {
         lines.push(format!("compact_tokens = {}", tokens));
+    }
+    for dir in &settings.skills_dirs {
+        lines.push(format!("skills_dir = {}", dir));
     }
 
     lines.push("".to_string());
