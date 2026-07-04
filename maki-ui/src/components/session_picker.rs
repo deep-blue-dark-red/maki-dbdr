@@ -13,7 +13,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 
 const TITLE: &str = " Sessions ";
-const NO_SESSIONS_MSG: &str = "No previous sessions";
+const NO_SESSIONS_MSG: &str = "no sessions in path; enable global sessions";
 
 
 pub enum SessionPickerAction {
