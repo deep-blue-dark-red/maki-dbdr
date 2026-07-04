@@ -1,10 +1,11 @@
-local VALID_FORMATS = { markdown = true, text = true, html = true }
+local VALID_FORMATS = { markdown = true, text = true, html = true, json = true }
 local DEFAULT_FORMAT = "markdown"
 local SKIP_TAGS = { script = true, style = true, noscript = true }
 local ACCEPT_HEADERS = {
   html = "text/html,*/*;q=0.5",
   text = "text/plain,text/html;q=0.9,*/*;q=0.5",
   markdown = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+  json = "application/json,*/*;q=0.5",
 }
 
 local LT, GT, SLASH, SPACE, TAB, CR, LF = 60, 62, 47, 32, 9, 13, 10
@@ -60,6 +61,52 @@ local function strip_html(html)
   return result:match("^%s*(.-)%s*$")
 end
 
+local function json_pretty(val, depth)
+  depth = depth or 0
+  local t = type(val)
+  if t == "string" then
+    local escaped = val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+    return '"' .. escaped .. '"'
+  elseif t == "number" then
+    return tostring(val)
+  elseif t == "boolean" then
+    return val and "true" or "false"
+  elseif val == nil then
+    return "null"
+  elseif t == "table" then
+    local pad = string.rep("  ", depth)
+    local inner = string.rep("  ", depth + 1)
+    local n = #val
+    local is_array = false
+    if n > 0 then
+      local count = 0
+      for _ in pairs(val) do count = count + 1 end
+      is_array = (count == n)
+    end
+    if is_array then
+      local parts = {}
+      for i = 1, n do
+        parts[i] = inner .. json_pretty(val[i], depth + 1)
+      end
+      return "[\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "]"
+    else
+      local parts = {}
+      local keys = {}
+      for k in pairs(val) do keys[#keys + 1] = k end
+      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+      for _, k in ipairs(keys) do
+        local v = val[k]
+        if v ~= nil then
+          parts[#parts + 1] = inner .. '"' .. tostring(k) .. '": ' .. json_pretty(v, depth + 1)
+        end
+      end
+      if #parts == 0 then return "{}" end
+      return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
+    end
+  end
+  return tostring(val)
+end
+
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 
@@ -71,13 +118,13 @@ end
 maki.api.register_tool({
   name = "webfetch",
   kind = "fetch",
-  description = [[Fetch a URL as markdown (default), text, or html. Best called inside code_execution with filtering to avoid dumping the whole page into context.]],
+  description = [[Fetch a URL as markdown (default), text, html, or json. Best called inside code_execution with filtering to avoid dumping the whole page into context.]],
 
   schema = {
     type = "object",
     properties = {
       url = { type = "string", description = "URL to fetch (http:// or https://)", required = true },
-      format = { type = "string", description = "Output format: markdown (default), text, or html" },
+      format = { type = "string", description = "Output format: markdown (default), text, html, or json" },
       timeout = { type = "integer", description = "Timeout in seconds (default 30, max 120)" },
     },
   },
@@ -133,6 +180,7 @@ maki.api.register_tool({
 
     local body = resp.body
     local is_html = ct:find("text/html") ~= nil
+    local is_json = ct:find("application/json") ~= nil or fmt == "json"
 
     if fmt == "markdown" and is_html then
       local converted = maki.text.html_to_markdown(body)
@@ -143,9 +191,17 @@ maki.api.register_tool({
 
     local llm_output = truncate(body, max_lines, max_bytes)
 
+    local display_body = body
+    if is_json then
+      local parsed, _ = maki.json.decode(body)
+      if parsed then
+        display_body = json_pretty(parsed)
+      end
+    end
+
     return {
       llm_output = llm_output,
-      body = ToolView.restore(body, web_view_opts(ctx)),
+      body = ToolView.restore(display_body, web_view_opts(ctx)),
     }
   end,
 })

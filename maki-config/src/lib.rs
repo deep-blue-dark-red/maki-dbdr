@@ -65,6 +65,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "edit",
     "glob",
     "grep",
+    "hackernews",
     "index",
     "memory",
     "multiedit",
