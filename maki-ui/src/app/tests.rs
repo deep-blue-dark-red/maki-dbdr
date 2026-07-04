@@ -2792,6 +2792,7 @@ fn skills_command_opens_modal() {
 fn delete_session_keybinding() {
     let mut app = test_app();
     let session_id = app.state.session.id.clone();
+    app.state.session.save(&app.storage).unwrap();
 
     let key_event = KeyEvent::new(
         KeyCode::Char('d'),
@@ -2799,7 +2800,8 @@ fn delete_session_keybinding() {
     );
     let actions = app.update(Msg::Key(key_event));
 
-    assert!(matches!(&actions[..], [Action::Quit]));
-    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert!(actions.is_empty());
+    assert!(app.session_picker.is_open());
+    assert_eq!(app.status_bar.flash_text(), Some("Session deleted"));
     assert!(AppSession::load(&session_id, &app.storage).is_err());
 }

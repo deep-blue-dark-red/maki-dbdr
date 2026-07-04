@@ -458,8 +458,20 @@ impl App {
         if !is_ctrl(&key) {
             return None;
         }
-        if key::DELETE_SESSION.matches(key) {
-            return Some(self.delete_current_session_and_quit());
+        if key::DELETE_CURRENT_SESSION.matches(key) {
+            let session_id = self.state.session.id.clone();
+
+            // 1. Delete the session from storage
+            if let Err(e) = AppSession::delete(&session_id, &self.storage) {
+                self.status_bar.flash(format!("Failed to delete session: {e}"));
+            } else {
+                self.status_bar.flash("Session deleted".into());
+                self.session_picker.remove_entry(&session_id);
+
+                // 2. Open the sessions list popup window directly
+                self.open_session_picker();
+            }
+            return Some(vec![]);
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
@@ -1047,17 +1059,7 @@ impl App {
         vec![Action::Quit]
     }
 
-    fn delete_current_session_and_quit(&mut self) -> Vec<Action> {
-        let session_id = self.state.session.id.clone();
-        if let Err(e) = AppSession::delete(&session_id, &self.storage) {
-            self.status_bar
-                .flash(format!("Failed to delete session: {e}"));
-        }
-        self.session_picker.remove_entry(&session_id);
-        self.save_input_history();
-        self.exit_request = ExitRequest::Success;
-        vec![Action::Quit]
-    }
+
 
     pub fn reload_config(&mut self) {
         let user_settings = UserSettings::load();
