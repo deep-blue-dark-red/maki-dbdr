@@ -39,6 +39,7 @@ use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
+use crate::components::plugins_modal::{PluginsModal, PluginsAction};
 use crate::components::skills_modal::{SkillsModal, SkillsAction};
 use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::scrollbar;
@@ -150,6 +151,7 @@ pub struct App {
     pub(super) goto_picker: GotoPicker,
     pub(super) help_modal: HelpModal,
     pub(super) export_picker: ExportPicker,
+    pub(super) plugins_modal: PluginsModal,
     pub(super) skills_modal: SkillsModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -256,6 +258,7 @@ impl App {
             goto_picker: GotoPicker::new(),
             help_modal: HelpModal::new(),
             export_picker: ExportPicker::new(),
+            plugins_modal: PluginsModal::new(),
             skills_modal: SkillsModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
@@ -544,6 +547,17 @@ impl App {
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
             return Some(vec![]);
+        }
+
+        if self.plugins_modal.is_open() {
+            match self.plugins_modal.handle_key(key) {
+                PluginsAction::EditPlugin(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                PluginsAction::None => {
+                    return Some(vec![]);
+                }
+            }
         }
 
         if self.skills_modal.is_open() {
@@ -1497,6 +1511,10 @@ impl App {
             "/system_prompt" => {
                 vec![Action::EditSystemPrompt]
             }
+            "/plugins" => {
+                self.plugins_modal.open(&self.lua_event_handle);
+                vec![]
+            }
             "/skills" => {
                 self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
                 vec![]
@@ -1713,10 +1731,11 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 17] {
+    fn overlays(&self) -> [&dyn Overlay; 18] {
         [
             &self.help_modal,
             &self.export_picker,
+            &self.plugins_modal,
             &self.skills_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -1735,10 +1754,11 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 17] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
         [
             &mut self.help_modal,
             &mut self.export_picker,
+            &mut self.plugins_modal,
             &mut self.skills_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,

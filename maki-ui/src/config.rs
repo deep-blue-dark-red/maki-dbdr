@@ -81,6 +81,7 @@ pub fn load_config() -> UserSettings {
                 "compact_tokens" => settings.compact_tokens = val.parse().ok(),
                 "skills_dir" => settings.skills_dirs.push(val.to_string()),
                 "export_path" => settings.export_path = Some(val.to_string()),
+                "disabled_plugin" => settings.disabled_plugins.push(val.to_string()),
                 "keybind" => {
                     if let Some((shortcut, action)) = val.split_once('=') {
                         let shortcut = shortcut.trim();
@@ -124,6 +125,9 @@ pub fn save_config(settings: &UserSettings) {
     }
     if let Some(ref path) = settings.export_path {
         lines.push(format!("export_path = {}", path));
+    }
+    for plugin in &settings.disabled_plugins {
+        lines.push(format!("disabled_plugin = {}", plugin));
     }
 
     lines.push("".to_string());

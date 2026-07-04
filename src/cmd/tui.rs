@@ -105,6 +105,15 @@ pub fn run(cli: Cli) -> Result<()> {
     }
     config.validate()?;
 
+    // Apply interactive plugin overrides from maki.config (disabled_plugin entries).
+    // These take precedence over init.lua to support the /plugins menu.
+    {
+        let ui_settings = maki_ui::config::load_config();
+        if !ui_settings.disabled_plugins.is_empty() {
+            config.plugins.tools.retain(|t| !ui_settings.disabled_plugins.contains(t));
+        }
+    }
+
     plugin_host
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;

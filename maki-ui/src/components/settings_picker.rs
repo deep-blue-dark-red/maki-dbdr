@@ -28,6 +28,8 @@ pub struct UserSettings {
     pub skills_dirs: Vec<String>,
     #[serde(default)]
     pub export_path: Option<String>,
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
 }
 
 impl UserSettings {

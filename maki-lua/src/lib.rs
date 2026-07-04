@@ -11,7 +11,7 @@ pub use api::util::command::{
     LuaCommandInfo, LuaCommandReader, Split, TitlePos, UiAction, WinCommand, WinEvent,
 };
 pub use error::PluginError;
-pub use loader::{EventHandle, PluginHost};
+pub use loader::{EventHandle, PluginHost, bundled_plugins};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{ClickReply, RestoreItem};
 

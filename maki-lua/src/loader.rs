@@ -19,6 +19,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct BundledPlugin {
     name: &'static str,
+    source_path: &'static str,
     dir: Dir<'static>,
 }
 
@@ -27,69 +28,91 @@ struct BundledPlugin {
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "index",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/index/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
     },
     BundledPlugin {
         name: "hackernews",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/hackernews/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/hackernews"),
     },
     BundledPlugin {
         name: "webfetch",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/webfetch/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
     },
     BundledPlugin {
         name: "websearch",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/websearch/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
     },
     BundledPlugin {
         name: "bash",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/bash/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
     },
     BundledPlugin {
         name: "grep",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/grep/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
     },
     BundledPlugin {
         name: "glob",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/glob/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
     },
     BundledPlugin {
         name: "skill",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/skill/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
     },
     BundledPlugin {
         name: "memory",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/memory/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
         name: "question",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/question/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
     },
     BundledPlugin {
         name: "todo_write",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/todo_write/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
     },
     BundledPlugin {
         name: "read",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/read/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
     },
     BundledPlugin {
         name: "write",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/write/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
     },
     BundledPlugin {
         name: "edit",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/edit/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
     },
     BundledPlugin {
         name: "task",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/task/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
     BundledPlugin {
         name: "lib",
+        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/lib/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
 ];
+
+/// Returns `(name, source_path)` for every bundled plugin. The source path is
+/// the compile-time filesystem path and is valid when running from the source tree.
+pub fn bundled_plugins() -> impl Iterator<Item = (&'static str, &'static str)> {
+    BUNDLED_PLUGINS.iter().map(|p| (p.name, p.source_path))
+}
 
 static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
@@ -369,6 +392,38 @@ impl EventHandle {
 
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
+    }
+
+    /// Load a bundled plugin by name. Returns `true` if the plugin was found
+    /// and the load request was sent. Takes effect immediately (the Lua thread
+    /// drains in-flight calls before executing the load).
+    pub fn load_builtin(&self, name: &str) -> bool {
+        let Some(plugin) = BUNDLED_PLUGINS.iter().find(|p| p.name == name) else {
+            return false;
+        };
+        let Some(source) = plugin.dir.get_file("init.lua").and_then(|f| f.contents_utf8()) else {
+            return false;
+        };
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::LoadSource {
+            name: Arc::from(name),
+            source: source.to_owned(),
+            plugin_dir: None,
+            permissions: PluginPermissions::trusted(),
+            reply: reply_tx,
+        });
+        let _ = reply_rx.recv();
+        true
+    }
+
+    /// Unload a plugin by name. Takes effect immediately.
+    pub fn unload_plugin(&self, name: &str) {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::ClearPlugin {
+            plugin: Arc::from(name),
+            reply: reply_tx,
+        });
+        let _ = reply_rx.recv();
     }
 }
 
