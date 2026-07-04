@@ -2787,3 +2787,19 @@ fn skills_command_opens_modal() {
     app.execute_command(cmd("/skills"));
     assert!(app.skills_modal.is_open());
 }
+
+#[test]
+fn delete_session_keybinding() {
+    let mut app = test_app();
+    let session_id = app.state.session.id.clone();
+
+    let key_event = KeyEvent::new(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let actions = app.update(Msg::Key(key_event));
+
+    assert!(matches!(&actions[..], [Action::Quit]));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+    assert!(AppSession::load(&session_id, &app.storage).is_err());
+}

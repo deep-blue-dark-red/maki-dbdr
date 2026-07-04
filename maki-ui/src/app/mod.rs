@@ -458,6 +458,9 @@ impl App {
         if !is_ctrl(&key) {
             return None;
         }
+        if key::DELETE_SESSION.matches(key) {
+            return Some(self.delete_current_session_and_quit());
+        }
         if key::QUIT.matches(key) {
             self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
@@ -1044,6 +1047,18 @@ impl App {
         vec![Action::Quit]
     }
 
+    fn delete_current_session_and_quit(&mut self) -> Vec<Action> {
+        let session_id = self.state.session.id.clone();
+        if let Err(e) = AppSession::delete(&session_id, &self.storage) {
+            self.status_bar
+                .flash(format!("Failed to delete session: {e}"));
+        }
+        self.session_picker.remove_entry(&session_id);
+        self.save_input_history();
+        self.exit_request = ExitRequest::Success;
+        vec![Action::Quit]
+    }
+
     pub fn reload_config(&mut self) {
         let user_settings = UserSettings::load();
         self.state.session.meta.show_system_prompt = user_settings.show_system_prompt;
@@ -1058,6 +1073,63 @@ impl App {
         }
         self.show_token_stats = user_settings.show_token_stats;
         self.status_bar.flash("Configuration reloaded".to_string());
+    }
+
+    fn start_rename(&mut self) -> Vec<Action> {
+        let user_texts: Vec<String> = self
+            .state
+            .session
+            .messages
+            .iter()
+            .filter_map(|m| m.user_text().map(str::to_string))
+            .take(3)
+            .collect();
+
+        if user_texts.is_empty() {
+            self.flash("Nothing to rename yet — send a message first".into());
+            return vec![];
+        }
+
+        let mut total_words = 0usize;
+        let mut parts: Vec<String> = Vec::new();
+        'outer: for text in &user_texts {
+            let mut words: Vec<&str> = Vec::new();
+            for word in text.split_whitespace() {
+                if total_words >= 200 {
+                    break 'outer;
+                }
+                words.push(word);
+                total_words += 1;
+            }
+            parts.push(words.join(" "));
+        }
+
+        let context = parts.join("\n\n");
+        let msg = Message::user(context);
+        self.flash("Renaming session…".into());
+        vec![Action::RenameSession(vec![msg])]
+    }
+
+    pub(crate) fn apply_rename(&mut self, title: String) {
+        let old_name = self.state.session.title.clone();
+        let session_id = self.state.session.id.clone();
+        let old_log = maki_providers::api_log_path_for(Some(&old_name), Some(&session_id));
+
+        self.state.session.title = title.clone();
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(title.clone());
+        self.save_session();
+
+        // Move any existing API log file to the new session-name path.
+        let new_log = maki_providers::api_log_path_for(Some(&title), Some(&session_id));
+        if let (Some(old), Some(new)) = (old_log, new_log) {
+            if old != new && old.exists() {
+                if let Err(e) = std::fs::rename(&old, &new) {
+                    tracing::warn!(error = %e, "failed to rename api log");
+                }
+            }
+        }
+
+        self.status_bar.flash(format!("Session renamed to: {title}"));
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -1142,6 +1214,11 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+        if let AgentEvent::RenameResult { title } = envelope.event {
+            self.apply_rename(title);
+            return vec![];
+        }
+
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
@@ -1587,6 +1664,7 @@ impl App {
                 self.reload_config();
                 vec![]
             }
+            "/rename" => self.start_rename(),
             "/exit" | "/q" => self.quit(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)

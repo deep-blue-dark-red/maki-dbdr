@@ -184,6 +184,7 @@ pub struct ConfiguredKeybindings {
     pub sessions: Bind,
     pub shift_session_down: Bind,
     pub shift_session_up: Bind,
+    pub delete_session: Bind,
 }
 
 impl Default for ConfiguredKeybindings {
@@ -247,6 +248,12 @@ impl Default for ConfiguredKeybindings {
                 label: "Alt+Shift+S",
                 name: Some("shift_session_up"),
             },
+            delete_session: Bind {
+                code: KeyCode::Char('d'),
+                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+                label: "Ctrl+Shift+D",
+                name: Some("delete_session"),
+            },
         }
     }
 }
@@ -285,6 +292,7 @@ pub fn get_configured_bind(name: &str) -> Option<Bind> {
         "sessions" => Some(read.sessions),
         "shift_session_down" => Some(read.shift_session_down),
         "shift_session_up" => Some(read.shift_session_up),
+        "delete_session" => Some(read.delete_session),
         _ => None,
     }
 }
@@ -499,6 +507,12 @@ pub mod key {
         modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
         label: "Alt+Shift+S",
         name: Some("shift_session_up"),
+    };
+    pub const DELETE_SESSION: Bind = Bind {
+        code: KeyCode::Char('d'),
+        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+        label: "Ctrl+Shift+D",
+        name: Some("delete_session"),
     };
 }
 
