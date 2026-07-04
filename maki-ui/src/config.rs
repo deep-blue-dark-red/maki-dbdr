@@ -3,9 +3,24 @@ use crate::components::keybindings::{update_bind, get_configured_bind, key_event
 use std::fs;
 use std::path::PathBuf;
 
+thread_local! {
+    static TEST_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn config_path() -> Result<PathBuf, std::io::Error> {
     if cfg!(test) {
-        return Ok(PathBuf::from("/nonexistent-path-for-tests/maki.config"));
+        return Ok(TEST_CONFIG_PATH.with(|p| {
+            let mut cell = p.borrow_mut();
+            if cell.is_none() {
+                use std::hash::{BuildHasher, Hasher};
+                let hasher_builder = std::collections::hash_map::RandomState::new();
+                let mut hasher = hasher_builder.build_hasher();
+                hasher.write_u64(42);
+                let rand_val = hasher.finish();
+                *cell = Some(std::env::temp_dir().join(format!("maki-test-{rand_val}.config")));
+            }
+            cell.as_ref().unwrap().clone()
+        }));
     }
     let config_dir = maki_storage::paths::config_dir()?;
     let parent = config_dir.parent().ok_or_else(|| {
@@ -82,6 +97,7 @@ pub fn load_config() -> UserSettings {
                 "skills_dir" => settings.skills_dirs.push(val.to_string()),
                 "export_path" => settings.export_path = Some(val.to_string()),
                 "disabled_plugin" => settings.disabled_plugins.push(val.to_string()),
+                "global_sessions" => settings.global_sessions = val.parse().unwrap_or(false),
                 "keybind" => {
                     if let Some((shortcut, action)) = val.split_once('=') {
                         let shortcut = shortcut.trim();
@@ -114,6 +130,7 @@ pub fn save_config(settings: &UserSettings) {
     lines.push(format!("api_logging = {}", settings.api_logging));
     lines.push(format!("show_reasoning = {}", settings.show_reasoning));
     lines.push(format!("show_token_stats = {}", settings.show_token_stats));
+    lines.push(format!("global_sessions = {}", settings.global_sessions));
     if let Some(ref cmd) = settings.log_command {
         lines.push(format!("log_command = {}", cmd));
     }
@@ -162,6 +179,8 @@ pub fn save_config(settings: &UserSettings) {
         "sessions",
         "shift_session_down",
         "shift_session_up",
+        "delete_current_session",
+        "toggle_global_sessions",
     ];
 
     for &action in actions {

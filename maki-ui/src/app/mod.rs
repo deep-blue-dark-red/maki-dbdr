@@ -473,6 +473,20 @@ impl App {
             }
             return Some(vec![]);
         }
+        if key::TOGGLE_GLOBAL_SESSIONS.matches(key) {
+            let mut settings = UserSettings::load();
+            settings.global_sessions = !settings.global_sessions;
+            settings.save();
+            if settings.global_sessions {
+                self.status_bar.flash("Global sessions enabled".into());
+            } else {
+                self.status_bar.flash("Global sessions disabled".into());
+            }
+            if self.session_picker.is_open() {
+                self.open_session_picker();
+            }
+            return Some(vec![]);
+        }
         if key::QUIT.matches(key) {
             self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
@@ -829,6 +843,17 @@ impl App {
                     settings.show_token_stats = val;
                     settings.save();
                     self.show_token_stats = val;
+                    vec![]
+                }
+                SettingsPickerAction::ToggleGlobalSessions(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.global_sessions = val;
+                    settings.save();
+                    if val {
+                        self.status_bar.flash("Global sessions enabled".into());
+                    } else {
+                        self.status_bar.flash("Global sessions disabled".into());
+                    }
                     vec![]
                 }
                 SettingsPickerAction::EditLogCommand => {
@@ -1582,6 +1607,7 @@ impl App {
                     settings.api_logging,
                     settings.show_reasoning,
                     settings.show_token_stats,
+                    settings.global_sessions,
                     settings.log_command,
                     settings.compact_tokens,
                 );

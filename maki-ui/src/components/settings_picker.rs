@@ -30,6 +30,8 @@ pub struct UserSettings {
     pub export_path: Option<String>,
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
+    #[serde(default)]
+    pub global_sessions: bool,
 }
 
 impl UserSettings {
@@ -79,6 +81,7 @@ pub enum SettingsPickerAction {
     ToggleShowTokenStats(bool),
     EditLogCommand,
     Closed,
+    ToggleGlobalSessions(bool),
 }
 
 #[derive(Clone)]
@@ -109,6 +112,7 @@ impl SettingsPicker {
         api_logging: bool,
         show_reasoning: bool,
         show_token_stats: bool,
+        global_sessions: bool,
         log_command: Option<String>,
         compact_tokens: Option<usize>,
     ) {
@@ -124,6 +128,9 @@ impl SettingsPicker {
             },
             SettingItem {
                 name: "show-token-stats".to_string(),
+            },
+            SettingItem {
+                name: "global-sessions".to_string(),
             },
             SettingItem {
                 name: format!("log-command: {}", log_command.as_deref().unwrap_or("less +G {}")),
@@ -142,6 +149,7 @@ impl SettingsPicker {
             api_logging,
             show_reasoning,
             show_token_stats,
+            global_sessions,
             false,
             false,
         ];
@@ -175,8 +183,9 @@ impl SettingsPicker {
                 1 => SettingsPickerAction::ToggleApiLogging(val),
                 2 => SettingsPickerAction::ToggleShowReasoning(val),
                 3 => SettingsPickerAction::ToggleShowTokenStats(val),
-                4 => SettingsPickerAction::EditLogCommand,
+                4 => SettingsPickerAction::ToggleGlobalSessions(val),
                 5 => SettingsPickerAction::EditLogCommand,
+                6 => SettingsPickerAction::EditLogCommand,
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,

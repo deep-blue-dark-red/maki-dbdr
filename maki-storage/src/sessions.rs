@@ -24,8 +24,9 @@ const SESSION_VERSION: u32 = 1;
 const LOG_FORMAT_VERSION: u32 = 2;
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
-const DEFAULT_TITLE: &str = "New session";
-const MAX_TITLE_LEN: usize = 60;
+pub const DEFAULT_TITLE: &str = "New session";
+const MAX_TITLE_LEN: usize = 25;
+const MAX_TITLE_WORDS: usize = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -179,16 +180,29 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
         return DEFAULT_TITLE.into();
     };
 
-    if text.len() <= MAX_TITLE_LEN {
-        return text.to_string();
+    // Strip punctuation, lowercase, take first MAX_TITLE_WORDS words, join with hyphens.
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .take(MAX_TITLE_WORDS)
+        .collect();
+
+    if words.is_empty() {
+        return DEFAULT_TITLE.into();
     }
 
-    let boundary = text.floor_char_boundary(MAX_TITLE_LEN);
-    let truncated = &text[..boundary];
-    match truncated.rfind(' ') {
-        Some(pos) if pos > MAX_TITLE_LEN / 2 => format!("{}…", &truncated[..pos]),
-        _ => format!("{truncated}…"),
+    let mut title = words.join("-");
+    if title.len() > MAX_TITLE_LEN {
+        let boundary = title.floor_char_boundary(MAX_TITLE_LEN);
+        let truncated = &title[..boundary];
+        title = match truncated.rfind('-') {
+            Some(pos) if pos > 0 => truncated[..pos].to_string(),
+            _ => truncated.to_string(),
+        };
     }
+
+    if title.is_empty() { DEFAULT_TITLE.into() } else { title }
 }
 
 // -- JSONL record types --
@@ -228,6 +242,7 @@ pub struct SessionLog {
     saved_msg_count: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
+    last_saved_title: String,
 }
 
 fn sub_msg_snapshot<M>(map: &HashMap<String, Vec<M>>) -> HashMap<String, usize> {
@@ -347,7 +362,8 @@ impl SessionLog {
             }
         }
 
-        if buf.is_empty() {
+        let title_changed = session.title != self.last_saved_title;
+        if buf.is_empty() && !title_changed {
             return Ok(());
         }
 
@@ -366,6 +382,7 @@ impl SessionLog {
 
         self.saved_msg_count = new_msg_count;
         self.saved_tool_ids.extend(new_tool_ids);
+        self.last_saved_title = session.title.clone();
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
         }
@@ -406,6 +423,7 @@ impl SessionLog {
         self.saved_msg_count = session.messages.len();
         self.saved_tool_ids = session.tool_outputs.keys().cloned().collect();
         self.saved_sub_msg_counts = sub_msg_snapshot(&session.subagent_messages);
+        self.last_saved_title = session.title.clone();
 
         Ok(())
     }
@@ -417,6 +435,7 @@ impl SessionLog {
             saved_msg_count: session.messages.len(),
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
+            last_saved_title: session.title.clone(),
         }
     }
 }
@@ -648,7 +667,7 @@ enum ScanRecord {
     Other,
 }
 
-fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
     let mut out = Vec::new();
     for path in session_entries(dir)? {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -671,7 +690,7 @@ fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageErr
 
 const TAIL_BUF: u64 = 4096;
 
-fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+fn scan_jsonl_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> {
     let mut file = File::open(path).ok()?;
     let header: JsonlHeader = {
         let mut reader = BufReader::new(&file);
@@ -679,8 +698,13 @@ fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
         reader.read_line(&mut line).ok()?;
         serde_json::from_str(line.trim_end()).ok()?
     };
-    if header.v != LOG_FORMAT_VERSION || header.cwd != cwd {
+    if header.v != LOG_FORMAT_VERSION {
         return None;
+    }
+    if let Some(c) = cwd {
+        if header.cwd != c {
+            return None;
+        }
     }
 
     let (title, updated_at, context_size) =
@@ -718,11 +742,16 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64, u32)> {
     }
 }
 
-fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
+fn scan_legacy_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> {
     let data = fs::read(path).ok()?;
     let h: LegacyHeader = serde_json::from_slice(&data).ok()?;
-    if h.version != SESSION_VERSION || h.cwd != cwd {
+    if h.version != SESSION_VERSION {
         return None;
+    }
+    if let Some(c) = cwd {
+        if h.cwd != c {
+            return None;
+        }
     }
     Some(SessionSummary {
         id: h.id,
@@ -825,7 +854,18 @@ where
     }
 
     pub fn list_in(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-        let mut summaries = scan_headers(cwd, dir)?;
+        let mut summaries = scan_headers(Some(cwd), dir)?;
+        summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
+        Ok(summaries)
+    }
+
+    pub fn list_all(dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
+        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
+        Self::list_all_in(&sessions_dir)
+    }
+
+    pub fn list_all_in(dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+        let mut summaries = scan_headers(None, dir)?;
         summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
         Ok(summaries)
     }
@@ -842,7 +882,7 @@ where
         {
             return Ok(Some(s));
         }
-        let summaries = scan_headers(cwd, dir)?;
+        let summaries = scan_headers(Some(cwd), dir)?;
         let latest = summaries.into_iter().max_by_key(|s| s.updated_at);
         match latest {
             Some(s) => Self::load_from(&s.id, dir).map(Some),
@@ -1135,13 +1175,13 @@ mod tests {
         assert_eq!(latest.id, session.id);
     }
 
-    #[test_case("short title", "short title" ; "short_passthrough")]
+    #[test_case("short title", "short-title" ; "two_words_hyphenated")]
+    #[test_case("Fix the auth bug", "fix-the-auth" ; "three_words_max")]
+    #[test_case("debug auth middleware now", "debug-auth-middleware" ; "four_words_truncated_to_three")]
+    #[test_case("What's the best way?", "whats-the-best" ; "punctuation_stripped")]
+    #[test_case("UPPERCASE INPUT", "uppercase-input" ; "lowercased")]
     #[test_case("", DEFAULT_TITLE ; "empty_defaults")]
-    #[test_case(
-        "This is a very long title that exceeds the sixty character limit and should be truncated at a word boundary",
-        "This is a very long title that exceeds the sixty character…"
-        ; "long_truncates_at_word"
-    )]
+    #[test_case("!!!", DEFAULT_TITLE ; "only_punctuation_defaults")]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
             vec![]
@@ -1181,7 +1221,7 @@ mod tests {
     fn title_unicode_safe() {
         let input = "あ".repeat(100);
         let title = generate_title(&[user_message(&input)]);
-        assert!(title.len() <= MAX_TITLE_LEN * 4);
+        assert!(title.len() <= MAX_TITLE_LEN);
         assert!(title.is_char_boundary(title.len()));
     }
 

@@ -1,6 +1,7 @@
 use std::thread;
 
 use crate::AppSession;
+use crate::components::settings_picker::UserSettings;
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -64,8 +65,14 @@ impl SessionPicker {
         let current_session_id = current_session_id.to_owned();
         let dir = dir.clone();
         let (tx, rx) = flume::bounded(1);
+        let settings = UserSettings::load();
         thread::spawn(move || {
-            let result = AppSession::list(&cwd, &dir)
+            let list_res = if settings.global_sessions {
+                AppSession::list_all(&dir)
+            } else {
+                AppSession::list(&cwd, &dir)
+            };
+            let result = list_res
                 .map(|summaries| {
                     summaries
                         .into_iter()

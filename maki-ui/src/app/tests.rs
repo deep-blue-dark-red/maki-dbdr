@@ -2805,3 +2805,29 @@ fn delete_session_keybinding() {
     assert_eq!(app.status_bar.flash_text(), Some("Session deleted"));
     assert!(AppSession::load(&session_id, &app.storage).is_err());
 }
+
+#[test]
+fn toggle_global_sessions_keybinding() {
+    let mut app = test_app();
+
+    // Default is false
+    assert!(!UserSettings::load().global_sessions);
+
+    // Press Ctrl+Shift+M
+    let key_event = KeyEvent::new(
+        KeyCode::Char('m'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let actions = app.update(Msg::Key(key_event));
+
+    assert!(actions.is_empty());
+    assert!(UserSettings::load().global_sessions);
+    assert_eq!(app.status_bar.flash_text(), Some("Global sessions enabled"));
+
+    // Press Ctrl+Shift+M again
+    let actions = app.update(Msg::Key(key_event));
+
+    assert!(actions.is_empty());
+    assert!(!UserSettings::load().global_sessions);
+    assert_eq!(app.status_bar.flash_text(), Some("Global sessions disabled"));
+}

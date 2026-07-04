@@ -185,6 +185,7 @@ pub struct ConfiguredKeybindings {
     pub shift_session_down: Bind,
     pub shift_session_up: Bind,
     pub delete_current_session: Bind,
+    pub toggle_global_sessions: Bind,
 }
 
 impl Default for ConfiguredKeybindings {
@@ -254,6 +255,12 @@ impl Default for ConfiguredKeybindings {
                 label: "Ctrl+Shift+D",
                 name: Some("delete_current_session"),
             },
+            toggle_global_sessions: Bind {
+                code: KeyCode::Char('m'),
+                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+                label: "Ctrl+Shift+M",
+                name: Some("toggle_global_sessions"),
+            },
         }
     }
 }
@@ -293,6 +300,7 @@ pub fn get_configured_bind(name: &str) -> Option<Bind> {
         "shift_session_down" => Some(read.shift_session_down),
         "shift_session_up" => Some(read.shift_session_up),
         "delete_current_session" => Some(read.delete_current_session),
+        "toggle_global_sessions" => Some(read.toggle_global_sessions),
         _ => None,
     }
 }
@@ -513,6 +521,12 @@ pub mod key {
         modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
         label: "Ctrl+Shift+D",
         name: Some("delete_current_session"),
+    };
+    pub const TOGGLE_GLOBAL_SESSIONS: Bind = Bind {
+        code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+        label: "Ctrl+Shift+M",
+        name: Some("toggle_global_sessions"),
     };
 }
 

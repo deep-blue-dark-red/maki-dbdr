@@ -12,6 +12,7 @@ use maki_providers::{ContentBlock, Message, Model, Role, TokenUsage};
 use maki_storage::sessions::StoredSubagent;
 
 use crate::AppSession;
+use crate::components::settings_picker::UserSettings;
 
 use super::session_state::{SessionState, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState};
@@ -287,7 +288,13 @@ impl App {
 
     pub(super) fn shift_session(&mut self, direction_down: bool) -> Vec<Action> {
         self.save_session();
-        let summaries = match AppSession::list(&self.state.session.cwd, &self.storage) {
+        let settings = UserSettings::load();
+        let summaries_res = if settings.global_sessions {
+            AppSession::list_all(&self.storage)
+        } else {
+            AppSession::list(&self.state.session.cwd, &self.storage)
+        };
+        let summaries = match summaries_res {
             Ok(list) => list,
             Err(e) => {
                 self.status_bar.flash(format!("Failed to list sessions: {e}"));
