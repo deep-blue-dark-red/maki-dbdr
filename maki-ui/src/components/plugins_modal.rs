@@ -117,7 +117,7 @@ impl PluginsModal {
             return Rect::default();
         }
 
-        let content_height = (self.plugins.len() as u16 + 4).max(12).min(30);
+        let content_height = (self.plugins.len() as u16 + 4).clamp(12, 30);
         let modal = Modal {
             title: " Plugins ",
             width_percent: 80,

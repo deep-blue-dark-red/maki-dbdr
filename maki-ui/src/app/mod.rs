@@ -1148,12 +1148,12 @@ impl App {
 
         // Move any existing API log file to the new session-name path.
         let new_log = maki_providers::api_log_path_for(Some(&title), Some(&session_id));
-        if let (Some(old), Some(new)) = (old_log, new_log) {
-            if old != new && old.exists() {
-                if let Err(e) = std::fs::rename(&old, &new) {
-                    tracing::warn!(error = %e, "failed to rename api log");
-                }
-            }
+        if let (Some(old), Some(new)) = (old_log, new_log)
+            && old != new
+            && old.exists()
+            && let Err(e) = std::fs::rename(&old, &new)
+        {
+            tracing::warn!(error = %e, "failed to rename api log");
         }
 
         self.status_bar.flash(format!("Session renamed to: {title}"));
@@ -1602,15 +1602,7 @@ impl App {
             }
             "/settings" => {
                 let settings = UserSettings::load();
-                self.settings_picker.open(
-                    settings.show_system_prompt,
-                    settings.api_logging,
-                    settings.show_reasoning,
-                    settings.show_token_stats,
-                    settings.global_sessions,
-                    settings.log_command,
-                    settings.compact_tokens,
-                );
+                self.settings_picker.open(&settings);
                 vec![]
             }
             "/system_prompt" => {

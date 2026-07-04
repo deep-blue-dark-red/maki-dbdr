@@ -701,10 +701,10 @@ fn scan_jsonl_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> {
     if header.v != LOG_FORMAT_VERSION {
         return None;
     }
-    if let Some(c) = cwd {
-        if header.cwd != c {
-            return None;
-        }
+    if let Some(c) = cwd
+        && header.cwd != c
+    {
+        return None;
     }
 
     let (title, updated_at, context_size) =
@@ -748,10 +748,10 @@ fn scan_legacy_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> 
     if h.version != SESSION_VERSION {
         return None;
     }
-    if let Some(c) = cwd {
-        if h.cwd != c {
-            return None;
-        }
+    if let Some(c) = cwd
+        && h.cwd != c
+    {
+        return None;
     }
     Some(SessionSummary {
         id: h.id,

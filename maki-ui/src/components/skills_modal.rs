@@ -157,9 +157,9 @@ impl SkillsModal {
                         let path = std::path::Path::new(&path_str);
                         if path_str.starts_with('~') || path_str.starts_with('/') || path.is_absolute() {
                             let mut settings = UserSettings::load();
-                            let resolved = if path_str.starts_with("~/") {
+                            let resolved = if let Some(stripped) = path_str.strip_prefix("~/") {
                                 if let Some(home) = maki_storage::paths::home() {
-                                    home.join(&path_str[2..]).to_string_lossy().into_owned()
+                                    home.join(stripped).to_string_lossy().into_owned()
                                 } else {
                                     path_str.clone()
                                 }

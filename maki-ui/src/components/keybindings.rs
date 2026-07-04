@@ -119,10 +119,10 @@ pub struct Bind {
 
 impl Bind {
     pub fn matches(&self, key: KeyEvent) -> bool {
-        if let Some(name) = self.name {
-            if let Some(dyn_bind) = get_configured_bind(name) {
-                return dyn_bind.matches_raw(key);
-            }
+        if let Some(name) = self.name
+            && let Some(dyn_bind) = get_configured_bind(name)
+        {
+            return dyn_bind.matches_raw(key);
         }
         self.matches_raw(key)
     }
@@ -136,10 +136,10 @@ impl Bind {
     }
 
     pub fn label(&self) -> &str {
-        if let Some(name) = self.name {
-            if let Some(dyn_bind) = get_configured_bind(name) {
-                return dyn_bind.label;
-            }
+        if let Some(name) = self.name
+            && let Some(dyn_bind) = get_configured_bind(name)
+        {
+            return dyn_bind.label;
         }
         self.label
     }
@@ -350,11 +350,11 @@ pub fn parse_keybind(s: &str) -> Option<Bind> {
             "pagedown" | "pgdn" => code = Some(KeyCode::PageDown),
             "insert" | "ins" => code = Some(KeyCode::Insert),
             other => {
-                if other.starts_with('f') {
-                    if let Ok(n) = other[1..].parse::<u8>() {
-                        code = Some(KeyCode::F(n));
-                        continue;
-                    }
+                if let Some(stripped) = other.strip_prefix('f')
+                    && let Ok(n) = stripped.parse::<u8>()
+                {
+                    code = Some(KeyCode::F(n));
+                    continue;
                 }
                 if other.chars().count() == 1 {
                     code = Some(KeyCode::Char(other.chars().next().unwrap()));

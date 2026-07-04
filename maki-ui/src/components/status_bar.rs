@@ -55,6 +55,7 @@ pub struct StatusBarContext<'a> {
     pub stats: UsageStats<'a>,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
+    pub session_name: Option<&'a str>,
     pub retry_info: Option<&'a RetryInfo>,
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
@@ -167,9 +168,26 @@ impl StatusBar {
             left_spans.push(Span::styled(" ✻", theme::current().spinner));
         }
 
+        if let Some(name) = ctx.session_name {
+            left_spans.push(Span::styled(
+                format!(" [{name}]"),
+                theme::current().status_dim,
+            ));
+        }
+
+        let mut token_stats_idx: Option<usize> = None;
+        let mut token_stats_abbrev: Option<String> = None;
         if ctx.show_token_stats
             && let Some(stats) = ctx.last_turn_stats
         {
+            let abbrev = format!(
+                " (PP {:.0}|TG {:.0}|CR {:.0})",
+                stats.pp_tps,
+                stats.tg_tps,
+                stats.cache_rate * 100.0,
+            );
+            token_stats_idx = Some(left_spans.len());
+            token_stats_abbrev = Some(abbrev);
             left_spans.push(Span::styled(
                 format!(
                     " PP {:.1} t/s | TG {:.1} t/s | CR {:.1}%",
@@ -217,75 +235,8 @@ impl StatusBar {
             ));
         }
 
-        let mut right_spans = Vec::new();
-
-        match ctx.status {
-            Status::Error { message: e, .. } => {
-                left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
-            }
-            _ => {
-                let pct = if ctx.stats.context_window > 0 {
-                    (ctx.stats.context_size as f64 / ctx.stats.context_window as f64 * 100.0) as u32
-                } else {
-                    0
-                };
-
-                if ctx.verbose {
-                    right_spans.push(Span::styled("[verbose] ", theme::current().status_dim));
-                }
-                right_spans.push(Span::styled(format!("{}  ", ctx.mode_label), ctx.mode_style));
-
-                right_spans.push(Span::styled(
-                    self.cwd_branch.clone(),
-                    theme::current().status_dim,
-                ));
-                right_spans.push(Span::raw("  "));
-                right_spans.push(Span::styled(
-                    ctx.model_id.to_string(),
-                    theme::current().status_dim,
-                ));
-
-                if let Some(ref label) = ctx.thinking_label {
-                    right_spans.push(Span::styled(
-                        format!(" [{label}]"),
-                        theme::current().status_dim,
-                    ));
-                }
-
-                if ctx.fast {
-                    right_spans.push(Span::styled(FAST_LABEL, theme::current().status_dim));
-                }
-
-                let context_text = format!(
-                    "  {}/{} ({}%)",
-                    format_tokens(ctx.stats.context_size),
-                    format_tokens(ctx.stats.context_window),
-                    pct,
-                );
-                let rest_text = if ctx.stats.pricing.is_zero() {
-                    format!("{context_text} ")
-                } else {
-                    format!(
-                        "{context_text} ${:.3} ",
-                        ctx.stats.usage.cost(ctx.stats.pricing, ctx.fast),
-                    )
-                };
-                right_spans.push(Span::styled(
-                    rest_text,
-                    Style::new().fg(theme::current().foreground),
-                ));
-
-                if ctx.stats.show_global && !ctx.stats.pricing.is_zero() {
-                    let global_text = format!(
-                        " \u{03a3}${:.3} ",
-                        ctx.stats.global_usage.cost(ctx.stats.pricing, ctx.fast),
-                    );
-                    right_spans.push(Span::styled(
-                        global_text,
-                        Style::new().fg(theme::current().foreground),
-                    ));
-                }
-            }
+        if let Status::Error { message: e, .. } = ctx.status {
+            left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
         }
 
         if let Some((ref msg, _)) = self.flash {
@@ -295,9 +246,122 @@ impl StatusBar {
             ));
         }
 
+        let mut right_spans = Vec::new();
+
+        if !matches!(ctx.status, Status::Error { .. }) {
+            let pct = if ctx.stats.context_window > 0 {
+                (ctx.stats.context_size as f64 / ctx.stats.context_window as f64 * 100.0) as u32
+            } else {
+                0
+            };
+
+            // Order: [verbose] [thinking] [fast] mode  ctx/window (pct%) [$cost] [global]  model  cwd
+            if ctx.verbose {
+                right_spans.push(Span::styled("[verbose] ", theme::current().status_dim));
+            }
+
+            if let Some(ref label) = ctx.thinking_label {
+                right_spans.push(Span::styled(
+                    format!("[{label}] "),
+                    theme::current().status_dim,
+                ));
+            }
+
+            if ctx.fast {
+                right_spans.push(Span::styled(
+                    format!("{} ", FAST_LABEL.trim()),
+                    theme::current().status_dim,
+                ));
+            }
+
+            right_spans.push(Span::styled(format!("{}  ", ctx.mode_label), ctx.mode_style));
+
+            let context_style = Style::new().fg(theme::current().foreground);
+            let context_text = format!(
+                "{}/{} ({}%)",
+                format_tokens(ctx.stats.context_size),
+                format_tokens(ctx.stats.context_window),
+                pct,
+            );
+            let rest_text = if ctx.stats.pricing.is_zero() {
+                format!("{context_text}  ")
+            } else {
+                format!(
+                    "{context_text} ${:.3}  ",
+                    ctx.stats.usage.cost(ctx.stats.pricing, ctx.fast),
+                )
+            };
+            right_spans.push(Span::styled(rest_text, context_style));
+
+            if ctx.stats.show_global && !ctx.stats.pricing.is_zero() {
+                let global_text = format!(
+                    "\u{03a3}${:.3}  ",
+                    ctx.stats.global_usage.cost(ctx.stats.pricing, ctx.fast),
+                );
+                right_spans.push(Span::styled(global_text, context_style));
+            }
+
+            // Model ID: always strip middle path components
+            let model_short = shorten_model_id(ctx.model_id);
+            let model_idx = right_spans.len();
+            right_spans.push(Span::styled(model_short.clone(), theme::current().status_dim));
+
+            // CWD at far right, same color as context usage
+            right_spans.push(Span::raw("  "));
+            let cwd_idx = right_spans.len();
+            right_spans.push(Span::styled(self.cwd_branch.clone(), context_style));
+            right_spans.push(Span::raw(" "));
+
+            // Adaptive shortening when total exceeds terminal width.
+            // Pass 1: abbreviate cwd path components.
+            // Pass 2: truncate model with "...".
+            // Pass 3: abbreviate left-side token stats to compact form.
+            let span_width = |spans: &[Span]| -> u16 {
+                spans.iter().map(|s| s.width() as u16).sum()
+            };
+            let left_w = || -> u16 {
+                left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1)
+            };
+
+            if left_w() + span_width(&right_spans) > area.width {
+                right_spans[cwd_idx] =
+                    Span::styled(abbreviate_path_components(&self.cwd_branch), context_style);
+
+                if left_w() + span_width(&right_spans) > area.width {
+                    let overflow =
+                        (left_w() + span_width(&right_spans)).saturating_sub(area.width) as usize;
+                    let model_width = right_spans[model_idx].width();
+                    if overflow + 3 < model_width {
+                        let keep = model_width - overflow - 3;
+                        let end = model_short
+                            .char_indices()
+                            .nth(keep)
+                            .map(|(i, _)| i)
+                            .unwrap_or(model_short.len());
+                        right_spans[model_idx] = Span::styled(
+                            format!("{}...", &model_short[..end]),
+                            theme::current().status_dim,
+                        );
+                    } else {
+                        right_spans[model_idx] =
+                            Span::styled("...", theme::current().status_dim);
+                    }
+
+                    if left_w() + span_width(&right_spans) > area.width
+                        && let (Some(idx), Some(abbrev)) = (token_stats_idx, token_stats_abbrev)
+                    {
+                        left_spans[idx] =
+                            Span::styled(abbrev, theme::current().status_dim);
+                    }
+                }
+            }
+        }
+
+        let left_width = left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1);
+
         let [left_area, right_area] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(right_spans.iter().map(|s| s.width() as u16).sum()),
+            Constraint::Length(left_width),
+            Constraint::Fill(1),
         ])
         .areas(area);
 
@@ -307,6 +371,41 @@ impl StatusBar {
             right_area,
         );
     }
+}
+
+fn shorten_model_id(model_id: &str) -> String {
+    let first = model_id.find('/');
+    let last = model_id.rfind('/');
+    match (first, last) {
+        (Some(f), Some(l)) if f < l => format!("{}/{}", &model_id[..f], &model_id[l + 1..]),
+        _ => model_id.to_string(),
+    }
+}
+
+fn abbreviate_path_components(path: &str) -> String {
+    // Separate optional ":branch" suffix (Unix paths never contain ':')
+    let (path_part, branch_suffix) = path
+        .find(':')
+        .map(|i| (&path[..i], &path[i..]))
+        .unwrap_or((path, ""));
+
+    let parts: Vec<&str> = path_part.split('/').collect();
+    if parts.len() <= 2 {
+        return path.to_string();
+    }
+    let last = parts.len() - 1;
+    let abbreviated: Vec<String> = parts
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            if i == last || p.is_empty() || p == "~" {
+                p.to_string()
+            } else {
+                p.chars().next().map(|c| c.to_string()).unwrap_or_default()
+            }
+        })
+        .collect();
+    format!("{}{}", abbreviated.join("/"), branch_suffix)
 }
 
 fn collapse_home(path: &str) -> String {
@@ -436,6 +535,23 @@ mod tests {
         bar.flash("Copied".into());
         bar.clear_expired_hint();
         assert!(bar.flash.is_none());
+    }
+
+    #[test_case("llama-cpp//mnt/commons/models/Qwen3.gguf", "llama-cpp/Qwen3.gguf" ; "strips_middle")]
+    #[test_case("llama-cpp/Qwen3.gguf", "llama-cpp/Qwen3.gguf"                    ; "single_slash_unchanged")]
+    #[test_case("gpt-4", "gpt-4"                                                   ; "no_slash_unchanged")]
+    #[test_case("a/b/c/d", "a/d"                                                   ; "many_segments")]
+    fn shorten_model_id_cases(input: &str, expected: &str) {
+        assert_eq!(shorten_model_id(input), expected);
+    }
+
+    #[test_case("~/git/maki/target/release:main", "~/g/m/t/release:main" ; "typical_path_with_branch")]
+    #[test_case("~/git/maki:feature/foo", "~/g/maki:feature/foo"         ; "branch_with_slash")]
+    #[test_case("~/git/maki", "~/g/maki"                                 ; "no_branch")]
+    #[test_case("~/maki", "~/maki"                                        ; "short_path_unchanged")]
+    #[test_case("/home/user/proj/src:main", "/h/u/p/src:main"            ; "absolute_path")]
+    fn abbreviate_path_cases(input: &str, expected: &str) {
+        assert_eq!(abbreviate_path_components(input), expected);
     }
 
     #[test]

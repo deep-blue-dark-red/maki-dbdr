@@ -49,9 +49,9 @@ impl UserSettings {
             cwd.to_path_buf()
         } else {
             let path_str = raw.to_string();
-            if path_str.starts_with("~/") {
+            if let Some(stripped) = path_str.strip_prefix("~/") {
                 if let Some(home) = maki_storage::paths::home() {
-                    home.join(&path_str[2..])
+                    home.join(stripped)
                 } else {
                     std::path::PathBuf::from(path_str)
                 }
@@ -108,13 +108,7 @@ impl SettingsPicker {
 
     pub fn open(
         &mut self,
-        show_system_prompt: bool,
-        api_logging: bool,
-        show_reasoning: bool,
-        show_token_stats: bool,
-        global_sessions: bool,
-        log_command: Option<String>,
-        compact_tokens: Option<usize>,
+        settings: &UserSettings,
     ) {
         let items = vec![
             SettingItem {
@@ -133,23 +127,23 @@ impl SettingsPicker {
                 name: "global-sessions".to_string(),
             },
             SettingItem {
-                name: format!("log-command: {}", log_command.as_deref().unwrap_or("less +G {}")),
+                name: format!("log-command: {}", settings.log_command.as_deref().unwrap_or("less +G {}")),
             },
             SettingItem {
                 name: format!(
                     "compact-tokens: {}",
-                    compact_tokens
+                    settings.compact_tokens
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "none".to_string())
                 ),
             },
         ];
         let enabled = vec![
-            show_system_prompt,
-            api_logging,
-            show_reasoning,
-            show_token_stats,
-            global_sessions,
+            settings.show_system_prompt,
+            settings.api_logging,
+            settings.show_reasoning,
+            settings.show_token_stats,
+            settings.global_sessions,
             false,
             false,
         ];

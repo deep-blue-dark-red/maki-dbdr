@@ -273,7 +273,7 @@ impl App {
                 }
             }
         }
-        self.status_bar.flash(format!("Turn {turn_num} not found").into());
+        self.status_bar.flash(format!("Turn {turn_num} not found"));
         vec![]
     }
 

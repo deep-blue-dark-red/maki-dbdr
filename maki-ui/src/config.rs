@@ -55,10 +55,10 @@ pub fn load_config() -> UserSettings {
         if let Ok(config_dir) = maki_storage::paths::config_dir() {
             let old_path = config_dir.join("settings.json");
             if old_path.exists() {
-                if let Ok(data) = fs::read(&old_path) {
-                    if let Ok(parsed) = serde_json::from_slice::<UserSettings>(&data) {
-                        settings = parsed;
-                    }
+                if let Ok(data) = fs::read(&old_path)
+                    && let Ok(parsed) = serde_json::from_slice::<UserSettings>(&data)
+                {
+                    settings = parsed;
                 }
                 let _ = fs::remove_file(&old_path);
             }
