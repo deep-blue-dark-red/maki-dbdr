@@ -149,9 +149,9 @@ impl StatusBar {
                 };
 
                 if !is_working && info.input_tokens > 0 {
-                    stats.push(format!("↑ {} tokens", format_tokens(info.input_tokens)));
+                    stats.push(format!("↑ {} t", format_tokens(info.input_tokens)));
                 } else if is_working && info.output_tokens > 0 {
-                    stats.push(format!("↓ {} tokens", format_tokens(info.output_tokens)));
+                    stats.push(format!("↓ {} t", format_tokens(info.output_tokens)));
                 }
 
                 let stats_str = if stats.is_empty() {
