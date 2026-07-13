@@ -10,7 +10,13 @@ local STATUS_MARKERS = {
   cancelled = { "[x]", "todo_cancelled" },
 }
 
-local DESCRIPTION = [[Track work of 3+ steps. Send the full list each time (replace-all). Update after each step. Skip for trivial tasks.]]
+local DESCRIPTION = [[Create or update a structured todo list to track tasks.
+
+**Use after EACH completed step!**
+
+- Send the complete list each time (replace-all semantics).
+- Use ONLY for multi-step work (3+ steps).
+- Skip for trivial tasks.]]
 
 local function count_done()
   local n = 0
@@ -77,7 +83,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- **todo_write** to plan any task of 3+ steps; update it after each step, not all at once.",
+  content = "- Use todo_write to plan and track multi-step tasks (must be 3+ steps). Update after EACH step, not only all at once.",
 })
 
 maki.api.register_tool({
@@ -158,13 +164,13 @@ end
 
 maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
 
-maki.api.create_autocmd("TurnEnd", {
-  callback = function()
-    items = {}
-    seen_first = false
-    if win and win:is_open() then
-      win:hide()
-    end
-    maki.ui.set_status_hint(nil)
-  end,
-})
+local function clear_todos()
+  items = {}
+  seen_first = false
+  if win and win:is_open() then
+    win:hide()
+  end
+  maki.ui.set_status_hint(nil)
+end
+
+maki.api.create_autocmd({ "TurnEnd", "SessionReset" }, { callback = clear_todos })

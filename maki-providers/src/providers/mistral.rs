@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -59,6 +59,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             ],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 1.5,
@@ -74,6 +75,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["mistral-small-latest", "mistral-small-2603"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 0.15,
@@ -89,6 +91,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["ministral-14b-latest", "ministral-14b-2512"],
             tier: ModelTier::Weak,
             family: ModelFamily::Generic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.20,
@@ -194,11 +197,8 @@ impl Provider for Mistral {
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
-            // Ministral does not support reasoning, Mistral Small 4 and Mistral Medium 3.5 do
-            if !matches!(opts.thinking, ThinkingConfig::Off) && !model.id.starts_with("ministral-")
-            {
-                body["reasoning_effort"] = json!("high");
-            }
+            opts.thinking
+                .apply_reasoning_effort(&mut body, EffortScale::HighOnly);
             // Convert assistant messages to Mistral's expected format with thinking content
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 
@@ -215,44 +215,39 @@ impl Provider for Mistral {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let base = auth
-                .base_url
-                .as_deref()
-                .unwrap_or(self.compat.config().base_url);
-            let url = format!("{base}/models");
-            let body_text = self.compat.get_text(&auth, &url).await?;
-            let body: Value = serde_json::from_str(&body_text)?;
-            let mut models: Vec<crate::model::ModelInfo> = body["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            // Only include models with completion_chat: true
-                            let has_completion_chat = m
-                                .get("capabilities")
-                                .and_then(Value::as_object)
-                                .and_then(|c| c.get("completion_chat"))
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            if !has_completion_chat {
-                                return None;
-                            }
-                            let id = m["id"].as_str()?;
-                            let context_window = m["max_context_length"]
-                                .as_u64()
-                                .and_then(|v| u32::try_from(v).ok());
-                            Some(crate::model::ModelInfo {
-                                id: id.to_string(),
-                                context_window,
-                                max_output_tokens: None,
-                                pricing: None,
-                            })
-                        })
-                        .collect()
+            self.compat
+                .fetch_and_parse_models(&auth, |m| {
+                    // Filter: only completion_chat capable models
+                    let has_completion_chat = m
+                        .get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|c| c.get("completion_chat"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !has_completion_chat {
+                        return None;
+                    }
+
+                    // Parse with Mistral-specific field names
+                    let id = m["id"].as_str()?;
+                    let context_window = m["max_context_length"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok());
+                    let supports_thinking = m
+                        .get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|c| c.get("reasoning"))
+                        .and_then(Value::as_bool);
+                    Some(crate::model::ModelInfo {
+                        id: id.to_string(),
+                        context_window,
+                        max_output_tokens: None,
+                        pricing: None,
+                        supports_thinking,
+                        provider_info: None,
+                    })
                 })
-                .unwrap_or_default();
-            models.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(models)
+                .await
         })
     }
 
@@ -263,6 +258,16 @@ impl Provider for Mistral {
                 .as_ref()
                 .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
         })
+    }
+
+    fn adjust_model(&self, model: &mut Model) {
+        adjust_model(model);
+    }
+}
+
+fn adjust_model(model: &mut Model) {
+    if model.id.starts_with("ministral-") {
+        model.supports_thinking_override = Some(false);
     }
 }
 
@@ -332,5 +337,13 @@ mod tests {
         let mut input_clone = input.clone();
         convert_assistant_messages_in_place(&mut input_clone);
         assert_eq!(input_clone, expected);
+    }
+
+    #[test_case("mistral/ministral-14b-latest", false ; "ministral_no_thinking")]
+    #[test_case("mistral/mistral-medium-latest", true ; "mistral_medium_supports_thinking")]
+    fn adjust_model_sets_thinking_support(spec: &str, expected: bool) {
+        let mut model = Model::from_spec(spec).unwrap();
+        adjust_model(&mut model);
+        assert_eq!(model.supports_thinking(), expected);
     }
 }

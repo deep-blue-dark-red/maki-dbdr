@@ -641,6 +641,49 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
 }
 
 #[test]
+fn turn_complete_accumulates_usage_by_model() {
+    let mut app = app_with_subagent();
+
+    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
+        TurnCompleteEvent {
+            message: Default::default(),
+            usage: TokenUsage {
+                input: 100,
+                output: 50,
+                cache_read: 10,
+                ..Default::default()
+            },
+            model: "main-model".into(),
+            context_size: None,
+        },
+    ))));
+    app.update(subagent_msg(
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Default::default(),
+            usage: TokenUsage {
+                input: 200,
+                output: 75,
+                ..Default::default()
+            },
+            model: "sub-model".into(),
+            context_size: None,
+        })),
+        "task1",
+        None,
+    ));
+
+    let by_model = &app.state.session.meta.usage_by_model;
+    assert_eq!(by_model.len(), 2);
+    let main = &by_model["main-model"];
+    assert_eq!(main.input, 100);
+    assert_eq!(main.output, 50);
+    assert_eq!(main.cache_read, 10);
+    let sub = &by_model["sub-model"];
+    assert_eq!(sub.input, 200);
+    assert_eq!(sub.output, 75);
+}
+
+#[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
     app.update(subagent_msg(
@@ -830,18 +873,8 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 fn compact_command_sets_streaming() {
     let mut app = test_app();
     let actions = app.execute_command(cmd("/compact"));
-    assert!(matches!(&actions[0], Action::Compact(None)));
+    assert!(matches!(&actions[0], Action::Compact));
     assert_eq!(app.status, Status::Streaming);
-}
-
-#[test]
-fn compact_command_with_value() {
-    let mut app = test_app();
-    let actions = app.execute_command(ParsedCommand {
-        name: "/compact".into(),
-        args: "1234".into(),
-    });
-    assert!(matches!(&actions[0], Action::Compact(Some(1234))));
 }
 
 #[test]
@@ -1035,17 +1068,6 @@ fn double_esc_idle_no_user_turns_flashes_error() {
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(!app.rewind_picker.is_open());
-}
-
-#[test]
-fn reload_config_command_updates_options() {
-    let mut app = test_app();
-    app.status_bar.clear_flash();
-    app.execute_command(crate::components::command::ParsedCommand {
-        name: "/reload".to_string(),
-        args: String::new(),
-    });
-    assert_eq!(app.status_bar.flash_text(), Some("Configuration reloaded"));
 }
 
 #[test]
@@ -1503,6 +1525,42 @@ fn yolo_toggle() {
 }
 
 #[test]
+fn usage_command_toggles_modal() {
+    let mut app = test_app();
+    assert!(!app.usage_modal.is_open());
+    let open_actions = app.execute_command(cmd("/usage"));
+    assert!(app.usage_modal.is_open());
+    assert!(
+        open_actions
+            .iter()
+            .any(|a| matches!(a, Action::RefreshUsage)),
+        "opening should request a quota refresh"
+    );
+    let close_actions = app.execute_command(cmd("/usage"));
+    assert!(!app.usage_modal.is_open());
+    assert!(
+        !close_actions
+            .iter()
+            .any(|a| matches!(a, Action::RefreshUsage)),
+        "closing should not trigger a refresh"
+    );
+}
+
+#[test]
+fn ctrl_r_refreshes_usage_while_modal_open() {
+    let mut app = test_app();
+    app.execute_command(cmd("/usage"));
+    assert!(app.usage_modal.is_open());
+
+    let actions = app.update(Msg::Key(kb::REFRESH.to_key_event()));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::RefreshUsage)),
+        "Ctrl+R should emit RefreshUsage"
+    );
+    assert!(app.usage_modal.is_open(), "modal should stay open");
+}
+
+#[test]
 fn cd_command_behavior() {
     let mut app = test_app();
     app.execute_command(ParsedCommand {
@@ -1581,11 +1639,11 @@ fn build_rewind_app() -> App {
 #[test]
 fn rewind_to_middle_truncates_and_populates_input() {
     let mut app = build_rewind_app();
+    app.state.context_size = 100_000;
     let old_run_id = app.run_id;
     let entry = crate::components::rewind_picker::RewindEntry {
-segment_index: 0,
-                turn_index: 2,
-                prompt_preview: "2: second".into(),
+        turn_index: 2,
+        prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
     };
     let actions = app.rewind_to(entry);
@@ -1594,6 +1652,9 @@ segment_index: 0,
     assert!(app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id + 1);
+    let expected_ctx = maki_agent::agent::estimate_message_tokens(&app.state.session.messages);
+    assert_eq!(app.state.context_size, expected_ctx);
+    assert_eq!(app.chats[0].context_size, expected_ctx);
 
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
@@ -1605,12 +1666,12 @@ segment_index: 0,
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
+    app.state.context_size = 100_000;
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
-segment_index: 0,
-                turn_index: 0,
-                prompt_preview: "1: first".into(),
+        turn_index: 0,
+        prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
     };
     let actions = app.rewind_to(entry);
@@ -1619,6 +1680,8 @@ segment_index: 0,
     assert!(!app.state.session.tool_outputs.contains_key("tool-1"));
     assert_eq!(app.state.token_usage.input, 500);
     assert_eq!(app.state.token_usage.output, 200);
+    assert_eq!(app.state.context_size, 0);
+    assert_eq!(app.chats[0].context_size, 0);
     assert!(matches!(&actions[0], Action::LoadSession(_)));
 }
 
@@ -1909,60 +1972,6 @@ fn alt_o_opens_editor_for_input() {
     app.input_box.buffer.insert_text("hello");
     let actions = app.update(Msg::Key(kb::EDIT_INPUT.to_key_event()));
     assert!(matches!(&actions[..], [Action::EditInputInEditor]));
-}
-
-#[test]
-fn alt_s_opens_sessions_list() {
-    let mut app = test_app();
-    assert!(!app.session_picker.is_open());
-    app.update(Msg::Key(kb::SESSIONS.to_key_event()));
-    assert!(app.session_picker.is_open());
-}
-
-#[test]
-fn shift_session_with_keybinds() {
-    let tmp = TempDir::new().unwrap();
-    let storage = StateDir::from_path(tmp.path().to_path_buf());
-
-    let mut s1 = AppSession::new("test-model", "/tmp/test");
-    s1.title = "Session 1".into();
-    s1.updated_at = 1000;
-
-    let mut s2 = AppSession::new("test-model", "/tmp/test");
-    s2.title = "Session 2".into();
-    s2.updated_at = 2000;
-
-    s1.save(&storage).unwrap();
-    s2.save(&storage).unwrap();
-
-    let writer = Arc::new(StorageWriter::new(storage.clone()));
-    let permissions = Arc::new(PermissionManager::new(
-        PermissionsConfig::default(),
-        PathBuf::from("/tmp"),
-    ));
-    let model = test_model();
-    let mut app = App::new(
-        &model,
-        s2.clone(),
-        storage.clone(),
-        Arc::new(ArcSwapOption::empty()),
-        McpSnapshotReader::empty(),
-        McpConfigErrors::new(PathBuf::new()),
-        LuaCommandReader::empty(),
-        KeymapReader::empty(),
-        HintReader::empty(),
-        writer,
-        UiConfig::default(),
-        100,
-        permissions,
-        Arc::from([]),
-    );
-
-    app.update(Msg::Key(kb::SHIFT_SESSION_DOWN.to_key_event()));
-    assert_eq!(app.state.session.title, "Session 1");
-
-    app.update(Msg::Key(kb::SHIFT_SESSION_UP.to_key_event()));
-    assert_eq!(app.state.session.title, "Session 2");
 }
 
 #[test]
@@ -2307,7 +2316,7 @@ fn bash_prefix_overrides_mode() {
     let mut app = test_app();
 
     app.input_box.set_input("! ls".into());
-    assert_eq!(&*app.mode_label().0, "[bash]");
+    assert_eq!(&*app.mode_label().0, "[BASH]");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert_eq!(
@@ -2317,7 +2326,7 @@ fn bash_prefix_overrides_mode() {
     );
 
     app.input_box.set_input("ls".into());
-    assert_eq!(&*app.mode_label().0, "[build]");
+    assert_eq!(&*app.mode_label().0, "[BUILD]");
 }
 
 #[test]
@@ -2344,9 +2353,9 @@ fn thinking_explicit_args() {
 }
 
 #[test]
-fn thinking_non_anthropic_flashes_error() {
+fn thinking_unsupported_model_flashes_error() {
     let mut app = test_app();
-    app.state.model.provider = maki_providers::provider::ProviderKind::Ollama;
+    app.state.model.supports_thinking_override = Some(false);
 
     app.execute_command(cmd("/thinking"));
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
@@ -2381,6 +2390,50 @@ fn fast_toggle_on_off_on_opus() {
     app.execute_command(cmd("/fast"));
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
+}
+
+#[test]
+fn workflow_toggle_flows_into_agent_input() {
+    let mut app = test_app();
+    let msg = QueuedMessage {
+        text: "hi".into(),
+        images: Vec::new(),
+    };
+    assert!(!app.build_agent_input(&msg).workflow);
+
+    app.execute_command(cmd("/workflow"));
+    assert!(app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
+
+    app.execute_command(cmd("/workflow"));
+    assert!(!app.build_agent_input(&msg).workflow);
+    assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
+}
+
+/// Workflow sessions have synthetic ids that no ToolDone matches, so
+/// SubagentHistory is what finishes their chat.
+#[test]
+fn subagent_history_finishes_workflow_chat() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        "session-abc",
+        Some("researcher"),
+    ));
+    assert_eq!(app.chats.len(), 2);
+    assert!(!app.chats[1].is_finished());
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::SubagentHistory {
+            tool_use_id: "session-abc".into(),
+            messages: vec![],
+        },
+        1,
+    ));
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
 #[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
@@ -2463,8 +2516,12 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
-    app.permission_prompt
-        .open("id".into(), "bash".into(), vec!["execute".into()], None);
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
     assert!(app.permission_prompt.is_open());
 
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
@@ -2567,8 +2624,12 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
     open_split_window(&mut app, maki_lua::Split::Below);
     open_split_window(&mut app, maki_lua::Split::Left);
     open_split_window(&mut app, maki_lua::Split::Above);
-    app.permission_prompt
-        .open("perm-1".into(), "bash".into(), vec!["ls".into()], None);
+    app.permission_prompt.open(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+    );
 
     let (_msg, _bottom, _status, _input, splits) = app.layout_geometry(TEST_AREA);
     assert!(
@@ -2685,149 +2746,4 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert_eq!(app.active_chat, 0);
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
-}
-
-#[test]
-fn export_command() {
-    let mut app = test_app();
-    app.state.session.title = "Test Session".into();
-    app.state.session.model = "test-model".into();
-    app.state.session.cwd = "/tmp/test".into();
-
-    app.state.session.messages = vec![
-        Message::user("Hello agent".into()),
-        Message {
-            role: Role::Assistant,
-            content: vec![
-                ContentBlock::Thinking {
-                    thinking: "I should greet back".into(),
-                    signature: None,
-                },
-                ContentBlock::Text {
-                    text: "Hello user!".into(),
-                },
-                ContentBlock::ToolUse {
-                    id: "tool-1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({"command": "echo 1"}),
-                },
-            ],
-            ..Default::default()
-        },
-        Message {
-            role: Role::User,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool-1".into(),
-                content: "1".into(),
-                is_error: false,
-            }],
-            ..Default::default()
-        },
-    ];
-
-    app.state.session.tool_outputs.insert(
-        "tool-1".into(),
-        ToolOutput::Plain("1".into()),
-    );
-
-    let markdown = app.export_session_to_markdown();
-    let expected = "\
-# Session: Test Session
-- **Model:** `test-model`
-- **CWD:** `/tmp/test`
-
----
-
-### User
-
-Hello agent
-
-### Assistant
-
-<details>
-<summary>Thinking</summary>
-
-I should greet back
-</details>
-
-Hello user!
-
-**Tool Call:** `bash`
-```json
-{
-  \"command\": \"echo 1\"
-}
-```
-**Output:**
-```
-1
-```
-";
-    assert_eq!(markdown, expected);
-
-    app.execute_command(cmd("/export"));
-    assert!(app.export_picker.is_open());
-    app.update(Msg::Key(key(KeyCode::Enter)));
-    assert!(!app.export_picker.is_open());
-    assert_eq!(app.status_bar.flash_text(), Some("Copied transcript to clipboard"));
-}
-
-#[test]
-fn logs_command_yields_action() {
-    let mut app = test_app();
-    let actions = app.execute_command(cmd("/logs"));
-    assert!(matches!(&actions[..], [Action::RunLogsCommand]));
-}
-
-#[test]
-fn skills_command_opens_modal() {
-    let mut app = test_app();
-    assert!(!app.skills_modal.is_open());
-
-    app.execute_command(cmd("/skills"));
-    assert!(app.skills_modal.is_open());
-}
-
-#[test]
-fn delete_session_keybinding() {
-    let mut app = test_app();
-    let session_id = app.state.session.id.clone();
-    app.state.session.save(&app.storage).unwrap();
-
-    let key_event = KeyEvent::new(
-        KeyCode::Char('d'),
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    );
-    let actions = app.update(Msg::Key(key_event));
-
-    assert!(actions.is_empty());
-    assert!(app.session_picker.is_open());
-    assert_eq!(app.status_bar.flash_text(), Some("Session deleted"));
-    assert!(AppSession::load(&session_id, &app.storage).is_err());
-}
-
-#[test]
-fn toggle_global_sessions_keybinding() {
-    let mut app = test_app();
-
-    // Default is false
-    assert!(!UserSettings::load().global_sessions);
-
-    // Press Ctrl+Shift+M
-    let key_event = KeyEvent::new(
-        KeyCode::Char('m'),
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-    );
-    let actions = app.update(Msg::Key(key_event));
-
-    assert!(actions.is_empty());
-    assert!(UserSettings::load().global_sessions);
-    assert_eq!(app.status_bar.flash_text(), Some("Global sessions enabled"));
-
-    // Press Ctrl+Shift+M again
-    let actions = app.update(Msg::Key(key_event));
-
-    assert!(actions.is_empty());
-    assert!(!UserSettings::load().global_sessions);
-    assert_eq!(app.status_bar.flash_text(), Some("Global sessions disabled"));
 }

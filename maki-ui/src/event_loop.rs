@@ -24,6 +24,7 @@ use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueIte
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg};
 use crate::components::input::Submission;
+use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 
 use crate::storage_writer::StorageWriter;
@@ -31,8 +32,6 @@ use crate::terminal;
 
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
-
-pub type BufClickHandler = Arc<dyn Fn(&str, u32) -> Option<maki_lua::ClickReply> + Send + Sync>;
 
 pub struct EventLoopParams {
     pub model: Model,
@@ -51,7 +50,6 @@ pub struct EventLoopParams {
     pub hint_reader: HintReader,
     pub ui_action_rx: Option<flume::Receiver<UiAction>>,
     pub lua_event_handle: Option<EventHandle>,
-    pub buf_click: Option<BufClickHandler>,
 }
 
 pub(crate) struct EventLoop<'t> {
@@ -175,7 +173,6 @@ impl<'t> EventLoop<'t> {
             hint_reader,
             ui_action_rx,
             lua_event_handle,
-            buf_click,
         } = params;
 
         std::thread::spawn(crate::highlight::warmup);
@@ -208,7 +205,6 @@ impl<'t> EventLoop<'t> {
             &permissions,
             cwd,
             Some(session.id.clone()),
-            Some(session.created_at),
             timeouts,
             lua_event_handle.clone(),
         );
@@ -231,7 +227,6 @@ impl<'t> EventLoop<'t> {
             custom_commands,
         );
         app.exit_on_done = exit_on_done;
-        app.buf_click = buf_click;
         app.lua_event_handle = lua_event_handle;
 
         if needs_login {
@@ -364,8 +359,6 @@ impl<'t> EventLoop<'t> {
             }
         }
 
-
-
         had_agent_msg
     }
 
@@ -482,6 +475,7 @@ impl<'t> EventLoop<'t> {
                     && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
                     && let Ok(new_provider) = from_model(&mut new_model, self.timeouts)
                 {
+                    self.app.usage_slot.store(None);
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
                         provider: Arc::from(new_provider),
@@ -502,14 +496,8 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.app.storage);
             }
-            Action::Compact(target) => {
+            Action::Compact => {
                 self.handles.queue.push(QueueItem::Compact {
-                    run_id: self.app.run_id,
-                    target_tokens: target,
-                });
-            }
-            Action::Checkpoint => {
-                self.handles.queue.push(QueueItem::Checkpoint {
                     run_id: self.app.run_id,
                 });
             }
@@ -547,53 +535,14 @@ impl<'t> EventLoop<'t> {
                     Err(e) => self.app.flash(e),
                 }
             }
-            Action::EditSystemPrompt => {
-                match maki_storage::paths::config_dir() {
-                    Ok(config_dir) => {
-                        let path = config_dir.join("system.md");
-                        if !path.exists()
-                            && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
-                        {
-                            self.app.flash(format!("Failed to create system.md: {e}"));
-                            return;
-                        }
-                        if let Err(e) = terminal::open_in_editor(&path, self.terminal) {
-                            self.app.flash(e);
-                        }
-                    }
-                    Err(e) => self.app.flash(format!("Failed to get config directory: {e}")),
-                }
-            }
-            Action::RunLogsCommand => {
-                let settings = crate::components::settings_picker::UserSettings::load();
-                let log_path = self.app.storage.path().join("maki.log");
-                let log_path_str = log_path.to_string_lossy();
-                let cmd_string = match &settings.log_command {
-                    Some(cmd) if !cmd.trim().is_empty() => cmd.clone(),
-                    _ => "less +G {}".to_string(),
-                };
-                let cmd_string = cmd_string
-                    .replace("<path>", &log_path_str)
-                    .replace("alog", &log_path_str)
-                    .replace("{}", &log_path_str);
-
-                if let Err(e) = terminal::run_view_log_command(&cmd_string, self.terminal) {
-                    self.app.flash(e);
-                }
-            }
             Action::Btw(question) => {
                 let slot = self.model_slot.load();
                 self.app
                     .start_btw(question, Arc::clone(&slot.provider), slot.model.clone());
             }
-            Action::RenameSession(messages) => {
-                self.handles.queue.push(QueueItem::Rename {
-                    messages,
-                    run_id: self.app.run_id,
-                });
-            }
             Action::Suspend => terminal::suspend(self.terminal),
             Action::RefreshModels => self.refresh_models(),
+            Action::RefreshUsage => self.refresh_usage(),
             Action::Quit => {}
         }
     }
@@ -603,6 +552,8 @@ impl<'t> EventLoop<'t> {
             Ok(mut new_model) => match from_model(&mut new_model, self.timeouts) {
                 Ok(new_provider) => {
                     self.app.update_model(&new_model);
+                    self.app.record_recent_model(&spec);
+                    self.app.usage_slot.store(None);
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
                         provider: Arc::from(new_provider),
@@ -624,6 +575,21 @@ impl<'t> EventLoop<'t> {
         .detach();
     }
 
+    fn refresh_usage(&self) {
+        let provider = Arc::clone(&self.model_slot.load().provider);
+        let slot = Arc::clone(&self.app.usage_slot);
+        slot.store(Some(Arc::new(UsageFetchState::Loading)));
+        smol::spawn(async move {
+            let state = match provider.fetch_usage().await {
+                Ok(Some(usage)) => UsageFetchState::Ready(usage),
+                Ok(None) => UsageFetchState::Unsupported,
+                Err(e) => UsageFetchState::Error(e.user_message()),
+            };
+            slot.store(Some(Arc::new(state)));
+        })
+        .detach();
+    }
+
     fn refresh_provider(&mut self, slug: String) {
         let current = self.model_slot.load();
         let current_model = &current.model;
@@ -631,6 +597,7 @@ impl<'t> EventLoop<'t> {
         if current_model.provider.to_string() == slug {
             let mut m = current_model.clone();
             if let Ok(provider) = maki_providers::provider::from_model(&mut m, self.timeouts) {
+                self.app.usage_slot.store(None);
                 self.model_slot.store(Arc::new(ModelSlot {
                     model: m,
                     provider: Arc::from(provider),
@@ -643,9 +610,6 @@ impl<'t> EventLoop<'t> {
     }
 
     fn shutdown(mut self) -> (Option<String>, i32) {
-        let settings = crate::components::settings_picker::UserSettings::load();
-        settings.save();
-
         let exit_code = self.app.exit_request.code();
         let session_id = self
             .app

@@ -32,6 +32,9 @@ pub(crate) async fn stream_with_retry(
     opts: RequestOptions,
     session_id: Option<&str>,
 ) -> Result<StreamResponse, AgentError> {
+    let opts = opts.clamped(model);
+    let messages = maki_providers::adapt_images_for_model(model, messages);
+    let messages = &*messages;
     let mut retry = RetryState::new();
     loop {
         let (ptx, prx) = flume::unbounded();

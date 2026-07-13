@@ -180,13 +180,19 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- **grep** to find a known string or regex across files; don't double-escape the pattern.",
+  content = "- Use the **grep** tool when searching for specific content across files.",
 })
 
 maki.api.register_tool({
   name = "grep",
   kind = "search",
-  description = [[Regex search over file contents (respects .gitignore). Don't quote or double-escape the pattern (`\[` not `\\[`). Multi-line auto-enables with \n, (?s), or (?m).]],
+  description = [[Search file contents using regex.
+
+- Respects .gitignore.
+- Results grouped by file, sorted by modification time.
+- Prefer speculative parallel searches over sequential rounds of glob+grep.
+- Do NOT wrap the pattern in quotes. Do NOT double-escape (e.g. `\[` not `\\[`).
+- Multi-line matching is auto-enabled when the pattern contains `\n`, `(?s)`, or `(?m)`.]],
 
   schema = {
     type = "object",

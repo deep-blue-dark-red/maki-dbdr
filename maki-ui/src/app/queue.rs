@@ -122,21 +122,11 @@ impl App {
         });
     }
 
-    pub(super) fn queue_compact(&mut self, target_tokens: Option<usize>) {
+    pub(super) fn queue_compact(&mut self) {
         let Some(ref shared) = self.queue.shared else {
             return;
         };
         shared.push(QueueItem::Compact {
-            run_id: self.run_id,
-            target_tokens,
-        });
-    }
-
-    pub(super) fn queue_checkpoint(&mut self) {
-        let Some(ref shared) = self.queue.shared else {
-            return;
-        };
-        shared.push(QueueItem::Checkpoint {
             run_id: self.run_id,
         });
     }
@@ -152,16 +142,6 @@ impl App {
     /// frame, so the user sees their message land where it will stay.
     pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
         self.status = super::Status::Streaming;
-        self.active_run_start = Some(std::time::Instant::now());
-        self.active_run_duration = None;
-        let mut input_tokens = self.main_chat().context_size;
-        if input_tokens == 0 && let Some(ref sys) = self.state.session.meta.system_prompt {
-            input_tokens = (sys.len() / 4) as u32;
-        }
-        self.active_run_input_tokens = input_tokens + (msg.text.len() / 4) as u32;
-        self.active_run_output_chars = 0;
-        self.turn_api_sent_at = Some(std::time::Instant::now());
-        self.turn_first_token_at = None;
         if let Some(ref handle) = self.lua_event_handle {
             handle.fire_autocmd("TurnStart", serde_json::json!({}));
         }

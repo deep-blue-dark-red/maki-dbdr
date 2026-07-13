@@ -38,6 +38,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gemini-2.5-pro"],
             tier: ModelTier::Strong,
             family: ModelFamily::Gemini,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 1.25,
@@ -53,6 +54,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gemini-2.5-flash"],
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 0.15,
@@ -68,6 +70,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gemini-2.0-flash-lite"],
             tier: ModelTier::Weak,
             family: ModelFamily::Gemini,
+            vision: true,
             default: true,
             pricing: ModelPricing {
                 input: 0.075,
@@ -122,14 +125,12 @@ impl Google {
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
         let auth = self.auth.lock().unwrap();
-        let mut builder = Request::builder()
-            .method(method)
-            .uri(url)
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        builder
+        auth.configure_request(
+            Request::builder()
+                .method(method)
+                .uri(url)
+                .header("user-agent", super::user_agent()),
+        )
     }
 
     fn api_key(&self) -> String {
@@ -175,14 +176,7 @@ impl Google {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
 
-        if !matches!(thinking, ThinkingConfig::Off) {
-            let config = match thinking {
-                ThinkingConfig::Budget(n) => json!({"thinkingBudget": n}),
-                ThinkingConfig::Adaptive => json!({"includeThoughts": true}),
-                ThinkingConfig::Off => unreachable!(),
-            };
-            body["generationConfig"]["thinkingConfig"] = config;
-        }
+        thinking.apply_google_thinking(&mut body);
 
         if model.max_output_tokens > 0 {
             body["generationConfig"]["maxOutputTokens"] = json!(model.max_output_tokens);
@@ -214,7 +208,7 @@ impl Google {
             .header("content-type", "application/json")
             .body(json_body)?;
 
-        let response = super::send_request(&self.client, request).await?;
+        let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
 
         if status == 200 {
@@ -241,10 +235,10 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request("GET", &url).body(Vec::new()).unwrap();
+        let request = self.build_request("GET", &url).body(()).unwrap();
         let client = self.client.clone();
         Box::pin(async move {
-            let mut response = super::send_request(&client, request).await?;
+            let mut response = client.send_async(request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
             }
@@ -309,6 +303,14 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
         };
 
         let mut parts: Vec<Value> = Vec::new();
+        // Gemini is strict about function-response turns: tool-returned
+        // images get their own user turn instead of mixing inlineData into
+        // the functionResponse content.
+        let has_tool_results = msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        let mut image_parts: Vec<Value> = Vec::new();
 
         for block in &msg.content {
             match block {
@@ -356,24 +358,26 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     }));
                 }
                 ContentBlock::Image { source } => {
-                    let mime = match source.media_type {
-                        crate::ImageMediaType::Png => "image/png",
-                        crate::ImageMediaType::Jpeg => "image/jpeg",
-                        crate::ImageMediaType::Gif => "image/gif",
-                        crate::ImageMediaType::Webp => "image/webp",
-                    };
-                    parts.push(json!({
+                    let part = json!({
                         "inlineData": {
-                            "mimeType": mime,
+                            "mimeType": source.media_type.mime(),
                             "data": source.data,
                         }
-                    }));
+                    });
+                    if has_tool_results {
+                        image_parts.push(part);
+                    } else {
+                        parts.push(part);
+                    }
                 }
             }
         }
 
         if !parts.is_empty() {
             out.push(json!({"role": role, "parts": parts}));
+        }
+        if !image_parts.is_empty() {
+            out.push(json!({"role": "user", "parts": image_parts}));
         }
     }
 
@@ -607,20 +611,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn google_build_body_basic() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = Model {
+    fn test_model() -> Model {
+        Model {
             id: "gemini-2.5-flash".into(),
             provider: crate::provider::ProviderKind::Google,
             dynamic_slug: None,
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
+            vision: true,
             supports_tool_examples_override: None,
+            supports_thinking_override: None,
             pricing: ModelPricing::default(),
             max_output_tokens: 8192,
             context_window: 1_048_576,
-        };
+        }
+    }
+
+    #[test]
+    fn google_build_body_basic() {
+        let google = Google::with_auth(test_auth(), test_timeouts());
+        let model = test_model();
         let messages = vec![Message::user("hello".into())];
         let body = google.build_body(
             &model,
@@ -639,19 +649,14 @@ mod tests {
     #[test]
     fn google_build_body_thinking_adaptive() {
         let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = Model {
-            id: "gemini-2.5-flash".into(),
-            provider: crate::provider::ProviderKind::Google,
-            dynamic_slug: None,
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gemini,
-            supports_tool_examples_override: None,
-            pricing: ModelPricing::default(),
-            max_output_tokens: 8192,
-            context_window: 1_048_576,
-        };
-        let messages = vec![Message::user("think about this".into())];
-        let body = google.build_body(&model, &messages, "", &json!([]), ThinkingConfig::Adaptive);
+        let messages = vec![Message::user("think".into())];
+        let body = google.build_body(
+            &test_model(),
+            &messages,
+            "",
+            &json!([]),
+            ThinkingConfig::Adaptive,
+        );
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"],
@@ -662,20 +667,9 @@ mod tests {
     #[test]
     fn google_build_body_thinking_budget() {
         let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = Model {
-            id: "gemini-2.5-flash".into(),
-            provider: crate::provider::ProviderKind::Google,
-            dynamic_slug: None,
-            tier: ModelTier::Medium,
-            family: ModelFamily::Gemini,
-            supports_tool_examples_override: None,
-            pricing: ModelPricing::default(),
-            max_output_tokens: 8192,
-            context_window: 1_048_576,
-        };
         let messages = vec![Message::user("think hard".into())];
         let body = google.build_body(
-            &model,
+            &test_model(),
             &messages,
             "",
             &json!([]),
@@ -761,6 +755,59 @@ mod tests {
             result[1]["parts"][0]["functionResponse"]["name"],
             "read_file"
         );
+    }
+
+    #[test]
+    fn convert_messages_tool_returned_image_gets_own_user_turn() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "[image: pic.png 1KB]".into(),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    source: crate::ImageSource::new(
+                        crate::ImageMediaType::Png,
+                        std::sync::Arc::from("aGVsbG8="),
+                    ),
+                },
+            ],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result.len(), 2);
+        assert!(result[0]["parts"][0].get("functionResponse").is_some());
+        assert!(result[0]["parts"].as_array().unwrap().len() == 1);
+        assert_eq!(result[1]["role"], "user");
+        assert_eq!(result[1]["parts"][0]["inlineData"]["mimeType"], "image/png");
+    }
+
+    #[test]
+    fn convert_messages_chat_pasted_image_stays_in_same_turn() {
+        // Split the turn and the question drifts apart from its picture.
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is this?".into(),
+                },
+                ContentBlock::Image {
+                    source: crate::ImageSource::new(
+                        crate::ImageMediaType::Webp,
+                        std::sync::Arc::from("aGVsbG8="),
+                    ),
+                },
+            ],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result.len(), 1);
+        let parts = result[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/webp");
     }
 
     #[test]

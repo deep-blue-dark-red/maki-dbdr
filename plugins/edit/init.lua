@@ -1,10 +1,30 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
+local replace_lines = require("edit_helpers").replace_lines
 
-local EDIT_DESCRIPTION = [[Replace an exact string in a file. old_string must be unique (or set replace_all). Read the file first; exclude the line-number prefix from read output when copying. Cheaper than write for targeted changes.]]
+local EDIT_LINES_DESCRIPTION =
+  [[Edit lines by number. Omit `end` to insert before `start` without removing lines. Set `end` to replace or delete (empty `new_string`) a range.]]
 
-local MULTIEDIT_DESCRIPTION = [[Several exact-string replacements in one file, applied in order, all-or-nothing. Read the file first. Order edits so an earlier one doesn't alter text a later one matches on.]]
+local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
+
+- The old_string must appear exactly once unless replace_all is true.
+- Read the file first to get exact content.
+- When copying text from read output, do NOT include the line number prefix (e.g. `42: `) - only the content after it.
+- Prefer this over write for targeted changes - it uses far fewer tokens.
+- Use replace_all for renaming across a file.
+]]
+
+local MULTIEDIT_DESCRIPTION = [[Make multiple find-and-replace edits to a single file atomically.
+Prefer this over edit when making multiple changes to the same file.
+
+- Read the file first to get exact content.
+- old_string must match the file contents exactly, including all whitespace and indentation.
+- Each edit must match exactly once unless replace_all is true. Use replace_all for renaming across a file.
+- Edits are applied in sequence - each operates on the result of the previous.
+- If any edit fails, none are written.
+- Ensure earlier edits don't affect text that later edits need to find.
+]]
 
 local function edit_header(input)
   local buf = maki.ui.buf()
@@ -12,8 +32,53 @@ local function edit_header(input)
   return buf
 end
 
-local function edit_restore(_input, output, _is_error, _ctx)
-  return ToolView.restore(output, { max_lines = 0 })
+local function split_lines(text)
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  if lines[#lines] == "" then
+    lines[#lines] = nil
+  end
+  return lines
+end
+
+local function edit_view_opts(ctx)
+  local tol = ctx:tool_output_lines()
+  return { max_lines = (tol and tol.write) or FALLBACK_VIEW_LINES, keep = "head" }
+end
+
+-- Old lines red, new lines green, one block per edit. Rebuilt purely from
+-- the input, so a batch child can render the change without the file
+-- snapshots (those live in ToolOutput::Diff, which Rust renders standalone).
+local function diff_view(blocks, ctx)
+  local buf = maki.ui.buf()
+  local view = ToolView.new(buf, edit_view_opts(ctx))
+  for i, block in ipairs(blocks) do
+    if i > 1 then
+      view:append({})
+    end
+    for _, line in ipairs(split_lines(block.old or "")) do
+      view:append({ { line, "diff_old" } })
+    end
+    for _, line in ipairs(split_lines(block.new or "")) do
+      view:append({ { line, "diff_new" } })
+    end
+  end
+  view:finish()
+  buf:on("click", function()
+    view:toggle()
+  end)
+  return buf
+end
+
+local function diff_restore(blocks_from)
+  return function(input, output, is_error, ctx)
+    if is_error then
+      return ToolView.restore(output, edit_view_opts(ctx))
+    end
+    return diff_view(blocks_from(input), ctx)
+  end
 end
 
 local function apply_edit(path, ctx, transform)
@@ -62,7 +127,7 @@ maki.api.register_tool({
   name = "edit",
   kind = "edit",
   mutable_path = "path",
-  permission_scope = "path",
+  permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
   description = EDIT_DESCRIPTION,
 
@@ -93,7 +158,9 @@ maki.api.register_tool({
   },
 
   header = edit_header,
-  restore = edit_restore,
+  restore = diff_restore(function(input)
+    return { { old = input.old_string, new = input.new_string } }
+  end),
 
   handler = function(input, ctx)
     local result, err = apply_edit(input.path, ctx, function(content)
@@ -111,7 +178,7 @@ maki.api.register_tool({
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
-  permission_scope = "path",
+  permission_scopes = "path",
   start_annotation = "edits",
   audiences = { "main", "general_sub", "interpreter" },
   description = MULTIEDIT_DESCRIPTION,
@@ -153,7 +220,13 @@ maki.api.register_tool({
   },
 
   header = edit_header,
-  restore = edit_restore,
+  restore = diff_restore(function(input)
+    local blocks = {}
+    for _, edit in ipairs(input.edits or {}) do
+      blocks[#blocks + 1] = { old = edit.old_string, new = edit.new_string }
+    end
+    return blocks
+  end),
 
   handler = function(input, ctx)
     local edits = input.edits
@@ -179,5 +252,59 @@ maki.api.register_tool({
     local n = #edits
     local s = n == 1 and "" or "s"
     return diff_result(result, string.format("applied %d edit%s to %s", n, s, shorten_path(result.path)))
+  end,
+})
+
+maki.api.register_tool({
+  name = "edit_lines",
+  kind = "edit",
+  mutable_path = "path",
+  permission_scopes = "path",
+  audiences = { "main", "general_sub", "interpreter" },
+  description = EDIT_LINES_DESCRIPTION,
+
+  schema = {
+    type = "object",
+    properties = {
+      path = {
+        type = "string",
+        description = "Absolute path to the file",
+        required = true,
+        alias = "file_path",
+      },
+      start = {
+        type = "integer",
+        description = "First line (1-indexed)",
+        required = true,
+      },
+      ["end"] = {
+        type = "integer",
+        description = "Last line, inclusive. Omit to insert before start without removing lines.",
+      },
+      new_string = {
+        type = "string",
+        description = "Replacement text",
+        required = true,
+      },
+    },
+  },
+
+  header = edit_header,
+  restore = diff_restore(function(input)
+    return { { new = input.new_string } }
+  end),
+
+  handler = function(input, ctx)
+    local end_line = input["end"]
+    local result, err = apply_edit(input.path, ctx, function(content)
+      return replace_lines(content, input.start, end_line, input.new_string)
+    end)
+    if not result then
+      return { llm_output = err, is_error = true }
+    end
+    local summary = end_line
+        and string.format("replaced lines %d-%d in %s", input.start, end_line, shorten_path(result.path))
+      or string.format("inserted at line %d in %s", input.start, shorten_path(result.path))
+    return diff_result(result, summary)
   end,
 })

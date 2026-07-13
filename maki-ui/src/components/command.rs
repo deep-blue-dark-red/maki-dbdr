@@ -33,11 +33,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
-        name: "/checkpoint",
-        description: "Insert a summary checkpoint without discarding history",
-        max_args: 0,
-    },
-    BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
@@ -45,6 +40,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/help",
         description: "Show keybindings",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/usage",
+        description: "Show token usage breakdown",
         max_args: 0,
     },
     BuiltinCommand {
@@ -103,63 +103,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
-        name: "/export",
-        description: "Export session transcript as Markdown or JSON",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/logs",
-        description: "Show last 30 lines of application logs",
+        name: "/workflow",
+        description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,
     },
     BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/q",
-        description: "Exit the application (shortcut for /exit)",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/settings",
-        description: "Show settings menu",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/system_prompt",
-        description: "Edit the system prompt template in default editor",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/skills",
-        description: "Manage global and project AI agent skills",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/plugins",
-        description: "Enable or disable built-in Lua plugins",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/rewind",
-        description: "Show rewind menu to delete turns",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/goto",
-        description: "Scroll to a specific turn",
-        max_args: 1,
-    },
-    BuiltinCommand {
-        name: "/reload",
-        description: "Reload user configuration file (maki.config) and update keybindings",
-        max_args: 0,
-    },
-    BuiltinCommand {
-        name: "/rename",
-        description: "Generate a session name from the conversation using AI",
         max_args: 0,
     },
 ];
@@ -382,13 +332,6 @@ impl CommandPalette {
 
         // Tick to get matches
         self.tick();
-
-        let input_cmd = format!("/{}", cmd_word);
-        if let Some(exact_idx) = self.filtered.iter().position(|m| {
-            self.item_name(m).eq_ignore_ascii_case(&input_cmd)
-        }) {
-            self.selected = exact_idx;
-        }
     }
 
     fn tick(&mut self) {
@@ -662,14 +605,6 @@ mod tests {
                 accepts_args: false,
             },
         ])
-    }
-
-    #[test]
-    fn exact_match_takes_precedence() {
-        let p = synced("/q");
-        assert!(p.is_active());
-        let selected_name = p.item_name(&p.filtered[p.selected]);
-        assert_eq!(selected_name, "/q");
     }
 
     #[test]

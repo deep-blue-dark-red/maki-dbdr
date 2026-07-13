@@ -6,14 +6,13 @@
 pub mod animation;
 pub mod app;
 pub mod chat;
-pub mod config;
 mod clipboard;
 mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;
 pub use highlight::highlight_ansi;
-mod image;
+pub mod image;
 mod markdown;
 mod render_worker;
 mod selection;
@@ -35,7 +34,7 @@ use maki_providers::TokenUsage;
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
 pub(crate) use agent::AgentCommand;
-pub use event_loop::{BufClickHandler, EventLoopParams};
+pub use event_loop::EventLoopParams;
 
 pub fn run(
     params: EventLoopParams,

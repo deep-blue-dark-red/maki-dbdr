@@ -141,7 +141,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- **index** a source file for its skeleton first, then **read** with offset/limit for the section you need.",
+  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
 })
 
 maki.api.register_prompt_hint({
@@ -152,7 +152,12 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "index",
   kind = "read",
-  description = [[Compact skeleton of a source file — imports, types, signatures with [line numbers]. Use before read to locate the section you need. Source files and markdown only; on failure use read.]],
+  description = [[
+Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
+
+- Use this FIRST to understand file structure before using read with offset/limit.
+- Supports source files in different programming languages and markdown.
+- Falls back with an error on unsupported languages. Use read instead.]],
 
   schema = {
     type = "object",
@@ -197,8 +202,7 @@ maki.api.register_tool({
       end
     end
 
-    local config = ctx:config()
-    local max_file_size = (config and config.index_max_file_size) or (2 * 1024 * 1024)
+    local max_file_size = ctx:config("index_max_file_size", (2 * 1024 * 1024))
     if meta and meta.size > max_file_size then
       return "error: File too large ("
         .. meta.size

@@ -231,11 +231,20 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Run git, build, test, and system commands. Not for reading or writing files. Use workdir instead of `cd &&`. Chain dependent commands with &&; use batch for independent ones. Output truncates past ~2000 lines.]]
+local description = [[Execute a bash command.
+Commands run in ]] .. cwd .. [[ by default.
+
+- **DO NOT** use for file ops! Only git, builds, tests, and system commands.
+- Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
+- Do NOT use to communicate text to the user.
+- Chain dependent commands with `&&`. Use batch for independent ones.
+- Provide a short `description` (3-5 words).
+- Output truncated beyond 2000 lines or 50KB.
+- Interactive commands (sudo, ssh prompts) fail immediately.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- **bash** runs anything, but prefer an explicit tool over its shell equivalent where one exists.",
+  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
 })
 
 maki.api.register_tool({
@@ -326,10 +335,9 @@ maki.api.register_tool({
     end
 
     local command, workdir = parse_cd_hint(input)
-    local config = ctx:config()
-    local timeout_secs = input.timeout or (config and config.bash_timeout_secs) or 120
-    local max_lines = (config and config.max_output_lines) or 2000
-    local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
+    local timeout_secs = input.timeout or ctx:config("bash_timeout_secs", 120)
+    local max_lines = ctx:config("max_output_lines", 2000)
+    local max_bytes = ctx:config("max_output_bytes", (50 * 1024))
 
     ctx:set_deadline(timeout_secs)
 

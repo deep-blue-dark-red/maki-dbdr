@@ -8,36 +8,6 @@ use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
-pub(crate) fn display_msg_index_for_turn(messages: &[Message], turn_msg_idx: usize) -> usize {
-    let mut display_idx = 0;
-    for (i, msg) in messages.iter().enumerate() {
-        if i == turn_msg_idx {
-            return display_idx;
-        }
-        match msg.role {
-            Role::User => display_idx += 1,
-            Role::Assistant => {
-                for block in &msg.content {
-                    let non_empty = match block {
-                        maki_providers::ContentBlock::Text { text } if !text.is_empty() => true,
-                        maki_providers::ContentBlock::Thinking { thinking, .. }
-                            if !thinking.is_empty() =>
-                        {
-                            true
-                        }
-                        maki_providers::ContentBlock::ToolUse { .. } => true,
-                        _ => false,
-                    };
-                    if non_empty {
-                        display_idx += 1;
-                    }
-                }
-            }
-        }
-    }
-    0
-}
-
 pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
 
 pub enum RewindPickerAction {
@@ -48,7 +18,6 @@ pub enum RewindPickerAction {
 
 pub struct RewindEntry {
     pub turn_index: usize,
-    pub segment_index: usize,
     pub prompt_preview: String,
     pub prompt_text: String,
 }
@@ -92,7 +61,6 @@ impl RewindPicker {
             };
             entries.push(RewindEntry {
                 turn_index: msg_idx,
-                segment_index: 0,
                 prompt_preview: preview,
                 prompt_text: full_text.to_owned(),
             });

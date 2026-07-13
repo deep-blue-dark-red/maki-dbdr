@@ -72,7 +72,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut plugin_host = if cli.no_plugins {
         PluginHost::disabled()
     } else {
-        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+        PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
             .context("initialize lua plugin host")?
     };
 
@@ -104,15 +104,6 @@ pub fn run(cli: Cli) -> Result<()> {
         );
     }
     config.validate()?;
-
-    // Apply interactive plugin overrides from maki.config (disabled_plugin entries).
-    // These take precedence over init.lua to support the /plugins menu.
-    {
-        let ui_settings = maki_ui::config::load_config();
-        if !ui_settings.disabled_plugins.is_empty() {
-            config.plugins.tools.retain(|t| !ui_settings.disabled_plugins.contains(t));
-        }
-    }
 
     plugin_host
         .load_builtins(&config.plugins)
@@ -157,6 +148,7 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             prompt_slots,
             fast,
+            workflow: config.always_workflow,
         })
         .context("run sdk mode")?;
     } else if cli.print {
@@ -164,6 +156,7 @@ pub fn run(cli: Cli) -> Result<()> {
         crate::print::run(
             &model,
             cli.initial_prompt,
+            cli.images,
             cli.output_format,
             cli.verbose,
             config.agent,
@@ -171,8 +164,7 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             plugin_host.event_handle(),
             fast,
-            cli.system_prompt.filter(|s| !s.is_empty()),
-            cli.append_system_prompt.filter(|s| !s.is_empty()),
+            config.always_workflow,
         )
         .context("run print mode")?;
     } else {
@@ -186,6 +178,7 @@ pub fn run(cli: Cli) -> Result<()> {
         )?;
         if session.messages.is_empty() {
             session.meta.fast |= config.always_fast;
+            session.meta.workflow |= config.always_workflow;
             if let Some(thinking) = config.always_thinking {
                 session.meta.thinking = Some(thinking);
             }
@@ -217,13 +210,6 @@ pub fn run(cli: Cli) -> Result<()> {
                 hint_reader: plugin_host.hint_reader(),
                 ui_action_rx,
                 lua_event_handle: plugin_host.event_handle(),
-                buf_click: plugin_host.event_handle().map(|eh| {
-                    Arc::new(
-                        move |tool_id: &str, row: u32| -> Option<maki_lua::ClickReply> {
-                            eh.fire_click(tool_id, row)
-                        },
-                    ) as maki_ui::BufClickHandler
-                }),
             },
             initial_prompt,
         )

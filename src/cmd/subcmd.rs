@@ -26,7 +26,7 @@ use maki_storage::model::persist_model;
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
-        Some("copilot") => copilot_auth::login()?,
+        Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => login_provider(&slugify(slug), storage)?,
         None => login_interactive(storage)?,
     }
@@ -333,7 +333,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
-        "copilot" => copilot_auth::logout()?,
+        "copilot" => copilot_auth::logout(storage)?,
         _ => {
             let mut config = ProvidersConfig::load();
             let deleted =
@@ -455,7 +455,7 @@ pub fn index(path: &str, no_plugins: bool) -> Result<()> {
     let mut host = if no_plugins {
         PluginHost::disabled()
     } else {
-        PluginHost::new(Arc::clone(ToolRegistry::native_arc()))
+        PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
             .context("initialize lua plugin host")?
     };
 
@@ -474,7 +474,7 @@ pub fn index(path: &str, no_plugins: bool) -> Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| Path::new(path).to_path_buf());
     let input = serde_json::json!({"path": abs_path.to_str().unwrap_or(path)});
-    let reg = ToolRegistry::native_arc();
+    let reg = ToolRegistry::global_arc();
     let entry = reg
         .get("index")
         .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
@@ -529,7 +529,8 @@ pub fn prompt(
     use maki_agent::agent::{build_system_prompt, load_instruction_text};
     use maki_agent::prompt::{PromptId, assemble};
     use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolFilter, ToolRegistry};
+    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
+    use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
         bail!("--plan can only be used with the 'system' prompt variant");
@@ -539,7 +540,7 @@ pub fn prompt(
     load_env_files(&cwd);
 
     let vars = template::env_vars();
-    let reg = ToolRegistry::native_arc();
+    let reg = ToolRegistry::global_arc();
     let mut host = PluginHost::new(Arc::clone(reg)).context("initialize lua plugin host")?;
     let raw_config = host.load_init_files(&cwd).context("load init.lua files")?;
     let config = raw_config
@@ -552,6 +553,8 @@ pub fn prompt(
     if tools {
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {
@@ -583,10 +586,16 @@ pub fn prompt(
             } else {
                 maki_agent::AgentMode::Build
             };
-            build_system_prompt(&vars, &mode, &instructions, &slots)
+            let model_spec = config
+                .provider
+                .default_model
+                .as_deref()
+                .unwrap_or("anthropic/claude-sonnet-4-20250514");
+            let model = Model::from_spec(model_spec).context("invalid default model")?;
+            build_system_prompt(&vars, &mode, &instructions, &slots, &model)
         }
-        PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions, None),
-        PromptVariant::General => assemble(PromptId::General, &slots, &instructions, None),
+        PromptVariant::Research => assemble(PromptId::Research, &slots, &instructions),
+        PromptVariant::General => assemble(PromptId::General, &slots, &instructions),
     };
 
     print!("{output}");

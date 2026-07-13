@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::model::{Model, ModelPricing, ModelTier, models_for_provider};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 use super::ResolvedAuth;
 use super::anthropic::Anthropic;
@@ -23,6 +23,7 @@ use super::google::Google;
 use super::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use super::mistral::Mistral;
 use super::openai::OpenAi;
+use super::opencode::Opencode;
 use super::openrouter::OpenRouter;
 use super::synthetic::Synthetic;
 use super::tensorx::TensorX;
@@ -58,12 +59,36 @@ struct ScriptModel {
     tier: ModelTier,
     #[serde(default)]
     supports_tool_examples: Option<bool>,
+    #[serde(default)]
+    supports_thinking: Option<bool>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
     #[serde(default = "default_max_output_tokens")]
     max_output_tokens: u32,
     #[serde(default = "default_context_window")]
     context_window: u32,
     #[serde(default)]
     pricing: Option<ModelPricing>,
+}
+
+impl ScriptModel {
+    fn to_model(&self, slug: &str, base: ProviderKind, id: String, tier: ModelTier) -> Model {
+        Model {
+            id,
+            provider: base,
+            dynamic_slug: Some(slug.to_string()),
+            tier,
+            family: base.family(),
+            supports_tool_examples_override: self.supports_tool_examples,
+            supports_thinking_override: self.supports_thinking,
+            vision: self
+                .supports_vision
+                .unwrap_or_else(|| base.family().supports_vision()),
+            pricing: self.pricing.clone().unwrap_or_default(),
+            max_output_tokens: self.max_output_tokens,
+            context_window: self.context_window,
+        }
+    }
 }
 
 fn default_tier() -> ModelTier {
@@ -394,6 +419,10 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             TensorX::with_auth(auth.clone(), timeouts)
                 .with_system_prefix(meta.system_prefix.clone()),
         ),
+        ProviderKind::Opencode => Box::new(
+            Opencode::with_auth(auth.clone(), timeouts)
+                .with_system_prefix(meta.system_prefix.clone()),
+        ),
     };
 
     Ok(Box::new(DynamicProvider {
@@ -441,33 +470,13 @@ pub fn lookup_model(slug: &str, model_id: &str) -> Option<Model> {
         .iter()
         .filter(|m| model_id.starts_with(&m.id))
         .max_by_key(|m| m.id.len())?;
-    Some(Model {
-        id: model_id.to_string(),
-        provider: meta.base,
-        dynamic_slug: Some(slug.to_string()),
-        tier: script_model.tier,
-        family: meta.base.family(),
-        supports_tool_examples_override: script_model.supports_tool_examples,
-        pricing: script_model.pricing.clone().unwrap_or_default(),
-        max_output_tokens: script_model.max_output_tokens,
-        context_window: script_model.context_window,
-    })
+    Some(script_model.to_model(slug, meta.base, model_id.to_string(), script_model.tier))
 }
 
 pub fn find_model_for_tier(slug: &str, tier: ModelTier) -> Option<Model> {
     let meta = find_meta(slug)?;
     let script_model = meta.models.iter().find(|m| m.tier == tier)?;
-    Some(Model {
-        id: script_model.id.clone(),
-        provider: meta.base,
-        dynamic_slug: Some(slug.to_string()),
-        tier,
-        family: meta.base.family(),
-        supports_tool_examples_override: script_model.supports_tool_examples,
-        pricing: script_model.pricing.clone().unwrap_or_default(),
-        max_output_tokens: script_model.max_output_tokens,
-        context_window: script_model.context_window,
-    })
+    Some(script_model.to_model(slug, meta.base, script_model.id.clone(), tier))
 }
 
 struct DynamicProvider {
@@ -515,6 +524,9 @@ impl Provider for DynamicProvider {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
+        if self.models.is_empty() {
+            return self.inner.list_models();
+        }
         Box::pin(async {
             Ok(self
                 .models
@@ -524,6 +536,8 @@ impl Provider for DynamicProvider {
                     context_window: Some(m.context_window),
                     max_output_tokens: Some(m.max_output_tokens),
                     pricing: m.pricing.clone(),
+                    supports_thinking: None,
+                    provider_info: None,
                 })
                 .collect())
         })
@@ -534,7 +548,11 @@ impl Provider for DynamicProvider {
     }
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
-        self.run_auth_script("resolve")
+        self.run_auth_script("reload")
+    }
+
+    fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+        self.inner.fetch_usage()
     }
 }
 
@@ -542,7 +560,9 @@ impl Provider for DynamicProvider {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::fs;
+    use std::fs::{self, File};
+    #[cfg(unix)]
+    use std::io::Write;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(unix)]
@@ -616,7 +636,10 @@ mod tests {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in\n  info) echo '{info_json}' ;;\n  resolve) echo '{{\"headers\": {{\"authorization\": \"Bearer test\"}}}}' ;;\n  refresh) echo '{{\"headers\": {{\"authorization\": \"Bearer refreshed\"}}}}' ;;\n  *) exit 1 ;;\nesac\n"
         );
-        fs::write(&path, script).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -662,7 +685,10 @@ case "$1" in
   *) exit 1 ;;
 esac
 "#;
-        fs::write(&path, script).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         let providers = discover_in(tmp.path());
         assert_eq!(providers.len(), 1);
@@ -693,6 +719,7 @@ esac
     #[test_case("zai", ProviderKind::Zai ; "base_zai")]
     #[test_case("synthetic", ProviderKind::Synthetic ; "base_synthetic")]
     #[test_case("deepseek", ProviderKind::DeepSeek ; "base_deepseek")]
+    #[test_case("opencode", ProviderKind::Opencode ; "base_opencode")]
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);

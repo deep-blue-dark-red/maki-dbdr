@@ -620,7 +620,7 @@ impl Provider for Bedrock {
 
             debug!(model = %model_id, region = %auth.region, "sending Bedrock request");
 
-            let mut response = super::super::send_request(&self.client, request).await?;
+            let mut response = self.client.send_async(request).await?;
             let status = response.status().as_u16();
             if status != 200 {
                 return Err(AgentError::from_response(response).await);

@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -36,6 +36,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["hf:moonshotai/Kimi-K2.5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Synthetic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.45,
@@ -51,6 +52,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
             tier: ModelTier::Medium,
             family: ModelFamily::Synthetic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.56,
@@ -66,6 +68,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["hf:zai-org/GLM-4.7-Flash"],
             tier: ModelTier::Weak,
             family: ModelFamily::Synthetic,
+            vision: false,
             default: true,
             pricing: ModelPricing {
                 input: 0.10,
@@ -129,7 +132,8 @@ impl Provider for Synthetic {
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking.apply_reasoning_effort(&mut body);
+            opts.thinking
+                .apply_reasoning_effort(&mut body, EffortScale::Standard);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

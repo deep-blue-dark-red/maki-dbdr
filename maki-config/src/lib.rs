@@ -29,6 +29,7 @@ pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: u32 = 40_000;
 pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
 pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
+pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -50,6 +51,7 @@ pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 pub const MIN_SEARCH_RESULT_LIMIT: usize = 10;
 pub const MIN_INTERPRETER_MAX_MEMORY_MB: usize = 10;
+pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
 pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
@@ -62,10 +64,11 @@ pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
+    "batch",
+    "code_execution",
     "edit",
     "glob",
     "grep",
-    "hackernews",
     "index",
     "memory",
     "multiedit",
@@ -74,14 +77,15 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "skill",
     "task",
     "todo_write",
+    "view_image",
     "webfetch",
     "websearch",
     "write",
 ];
 
-pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
+
+pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines"];
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -127,6 +131,13 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
+    },
+    ConfigField {
+        name: "always_workflow",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        description: "Start every session with workflow mode (task callable inside code_execution)",
     },
     ConfigField {
         name: "always_thinking",
@@ -205,6 +216,7 @@ impl AlwaysThinking {
 pub struct RawConfig {
     pub always_yolo: Option<bool>,
     pub always_fast: Option<bool>,
+    pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
     pub ui: UiFileConfig,
@@ -217,7 +229,14 @@ pub struct RawConfig {
 
 impl RawConfig {
     pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(self, overlay, always_yolo, always_fast, always_thinking);
+        merge_option!(
+            self,
+            overlay,
+            always_yolo,
+            always_fast,
+            always_workflow,
+            always_thinking
+        );
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
@@ -227,16 +246,21 @@ impl RawConfig {
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
-        let disabled_tools: Vec<String> = self
+        let mut disabled_tools: Vec<String> = self
             .tools
             .iter()
             .filter(|(_, cfg)| cfg.enabled == Some(false))
             .map(|(name, _)| name.clone())
             .collect();
-        LOG_API.store(self.provider.log_api.unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
+        for &name in OPT_IN_TOOLS {
+            if self.tools.get(name).and_then(|t| t.enabled) != Some(true) {
+                disabled_tools.push(name.to_string());
+            }
+        }
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
+            always_workflow: self.always_workflow.unwrap_or(false),
             always_thinking: self
                 .always_thinking
                 .map(AlwaysThinking::resolve)
@@ -265,6 +289,7 @@ pub struct UiFileConfig {
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
+    pub show_thinking: Option<bool>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
 }
 
@@ -277,7 +302,8 @@ impl UiFileConfig {
             scrollbar,
             flash_duration_ms,
             typewriter_ms_per_char,
-            mouse_scroll_lines
+            mouse_scroll_lines,
+            show_thinking
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -332,6 +358,7 @@ pub struct AgentFileConfig {
     pub compaction_buffer: Option<u32>,
     pub search_result_limit: Option<usize>,
     pub interpreter_max_memory_mb: Option<usize>,
+    pub task_max_concurrent: Option<usize>,
 }
 
 impl AgentFileConfig {
@@ -348,7 +375,8 @@ impl AgentFileConfig {
             max_continuation_turns,
             compaction_buffer,
             search_result_limit,
-            interpreter_max_memory_mb
+            interpreter_max_memory_mb,
+            task_max_concurrent
         );
     }
 }
@@ -360,7 +388,6 @@ pub struct ProviderFileConfig {
     pub connect_timeout_secs: Option<u64>,
     pub low_speed_timeout_secs: Option<u64>,
     pub stream_timeout_secs: Option<u64>,
-    pub log_api: Option<bool>,
 }
 
 impl ProviderFileConfig {
@@ -371,8 +398,7 @@ impl ProviderFileConfig {
             default_model,
             connect_timeout_secs,
             low_speed_timeout_secs,
-            stream_timeout_secs,
-            log_api
+            stream_timeout_secs
         );
     }
 }
@@ -413,6 +439,8 @@ impl IndexFileConfig {
 struct PermissionsFileConfig {
     default: Option<DefaultEffect>,
     tools: HashMap<String, ToolPermissions>,
+    mcp_rules: Vec<PermissionRule>,
+    mcp_defaults: HashMap<ToolKey, DefaultEffect>,
 }
 
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
@@ -427,12 +455,54 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
                     .as_bool()?
                     .then_some(DefaultEffect::Allow)
             });
-        let tools = table
-            .iter()
-            .filter(|(k, _)| k != &"allow_all" && k != &"default")
-            .filter_map(|(k, v)| Some((k.clone(), v.clone().try_into::<ToolPermissions>().ok()?)))
-            .collect();
-        Ok(Self { default, tools })
+
+        let mut tools = HashMap::new();
+        let mut mcp_rules = Vec::new();
+        let mut mcp_defaults = HashMap::new();
+
+        for (k, v) in table.iter() {
+            if k.is_empty() || k == "allow_all" || k == "default" {
+                continue;
+            }
+            if k == "mcp" {
+                // TOML [mcp.server] creates nested table: mcp → {server → {...}}
+                if let Some(mcp_table) = v.as_table() {
+                    for (server_name, server_value) in mcp_table {
+                        if let Some(server_table) = server_value.as_table() {
+                            parse_mcp_server_table(
+                                server_name,
+                                server_table,
+                                &mut mcp_rules,
+                                &mut mcp_defaults,
+                            );
+                        } else {
+                            tracing::warn!(
+                                server = server_name.as_str(),
+                                "[mcp.{server_name}] is not a table — skipping"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!("[mcp] is not a table (got {}) — skipping", v.type_str());
+                }
+            } else if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
+                if k.contains('.') {
+                    tracing::warn!(
+                        key = k.as_str(),
+                        "tool section [{k}] contains a dot — did you mean [mcp.{k}]? Skipping."
+                    );
+                } else {
+                    tools.insert(k.clone(), tp);
+                }
+            }
+        }
+
+        Ok(Self {
+            default,
+            tools,
+            mcp_rules,
+            mcp_defaults,
+        })
     }
 }
 
@@ -450,19 +520,29 @@ enum ScopeSet {
     Scopes(Vec<String>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DefaultEffect {
-    #[default]
-    Prompt,
-    Deny,
-    Allow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
     Allow,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultEffect {
+    Allow,
+    Deny,
+    #[default]
+    Prompt,
+}
+
+impl From<Effect> for DefaultEffect {
+    fn from(e: Effect) -> Self {
+        match e {
+            Effect::Allow => DefaultEffect::Allow,
+            Effect::Deny => DefaultEffect::Deny,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -471,9 +551,149 @@ pub enum PermissionTarget {
     Project(PathBuf),
 }
 
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ToolKey {
+    Wildcard,
+    Native(Arc<str>),
+    McpServer { server: Arc<str> },
+    McpTool { server: Arc<str>, tool: Arc<str> },
+}
+
+/// NOTE: `ToolKey` deliberately does not implement `serde::Deserialize`.
+/// Use `ToolKey::parse(&str)` at deserialization boundaries — it performs
+/// validation (wire format, server name, length) that a blanket Deserialize
+/// would skip. All current deserialization paths go through `parse`.
+impl serde::Serialize for ToolKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Check if a name matches the LLM wire format: `^[a-zA-Z0-9_-]{1,64}$`.
+/// Tool names with dots, over 64 chars, or special characters are rejected.
+pub fn is_valid_wire_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+impl ToolKey {
+    /// Parse a qualified tool name into a `ToolKey`.
+    ///
+    /// Returns `Err` for malformed input (empty names, empty server/tool parts,
+    /// tool names that don't match the wire format `^[a-zA-Z0-9_-]{1,64}$`).
+    /// Use this at config/dispatch boundaries where input is untrusted.
+    pub fn parse(name: &str) -> Result<Self, ToolKeyParseError> {
+        if name.is_empty() {
+            return Err(ToolKeyParseError::EmptyName);
+        }
+        if name == "*" {
+            return Ok(Self::Wildcard);
+        }
+        match name.split_once('.') {
+            Some(("", _)) | Some((_, "")) => {
+                Err(ToolKeyParseError::MalformedParts(name.to_string()))
+            }
+            Some((server, "*")) => {
+                if !is_valid_server_name(server) {
+                    return Err(ToolKeyParseError::InvalidServerName(server.to_string()));
+                }
+                Ok(Self::McpServer {
+                    server: server.into(),
+                })
+            }
+            Some((server, tool)) => {
+                if !is_valid_server_name(server) {
+                    return Err(ToolKeyParseError::InvalidServerName(server.to_string()));
+                }
+                if !is_valid_wire_name(tool) {
+                    return Err(ToolKeyParseError::InvalidToolName(tool.to_string()));
+                }
+                // Wire format is server__tool — check total length fits LLM API limits
+                let wire_len = server.len() + 2 + tool.len();
+                if wire_len > 64 {
+                    return Err(ToolKeyParseError::WireNameTooLong {
+                        server: server.to_string(),
+                        tool: tool.to_string(),
+                        len: wire_len,
+                    });
+                }
+                Ok(Self::McpTool {
+                    server: server.into(),
+                    tool: tool.into(),
+                })
+            }
+            None => {
+                if !is_valid_wire_name(name) {
+                    return Err(ToolKeyParseError::InvalidToolName(name.to_string()));
+                }
+                Ok(Self::Native(name.into()))
+            }
+        }
+    }
+
+    /// Create a `ToolKey` from a known-valid native tool name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is empty or contains dots. Use `ToolKey::parse` for
+    /// untrusted input or MCP tool names.
+    pub fn native(name: &str) -> Self {
+        match name {
+            "*" => Self::Wildcard,
+            _ => {
+                assert!(!name.is_empty(), "native tool name must not be empty");
+                assert!(
+                    !name.contains('.'),
+                    "native tool name must not contain dots: {name:?} - use ToolKey::parse for MCP tools"
+                );
+                Self::Native(name.into())
+            }
+        }
+    }
+
+    pub fn is_mcp(&self) -> bool {
+        matches!(self, Self::McpServer { .. } | Self::McpTool { .. })
+    }
+}
+
+impl std::fmt::Display for ToolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wildcard => write!(f, "*"),
+            Self::Native(name) => write!(f, "{name}"),
+            Self::McpServer { server } => write!(f, "{server}.*"),
+            Self::McpTool { server, tool } => write!(f, "{server}.{tool}"),
+        }
+    }
+}
+
+/// Error returned when a tool key string fails validation.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolKeyParseError {
+    #[error("tool name is empty")]
+    EmptyName,
+    #[error("malformed tool key: empty server or tool part in {0:?}")]
+    MalformedParts(String),
+    #[error("invalid server name {0:?}: must match [a-zA-Z0-9-]{{1,64}}")]
+    InvalidServerName(String),
+    #[error("invalid tool name {0:?}: must match [a-zA-Z0-9_-]{{1,64}}")]
+    InvalidToolName(String),
+    #[error("wire name {server}__{tool} is {len} chars, max 64")]
+    WireNameTooLong {
+        server: String,
+        tool: String,
+        len: usize,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PermissionRule {
-    pub tool: String,
+    pub tool: ToolKey,
     pub scope: Option<String>,
     pub effect: Effect,
 }
@@ -481,7 +701,7 @@ pub struct PermissionRule {
 #[derive(Debug, Clone, Default)]
 pub struct PermissionsConfig {
     pub default: DefaultEffect,
-    pub tool_defaults: HashMap<String, DefaultEffect>,
+    pub tool_defaults: HashMap<ToolKey, DefaultEffect>,
     pub rules: Vec<PermissionRule>,
     pub yolo: bool,
 }
@@ -489,6 +709,7 @@ pub struct PermissionsConfig {
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,
+    pub always_workflow: bool,
     pub always_thinking: Option<StoredThinking>,
     pub ui: UiConfig,
     pub agent: AgentConfig,
@@ -516,6 +737,12 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(
+        default = true,
+        desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
+    )]
+    pub show_thinking: bool,
+
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
 }
@@ -534,6 +761,7 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            show_thinking: f.show_thinking.unwrap_or(true),
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }
     }
@@ -545,7 +773,8 @@ impl UiConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ToolOutputLines {
     pub bash: usize,
     pub code_execution: usize,
@@ -633,7 +862,8 @@ impl ToolOutputLines {
             "index" => self.index,
             "grep" | "glob" => self.grep,
             "read" => self.read,
-            "write" | "edit" | "multiedit" | "memory" => self.write,
+            "memory" => self.write,
+            name if FILE_WRITE_TOOLS.contains(&name) => self.write,
             "webfetch" | "websearch" => self.web,
             _ => self.other,
         }
@@ -678,6 +908,9 @@ pub struct AgentConfig {
 
     #[config(default = DEFAULT_INTERPRETER_MAX_MEMORY_MB, min = MIN_INTERPRETER_MAX_MEMORY_MB, desc = "Memory limit for code interpreter (MB)")]
     pub interpreter_max_memory_mb: usize,
+
+    #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (task tool)")]
+    pub task_max_concurrent: usize,
 
     #[config(skip, default = false)]
     pub no_rtk: bool,
@@ -724,6 +957,9 @@ impl AgentConfig {
             interpreter_max_memory_mb: file
                 .interpreter_max_memory_mb
                 .unwrap_or(DEFAULT_INTERPRETER_MAX_MEMORY_MB),
+            task_max_concurrent: file
+                .task_max_concurrent
+                .unwrap_or(DEFAULT_TASK_MAX_CONCURRENT),
             index_max_file_size: index_file_config
                 .max_file_size_mb
                 .unwrap_or(DEFAULT_MAX_FILE_SIZE_MB)
@@ -770,9 +1006,6 @@ pub struct ProviderConfig {
              min = MIN_STREAM_TIMEOUT_SECS, val = "self.stream_timeout.as_secs()",
              desc = "Streaming response timeout (seconds)")]
     pub stream_timeout: Duration,
-
-    #[config(default = false, desc = "Log all outbound and inbound API text for auditing")]
-    pub log_api: bool,
 }
 
 impl Default for ProviderConfig {
@@ -782,7 +1015,6 @@ impl Default for ProviderConfig {
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
-            log_api: false,
         }
     }
 }
@@ -802,7 +1034,6 @@ impl ProviderConfig {
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
             ),
-            log_api: f.log_api.unwrap_or(false),
         }
     }
 }
@@ -900,20 +1131,211 @@ fn push_rules(
         };
         match scope_set {
             ScopeSet::All(true) => rules.push(PermissionRule {
-                tool: tool.clone(),
+                tool: ToolKey::native(tool),
                 scope: None,
                 effect,
             }),
             ScopeSet::Scopes(scopes) => {
                 for s in scopes {
                     rules.push(PermissionRule {
-                        tool: tool.clone(),
+                        tool: ToolKey::native(tool),
                         scope: Some(s.clone()),
                         effect,
                     });
                 }
             }
             ScopeSet::All(false) => {}
+        }
+    }
+}
+
+pub fn is_valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Validates the *tool* portion of an MCP qualified name.
+/// Currently identical to `is_valid_wire_name`, but kept distinct
+/// in case MCP tools need different constraints from native wire names.
+fn is_valid_tool_name(name: &str) -> bool {
+    is_valid_wire_name(name)
+}
+
+fn push_mcp_tool_rule(
+    rules: &mut Vec<PermissionRule>,
+    server_name: &str,
+    tool_name: &str,
+    effect: Effect,
+) {
+    let qualified = format!("{server_name}.{tool_name}");
+    match ToolKey::parse(&qualified) {
+        Ok(key) => {
+            rules.push(PermissionRule {
+                tool: key,
+                scope: None,
+                effect,
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                server = server_name,
+                tool = tool_name,
+                error = %e,
+                "skipping invalid MCP tool name"
+            );
+        }
+    }
+}
+
+fn child_table<'a>(
+    table: &'a mut toml_edit::Table,
+    key: &str,
+) -> Result<&'a mut toml_edit::Table, String> {
+    table
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("[{key}] is not a table"))
+}
+
+fn push_unique(table: &mut toml_edit::Table, key: &str, value: &str) -> Result<(), String> {
+    let arr = table
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())))
+        .as_array_mut()
+        .ok_or_else(|| format!("{key} is not an array"))?;
+    if !arr.iter().any(|v| v.as_str() == Some(value)) {
+        arr.push(value);
+        arr.set_trailing("\n");
+        arr.set_trailing_comma(true);
+        for item in arr.iter_mut() {
+            item.decor_mut().set_prefix("\n    ");
+        }
+    }
+    Ok(())
+}
+
+fn parse_mcp_server_table(
+    server_name: &str,
+    table: &toml::Table,
+    rules: &mut Vec<PermissionRule>,
+    mcp_defaults: &mut HashMap<ToolKey, DefaultEffect>,
+) {
+    if !is_valid_server_name(server_name) {
+        tracing::warn!(
+            server = server_name,
+            "skipping [mcp.{server_name}] — invalid server name; \
+             must contain only alphanumeric characters and hyphens"
+        );
+        return;
+    }
+
+    for (key, value) in table {
+        match key.as_str() {
+            "allow" | "deny" => {
+                let effect = if key == "allow" {
+                    Effect::Allow
+                } else {
+                    Effect::Deny
+                };
+                match value {
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if let Some(tool_name) = item.as_str() {
+                                if tool_name == "*" {
+                                    // `allow = ["*"]` / `deny = ["*"]` means server-wide.
+                                    // Create an McpServer rule so deny-wins logic applies:
+                                    // McpServer deny blocks all tools on the server.
+                                    // No allow can override a deny — any deny wins.
+                                    rules.push(PermissionRule {
+                                        tool: ToolKey::McpServer {
+                                            server: server_name.into(),
+                                        },
+                                        scope: None,
+                                        effect,
+                                    });
+                                    continue;
+                                }
+                                push_mcp_tool_rule(rules, server_name, tool_name, effect);
+                            }
+                        }
+                    }
+                    toml::Value::Boolean(true) => {
+                        tracing::warn!(
+                            server = server_name,
+                            key = key.as_str(),
+                            "{key} = true is deprecated — use default = \"{key}\" instead; ignoring"
+                        );
+                    }
+                    toml::Value::Boolean(false) => {
+                        // No-op: explicitly disabled.
+                    }
+                    toml::Value::String(s) => {
+                        let tool_name = s.as_str();
+                        if tool_name == "*" {
+                            // Treat `allow = "*"` the same as `allow = ["*"]` —
+                            // create a hard McpServer rule, not a default.
+                            rules.push(PermissionRule {
+                                tool: ToolKey::McpServer {
+                                    server: server_name.into(),
+                                },
+                                scope: None,
+                                effect,
+                            });
+                        } else {
+                            tracing::info!(
+                                server = server_name,
+                                tool = tool_name,
+                                "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"] — \
+                                 consider using array syntax"
+                            );
+                            push_mcp_tool_rule(rules, server_name, tool_name, effect);
+                        }
+                    }
+                    other => {
+                        tracing::warn!(
+                            server = server_name,
+                            key = key.as_str(),
+                            value = ?other,
+                            "unexpected value for [mcp.{server_name}].{key} — \
+                             expected array of tool names or default = \"allow\"/\"deny\""
+                        );
+                    }
+                }
+            }
+            "default" => {
+                if let Ok(d) = value.clone().try_into::<DefaultEffect>() {
+                    mcp_defaults.insert(
+                        ToolKey::McpServer {
+                            server: server_name.into(),
+                        },
+                        d,
+                    );
+                } else {
+                    tracing::warn!(
+                        server = server_name,
+                        value = ?value,
+                        "invalid [mcp.{server_name}].default value — expected \"allow\", \"deny\", or \"prompt\""
+                    );
+                }
+            }
+            other => {
+                if value.is_table() {
+                    tracing::warn!(
+                        server = server_name,
+                        key = other,
+                        "unknown key [mcp.{server_name}.{other}] — server names cannot \
+                         contain dots; use [mcp.{other}] instead if this is a server name"
+                    );
+                } else {
+                    tracing::warn!(
+                        server = server_name,
+                        key = other,
+                        "unknown key in [mcp.{server_name}] — ignored"
+                    );
+                }
+            }
         }
     }
 }
@@ -932,21 +1354,66 @@ fn build_permissions(
     let mut tool_defaults = HashMap::new();
     for (tool, perms) in &global.tools {
         if let Some(d) = perms.default {
-            tool_defaults.insert(tool.clone(), d);
+            let key = ToolKey::native(tool);
+            if matches!(key, ToolKey::Wildcard) {
+                tracing::warn!(
+                    tool = tool,
+                    "ignoring [\"*\"].default — use the top-level `default` field instead \
+                     for global fallback behavior"
+                );
+            } else {
+                tool_defaults.insert(key, d);
+            }
         }
+    }
+    for (key, d) in &global.mcp_defaults {
+        tool_defaults.insert(key.clone(), *d);
     }
     for (tool, perms) in &project.tools {
         if let Some(d) = perms.default
             && d != DefaultEffect::Allow
         {
-            tool_defaults.insert(tool.clone(), d);
+            let key = ToolKey::native(tool);
+            if matches!(key, ToolKey::Wildcard) {
+                tracing::warn!(
+                    tool = tool,
+                    "ignoring project [\"*\"].default — use the top-level `default` field instead"
+                );
+            } else {
+                tool_defaults.insert(key, d);
+            }
+        }
+    }
+    for (key, d) in &project.mcp_defaults {
+        if *d != DefaultEffect::Allow {
+            tool_defaults.insert(key.clone(), *d);
         }
     }
 
     let mut rules = Vec::new();
+    for rule in &global.mcp_rules {
+        if rule.effect == Effect::Deny {
+            rules.push(rule.clone());
+        }
+    }
+    for rule in &global.mcp_rules {
+        if rule.effect == Effect::Allow {
+            rules.push(rule.clone());
+        }
+    }
     for tools in [&global.tools, &project.tools] {
         push_rules(&mut rules, tools, Effect::Deny);
         push_rules(&mut rules, tools, Effect::Allow);
+    }
+    for rule in &project.mcp_rules {
+        if rule.effect == Effect::Deny {
+            rules.push(rule.clone());
+        }
+    }
+    for rule in &project.mcp_rules {
+        if rule.effect == Effect::Allow {
+            rules.push(rule.clone());
+        }
     }
     PermissionsConfig {
         default,
@@ -1009,40 +1476,175 @@ pub fn load_permissions(cwd: &Path) -> PermissionsConfig {
 fn load_permissions_inner(cwd: &Path, global_dirs: &[PathBuf]) -> PermissionsConfig {
     let mut global_perms = PermissionsFileConfig::default();
     for dir in global_dirs {
-        let path = dir.join(PERMISSIONS_FILE);
-        migrate_permissions_file(&path);
-        if let Some(p) = read_permissions_file(&path) {
+        if let Some(p) = read_permissions_file(&dir.join(PERMISSIONS_FILE)) {
             global_perms = p;
         }
     }
 
-    let project_path = cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE);
-    migrate_permissions_file(&project_path);
-    let project_perms = read_permissions_file(&project_path).unwrap_or_default();
+    let project_perms =
+        read_permissions_file(&cwd.join(PROJECT_DIR).join(PERMISSIONS_FILE)).unwrap_or_default();
 
     build_permissions(global_perms, project_perms)
 }
 
-fn migrate_permissions_file(path: &Path) {
-    let Ok(content) = fs::read_to_string(path) else {
-        return;
+fn migrate_mcp_entry(
+    doc: &mut toml_edit::DocumentMut,
+    server_name: &str,
+    tool_name: &str,
+    item: &toml_edit::Item,
+) {
+    // Old format: ["mcp:server__tool"] with booleans or scope-string arrays.
+    // New format: [mcp.server] allow = ["tool_name"]. Old scope strings were
+    // dead code (MCP scopes are always wildcarded), so only the effect survives.
+    let mut push = |effect_key: &str| {
+        let res = child_table(doc.as_table_mut(), "mcp")
+            .and_then(|mcp| child_table(mcp, server_name))
+            .and_then(|server| push_unique(server, effect_key, tool_name));
+        if let Err(e) = res {
+            warn!(
+                server = server_name,
+                tool = tool_name,
+                error = %e,
+                "skipping MCP entry migration"
+            );
+        }
     };
-    let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
+
+    // Bare boolean: old format like [mcp]\ndeepwiki__search = true
+    // means "allow this tool".
+    if let Some(b) = item.as_bool() {
+        if b {
+            push("allow");
+        }
         return;
-    };
-    let Some(item) = doc.remove("allow_all") else {
-        return;
-    };
-    if item.as_bool() == Some(true) {
-        doc.insert("default", toml_edit::value("allow"));
     }
-    if let Err(e) = fs::write(path, doc.to_string()) {
-        warn!(path = %path.display(), error = %e, "failed to migrate permissions file");
+
+    if let Some(old_table) = item.as_table() {
+        for (key, value) in old_table.iter() {
+            match key {
+                "allow" | "deny" => {
+                    if value.as_bool() == Some(true) || value.as_array().is_some() {
+                        push(key);
+                    }
+                }
+                _ => {
+                    warn!(
+                        key,
+                        server = server_name,
+                        tool = tool_name,
+                        "dropping unknown key in old MCP entry during migration"
+                    );
+                }
+            }
+        }
     }
 }
 
-fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
+/// Migrates old permission formats and returns the (possibly rewritten)
+/// file content. The rewrite to disk is best-effort: loading uses the
+/// migrated content even when the write fails.
+fn migrate_permissions_file(path: &Path) -> Option<String> {
     let content = fs::read_to_string(path).ok()?;
+    let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() else {
+        return Some(content);
+    };
+    let mut migrated = false;
+
+    if let Some(item) = doc.remove("allow_all") {
+        migrated = true;
+        if item.as_bool() == Some(true) {
+            doc.insert("default", toml_edit::value("allow"));
+        }
+    }
+
+    // Migrate flat MCP keys: "mcp:server__tool" → [mcp.server]
+    // Two TOML representations to handle:
+    // 1. Quoted keys: ["mcp:server__tool"] → flat top-level key
+    // 2. Bare keys: [mcp:server__tool] → nested "mcp" → {"server__tool": ...}
+
+    // Path 1: Flat quoted keys starting with "mcp:" containing "__"
+    let flat_old_keys: Vec<String> = doc
+        .iter()
+        .filter_map(|(k, _)| {
+            k.strip_prefix("mcp:")
+                .and_then(|rest| rest.contains("__").then(|| k.to_string()))
+        })
+        .collect();
+
+    for old_key in flat_old_keys {
+        if let Some(item) = doc.remove(&old_key) {
+            let rest = &old_key[4..]; // strip "mcp:"
+            if let Some((server, tool)) = rest.split_once("__") {
+                if !is_valid_server_name(server) || !is_valid_tool_name(tool) {
+                    tracing::error!(
+                        key = old_key.as_str(),
+                        server = server,
+                        tool = tool,
+                        "SECURITY: skipping migration of malformed MCP key — \
+                         rules for this tool will not be restored"
+                    );
+                    continue;
+                }
+                migrate_mcp_entry(&mut doc, server, tool, &item);
+                migrated = true;
+            }
+        }
+    }
+
+    // Path 2: Nested "mcp" sub-table (bare key mcp: created nesting)
+    let nested_old_entries: Vec<(String, String, toml_edit::Item)> = {
+        let mut entries = Vec::new();
+        if let Some(toml_edit::Item::Table(mcp_table)) = doc.get("mcp") {
+            for (key, _) in mcp_table.iter() {
+                if key.contains("__")
+                    && let Some((server, tool)) = key.split_once("__")
+                {
+                    let item = mcp_table.get(key).cloned();
+                    if let Some(item) = item {
+                        entries.push((server.to_string(), tool.to_string(), item));
+                    }
+                }
+            }
+        }
+        entries
+    };
+
+    for (server_name, tool_name, item) in nested_old_entries {
+        if !is_valid_server_name(&server_name) || !is_valid_tool_name(&tool_name) {
+            tracing::error!(
+                server = server_name.as_str(),
+                tool = &*tool_name,
+                "SECURITY: skipping migration of malformed nested MCP key — \
+                 rules for this tool will not be restored"
+            );
+            continue;
+        }
+        if let Some(toml_edit::Item::Table(mcp_table)) = doc.get_mut("mcp") {
+            mcp_table.remove(&format!("{server_name}__{tool_name}"));
+        }
+        migrate_mcp_entry(&mut doc, &server_name, &tool_name, &item);
+        migrated = true;
+    }
+
+    // Clean up the now-empty "mcp" parent table if it has no children
+    if let Some(toml_edit::Item::Table(mcp_table)) = doc.get("mcp")
+        && mcp_table.is_empty()
+    {
+        doc.remove("mcp");
+    }
+
+    if !migrated {
+        return Some(content);
+    }
+    let new_content = doc.to_string();
+    if let Err(e) = maki_storage::atomic_write(path, new_content.as_bytes()) {
+        warn!(path = %path.display(), error = %e, "failed to persist migrated permissions file");
+    }
+    Some(new_content)
+}
+
+fn read_permissions_file(path: &Path) -> Option<PermissionsFileConfig> {
+    let content = migrate_permissions_file(path)?;
     match toml::from_str(&content) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -1061,7 +1663,7 @@ pub fn global_config_dirs() -> Vec<PathBuf> {
 }
 
 pub fn append_permission_rule(
-    tool: &str,
+    tool: &ToolKey,
     scope: Option<&str>,
     effect: Effect,
     target: &PermissionTarget,
@@ -1073,7 +1675,7 @@ pub fn append_permission_rule(
 }
 
 fn append_permission_rule_with_global(
-    tool: &str,
+    tool: &ToolKey,
     scope: Option<&str>,
     effect: Effect,
     target: &PermissionTarget,
@@ -1086,7 +1688,7 @@ fn append_permission_rule_with_global(
 }
 
 fn append_global_permission(
-    tool: &str,
+    tool: &ToolKey,
     scope: Option<&str>,
     effect: Effect,
     global: Option<PathBuf>,
@@ -1104,12 +1706,13 @@ fn append_global_permission(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create config dir: {e}"))?;
     }
-    std::fs::write(&path, doc.to_string()).map_err(|e| format!("cannot write permissions: {e}"))?;
+    maki_storage::atomic_write(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write permissions: {e}"))?;
     Ok(())
 }
 
 fn append_project_permission(
-    tool: &str,
+    tool: &ToolKey,
     scope: Option<&str>,
     effect: Effect,
     cwd: &Path,
@@ -1125,14 +1728,14 @@ fn append_project_permission(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create .maki dir: {e}"))?;
     }
-    std::fs::write(&path, doc.to_string())
+    maki_storage::atomic_write(&path, doc.to_string().as_bytes())
         .map_err(|e| format!("cannot write .maki/{PERMISSIONS_FILE}: {e}"))?;
     Ok(())
 }
 
 fn insert_permission_entry(
     doc: &mut toml_edit::DocumentMut,
-    tool: &str,
+    tool_key: &ToolKey,
     scope: Option<&str>,
     effect: Effect,
 ) -> Result<(), String> {
@@ -1141,35 +1744,28 @@ fn insert_permission_entry(
         Effect::Deny => "deny",
     };
 
-    let tool_table = doc
-        .entry(tool)
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-    let tool_table = tool_table
-        .as_table_mut()
-        .ok_or_else(|| format!("[{tool}] is not a table"))?;
-
-    match scope {
-        Some(s) => {
-            let arr = tool_table.entry(key).or_insert_with(|| {
-                toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new()))
-            });
-            let arr = arr
-                .as_array_mut()
-                .ok_or_else(|| format!("[{tool}].{key} is not an array"))?;
-            let already_exists = arr
-                .iter()
-                .any(|v| v.as_str().is_some_and(|existing| existing == s));
-            if !already_exists {
-                arr.push(s);
-                arr.set_trailing("\n");
-                arr.set_trailing_comma(true);
-                for item in arr.iter_mut() {
-                    item.decor_mut().set_prefix("\n    ");
+    match tool_key {
+        // MCP scopes are always wildcarded, so `scope` is ignored for MCP keys.
+        ToolKey::McpTool { server, tool } => {
+            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
+            push_unique(server_table, key, tool)?;
+        }
+        ToolKey::McpServer { server } => {
+            let server_table = child_table(child_table(doc.as_table_mut(), "mcp")?, server)?;
+            server_table.insert("default", toml_edit::value(key));
+        }
+        ToolKey::Wildcard => {
+            // Wildcard rules are config-only; runtime never writes them.
+            return Err("cannot write wildcard permission rule to config".to_string());
+        }
+        ToolKey::Native(name) => {
+            let tool_table = child_table(doc.as_table_mut(), name)?;
+            match scope {
+                Some(s) => push_unique(tool_table, key, s)?,
+                None => {
+                    tool_table.insert(key, toml_edit::value(true));
                 }
             }
-        }
-        None => {
-            tool_table.insert(key, toml_edit::value(true));
         }
     }
     Ok(())
@@ -1257,25 +1853,58 @@ mod tests {
     }
 
     #[test]
-    fn merge_always_fast_and_thinking_overlay_wins() {
+    fn merge_always_flags_overlay_wins() {
         let mut base = RawConfig {
             always_fast: Some(false),
+            always_workflow: Some(false),
             always_thinking: Some(AlwaysThinking::Mode("off".into())),
             ..Default::default()
         };
         let overlay = RawConfig {
             always_fast: Some(true),
+            always_workflow: Some(true),
             always_thinking: Some(AlwaysThinking::Toggle(true)),
             ..Default::default()
         };
         base.merge(overlay);
 
         assert_eq!(base.always_fast, Some(true), "overlay wins");
+        assert_eq!(base.always_workflow, Some(true), "overlay wins");
         assert_eq!(
             base.always_thinking,
             Some(AlwaysThinking::Toggle(true)),
             "overlay wins"
         );
+    }
+
+    #[test]
+    fn always_workflow_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert!(!defaults.always_workflow, "absent resolves to false");
+
+        let raw = RawConfig {
+            always_workflow: Some(true),
+            ..Default::default()
+        };
+        assert!(raw.into_config(false).unwrap().always_workflow);
+    }
+
+    #[test]
+    fn task_max_concurrent_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert_eq!(
+            defaults.agent.task_max_concurrent,
+            DEFAULT_TASK_MAX_CONCURRENT
+        );
+
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                task_max_concurrent: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(raw.into_config(false).unwrap().agent.task_max_concurrent, 3);
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -1314,6 +1943,7 @@ mod tests {
     #[test_case("max_line_bytes",    0 ; "zero_line_bytes")]
     #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
     #[test_case("max_line_bytes",    10 ; "below_min_line_bytes")]
+    #[test_case("task_max_concurrent", 0 ; "zero_task_max_concurrent")]
     fn validate_rejects_invalid_agent(field: &str, value: usize) {
         let mut config = AgentConfig::default();
         match field {
@@ -1321,6 +1951,7 @@ mod tests {
             "max_output_lines" => config.max_output_lines = value,
             "max_response_bytes" => config.max_response_bytes = value,
             "max_line_bytes" => config.max_line_bytes = value,
+            "task_max_concurrent" => config.task_max_concurrent = value,
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();
@@ -1358,6 +1989,7 @@ mod tests {
         let mut config = Config {
             always_yolo: false,
             always_fast: false,
+            always_workflow: false,
             always_thinking: None,
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
@@ -1397,10 +2029,10 @@ mod tests {
         assert_eq!(perms.default, DefaultEffect::Allow);
         assert_eq!(perms.rules.len(), 2);
         assert_eq!(perms.rules[0].effect, Effect::Deny);
-        assert_eq!(perms.rules[0].tool, "bash");
+        assert_eq!(perms.rules[0].tool, ToolKey::native("bash"));
         assert_eq!(perms.rules[0].scope.as_deref(), Some("rm -rf *"));
         assert_eq!(perms.rules[1].effect, Effect::Allow);
-        assert_eq!(perms.rules[1].tool, "bash");
+        assert_eq!(perms.rules[1].tool, ToolKey::native("bash"));
         assert_eq!(perms.rules[1].scope.as_deref(), Some("cargo *"));
     }
 
@@ -1437,12 +2069,12 @@ mod tests {
             .collect();
 
         assert_eq!(deny_rules.len(), 2);
-        assert_eq!(deny_rules[0].tool, "bash");
-        assert_eq!(deny_rules[1].tool, "write");
+        assert_eq!(deny_rules[0].tool, ToolKey::native("bash"));
+        assert_eq!(deny_rules[1].tool, ToolKey::native("write"));
 
         assert_eq!(allow_rules.len(), 2);
-        assert_eq!(allow_rules[0].tool, "bash");
-        assert_eq!(allow_rules[1].tool, "read");
+        assert_eq!(allow_rules[0].tool, ToolKey::native("bash"));
+        assert_eq!(allow_rules[1].tool, ToolKey::native("read"));
     }
 
     #[test]
@@ -1464,7 +2096,7 @@ mod tests {
         fs::create_dir_all(&global).unwrap();
 
         append_permission_rule_with_global(
-            "bash",
+            &ToolKey::native("bash"),
             Some("cargo *"),
             Effect::Allow,
             &PermissionTarget::Global,
@@ -1472,7 +2104,7 @@ mod tests {
         )
         .unwrap();
         append_permission_rule_with_global(
-            "bash",
+            &ToolKey::native("bash"),
             Some("rm -rf *"),
             Effect::Deny,
             &PermissionTarget::Global,
@@ -1485,6 +2117,28 @@ mod tests {
         assert!(content.contains("cargo *"));
         assert!(content.contains("rm -rf *"));
         assert!(!content.contains("[permissions]"));
+    }
+
+    #[test]
+    fn append_permission_rule_writes_mcp_nested_form() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+
+        append_permission_rule_with_global(
+            &ToolKey::parse("deepwiki.search").unwrap(),
+            Some("*"),
+            Effect::Allow,
+            &PermissionTarget::Global,
+            Some(global.clone()),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(content.contains("[mcp.deepwiki]"), "nested table present");
+        assert!(content.contains("\"search\""), "tool name in array");
+        assert!(!content.contains("deepwiki.search"), "no flat key");
+        assert!(!content.contains("__"), "no __ separator");
     }
 
     #[test]
@@ -1532,7 +2186,7 @@ mod tests {
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
         assert_eq!(perms.default, DefaultEffect::Deny);
         assert_eq!(
-            perms.tool_defaults.get("bash").copied(),
+            perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Allow)
         );
     }
@@ -1552,7 +2206,7 @@ mod tests {
 
         let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
         assert_eq!(
-            perms.tool_defaults.get("bash").copied(),
+            perms.tool_defaults.get(&ToolKey::native("bash")).copied(),
             Some(DefaultEffect::Deny)
         );
     }
@@ -1607,7 +2261,7 @@ mod tests {
         fs::create_dir_all(&global).unwrap();
 
         append_permission_rule_with_global(
-            "bash",
+            &ToolKey::native("bash"),
             Some("cargo *"),
             Effect::Allow,
             &PermissionTarget::Global,
@@ -1615,7 +2269,7 @@ mod tests {
         )
         .unwrap();
         append_permission_rule_with_global(
-            "bash",
+            &ToolKey::native("bash"),
             Some("cargo *"),
             Effect::Allow,
             &PermissionTarget::Global,
@@ -1623,7 +2277,7 @@ mod tests {
         )
         .unwrap();
         append_permission_rule_with_global(
-            "bash",
+            &ToolKey::native("bash"),
             Some("cargo *"),
             Effect::Allow,
             &PermissionTarget::Global,
@@ -1732,6 +2386,25 @@ mod tests {
             Some(true),
             "overlay-only key added"
         );
+    }
+
+    #[test]
+    fn show_thinking_deserializes_true() {
+        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = true\n").unwrap();
+        assert!(raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn show_thinking_deserializes_false() {
+        let raw: RawConfig = toml::from_str("[ui]\nshow_thinking = false\n").unwrap();
+        assert!(!raw.ui.show_thinking.unwrap());
+    }
+
+    #[test]
+    fn show_thinking_missing_defaults_true() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(config.ui.show_thinking);
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
@@ -1901,5 +2574,275 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn opt_in_tools_require_explicit_enable() {
+        let default_config = RawConfig::default().into_config(false).unwrap();
+        for &name in OPT_IN_TOOLS {
+            assert!(
+                default_config
+                    .agent
+                    .disabled_tools
+                    .contains(&name.to_string()),
+                "{name} should be disabled by default"
+            );
+        }
+
+        let mut tools = HashMap::new();
+        for &name in OPT_IN_TOOLS {
+            tools.insert(
+                name.to_string(),
+                ToolFileConfig {
+                    enabled: Some(true),
+                },
+            );
+        }
+        let enabled_config = RawConfig {
+            tools,
+            ..Default::default()
+        }
+        .into_config(false)
+        .unwrap();
+        for &name in OPT_IN_TOOLS {
+            assert!(
+                !enabled_config
+                    .agent
+                    .disabled_tools
+                    .contains(&name.to_string()),
+                "{name} should be enabled when configured"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_mcp_per_tool_allow() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[mcp.deepwiki]\nallow = [\"search\", \"fetch\"]\n",
+        );
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.rules.len(), 2);
+        assert!(perms.rules.iter().any(|r| r.tool
+            == ToolKey::McpTool {
+                server: "deepwiki".into(),
+                tool: "search".into()
+            }
+            && r.effect == Effect::Allow));
+        assert!(perms.rules.iter().any(|r| r.tool
+            == ToolKey::McpTool {
+                server: "deepwiki".into(),
+                tool: "fetch".into()
+            }
+            && r.effect == Effect::Allow));
+    }
+
+    #[test]
+    fn permissions_mcp_server_wide_allow_true_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[mcp.deepwiki]\nallow = true\n");
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.rules.len(), 0, "no rules generated");
+        assert!(
+            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
+                server: "deepwiki".into()
+            }),
+            "allow = true is deprecated and ignored — no default injected"
+        );
+    }
+
+    #[test]
+    fn permissions_mcp_deny_true_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[mcp.server]\ndeny = true\n");
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert!(
+            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
+                server: "server".into()
+            }),
+            "deny = true is deprecated and ignored — no default injected"
+        );
+    }
+
+    #[test]
+    fn explicit_default_preserved_with_deprecated_deny_true() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[mcp.server]\ndefault = \"allow\"\ndeny = true\n",
+        );
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::McpServer {
+                server: "server".into()
+            }),
+            Some(&DefaultEffect::Allow),
+            "explicit default still works; deprecated deny = true is ignored"
+        );
+    }
+
+    #[test]
+    fn permissions_mcp_deny_rules() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[mcp.github]\ndeny = [\"admin_delete\"]\n");
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::McpTool {
+                server: "github".into(),
+                tool: "admin_delete".into()
+            }
+        );
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+    }
+
+    #[test]
+    fn permissions_mcp_dotted_tool_name_rejected() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[mcp.myserver]\nallow = [\"web.search\"]\n");
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(perms.rules.len(), 0, "dotted tool name should be rejected");
+    }
+
+    #[test]
+    fn permissions_mcp_default_allow() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "default = \"deny\"\n\n[mcp.exa]\ndefault = \"allow\"\n",
+        );
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::McpServer {
+                server: "exa".into()
+            }),
+            Some(&DefaultEffect::Allow),
+            "MCP server default should be extracted"
+        );
+    }
+
+    #[test]
+    fn permissions_mcp_default_prompt() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(
+            dir.path(),
+            "[mcp.exa]\ndefault = \"prompt\"\nallow = [\"search\"]\n",
+        );
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert_eq!(
+            perms.tool_defaults.get(&ToolKey::McpServer {
+                server: "exa".into()
+            }),
+            Some(&DefaultEffect::Prompt),
+            "MCP server default = prompt should be extracted"
+        );
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::McpTool {
+                server: "exa".into(),
+                tool: "search".into()
+            }
+        );
+    }
+
+    #[test]
+    fn migrate_mcp_old_flat_keys() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        // Old maki format used quoted TOML keys for mcp:server__tool
+        fs::write(
+            global.join("permissions.toml"),
+            "[\"mcp:deepwiki__search\"]\nallow = true\n\
+             [\"mcp:github__issue\"]\nallow = [\"read\"]\n",
+        )
+        .unwrap();
+
+        let _perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(content.contains("[mcp.deepwiki]"), "server table present");
+        assert!(content.contains("[mcp.github]"), "server table present");
+        assert!(content.contains("\"search\""), "tool name migrated");
+        assert!(content.contains("\"issue\""), "tool name migrated");
+        assert!(
+            !content.contains("mcp:deepwiki__search"),
+            "old flat key gone"
+        );
+        assert!(!content.contains("mcp:github__issue"), "old flat key gone");
+        assert!(!content.contains("__"), "no old __ separator remains");
+    }
+
+    #[test]
+    fn migrate_mcp_nested_bare_keys() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        // Bare TOML key [mcp.deepwiki__search] creates nested mcp → deepwiki__search
+        fs::write(
+            global.join("permissions.toml"),
+            "[mcp]\n\
+             deepwiki__search = true\n\
+             github__issue = true\n",
+        )
+        .unwrap();
+
+        let _perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+
+        let content = fs::read_to_string(global.join("permissions.toml")).unwrap();
+        assert!(content.contains("[mcp.deepwiki]"), "server table present");
+        assert!(content.contains("[mcp.github]"), "server table present");
+        assert!(content.contains("\"search\""), "tool name migrated");
+        assert!(content.contains("\"issue\""), "tool name migrated");
+        assert!(!content.contains("__"), "no old __ separator remains");
+    }
+
+    #[test]
+    fn empty_tool_key_sections_ignored() {
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        write_global_permissions(dir.path(), "[\"\"]\ndefault = \"allow\"\nallow = [\"x\"]\n");
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        assert!(perms.rules.is_empty());
+        assert!(perms.tool_defaults.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_applies_in_memory_when_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        fs::write(
+            global.join("permissions.toml"),
+            "[\"mcp:github__delete\"]\ndeny = true\n",
+        )
+        .unwrap();
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(global.join("probe"), b"x").is_ok() {
+            return; // running as root, cannot simulate a read-only dir
+        }
+
+        let perms = load_permissions_inner(dir.path(), std::slice::from_ref(&global));
+        fs::set_permissions(&global, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(perms.rules.len(), 1);
+        assert_eq!(perms.rules[0].effect, Effect::Deny);
+        assert_eq!(
+            perms.rules[0].tool,
+            ToolKey::parse("github.delete").unwrap()
+        );
     }
 }

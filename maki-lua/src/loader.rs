@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,107 +13,92 @@ use crate::api::keymap::KeymapReader;
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct BundledPlugin {
     name: &'static str,
-    source_path: &'static str,
     dir: Dir<'static>,
 }
 
-/// `lib` is not a default builtin; it only exists so plugins can
-/// `require()` shared modules across plugin boundaries.
+/// `lib` is not a default builtin; it exists so plugins can
+/// `require()` shared modules across boundaries.
 static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "index",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/index/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
     },
     BundledPlugin {
-        name: "hackernews",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/hackernews/init.lua"),
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/hackernews"),
-    },
-    BundledPlugin {
         name: "webfetch",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/webfetch/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
     },
     BundledPlugin {
         name: "websearch",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/websearch/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/websearch"),
     },
     BundledPlugin {
         name: "bash",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/bash/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/bash"),
     },
     BundledPlugin {
+        name: "batch",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
+    },
+    BundledPlugin {
         name: "grep",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/grep/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
     },
     BundledPlugin {
         name: "glob",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/glob/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
     },
     BundledPlugin {
         name: "skill",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/skill/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/skill"),
     },
     BundledPlugin {
         name: "memory",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/memory/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
         name: "question",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/question/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/question"),
     },
     BundledPlugin {
         name: "todo_write",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/todo_write/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/todo_write"),
     },
     BundledPlugin {
         name: "read",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/read/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/read"),
     },
     BundledPlugin {
         name: "write",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/write/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/write"),
     },
     BundledPlugin {
         name: "edit",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/edit/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
     },
     BundledPlugin {
         name: "task",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/task/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
     },
     BundledPlugin {
+        name: "code_execution",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    },
+    BundledPlugin {
+        name: "view_image",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    },
+    BundledPlugin {
         name: "lib",
-        source_path: concat!(env!("CARGO_MANIFEST_DIR"), "/../plugins/lib/init.lua"),
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/lib"),
     },
 ];
-
-/// Returns `(name, source_path)` for every bundled plugin. The source path is
-/// the compile-time filesystem path and is valid when running from the source tree.
-pub fn bundled_plugins() -> impl Iterator<Item = (&'static str, &'static str)> {
-    BUNDLED_PLUGINS.iter().map(|p| (p.name, p.source_path))
-}
 
 static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
@@ -153,6 +139,16 @@ impl PluginHost {
 
     pub fn disabled() -> Self {
         Self { inner: None }
+    }
+
+    /// Boots the runtime and loads every default bundled plugin into `registry`.
+    /// A convenience over `new` + `load_builtins(PluginsConfig::from_tools(defaults))`
+    /// for callers (tests, docgen, headless runs) that want the full builtin set
+    /// without permuting a config.
+    pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let mut host = Self::new(registry)?;
+        host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))?;
+        Ok(host)
     }
 
     pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
@@ -345,15 +341,6 @@ impl EventHandle {
         let (tx, _rx) = flume::unbounded();
         Self { tx }
     }
-    pub fn fire_click(&self, tool_id: &str, row: u32) -> Option<ClickReply> {
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.try_send(Request::FireBufClick {
-            tool_id: tool_id.to_owned(),
-            row,
-            reply: tx,
-        });
-        rx.recv().ok().flatten()
-    }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
         let _ = self.tx.try_send(Request::RunCommand {
@@ -379,6 +366,12 @@ impl EventHandle {
         let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
     }
 
+    /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
+    /// outside it (header line etc.).
+    pub fn request_click(&self, tool_use_id: String, row: usize) {
+        let _ = self.tx.send(Request::ClickTool { tool_use_id, row });
+    }
+
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
         let _ = self.tx.send(Request::RestoreComplete { flag });
     }
@@ -393,38 +386,6 @@ impl EventHandle {
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
     }
-
-    /// Load a bundled plugin by name. Returns `true` if the plugin was found
-    /// and the load request was sent. Takes effect immediately (the Lua thread
-    /// drains in-flight calls before executing the load).
-    pub fn load_builtin(&self, name: &str) -> bool {
-        let Some(plugin) = BUNDLED_PLUGINS.iter().find(|p| p.name == name) else {
-            return false;
-        };
-        let Some(source) = plugin.dir.get_file("init.lua").and_then(|f| f.contents_utf8()) else {
-            return false;
-        };
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::LoadSource {
-            name: Arc::from(name),
-            source: source.to_owned(),
-            plugin_dir: None,
-            permissions: PluginPermissions::trusted(),
-            reply: reply_tx,
-        });
-        let _ = reply_rx.recv();
-        true
-    }
-
-    /// Unload a plugin by name. Takes effect immediately.
-    pub fn unload_plugin(&self, name: &str) {
-        let (reply_tx, reply_rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::ClearPlugin {
-            plugin: Arc::from(name),
-            reply: reply_tx,
-        });
-        let _ = reply_rx.recv();
-    }
 }
 
 #[cfg(test)]
@@ -435,8 +396,8 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use test_case::test_case;
 
-    /// Load `src` as a single plugin and collect the resolved slots. Panics on
-    /// load failure; reach for `load_err` when you want to inspect the error.
+    /// Load `src` as one plugin, collect resolved slots.
+    /// Panics on failure; use `load_err` to inspect errors.
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
@@ -471,9 +432,7 @@ mod tests {
     #[test]
     fn memory_builtin_registers_command() {
         let reg = Arc::new(ToolRegistry::new());
-        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-        host.load_builtins(&PluginsConfig::from_tools(std::collections::HashMap::new()))
-            .unwrap();
+        let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
         let reader = host.command_reader();
         let snap = reader.load();
         let found = snap.commands.iter().any(|c| c.name.as_ref() == "/memory");
@@ -604,12 +563,7 @@ mod tests {
             "#,
         );
         for &pid in PromptId::ALL {
-            let expected = if pid == PromptId::System {
-                vec![]
-            } else {
-                vec!["index"]
-            };
-            assert_eq!(contents(&slots, pid, Slot::EfficientTools), expected);
+            assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
         }
     }
 

@@ -39,6 +39,7 @@ libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
+zstd.workspace = true
 
 [dev-dependencies]
 test-case = { workspace = true }
@@ -55,14 +56,13 @@ members = [
   "maki-markdown",
   "maki-providers",
   "maki-storage",
-  "maki-tool-macro",
   "maki-config-macro",
   "maki-ui",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.3.23"
+version = "0.3.27"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -70,6 +70,7 @@ repository = "https://github.com/tontinton/maki"
 rust-version = "1.88"
 
 [workspace.dependencies]
+zstd = "0.13"
 maki-agent = { path = "maki-agent" }
 maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
@@ -78,7 +79,6 @@ maki-providers = { path = "maki-providers" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }
-maki-tool-macro = { path = "maki-tool-macro" }
 maki-config-macro = { path = "maki-config-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
@@ -111,7 +111,8 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-def
 unicode-width = "0.2"
 similar = { version = "2", features = ["inline", "unicode"] }
 jsonrepair = { version = "0.1", default-features = false, features = ["serde"] }
-jiff = { version = "0.2", default-features = false, features = ["std"] }
+jsonschema = { version = "0.33", default-features = false }
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system"] }
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.11", default-features = false, features = ["async"] }
@@ -135,7 +136,6 @@ open = "5"
 criterion = { version = "0.5", features = ["html_reports"] }
 etcetera = "0.11"
 dotenvy = "0.15"
-zstd = "0.13"
 tree-sitter = "0.26"
 include_dir = "0.7"
 mlua = { version = "0.11", features = ["luau", "async", "send", "serde", "macros"] }
@@ -162,7 +162,7 @@ tree-sitter-starlark = "1.3"
 tree-sitter-swift = "0.7"
 tree-sitter-typescript = "0.23"
 tree-sitter-zig = "1.1"
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.17", package = "monty" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.18", package = "monty" }
 notify = { version = "9.0.0-rc.2", default-features = false, features = ["flume", "macos_fsevent"] }
 serde_yaml = "0.9"
 shell-words = "1"

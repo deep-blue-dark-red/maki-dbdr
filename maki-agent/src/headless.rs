@@ -18,10 +18,10 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
+use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
+    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -72,13 +72,13 @@ pub struct HeadlessParams {
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
+    pub images: Vec<ImageSource>,
     pub prompt_slots: ResolvedSlots,
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub fast: bool,
-    pub system_prompt_override: Option<String>,
-    pub append_system_prompt: Option<String>,
+    pub workflow: bool,
 }
 
 pub struct HeadlessHandle {
@@ -95,21 +95,24 @@ struct AgentSetup {
     tools: Value,
 }
 
-fn get_session_created_at(session_id: &str) -> Option<u64> {
-    let dir = StateDir::resolve().ok()?;
-    StoredSession::load(session_id, &dir).ok().map(|s| s.created_at)
-}
-
 fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
-    created_at: Option<u64>,
+    workflow: bool,
 ) -> AgentSetup {
-    let vars = template::env_vars_with_creation_time(created_at);
+    let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(&vars, model, config, excluded_tools, mcp_handle);
+    let tools = tool_definitions(
+        &vars,
+        model,
+        config,
+        excluded_tools,
+        mcp_handle,
+        workflow,
+        ToolRegistry::global(),
+    );
 
     AgentSetup {
         vars,
@@ -124,10 +127,16 @@ fn tool_definitions(
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    workflow: bool,
+    registry: &ToolRegistry,
 ) -> Value {
-    let filter = ToolFilter::from_config(config, excluded_tools);
-    let ctx = DescriptionContext { filter: &filter };
-    let mut tools = ToolRegistry::native().definitions(vars, &ctx, model.supports_tool_examples());
+    let filter = ToolFilter::from_config(config, model, excluded_tools);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow,
+    };
+    let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
 
     if let Some(handle) = mcp_handle {
         handle.extend_tools(&mut tools);
@@ -148,24 +157,16 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
-        None,
+        params.workflow,
     );
 
-    let system = if let Some(override_prompt) = params.system_prompt_override.as_deref() {
-        override_prompt.to_string()
-    } else {
-        let mut s = agent::build_system_prompt(
-            &vars,
-            &mode,
-            &instructions.text,
-            &params.prompt_slots,
-        );
-        if let Some(append) = &params.append_system_prompt {
-            s.push('\n');
-            s.push_str(append);
-        }
-        s
-    };
+    let system = agent::build_system_prompt(
+        &vars,
+        &mode,
+        &instructions.text,
+        &params.prompt_slots,
+        &params.model,
+    );
 
     let tool_names = extract_tool_names(&tools);
 
@@ -174,6 +175,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     let session_id = uuid::Uuid::new_v4().to_string();
 
     let fast = params.fast;
+    let workflow = params.workflow;
     let task = smol::spawn({
         let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
@@ -209,6 +211,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    registry: Arc::clone(ToolRegistry::global_arc()),
+                    audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -224,8 +228,12 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
+                    images: params.images,
+                    preamble: Vec::new(),
+                    thinking: Default::default(),
                     fast,
-                    ..Default::default()
+                    workflow,
+                    prompt: None,
                 })
                 .await;
             drop(agent);
@@ -266,6 +274,7 @@ pub struct InteractiveParams {
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
+    pub workflow: bool,
 }
 
 pub struct InteractiveHandle {
@@ -276,17 +285,11 @@ pub struct InteractiveHandle {
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
     pub session_id: String,
+    pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
-    let session_id = params
-        .session_id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-    let created_at = get_session_created_at(&session_id);
-
     let AgentSetup {
         vars,
         instructions,
@@ -296,7 +299,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
-        created_at,
+        params.workflow,
     );
 
     let tool_names = extract_tool_names(&tools);
@@ -306,6 +309,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
+
+    let session_id = params
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -321,6 +328,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
     let task = smol::spawn({
         let session_id = session_id.clone();
+        let permissions = Arc::clone(&permissions);
         async move {
             let mut model = params.model;
             let mut provider: Arc<dyn Provider> =
@@ -355,6 +363,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &params.config,
                                 &params.excluded_tools,
                                 params.mcp_handle.as_ref(),
+                                params.workflow,
+                                ToolRegistry::global(),
                             );
                             model = new_model;
                         }
@@ -375,6 +385,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &input.mode,
                         &instructions.text,
                         &params.prompt_slots,
+                        &model,
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {
@@ -406,6 +417,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        registry: Arc::clone(ToolRegistry::global_arc()),
+                        audience: ToolAudience::MAIN,
                     },
                     AgentRunParams {
                         history: &mut history,
@@ -450,6 +463,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         cancel_tx,
         model_tx,
         session_id,
+        permissions,
         task,
     }
 }

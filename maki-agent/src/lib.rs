@@ -26,16 +26,16 @@ pub use tools::ToolFilter;
 pub mod types;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use maki_providers::AgentError;
 use maki_providers::Message;
 pub use maki_providers::{ImageMediaType, ImageSource, ThinkingConfig};
 pub use types::{
-    AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot, Envelope,
-    EventSender, GrepFileEntry, GrepLine, GrepMatchGroup, InstructionBlock, NO_FILES_FOUND,
-    SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, SubagentInfo, TextOutput, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    AgentEvent, BufferSnapshot, Envelope, EventSender, GrepFileEntry, GrepLine, GrepMatchGroup,
+    InstructionBlock, NO_FILES_FOUND, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle,
+    SubagentInfo, TextOutput, ToolDoneEvent, ToolInput, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -45,10 +45,18 @@ pub enum AgentMode {
     Plan(PathBuf),
 }
 
+impl AgentMode {
+    pub fn plan_path(&self) -> Option<&Path> {
+        match self {
+            Self::Plan(p) => Some(p),
+            Self::Build => None,
+        }
+    }
+}
+
 pub enum ExtractedCommand {
     Interrupt(AgentInput, u64),
     Compact(u64),
-    Checkpoint(u64),
 }
 
 pub trait InterruptSource: Send + Sync {
@@ -61,7 +69,6 @@ pub struct McpPromptRef {
     pub arguments: HashMap<String, String>,
 }
 
-#[derive(Default)]
 pub struct AgentInput {
     pub message: String,
     pub mode: AgentMode,
@@ -69,5 +76,7 @@ pub struct AgentInput {
     pub preamble: Vec<Message>,
     pub thinking: ThinkingConfig,
     pub fast: bool,
+    /// No `Default` on this struct so adding a field forces every call site to update.
+    pub workflow: bool,
     pub prompt: Option<Box<McpPromptRef>>,
 }

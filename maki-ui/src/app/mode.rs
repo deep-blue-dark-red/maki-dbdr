@@ -125,19 +125,21 @@ impl App {
             message: msg.text.clone(),
             mode: self.agent_mode(),
             images: msg.images.clone(),
+            preamble: Vec::new(),
             thinking: self.state.thinking,
             fast: self.state.fast,
-            ..Default::default()
+            workflow: self.state.workflow,
+            prompt: None,
         }
     }
 
     pub(super) fn mode_label(&self) -> (Cow<'static, str>, Style) {
         let label: Cow<'static, str> = if self.is_bash_input() {
-            "[bash]".into()
+            "[BASH]".into()
         } else {
             match self.state.mode {
-                Mode::Build => "[build]".into(),
-                Mode::Plan => "[plan]".into(),
+                Mode::Build => "[BUILD]".into(),
+                Mode::Plan => "[PLAN]".into(),
             }
         };
         let style = Style::new()

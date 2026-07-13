@@ -44,6 +44,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5-mini", "gpt-5 mini", "claude-haiku-4.5"],
             tier: ModelTier::Weak,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
@@ -53,6 +54,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["gpt-5.2", "gpt-4.1", "claude-sonnet-4.5"],
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
@@ -67,6 +69,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             ],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
+            vision: true,
             default: true,
             pricing: ModelPricing::ZERO,
             max_output_tokens: 100_000,
@@ -76,6 +79,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             prefixes: &["claude-opus-4.7"],
             tier: ModelTier::Strong,
             family: ModelFamily::Generic,
+            vision: true,
             default: false,
             pricing: ModelPricing::ZERO,
             max_output_tokens: 64_000,
@@ -165,9 +169,9 @@ impl Copilot {
             &auth,
             None,
         )
-        .body(Vec::new())?;
+        .body(())?;
 
-        let mut response = super::send_request(&self.client, request).await?;
+        let mut response = self.client.send_async(request).await?;
         if !response.status().is_success() {
             return Err(AgentError::from_response(response).await);
         }
@@ -225,7 +229,7 @@ impl Copilot {
                 &body,
             )?
             .body(serde_json::to_vec(&body)?)?;
-        let response = super::send_request(&self.client, request).await?;
+        let response = self.client.send_async(request).await?;
         if response.status().is_success() {
             openai_compat::parse_sse(
                 BufReader::new(response.into_body()),
@@ -287,7 +291,7 @@ impl Copilot {
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
             .body(serde_json::to_vec(&body)?)?;
-        let response = super::send_request(&self.client, request).await?;
+        let response = self.client.send_async(request).await?;
         if response.status().is_success() {
             super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
         } else {
@@ -433,7 +437,7 @@ async fn try_discover_api_endpoint(client: &HttpClient, token: &str) -> Result<S
         .header("user-agent", super::user_agent())
         .body(serde_json::to_vec(&body)?)?;
 
-    let mut response = super::send_request(client, request).await?;
+    let mut response = client.send_async(request).await?;
     if !response.status().is_success() {
         return Err(AgentError::from_response(response).await);
     }

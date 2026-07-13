@@ -1,7 +1,18 @@
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 
-local DESCRIPTION = [[Read a file with line numbers. Give offset and limit — locate them with index or grep first, and read one adequate window rather than repeated small slices. Read multiple files in parallel.]]
+local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
+
+- Supports absolute, relative, and ~/ paths.
+- **Always include offset and limit** if possible. Defaults: no offset = start at 1; no limit = up to 2000 lines.
+- Use the **index** tool or **grep** tool first to find the offset and limit.
+- Only read the sections you actually need.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable limit unless known already.
+- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
+- Do not reread the same range (same file and same offset).
+- Prefer grep to locate content instead of scanning full files.
+- Call in parallel when reading multiple files.
+- Avoid tiny repeated slices - read a larger window if you need more context.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_LINE_BYTES = 3000
@@ -30,34 +41,29 @@ local function read_view_opts(ctx)
   return { max_lines = (tol and tol.read) or 10, keep = "head" }
 end
 
-local function apply_highlights(view, hl_lines, ext, prefix)
-  local texts = {}
-  for _, fl in ipairs(hl_lines) do
-    texts[#texts + 1] = fl.text
-  end
+local function apply_highlights(view, lines, ext, prefix)
   local opts = prefix and { prefix = prefix } or nil
-  local highlighted = maki.ui.highlight(table.concat(texts, "\n"), ext, opts)
+  local highlighted = maki.ui.highlight(table.concat(lines, "\n"), ext, opts)
   if not highlighted then
     return
   end
-  for i, fl in ipairs(hl_lines) do
-    local hl_spans = highlighted[i]
-    if hl_spans then
-      view:update_line(fl.idx, { view.all_lines[fl.idx][1], table.unpack(hl_spans) })
+  for i, hl_spans in ipairs(highlighted) do
+    local plain = view.all_lines[i]
+    if not plain then
+      break
     end
+    view:update_line(i, { plain[1], table.unpack(hl_spans) })
   end
   view:flush()
 end
 
-local function build_file_view(lines, start_line, total_lines, path, ctx, sync, prefix)
+local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
   local nr_fmt = line_nr_fmt(total_lines)
 
-  local hl_lines = {}
   for i, line in ipairs(lines) do
     view:append({ { string.format(nr_fmt, start_line + i - 1), "line_nr" }, { line } })
-    hl_lines[#hl_lines + 1] = { idx = #view.all_lines, text = line }
   end
 
   local trunc_start = start_line + #lines
@@ -77,13 +83,9 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, sync, 
   view:finish()
 
   local ext = path:match("%.([^%.]+)$") or ""
-  if sync then
-    apply_highlights(view, hl_lines, ext, prefix)
-  else
-    maki.async.run(function()
-      apply_highlights(view, hl_lines, ext, prefix)
-    end)
-  end
+  maki.async.run(function()
+    apply_highlights(view, lines, ext, prefix)
+  end)
 
   buf:on("click", function()
     view:toggle()
@@ -120,10 +122,9 @@ local function read_file(path, offset, limit, ctx)
   end
   local total_lines = #all_lines
 
-  local config = ctx:config()
   local start = math.max(offset or 1, 1)
-  local max_lines = limit or (config and config.max_output_lines) or DEFAULT_MAX_OUTPUT_LINES
-  local max_line_bytes = (config and config.max_line_bytes) or DEFAULT_MAX_LINE_BYTES
+  local max_lines = limit or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local max_line_bytes = ctx:config("max_line_bytes", DEFAULT_MAX_LINE_BYTES)
 
   local lines = {}
   for i = start, math.min(start + max_lines - 1, total_lines) do
@@ -153,7 +154,7 @@ local function read_file(path, offset, limit, ctx)
   local annotation = shown < total_lines and string.format("%d of %d lines", shown, total_lines)
     or string.format("%d lines", shown)
 
-  local prefix = start > 1 and table.concat(all_lines, "\n", 1, start - 1) or nil
+  local prefix = start > 1 and table.concat(all_lines, "\n", 1, math.min(start - 1, total_lines)) or nil
 
   local basename = path:match("([^/]+)$")
   if not ctx:is_instruction_file(basename) then
@@ -163,7 +164,7 @@ local function read_file(path, offset, limit, ctx)
       if #instructions > 0 then
         return {
           llm_output = llm_output,
-          body = build_file_view(lines, start, total_lines, path, ctx, false, prefix),
+          body = build_file_view(lines, start, total_lines, path, ctx, prefix),
           annotation = annotation,
           instructions = instructions,
         }
@@ -173,15 +174,15 @@ local function read_file(path, offset, limit, ctx)
 
   return {
     llm_output = llm_output,
-    body = build_file_view(lines, start, total_lines, path, ctx, false, prefix),
+    body = build_file_view(lines, start, total_lines, path, ctx, prefix),
     annotation = annotation,
   }
 end
 
 local function list_dir(path, ctx)
-  local entries = maki.fs.dir(path)
+  local entries, err = maki.fs.dir(path)
   if not entries then
-    return { llm_output = "read error: cannot read directory: " .. path, is_error = true }
+    return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
 
   local sorted = {}
@@ -221,7 +222,8 @@ end
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
-- **read** only the sections you need; for a large file, check `wc -l` first to pick a line limit.]],
+- When using the **read** tool, only read the sections you actually need.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
 })
 
 maki.api.register_tool({
@@ -278,7 +280,7 @@ maki.api.register_tool({
     end
     start_line = start_line or 1
     total_lines = total_lines or (start_line + #lines - 1)
-    return build_file_view(lines, start_line, total_lines, input.path or "", ctx, true)
+    return build_file_view(lines, start_line, total_lines, input.path or "", ctx)
   end,
 
   handler = function(input, ctx)

@@ -25,6 +25,13 @@ pub(crate) fn models() -> &'static [ModelEntry] {
     &[]
 }
 
+#[derive(Debug)]
+struct OpenRouterModelInfo {
+    reasoning_mandatory: bool,
+    reasoning_default_enabled: bool,
+    reasoning_efforts: Vec<String>,
+}
+
 pub struct OpenRouter {
     compat: OpenAiCompatProvider,
     auth: Arc<Mutex<ResolvedAuth>>,
@@ -58,6 +65,24 @@ impl OpenRouter {
     }
 }
 
+fn map_effort_to_supported<'a>(requested: &'a str, supported: &'a [String]) -> &'a str {
+    const EFFORT_ORDER: &[&str] = &["max", "xhigh", "high", "medium", "low", "minimal", "none"];
+
+    if supported.iter().any(|s| s == requested) {
+        return requested;
+    }
+    let req_idx = EFFORT_ORDER
+        .iter()
+        .position(|&e| e == requested)
+        .unwrap_or(0);
+    for effort in EFFORT_ORDER.iter().skip(req_idx) {
+        if supported.contains(&effort.to_string()) {
+            return effort;
+        }
+    }
+    supported.last().map(|s| s.as_str()).unwrap_or(requested)
+}
+
 impl Provider for OpenRouter {
     fn stream_message<'a>(
         &'a self,
@@ -77,14 +102,52 @@ impl Provider for OpenRouter {
 
             body["cache_control"] = json!({"type": "ephemeral"});
 
-            match opts.thinking {
-                ThinkingConfig::Off => {}
-                ThinkingConfig::Adaptive => {
-                    body["reasoning_effort"] = json!("high");
+            let reasoning_info: Option<Arc<OpenRouterModelInfo>> = {
+                let guard = crate::model_registry::model_registry().read().unwrap();
+                guard
+                    .discovered(model.provider, &model.id)
+                    .and_then(|d| d.provider_info.clone())
+                    .map(|arc| {
+                        Arc::downcast::<OpenRouterModelInfo>(arc).expect("wrong provider info type")
+                    })
+            };
+
+            let (mandatory, default_enabled) = reasoning_info
+                .as_ref()
+                .map(|r| (r.reasoning_mandatory, r.reasoning_default_enabled))
+                .unwrap_or((false, false));
+
+            // Determine if and how to send reasoning config for OpenRouter.
+            // Models have three states:
+            // 1. mandatory: true - reasoning always on, can't be disabled.
+            // 2. default_enabled: true - reasoning on by default, disable with effort: "none".
+            // 3. default off - reasoning off by default, enabled with any reasoning object.
+            let reasoning_body = if model.supports_thinking() {
+                let effort = match opts.thinking {
+                    ThinkingConfig::Off => "none",
+                    // FIXME: Should probably use default_effort if provided instead of high
+                    ThinkingConfig::Adaptive => "high",
+                    ThinkingConfig::Budget(n) => ThinkingConfig::budget_to_effort(n),
+                };
+                match opts.thinking {
+                    ThinkingConfig::Off if mandatory => None,
+                    ThinkingConfig::Off if default_enabled => Some(json!({"effort": "none"})),
+                    ThinkingConfig::Off => None,
+                    _ => {
+                        let final_effort = if let Some(info) = &reasoning_info {
+                            map_effort_to_supported(effort, &info.reasoning_efforts)
+                        } else {
+                            effort
+                        };
+                        Some(json!({"effort": final_effort}))
+                    }
                 }
-                ThinkingConfig::Budget(n) => {
-                    body["reasoning_effort"] = json!(ThinkingConfig::budget_to_effort(n));
-                }
+            } else {
+                None
+            };
+
+            if let Some(reasoning) = reasoning_body {
+                body["reasoning"] = reasoning;
             }
 
             if let Some(sid) = session_id {
@@ -101,70 +164,81 @@ impl Provider for OpenRouter {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let base = auth
-                .base_url
-                .as_deref()
-                .unwrap_or(self.compat.config().base_url);
-            let url = format!("{base}/models");
-            let body_text = self.compat.get_text(&auth, &url).await?;
-            let body: Value = serde_json::from_str(&body_text)?;
-            let mut models: Vec<crate::model::ModelInfo> = body["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|m| {
-                            // Skip models without required architecture fields
-                            let architecture = m["architecture"].as_object()?;
-                            let input_modalities = architecture["input_modalities"].as_array()?;
-                            let output_modalities = architecture["output_modalities"].as_array()?;
+            self.compat
+                .fetch_and_parse_models(&auth, |m| {
+                    // Filter: only text input/output models
+                    let architecture = m["architecture"].as_object()?;
+                    let input_modalities = architecture["input_modalities"].as_array()?;
+                    let output_modalities = architecture["output_modalities"].as_array()?;
 
-                            // Check if both input and output modalities contain "text"
-                            let has_text_input =
-                                input_modalities.iter().any(|m| m.as_str() == Some("text"));
-                            let has_text_output =
-                                output_modalities.iter().any(|m| m.as_str() == Some("text"));
+                    let has_text_input =
+                        input_modalities.iter().any(|m| m.as_str() == Some("text"));
+                    let has_text_output =
+                        output_modalities.iter().any(|m| m.as_str() == Some("text"));
+                    if !has_text_input || !has_text_output {
+                        return None;
+                    }
 
-                            if !has_text_input || !has_text_output {
-                                return None;
-                            }
-
-                            let id = m["id"].as_str()?;
-                            let context_window = m["context_length"]
-                                .as_u64()
-                                .and_then(|v| u32::try_from(v).ok());
-                            let pricing = m["pricing"]
-                                .as_object()
-                                .and_then(|p| {
-                                    let per_million = 1_000_000.0;
-                                    Some(crate::model::ModelPricing {
-                                        input: p.get("prompt")?.as_str()?.parse::<f64>().ok()? * per_million,
-                                        output: p.get("completion")?.as_str()?.parse::<f64>().ok()? * per_million,
-                                        cache_write: p
-                                            .get("input_cache_write")
-                                            .and_then(|p| p.as_str()?.parse::<f64>().ok())
-                                            .unwrap_or(0.0)
-                                            * per_million,
-                                        cache_read: p
-                                            .get("input_cache_read")
-                                            .and_then(|p| p.as_str()?.parse::<f64>().ok())
-                                            .unwrap_or(0.0)
-                                            * per_million,
-                                        fast: None,
-                                    })
-                                })
-                                .unwrap_or_default();
-                            Some(crate::model::ModelInfo {
-                                id: id.to_string(),
-                                context_window,
-                                max_output_tokens: None,
-                                pricing: Some(pricing),
+                    // Parse with OpenRouter-specific pricing field names
+                    let id = m["id"].as_str()?;
+                    let context_window = m["context_length"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok());
+                    let pricing = m["pricing"]
+                        .as_object()
+                        .and_then(|p| {
+                            Some(crate::model::ModelPricing {
+                                input: p.get("prompt")?.as_str()?.parse().ok()?,
+                                output: p.get("completion")?.as_str()?.parse().ok()?,
+                                cache_write: p
+                                    .get("input_cache_write")
+                                    .and_then(|p| p.as_str()?.parse().ok())
+                                    .unwrap_or(0.0),
+                                cache_read: p
+                                    .get("input_cache_read")
+                                    .and_then(|p| p.as_str()?.parse().ok())
+                                    .unwrap_or(0.0),
+                                fast: None,
                             })
                         })
-                        .collect()
+                        .unwrap_or_default();
+
+                    let reasoning = m.get("reasoning").and_then(|v| v.as_object()).map(|v| {
+                        OpenRouterModelInfo {
+                            reasoning_mandatory: v.get("mandatory").and_then(Value::as_bool)
+                                == Some(true),
+                            reasoning_default_enabled: v
+                                .get("default_enabled")
+                                .and_then(Value::as_bool)
+                                == Some(true),
+                            reasoning_efforts: v
+                                .get("supported_efforts")
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        }
+                    });
+
+                    let supports_thinking = reasoning.is_some()
+                        || m.get("supported_parameters")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|v| v.iter().any(|v| v.as_str() == Some("reasoning")));
+
+                    Some(crate::model::ModelInfo {
+                        id: id.to_string(),
+                        context_window,
+                        max_output_tokens: None,
+                        pricing: Some(pricing),
+                        supports_thinking: Some(supports_thinking),
+                        provider_info: reasoning
+                            .map(|r| Arc::new(r) as Arc<dyn std::any::Any + Send + Sync>),
+                    })
                 })
-                .unwrap_or_default();
-            models.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(models)
+                .await
         })
     }
 

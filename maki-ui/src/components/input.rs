@@ -309,9 +309,7 @@ impl InputBox {
 
         lines_above + wrap_row
     }
-}
 
-impl InputBox {
     pub fn view(
         &mut self,
         frame: &mut Frame,
@@ -408,30 +406,18 @@ impl InputBox {
         }
 
         let text = Text::from(styled_lines);
-
-        let w = area.width as usize;
-        let hint_len = top_right_hint.as_ref().map(|h| h.width()).unwrap_or(0);
-        let dash_len = w.saturating_sub(hint_len);
-        let mut spans = vec![Span::styled("─".repeat(dash_len), border_style)];
-        if let Some(ref hint) = top_right_hint {
-            spans.extend(hint.spans.clone());
-        }
-
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
             .border_type(BorderType::Plain)
             .border_style(border_style);
-
+        if let Some(hint) = top_right_hint {
+            block = block.title_top(hint.right_aligned());
+        }
         let paragraph = Paragraph::new(text)
             .style(Style::new().fg(theme::current().foreground))
             .scroll((self.scroll_y, 0))
             .block(block);
         frame.render_widget(paragraph, area);
-
-        let top_border_line = Line::from(spans);
-        let top_border_paragraph = Paragraph::new(top_border_line);
-        let top_border_area = Rect::new(area.x, area.y, area.width, 1);
-        frame.render_widget(top_border_paragraph, top_border_area);
 
         if max_scroll > 0 {
             let inner = area.inner(ratatui::layout::Margin::new(0, 1));
@@ -791,14 +777,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                input.view(
-                    frame,
-                    area,
-                    streaming,
-                    border_style,
-                    true,
-                    None,
-                );
+                input.view(frame, area, streaming, border_style, true, None);
             })
             .unwrap();
         terminal

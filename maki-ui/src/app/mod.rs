@@ -38,21 +38,16 @@ use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
-use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
-use crate::components::plugins_modal::{PluginsModal, PluginsAction};
-use crate::components::skills_modal::{SkillsModal, SkillsAction};
-use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
 use crate::components::tool_display::format_turn_usage;
+use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
-use crate::event_loop::BufClickHandler;
 use crate::image;
 use crate::selection::{SelectionState, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -80,8 +75,8 @@ pub(crate) use queue::MessageQueue;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
-/// Bypasses the per-run staleness filter in `handle_agent_event` since
-/// re-bake replies don't belong to any real agent run.
+/// Bypasses the per-run staleness filter because re-bake replies
+/// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
@@ -91,13 +86,13 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
+const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
+const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 
-/// `Option<bool>` lets us distinguish the main chat (None, no status indicator)
-/// from subagents (Some, with spinner or checkmark).
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
@@ -142,17 +137,13 @@ pub struct App {
     pub(super) task_picker: ListPicker<TaskEntry>,
     pub(super) task_picker_original: Option<usize>,
     pub(super) theme_picker: ThemePicker,
-    pub(super) settings_picker: SettingsPicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
-    pub(super) goto_picker: GotoPicker,
     pub(super) help_modal: HelpModal,
-    pub(super) export_picker: ExportPicker,
-    pub(super) plugins_modal: PluginsModal,
-    pub(super) skills_modal: SkillsModal,
+    pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
@@ -161,15 +152,6 @@ pub struct App {
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
     pub status: Status,
-    pub(super) active_run_start: Option<Instant>,
-    pub(super) active_run_input_tokens: u32,
-    pub(super) active_run_output_chars: u32,
-    pub(super) active_run_duration: Option<Duration>,
-    pub(super) turn_api_sent_at: Option<Instant>,
-    pub(super) turn_first_token_at: Option<Instant>,
-    pub(super) last_turn_stats: Option<crate::components::status_bar::TurnStats>,
-    pub(super) show_token_stats: bool,
-    pub verbose: bool,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
@@ -185,6 +167,7 @@ pub struct App {
     pub(super) last_esc: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
     pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
@@ -193,7 +176,6 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(super) buf_click: Option<BufClickHandler>,
     pub(crate) lua_event_handle: Option<EventHandle>,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
@@ -221,23 +203,9 @@ impl App {
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let mut state = SessionState::from_session(session, model, &storage);
-        let user_settings = UserSettings::load();
-        state.session.meta.show_system_prompt = user_settings.show_system_prompt;
-        state.session.meta.show_reasoning = user_settings.show_reasoning;
-        maki_config::LOG_API.store(user_settings.api_logging, std::sync::atomic::Ordering::Relaxed);
-        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(state.session.id.clone());
-        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(state.session.title.clone());
-
-        let mut main_chat = Chat::new("Main".into(), ui_config);
-        main_chat.set_system_prompt(
-            user_settings.show_system_prompt,
-            state.session.meta.system_prompt.clone(),
-        );
-        main_chat.set_show_reasoning(user_settings.show_reasoning);
-
-        Self {
-            chats: vec![main_chat],
+        let state = SessionState::from_session(session, model, &storage);
+        let mut app = Self {
+            chats: vec![Chat::new("Main".into(), ui_config)],
             active_chat: 0,
             chat_index: HashMap::new(),
             input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
@@ -249,17 +217,13 @@ impl App {
             task_picker: ListPicker::new(),
             task_picker_original: None,
             theme_picker: ThemePicker::new(),
-            settings_picker: SettingsPicker::new(),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
-            goto_picker: GotoPicker::new(),
             help_modal: HelpModal::new(),
-            export_picker: ExportPicker::new(),
-            plugins_modal: PluginsModal::new(),
-            skills_modal: SkillsModal::new(),
+            usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
@@ -268,15 +232,6 @@ impl App {
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
             status: Status::Idle,
-            active_run_start: None,
-            active_run_input_tokens: 0,
-            active_run_output_chars: 0,
-            active_run_duration: None,
-            turn_api_sent_at: None,
-            turn_first_token_at: None,
-            last_turn_stats: None,
-            show_token_stats: user_settings.show_token_stats,
-            verbose: false,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
@@ -291,6 +246,7 @@ impl App {
             clipboard: ClipboardState::new(),
             last_esc: None,
             storage,
+            usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
             shared_tool_outputs: None,
@@ -299,14 +255,16 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
-            buf_click: None,
             lua_event_handle: None,
             keymap_reader,
             hint_reader,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
-        }
+        };
+        app.model_picker
+            .set_recents(maki_storage::model::read_recents(&app.storage));
+        app
     }
 
     pub(crate) fn main_chat(&mut self) -> &mut Chat {
@@ -324,6 +282,11 @@ impl App {
     pub(crate) fn update_model(&mut self, model: &Model) {
         self.state.update_model(model);
         persist_model(&self.storage, &self.state.session.model);
+    }
+
+    pub(crate) fn record_recent_model(&mut self, spec: &str) {
+        let recents = maki_storage::model::push_recent(&self.storage, spec);
+        self.model_picker.set_recents(recents);
     }
 
     pub(crate) fn flash(&mut self, msg: String) {
@@ -412,6 +375,10 @@ impl App {
             self.help_modal.scroll(delta);
             return;
         }
+        if self.usage_modal.is_open() {
+            self.usage_modal.scroll(delta);
+            return;
+        }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
@@ -429,7 +396,6 @@ impl App {
         }
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
-        try_picker!(self.goto_picker);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
@@ -453,39 +419,9 @@ impl App {
         self.task_picker.select(self.active_chat);
     }
 
-    /// Ctrl shortcuts that apply when no overlay owns input.
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
-        }
-        if key::DELETE_CURRENT_SESSION.matches(key) {
-            let session_id = self.state.session.id.clone();
-
-            // 1. Delete the session from storage
-            if let Err(e) = AppSession::delete(&session_id, &self.storage) {
-                self.status_bar.flash(format!("Failed to delete session: {e}"));
-            } else {
-                self.status_bar.flash("Session deleted".into());
-                self.session_picker.remove_entry(&session_id);
-
-                // 2. Open the sessions list popup window directly
-                self.open_session_picker();
-            }
-            return Some(vec![]);
-        }
-        if key::TOGGLE_GLOBAL_SESSIONS.matches(key) {
-            let mut settings = UserSettings::load();
-            settings.global_sessions = !settings.global_sessions;
-            settings.save();
-            if settings.global_sessions {
-                self.status_bar.flash("Global sessions enabled".into());
-            } else {
-                self.status_bar.flash("Global sessions disabled".into());
-            }
-            if self.session_picker.is_open() {
-                self.open_session_picker();
-            }
-            return Some(vec![]);
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
@@ -501,14 +437,6 @@ impl App {
         }
         if key::HELP.matches(key) {
             self.help_modal.toggle();
-            return Some(vec![]);
-        }
-        if key::TOGGLE_VERBOSE.matches(key) {
-            self.verbose = !self.verbose;
-            let verbose = self.verbose;
-            for chat in &mut self.chats {
-                chat.set_verbose(verbose);
-            }
             return Some(vec![]);
         }
         if key::TASKS.matches(key) {
@@ -551,9 +479,6 @@ impl App {
         None
     }
 
-    /// Routes input to whichever overlay currently owns focus.
-    /// Returns `Some` when an overlay is open (consuming the key),
-    /// `None` when no overlay is active and input should continue.
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
@@ -578,95 +503,11 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.plugins_modal.is_open() {
-            match self.plugins_modal.handle_key(key) {
-                PluginsAction::EditPlugin(path) => {
-                    return Some(vec![Action::OpenEditor(path)]);
-                }
-                PluginsAction::None => {
-                    return Some(vec![]);
-                }
+        if self.usage_modal.is_open() {
+            if key::REFRESH.matches(key) {
+                return Some(vec![Action::RefreshUsage]);
             }
-        }
-
-        if self.skills_modal.is_open() {
-            match self.skills_modal.handle_key(key) {
-                SkillsAction::CreateSkill(path) => {
-                    return Some(vec![Action::OpenEditor(path)]);
-                }
-                SkillsAction::EditSkillsJson(path) => {
-                    return Some(vec![Action::OpenEditor(path)]);
-                }
-                SkillsAction::EditSkill(path) => {
-                    return Some(vec![Action::OpenEditor(path)]);
-                }
-                SkillsAction::None => {
-                    return Some(vec![]);
-                }
-            }
-        }
-
-        if self.export_picker.is_open() {
-            match self.export_picker.handle_key(key) {
-                ExportPickerAction::Select(entry) => {
-                    let settings = UserSettings::load();
-                    let base_path = settings.resolved_export_path(std::path::Path::new(&self.state.session.cwd));
-                    match entry.export_type {
-                        ExportType::MarkdownClipboard => {
-                            let text = self.export_session_to_markdown();
-                            match self.clipboard.copy_text(&text) {
-                                Ok(crate::clipboard::CopyResult::Copied) => {
-                                    self.flash("Copied transcript to clipboard".into());
-                                }
-                                Ok(crate::clipboard::CopyResult::Noop) => {}
-                                Err(e) => {
-                                    self.flash(format!("Copy failed: {e}"));
-                                }
-                            }
-                        }
-                        ExportType::MarkdownSave => {
-                            let text = self.export_session_to_markdown();
-                            let filepath = if base_path.is_file() {
-                                base_path
-                            } else {
-                                let _ = std::fs::create_dir_all(&base_path);
-                                base_path.join(format!("session-{}.md", self.state.session.id))
-                            };
-                            match std::fs::write(&filepath, text) {
-                                Ok(_) => self.flash(format!("Saved transcript to {}", filepath.display())),
-                                Err(e) => self.flash(format!("Failed to save transcript: {e}")),
-                            }
-                        }
-                        ExportType::JsonClipboard => {
-                            let text = self.export_session_to_json();
-                            match self.clipboard.copy_text(&text) {
-                                Ok(crate::clipboard::CopyResult::Copied) => {
-                                    self.flash("Copied JSON session to clipboard".into());
-                                }
-                                Ok(crate::clipboard::CopyResult::Noop) => {}
-                                Err(e) => {
-                                    self.flash(format!("Copy failed: {e}"));
-                                }
-                            }
-                        }
-                        ExportType::JsonSave => {
-                            let text = self.export_session_to_json();
-                            let filepath = if base_path.is_file() {
-                                base_path
-                            } else {
-                                let _ = std::fs::create_dir_all(&base_path);
-                                base_path.join(format!("session-{}.json", self.state.session.id))
-                            };
-                            match std::fs::write(&filepath, text) {
-                                Ok(_) => self.flash(format!("Saved JSON session to {}", filepath.display())),
-                                Err(e) => self.flash(format!("Failed to save JSON session: {e}")),
-                            }
-                        }
-                    }
-                }
-                ExportPickerAction::Consumed => {}
-                ExportPickerAction::Close => {}
-            }
+            self.usage_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -770,7 +611,7 @@ impl App {
                 SessionPickerAction::ConfirmDelete => {
                     self.status_bar.flash(format!(
                         "Press {} again to confirm delete",
-                        key::DELETE.label()
+                        key::DELETE.label
                     ));
                     vec![]
                 }
@@ -787,84 +628,10 @@ impl App {
             });
         }
 
-        if self.goto_picker.is_open() {
-            return Some(match self.goto_picker.handle_key(key) {
-                GotoPickerAction::Consumed => vec![],
-                GotoPickerAction::Select(entry) => self.scroll_to_turn(entry),
-                GotoPickerAction::Close => vec![],
-            });
-        }
-
         if self.theme_picker.is_open() {
             return Some(match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
-            });
-        }
-
-        if self.settings_picker.is_open() {
-            return Some(match self.settings_picker.handle_key(key) {
-                SettingsPickerAction::Consumed => vec![],
-                SettingsPickerAction::ToggleShowSystemPrompt(val) => {
-                    let mut settings = UserSettings::load();
-                    settings.show_system_prompt = val;
-                    settings.save();
-
-                    self.state.session.meta.show_system_prompt = val;
-                    for chat in &mut self.chats {
-                        chat.set_system_prompt(val, self.state.session.meta.system_prompt.clone());
-                    }
-                    self.save_session();
-                    vec![]
-                }
-                SettingsPickerAction::ToggleApiLogging(val) => {
-                    let mut settings = UserSettings::load();
-                    settings.api_logging = val;
-                    settings.save();
-
-                    maki_config::LOG_API.store(val, std::sync::atomic::Ordering::Relaxed);
-                    self.save_session();
-                    vec![]
-                }
-                SettingsPickerAction::ToggleShowReasoning(val) => {
-                    let mut settings = UserSettings::load();
-                    settings.show_reasoning = val;
-                    settings.save();
-
-                    self.state.session.meta.show_reasoning = val;
-                    self.save_session();
-                    for chat in &mut self.chats {
-                        chat.set_show_reasoning(val);
-                    }
-                    vec![]
-                }
-                SettingsPickerAction::ToggleShowTokenStats(val) => {
-                    let mut settings = UserSettings::load();
-                    settings.show_token_stats = val;
-                    settings.save();
-                    self.show_token_stats = val;
-                    vec![]
-                }
-                SettingsPickerAction::ToggleGlobalSessions(val) => {
-                    let mut settings = UserSettings::load();
-                    settings.global_sessions = val;
-                    settings.save();
-                    if val {
-                        self.status_bar.flash("Global sessions enabled".into());
-                    } else {
-                        self.status_bar.flash("Global sessions disabled".into());
-                    }
-                    vec![]
-                }
-                SettingsPickerAction::EditLogCommand => {
-                    self.settings_picker.close();
-                    if let Ok(path) = crate::config::config_path() {
-                        vec![Action::OpenEditor(path)]
-                    } else {
-                        vec![]
-                    }
-                }
-                SettingsPickerAction::Closed => vec![],
             });
         }
 
@@ -970,30 +737,17 @@ impl App {
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
         }
-        if key::OPEN_EDITOR.matches(key) {
-            return match self.state.plan.path() {
-                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                None => {
-                    self.flash(FLASH_NO_PLAN.into());
-                    vec![]
-                }
-            };
-        }
-        if key::EDIT_SYSTEM_PROMPT.matches(key) {
-            return vec![Action::EditSystemPrompt];
-        }
-        if key::SESSIONS.matches(key) {
-            return self.open_session_picker();
-        }
-        if key::SHIFT_SESSION_DOWN.matches(key) {
-            return self.shift_session(true);
-        }
-        if key::SHIFT_SESSION_UP.matches(key) {
-            return self.shift_session(false);
-        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);
+            } else if key::OPEN_EDITOR.matches(key) {
+                return match self.state.plan.path() {
+                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    None => {
+                        self.flash(FLASH_NO_PLAN.into());
+                        vec![]
+                    }
+                };
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
@@ -1084,75 +838,6 @@ impl App {
         vec![Action::Quit]
     }
 
-
-
-    pub fn reload_config(&mut self) {
-        let user_settings = UserSettings::load();
-        self.state.session.meta.show_system_prompt = user_settings.show_system_prompt;
-        self.state.session.meta.show_reasoning = user_settings.show_reasoning;
-        maki_config::LOG_API.store(user_settings.api_logging, std::sync::atomic::Ordering::Relaxed);
-        for chat in &mut self.chats {
-            chat.set_system_prompt(
-                user_settings.show_system_prompt,
-                self.state.session.meta.system_prompt.clone(),
-            );
-            chat.set_show_reasoning(user_settings.show_reasoning);
-        }
-        self.show_token_stats = user_settings.show_token_stats;
-        self.status_bar.flash("Configuration reloaded".to_string());
-    }
-
-    fn start_rename(&mut self) -> Vec<Action> {
-        let user_texts: Vec<String> = self
-            .state
-            .session
-            .messages
-            .iter()
-            .filter_map(|m| m.user_text().map(str::to_string))
-            .take(3)
-            .collect();
-
-        if user_texts.is_empty() {
-            self.flash("Nothing to rename yet — send a message first".into());
-            return vec![];
-        }
-
-        let mut total_words = 0usize;
-        let mut parts: Vec<String> = Vec::new();
-        'outer: for text in &user_texts {
-            let mut words: Vec<&str> = Vec::new();
-            for word in text.split_whitespace() {
-                if total_words >= 200 {
-                    break 'outer;
-                }
-                words.push(word);
-                total_words += 1;
-            }
-            parts.push(words.join(" "));
-        }
-
-        let context = parts.join("\n\n");
-        let msg = Message::user(context);
-        self.flash("Renaming session…".into());
-        vec![Action::RenameSession(vec![msg])]
-    }
-
-    pub(crate) fn apply_rename(&mut self, title: String) {
-        let old_name = self.state.session.title.clone();
-        let session_id = self.state.session.id.clone();
-        self.state.session.title = title.clone();
-        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(title.clone());
-        self.save_session();
-        // Logs stay keyed by session id; point a friendly <title>.mlog symlink at it.
-        maki_providers::update_api_log_symlink(
-            &session_id,
-            Some(&old_name),
-            &title,
-            self.state.session.created_at,
-        );
-        self.status_bar.flash(format!("Session renamed to: {title}"));
-    }
-
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { subagent_id } => {
@@ -1235,11 +920,6 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
-        if let AgentEvent::RenameResult { title } = envelope.event {
-            self.apply_rename(title);
-            return vec![];
-        }
-
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
@@ -1280,6 +960,11 @@ impl App {
             messages,
         } = envelope.event
         {
+            // Workflow sessions use synthetic ids that no ToolDone will match,
+            // so we finish them here on SubagentHistory.
+            if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
+                self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+            }
             self.state
                 .session
                 .subagent_messages
@@ -1287,28 +972,15 @@ impl App {
             return vec![];
         }
 
-        let chat_idx = match envelope.subagent {
-            Some(ref subagent) => self.resolve_or_create_chat(subagent),
-            None => 0,
-        };
-
         let subagent_id = envelope
             .subagent
             .as_ref()
             .map(|s| s.parent_tool_use_id.clone());
 
-        if let AgentEvent::SystemPrompt { text } = envelope.event {
-            self.state.session.meta.system_prompt = Some(text.clone());
-            if chat_idx == 0 {
-                let estimated_tokens = (text.len() / 4) as u32;
-                self.active_run_input_tokens = self.active_run_input_tokens.max(estimated_tokens);
-            }
-            self.chats[chat_idx].set_system_prompt(
-                self.state.session.meta.show_system_prompt,
-                Some(text),
-            );
-            return vec![];
-        }
+        let chat_idx = match envelope.subagent {
+            Some(ref subagent) => self.resolve_or_create_chat(subagent),
+            None => 0,
+        };
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             if self.state.mode == Mode::Plan
@@ -1351,48 +1023,6 @@ impl App {
 
         self.retry_info = None;
 
-        match &envelope.event {
-            AgentEvent::ThinkingDelta { text } | AgentEvent::TextDelta { text } => {
-                if chat_idx == 0 {
-                    let chars = text.chars().count();
-                    self.active_run_output_chars += chars as u32;
-                    if self.turn_first_token_at.is_none() {
-                        self.turn_first_token_at = Some(Instant::now());
-                    }
-                }
-            }
-            AgentEvent::ToolResultsSubmitted { message } => {
-                if chat_idx == 0 {
-                    self.active_run_start = Some(Instant::now());
-                    let message_len: usize = message.content.iter().map(|block| {
-                        match block {
-                            maki_providers::ContentBlock::Text { text } => text.len(),
-                            maki_providers::ContentBlock::Thinking { thinking, .. } => thinking.len(),
-                            maki_providers::ContentBlock::RedactedThinking { data } => data.len(),
-                            maki_providers::ContentBlock::ToolResult { content, .. } => content.len(),
-                            _ => 0,
-                        }
-                    }).sum();
-                    self.active_run_input_tokens = self.chats[0].context_size + (message_len / 4) as u32;
-                    self.active_run_output_chars = 0;
-                    self.turn_api_sent_at = Some(Instant::now());
-                    self.turn_first_token_at = None;
-                }
-            }
-            AgentEvent::ToolStart(_) => {
-                if chat_idx == 0 {
-                    self.active_run_start = Some(Instant::now());
-                }
-            }
-            AgentEvent::Done { .. } | AgentEvent::Error { .. } if chat_idx == 0 => {
-                if let Some(start) = self.active_run_start {
-                    self.active_run_duration = Some(start.elapsed());
-                }
-                self.active_run_start = None;
-            }
-            _ => {}
-        }
-
         let plan_path = if self.state.mode == Mode::Plan {
             self.state.plan.path()
         } else {
@@ -1402,41 +1032,17 @@ impl App {
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
             self.chats[chat_idx].token_usage += tc.usage;
+            *self
+                .state
+                .session
+                .meta
+                .usage_by_model
+                .entry(tc.model.clone())
+                .or_default() += tc.usage.into();
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
-                if let (Some(sent_at), Some(first_token_at)) =
-                    (self.turn_api_sent_at, self.turn_first_token_at)
-                {
-                    let now = Instant::now();
-                    let ttft = first_token_at.duration_since(sent_at).as_secs_f64();
-                    let gen_time = now.duration_since(first_token_at).as_secs_f64();
-                    let total_input =
-                        tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
-                    let pp_tps = if ttft > 0.0 {
-                        total_input as f64 / ttft
-                    } else {
-                        0.0
-                    };
-                    let tg_tps = if gen_time > 0.0 {
-                        tc.usage.output as f64 / gen_time
-                    } else {
-                        0.0
-                    };
-                    let cache_rate = if total_input > 0 {
-                        tc.usage.cache_read as f64 / total_input as f64
-                    } else {
-                        0.0
-                    };
-                    self.last_turn_stats = Some(crate::components::status_bar::TurnStats {
-                        pp_tps,
-                        tg_tps,
-                        cache_rate,
-                    });
-                }
-                self.turn_api_sent_at = None;
-                self.turn_first_token_at = None;
             }
             let formatted =
                 format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
@@ -1453,7 +1059,8 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
-            self.permission_prompt.open(id, tool, scopes, subagent_id);
+            self.permission_prompt
+                .open(id, tool, scopes, subagent_id.clone());
             return vec![];
         }
 
@@ -1485,9 +1092,6 @@ impl App {
                     }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
-                    }
-                    if self.state.session.title == maki_storage::sessions::DEFAULT_TITLE {
-                        return self.start_rename();
                     }
                 }
                 ChatEventResult::Error(message) => {
@@ -1533,8 +1137,6 @@ impl App {
         let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
         chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
-        chat.set_show_reasoning(self.state.session.meta.show_reasoning);
-        chat.set_verbose(self.verbose);
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -1550,42 +1152,24 @@ impl App {
                 vec![]
             }
             "/compact" => {
-                let target = if cmd.args.trim().is_empty() {
-                    let settings = UserSettings::load();
-                    settings.compact_tokens
-                } else {
-                    cmd.args.trim().parse::<usize>().ok()
-                };
                 if self.status == Status::Streaming {
-                    self.queue_compact(target);
+                    self.queue_compact();
                     return vec![];
                 }
                 self.status = Status::Streaming;
-                self.active_run_start = Some(Instant::now());
-                self.active_run_duration = None;
-                self.active_run_input_tokens = self.main_chat().context_size;
-                self.active_run_output_chars = 0;
-                self.turn_api_sent_at = Some(Instant::now());
-                self.turn_first_token_at = None;
-                vec![Action::Compact(target)]
-            }
-            "/checkpoint" => {
-                if self.status == Status::Streaming {
-                    self.queue_checkpoint();
-                    return vec![];
-                }
-                self.status = Status::Streaming;
-                self.active_run_start = Some(Instant::now());
-                self.active_run_duration = None;
-                self.active_run_input_tokens = self.main_chat().context_size;
-                self.active_run_output_chars = 0;
-                self.turn_api_sent_at = Some(Instant::now());
-                self.turn_first_token_at = None;
-                vec![Action::Checkpoint]
+                vec![Action::Compact]
             }
             "/help" => {
                 self.help_modal.toggle();
                 vec![]
+            }
+            "/usage" => {
+                self.usage_modal.toggle();
+                if self.usage_modal.is_open() {
+                    vec![Action::RefreshUsage]
+                } else {
+                    vec![]
+                }
             }
             "/btw" => {
                 let question = cmd.args.trim().to_string();
@@ -1610,30 +1194,6 @@ impl App {
                 self.theme_picker.open();
                 vec![]
             }
-            "/settings" => {
-                let settings = UserSettings::load();
-                self.settings_picker.open(&settings);
-                vec![]
-            }
-            "/system_prompt" => {
-                vec![Action::EditSystemPrompt]
-            }
-            "/plugins" => {
-                self.plugins_modal.open(&self.lua_event_handle);
-                vec![]
-            }
-            "/skills" => {
-                self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
-                vec![]
-            }
-            "/rewind" => self.open_rewind_picker(),
-            "/goto" => {
-                if cmd.args.trim().is_empty() {
-                    self.open_goto_picker()
-                } else {
-                    self.goto_turn(cmd.args.trim())
-                }
-            }
             "/mcp" => {
                 self.mcp_picker.open();
                 vec![]
@@ -1654,8 +1214,8 @@ impl App {
                 vec![]
             }
             "/thinking" => {
-                if !self.state.model.provider.supports_thinking() {
-                    self.flash("Thinking requires a provider that supports it".into());
+                if !self.state.model.supports_thinking() {
+                    self.flash("Thinking requires a model that supports it".into());
                     return vec![];
                 }
                 match ThinkingConfig::parse(cmd.args.trim(), self.state.thinking) {
@@ -1683,19 +1243,19 @@ impl App {
                 );
                 vec![]
             }
-            "/export" => {
-                self.export_picker.open(std::path::Path::new(&self.state.session.cwd));
+            "/workflow" => {
+                self.state.workflow = !self.state.workflow;
+                self.flash(
+                    if self.state.workflow {
+                        WORKFLOW_ON_MSG
+                    } else {
+                        WORKFLOW_OFF_MSG
+                    }
+                    .into(),
+                );
                 vec![]
             }
-            "/logs" => {
-                vec![Action::RunLogsCommand]
-            }
-            "/reload" | "/reload_config" => {
-                self.reload_config();
-                vec![]
-            }
-            "/rename" => self.start_rename(),
-            "/exit" | "/q" => self.quit(),
+            "/exit" => self.quit(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1756,18 +1316,6 @@ impl App {
         } else {
             self.run_id += 1;
             self.status = Status::Streaming;
-            self.active_run_start = Some(Instant::now());
-            self.active_run_duration = None;
-            let mut input_tokens = self.main_chat().context_size;
-            if input_tokens == 0 {
-                if let Some(ref sys) = self.state.session.meta.system_prompt {
-                    input_tokens = (sys.len() / 4) as u32;
-                }
-            }
-            self.active_run_input_tokens = input_tokens + (display_text.len() / 4) as u32;
-            self.active_run_output_chars = 0;
-            self.turn_api_sent_at = Some(Instant::now());
-            self.turn_first_token_at = None;
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
@@ -1845,12 +1393,10 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 18] {
+    fn overlays(&self) -> [&dyn Overlay; 14] {
         [
             &self.help_modal,
-            &self.export_picker,
-            &self.plugins_modal,
-            &self.skills_modal,
+            &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -1858,9 +1404,7 @@ impl App {
             &self.task_picker,
             &self.session_picker,
             &self.rewind_picker,
-            &self.goto_picker,
             &self.theme_picker,
-            &self.settings_picker,
             &self.model_picker,
             &self.login_picker,
             &self.mcp_picker,
@@ -1868,12 +1412,10 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
         [
             &mut self.help_modal,
-            &mut self.export_picker,
-            &mut self.plugins_modal,
-            &mut self.skills_modal,
+            &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,
@@ -1881,9 +1423,7 @@ impl App {
             &mut self.task_picker,
             &mut self.session_picker,
             &mut self.rewind_picker,
-            &mut self.goto_picker,
             &mut self.theme_picker,
-            &mut self.settings_picker,
             &mut self.model_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
@@ -1914,7 +1454,6 @@ impl App {
                 .as_ref()
                 .is_some_and(|s| s.is_edge_scrolling())
             || self.restoring.load(Ordering::Relaxed)
-            || self.status == Status::Streaming
             || self.chats.iter().any(|c| c.is_animating())
     }
 
@@ -1960,9 +1499,7 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
-        try_picker!(self.goto_picker);
         try_picker!(self.theme_picker);
-        try_picker!(self.settings_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);

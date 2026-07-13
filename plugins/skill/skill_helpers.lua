@@ -28,14 +28,14 @@ function M.build_skill_list(skills)
   end)
 
   if #sorted == 0 then
-    return ""
+    return "\n\n<available_skills>\nNo skills available.\n</available_skills>"
   end
 
-  local names = {}
+  local lines = {}
   for _, s in ipairs(sorted) do
-    names[#names + 1] = s.name
+    lines[#lines + 1] = "- " .. s.name .. ": " .. s.description
   end
-  return " Available: " .. table.concat(names, ", ") .. "."
+  return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
 end
 
 return M

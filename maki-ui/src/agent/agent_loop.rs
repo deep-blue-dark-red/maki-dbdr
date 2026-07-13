@@ -7,7 +7,9 @@ use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{DescriptionContext, FileReadTracker, ToolFilter, ToolRegistry};
+use maki_agent::tools::{
+    DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry,
+};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
@@ -41,7 +43,6 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     session_id: Option<String>,
-    session_created_at: Option<u64>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -64,7 +65,6 @@ impl AgentLoop {
         cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
         session_id: Option<String>,
-        session_created_at: Option<u64>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
         subagent_cancels: Arc<CancelMap<String>>,
@@ -88,7 +88,6 @@ impl AgentLoop {
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
             session_id,
-            session_created_at,
             timeouts,
             lua_handle,
             subagent_cancels,
@@ -127,9 +126,7 @@ impl AgentLoop {
                 }
                 self.do_agent_run(input, event_tx, run_id).await
             }
-            QueueItem::Compact { target_tokens, .. } => self.do_compact(&event_tx, target_tokens).await,
-            QueueItem::Checkpoint { .. } => self.do_checkpoint(&event_tx).await,
-            QueueItem::Rename { messages, .. } => self.do_rename(&event_tx, messages).await,
+            QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
         };
 
         if let Err(e) = result {
@@ -138,7 +135,7 @@ impl AgentLoop {
     }
 
     async fn initialize(&mut self) -> bool {
-        self.vars = template::env_vars_with_creation_time(self.session_created_at);
+        self.vars = template::env_vars();
         self.reload_instructions().await;
         if self.init_cancel.is_cancelled() {
             return false;
@@ -146,7 +143,7 @@ impl AgentLoop {
         self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
 
         let slot = self.model_slot.load();
-        self.tools = self.build_tools(&slot.model);
+        self.tools = self.build_tools(&slot.model, false);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut self.tools);
             spawn_oauth_for_needs_auth(mcp);
@@ -154,26 +151,11 @@ impl AgentLoop {
         !self.init_cancel.is_cancelled()
     }
 
-    async fn do_compact(&mut self, event_tx: &EventSender, target_tokens: Option<usize>) -> Result<(), AgentError> {
+    async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::compact(&*provider, &model, &mut self.history, event_tx, target_tokens).await
-    }
-
-    async fn do_checkpoint(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
-        let slot = self.model_slot.load();
-        let (provider, model) =
-            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::checkpoint(&*provider, &model, &mut self.history, event_tx, None).await
-    }
-
-    async fn do_rename(&mut self, event_tx: &EventSender, messages: Vec<Message>) -> Result<(), AgentError> {
-        let slot = self.model_slot.load();
-        let model = slot.model.clone();
-        let provider = Arc::clone(&slot.provider);
-        drop(slot);
-        agent::rename_session(&*provider, &model, &messages, event_tx).await
+        agent::compact(&*provider, &model, &mut self.history, event_tx).await
     }
 
     async fn do_agent_run(
@@ -185,11 +167,11 @@ impl AgentLoop {
         let slot = self.model_slot.load();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars_with_creation_time(self.session_created_at);
+        self.vars = template::env_vars();
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        self.rebuild_tools(&slot.model);
+        self.rebuild_tools(&slot.model, input.workflow);
 
         for msg in std::mem::take(&mut input.preamble) {
             self.history.push(msg);
@@ -232,8 +214,8 @@ impl AgentLoop {
             &input.mode,
             &self.instructions.text,
             &prompt_slots,
+            &slot.model,
         );
-        let _ = event_tx.send(AgentEvent::SystemPrompt { text: system.clone() });
         self.publish_btw_system(&prompt_slots);
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
@@ -252,6 +234,8 @@ impl AgentLoop {
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
+                registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
+                audience: ToolAudience::MAIN,
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -278,19 +262,23 @@ impl AgentLoop {
         result
     }
 
-    fn rebuild_tools(&mut self, model: &Model) {
-        let mut tools = self.build_tools(model);
+    fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
+        let mut tools = self.build_tools(model, workflow);
         if let Some(ref mcp) = self.mcp_handle {
             mcp.extend_tools(&mut tools);
         }
         self.tools = tools;
     }
 
-    fn build_tools(&self, model: &Model) -> Value {
+    fn build_tools(&self, model: &Model, workflow: bool) -> Value {
         let examples = model.supports_tool_examples();
-        let filter = ToolFilter::from_config(&self.config, &[]);
-        let ctx = DescriptionContext { filter: &filter };
-        ToolRegistry::native().definitions(&self.vars, &ctx, examples)
+        let filter = ToolFilter::from_config(&self.config, model, &[]);
+        let ctx = DescriptionContext {
+            filter: &filter,
+            audience: ToolAudience::MAIN,
+            workflow,
+        };
+        ToolRegistry::global().definitions(&self.vars, &ctx, examples)
     }
 
     async fn reload_instructions(&mut self) {
@@ -301,12 +289,13 @@ impl AgentLoop {
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
     /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        let _slot = self.model_slot.load();
+        let slot = self.model_slot.load();
         let system = agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
+            &slot.model,
         );
         self.btw_system.store(Arc::new(system));
     }

@@ -1,31 +1,24 @@
-MODE: COMPACTION — this block REPLACES the conversation; it must stand alone for an agent that sees only this.
+Provide a detailed summary for continuing our conversation above.
+Focus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.
 
-Produce the state block now. Match the shape and annotations below, but the values shown are illustrative synthetic filler — replace every one with the real conversation; copy none of them. Output ONLY the block.
+Stick to this template:
+---
+## Goal
+[What goal(s) is the user trying to accomplish?]
 
-<compaction_state>
-### MISSION
-[USER] one line: the overarching goal
-[BLOCK] a hard constraint          (omit the line if none)
-1-3 lines: key decisions/pivots and why they were made
+## Instructions
+- [Important instructions the user gave that are relevant]
+- [If there is a plan or spec, include information about it]
 
-### WORKSPACE
-files:   (format: path:lines | state | note ; state = new|modified|deleted|read)
-  src/foo.rs:120-140 | modified | what changed and why it matters
-git_dirty: uncommitted changes relevant to resuming, or "clean"
-calls:   (format: exact command | outcome)
-  cargo test -p foo | 3 pass, 1 fail (see [ERR])
+## Discoveries
+[Notable things learned during this conversation]
 
-### GIT
-#a1b2c3d telegraphic description of the commit
+## Accomplished
+[What work has been completed, what is still in progress, what is left?]
 
-### CHAIN
-(only pivots, discoveries, state changes. [T-N] = transcript turn index if given, else number from [T-1])
-[T3] [USER] wants X → built Y → [ERR] Z → fixed by W
-[T5] discovered <fact> → switched approach to <plan>
+## Relevant files / directories
+[Structured list of relevant files that have been read, edited, or created]
 
-### QUEUE
-[ERR] unresolved failure, fenced          (omit if none)
-[Q] open question                          (omit if none)
-[NEXT] the single immediate next action
-further queued steps, one per line
-</compaction_state>
+## Todo list
+[If a todo list was in use, repeat it here verbatim with each item's current status; it must be kept up to date with todo_write after continuing. Otherwise omit this section]
+---

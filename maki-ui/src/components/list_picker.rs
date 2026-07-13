@@ -42,6 +42,9 @@ fn animation_elapsed_ms() -> u128 {
 
 pub trait PickerItem {
     fn label(&self) -> &str;
+    fn suffix(&self) -> Option<&str> {
+        None
+    }
     fn detail(&self) -> Option<&str> {
         None
     }
@@ -99,11 +102,9 @@ pub struct ListPicker<T> {
     error_text: Option<String>,
 }
 
-#[allow(dead_code)]
 enum FooterSpec {
     Pairs(&'static [(&'static str, &'static str)]),
     Builder(fn() -> Line<'static>),
-    Static(Line<'static>),
 }
 
 impl FooterSpec {
@@ -111,7 +112,6 @@ impl FooterSpec {
         match self {
             Self::Pairs(hints) => hint_line(hints),
             Self::Builder(b) => b(),
-            Self::Static(line) => line.clone(),
         }
     }
 }
@@ -210,6 +210,26 @@ impl<T: PickerItem> State<T> {
         self.ensure_visible();
     }
 
+    fn page_up(&mut self) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
+        }
+        let step = self.viewport_height.max(1);
+        self.selected = self.selected.saturating_sub(step);
+        self.ensure_visible();
+    }
+
+    fn page_down(&mut self) {
+        let len = self.filtered.len();
+        if len == 0 {
+            return;
+        }
+        let step = self.viewport_height.max(1);
+        self.selected = (self.selected + step).min(len - 1);
+        self.ensure_visible();
+    }
+
     fn move_down(&mut self) {
         let len = self.filtered.len();
         if len == 0 {
@@ -271,7 +291,6 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    #[allow(dead_code)]
     pub fn with_footer(mut self, hints: &'static [(&'static str, &'static str)]) -> Self {
         self.footer = Some(FooterSpec::Pairs(hints));
         self
@@ -280,12 +299,6 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
         self.footer = Some(FooterSpec::Builder(builder));
         self
-    }
-
-
-
-    pub fn set_static_footer(&mut self, line: Line<'static>) {
-        self.footer = Some(FooterSpec::Static(line));
     }
 
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
@@ -433,6 +446,14 @@ impl<T: PickerItem> ListPicker<T> {
             s.update_search_and_clamp();
             return PickerAction::Consumed;
         }
+        if key::SCROLL_HALF_UP.matches(key) {
+            s.page_up();
+            return PickerAction::Consumed;
+        }
+        if key::SCROLL_HALF_DOWN.matches(key) {
+            s.page_down();
+            return PickerAction::Consumed;
+        }
         if is_ctrl(&key) {
             return PickerAction::Consumed;
         }
@@ -443,6 +464,14 @@ impl<T: PickerItem> ListPicker<T> {
             }
             KeyCode::Down => {
                 s.move_down();
+                PickerAction::Consumed
+            }
+            KeyCode::PageUp => {
+                s.page_up();
+                PickerAction::Consumed
+            }
+            KeyCode::PageDown => {
+                s.page_down();
                 PickerAction::Consumed
             }
             KeyCode::Enter => {
@@ -745,14 +774,6 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
 }
 
-fn max_label_width(detail: &str, area_width: u16) -> usize {
-    area_width.saturating_sub(detail.width() as u16 + 1 + DETAIL_RIGHT_PAD) as usize
-}
-
-fn detail_padding(label: &str, detail: &str, area_width: u16) -> usize {
-    max_label_width(detail, area_width).saturating_sub(label.width())
-}
-
 fn truncate_label(label: &str, max_width: usize) -> String {
     if label.width() <= max_width {
         return label.to_string();
@@ -826,8 +847,7 @@ fn render_list<T: PickerItem>(
 
         let highlighted = item.is_highlighted();
         let t = theme::current();
-        let is_enabled = enabled.is_some_and(|en| en[item_idx]);
-        let (mut style, mut detail_style) = match (i == selected, highlighted) {
+        let (style, detail_style) = match (i == selected, highlighted) {
             (true, true) => {
                 let s = t.item_selected.fg(t.accent.fg.unwrap_or_default());
                 (s, theme::dim_style(s, 0.4))
@@ -836,36 +856,61 @@ fn render_list<T: PickerItem>(
             (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
             (false, false) => (t.item, t.item_desc),
         };
-        if is_enabled {
-            style = style.add_modifier(ratatui::style::Modifier::BOLD);
-        }
-        if enabled.is_some() {
-            detail_style = detail_style.add_modifier(ratatui::style::Modifier::BOLD);
-        }
+        let checkbox = enabled.map(|en| {
+            let sym = if en[item_idx] { "✓ " } else { "✗ " };
+            let sty = if i == selected {
+                style
+            } else if en[item_idx] {
+                theme::current().item
+            } else {
+                theme::current().item_desc
+            };
+            Span::styled(sym, sty)
+        });
         let label = format!("  {}", item.label());
-        let detail_str: Option<String>;
+        let suffix = item.suffix();
         let detail: Option<&str> = if item.is_spinning() {
             Some(spinner_str(animation_elapsed_ms()))
-        } else if enabled.is_some() {
-            detail_str = Some(if is_enabled { "true".to_string() } else { "false".to_string() });
-            detail_str.as_deref()
         } else {
             item.detail()
         };
+        let suffix_gap = 2usize;
+        let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
+        let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
         let line = match detail {
             Some(detail) => {
-                let label = truncate_label(&label, max_label_width(detail, area.width));
-                let pad = detail_padding(&label, detail, area.width);
-                let spans = vec![
-                    Span::styled(label, style),
-                    Span::styled(" ".repeat(pad), style),
-                    Span::styled(detail.to_string(), detail_style),
-                    Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style),
-                ];
+                let max_label = area.width.saturating_sub(
+                    detail.width() as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD,
+                ) as usize;
+                let label = truncate_label(&label, max_label);
+                let pad = (area.width as usize).saturating_sub(
+                    label.width() + trailing_gap + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
+                );
+                let mut spans = Vec::with_capacity(7);
+                if let Some(cb) = checkbox {
+                    spans.push(cb);
+                }
+                spans.push(Span::styled(label, style));
+                if let Some(s) = suffix {
+                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
+                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
+                }
+                spans.push(Span::styled(" ".repeat(pad), style));
+                spans.push(Span::styled(detail.to_string(), detail_style));
+                spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
                 Line::from(spans)
             }
             None => {
-                Line::from(Span::styled(label, style))
+                let mut spans: Vec<Span> = Vec::with_capacity(4);
+                if let Some(cb) = checkbox {
+                    spans.push(cb);
+                }
+                spans.push(Span::styled(label, style));
+                if let Some(s) = suffix {
+                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
+                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
+                }
+                Line::from(spans)
             }
         };
         lines.push(line);
@@ -955,6 +1000,54 @@ mod tests {
         assert_eq!(ready_state(&p).selected, 2);
 
         p.handle_key(key(KeyCode::Down));
+        assert_eq!(ready_state(&p).selected, 0);
+    }
+
+    #[test]
+    fn page_down_advances_and_clamps() {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        ready_state_mut(&mut p).viewport_height = 10;
+
+        p.handle_key(key(KeyCode::PageDown));
+        assert_eq!(ready_state(&p).selected, 10);
+
+        for _ in 0..10 {
+            p.handle_key(key(KeyCode::PageDown));
+        }
+        assert_eq!(ready_state(&p).selected, 49);
+    }
+
+    #[test]
+    fn page_up_retreats_and_clamps() {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        let s = ready_state_mut(&mut p);
+        s.viewport_height = 10;
+        s.selected = 25;
+
+        p.handle_key(key(KeyCode::PageUp));
+        assert_eq!(ready_state(&p).selected, 15);
+
+        for _ in 0..5 {
+            p.handle_key(key(KeyCode::PageUp));
+        }
+        assert_eq!(ready_state(&p).selected, 0);
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_page_like_page_keys() {
+        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
+        let mut p = ListPicker::new();
+        p.open(items, " Test ");
+        ready_state_mut(&mut p).viewport_height = 10;
+
+        p.handle_key(key::SCROLL_HALF_DOWN.to_key_event());
+        assert_eq!(ready_state(&p).selected, 10);
+
+        p.handle_key(key::SCROLL_HALF_UP.to_key_event());
         assert_eq!(ready_state(&p).selected, 0);
     }
 
@@ -1214,18 +1307,26 @@ mod tests {
     fn detail_right_edge_consistent_for_long_and_short_labels() {
         let width: u16 = 40;
         let detail = "2h ago";
-        let max_w = max_label_width(detail, width);
+        let suffix_gap = 2usize;
 
-        let end_col = |label: &str| -> usize {
-            let t = truncate_label(label, max_w);
-            t.width()
-                + detail_padding(&t, detail, width)
-                + detail.width()
-                + DETAIL_RIGHT_PAD as usize
+        let end_col = |label: &str, suffix_w: usize| -> usize {
+            let trailing = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
+            let max_label = width
+                .saturating_sub(detail.width() as u16 + trailing as u16 + 1 + DETAIL_RIGHT_PAD)
+                as usize;
+            let t = truncate_label(label, max_label);
+            let pad = (width as usize).saturating_sub(
+                t.width() + trailing + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
+            );
+            t.width() + trailing + pad + detail.width() + DETAIL_RIGHT_PAD as usize
         };
 
         let long = "  ".to_string() + &"x".repeat(60);
-        assert_eq!(end_col(&long), end_col("  hi"));
-        assert!(end_col(&long) <= width as usize);
+        assert_eq!(end_col(&long, 0), end_col("  hi", 0));
+        assert!(end_col(&long, 0) <= width as usize);
+
+        let sfx = "Anthropic".width();
+        assert_eq!(end_col(&long, sfx), end_col("  hi", sfx));
+        assert!(end_col(&long, sfx) <= width as usize);
     }
 }

@@ -161,29 +161,6 @@ pub(crate) fn open_in_editor(
     }
 }
 
-pub(crate) fn run_view_log_command(
-    command_line: &str,
-    terminal: &mut ratatui::DefaultTerminal,
-) -> Result<i32, String> {
-    teardown();
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let result = std::process::Command::new(&shell)
-        .arg("-c")
-        .arg(command_line)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status();
-
-    resume(terminal);
-
-    match result {
-        Ok(status) => Ok(status.code().unwrap_or(-1)),
-        Err(e) => Err(format!("Failed to run command {command_line}: {e}")),
-    }
-}
-
 pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut sequence = String::new();
     CopyToClipboard::to_clipboard_from(text)

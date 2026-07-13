@@ -3,10 +3,13 @@
 //! so dated snapshots resolve without registry churn. `context_tokens()` sums input + output
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
+use std::any::Any;
 use std::fmt;
 use std::ops::AddAssign;
 use std::str::FromStr;
+use std::sync::Arc;
 
+use maki_storage::sessions::StoredTokenUsage;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::ProviderKind;
@@ -52,6 +55,9 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub pricing: Option<ModelPricing>,
+    pub supports_thinking: Option<bool>,
+    /// Store of additional metadata from the provider.
+    pub provider_info: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ModelInfo {
@@ -61,6 +67,8 @@ impl ModelInfo {
             context_window: None,
             max_output_tokens: None,
             pricing: None,
+            supports_thinking: None,
+            provider_info: None,
         }
     }
 }
@@ -152,6 +160,8 @@ pub struct ModelEntry {
     pub prefixes: &'static [&'static str],
     pub tier: ModelTier,
     pub family: ModelFamily,
+    /// Gates vision-only tools (`view_image`) and image blocks at request time.
+    pub vision: bool,
     pub default: bool,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
@@ -185,6 +195,7 @@ pub fn models_for_provider(provider: ProviderKind) -> &'static [ModelEntry] {
         ProviderKind::TensorX => tensorx::models(),
         ProviderKind::DeepSeek => deepseek::models(),
         ProviderKind::OpenRouter => openrouter::models(),
+        ProviderKind::Opencode => &[],
     }
 }
 
@@ -194,6 +205,12 @@ impl ModelFamily {
             ModelFamily::Claude | ModelFamily::Gpt | ModelFamily::Synthetic => true,
             ModelFamily::Generic | ModelFamily::Gemini | ModelFamily::Glm => false,
         }
+    }
+
+    /// Fallback for models missing from the static tables; per-model truth
+    /// lives in `ModelEntry::vision`.
+    pub fn supports_vision(self) -> bool {
+        matches!(self, Self::Claude | Self::Gpt | Self::Gemini)
     }
 }
 
@@ -205,6 +222,9 @@ pub struct Model {
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
+    pub supports_thinking_override: Option<bool>,
+    /// Resolved once at construction so every consumer reads the same answer.
+    pub vision: bool,
     pub pricing: ModelPricing,
     pub max_output_tokens: u32,
     pub context_window: u32,
@@ -223,12 +243,13 @@ impl Model {
             .read()
             .unwrap()
             .tier_for(&spec, provider, static_entry.map(|e| e.tier));
-        let (family, pricing, max_output_tokens, context_window) = match static_entry {
+        let (family, pricing, max_output_tokens, context_window, vision) = match static_entry {
             Some(e) => (
                 e.family,
                 e.pricing.clone(),
                 e.max_output_tokens,
                 anthropic::shared::long_context_window(model_id).unwrap_or(e.context_window),
+                e.vision,
             ),
             None => {
                 let guard = crate::model_registry::model_registry().read().unwrap();
@@ -244,6 +265,7 @@ impl Model {
                     discovered
                         .and_then(|d| d.context_window)
                         .unwrap_or_else(|| provider.fallback_context_window()),
+                    provider.family().supports_vision(),
                 )
             }
         };
@@ -254,10 +276,23 @@ impl Model {
             tier,
             family,
             supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            vision,
             pricing,
             max_output_tokens,
             context_window,
         }
+    }
+
+    pub fn supports_thinking(&self) -> bool {
+        self.supports_thinking_override
+            .or_else(|| {
+                let guard = crate::model_registry::model_registry().read().unwrap();
+                guard
+                    .discovered(self.provider, &self.id)
+                    .and_then(|d| d.supports_thinking)
+            })
+            .unwrap_or_else(|| self.provider.supports_thinking())
     }
 
     pub fn supports_tool_examples(&self) -> bool {
@@ -350,6 +385,28 @@ pub struct TokenUsage {
     pub cache_creation: u32,
     #[serde(rename = "cache_read_input_tokens")]
     pub cache_read: u32,
+}
+
+impl From<StoredTokenUsage> for TokenUsage {
+    fn from(s: StoredTokenUsage) -> Self {
+        Self {
+            input: s.input,
+            output: s.output,
+            cache_creation: s.cache_creation,
+            cache_read: s.cache_read,
+        }
+    }
+}
+
+impl From<TokenUsage> for StoredTokenUsage {
+    fn from(u: TokenUsage) -> Self {
+        Self {
+            input: u.input,
+            output: u.output,
+            cache_creation: u.cache_creation,
+            cache_read: u.cache_read,
+        }
+    }
 }
 
 impl TokenUsage {
@@ -520,6 +577,24 @@ mod tests {
     }
 
     #[test]
+    fn opencode_from_spec_parses_four_levels() {
+        let spec = "opencode/nvidia/openai/gpt-oss-120b";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.id, "nvidia/openai/gpt-oss-120b");
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
+    fn opencode_from_spec_parses_three_levels() {
+        let spec = "opencode/opencode/big-pickle";
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(model.provider, ProviderKind::Opencode);
+        assert_eq!(model.id, "opencode/big-pickle");
+        assert_eq!(model.spec(), spec);
+    }
+
+    #[test]
     fn from_tier_covers_all_providers() {
         for provider in ProviderKind::iter() {
             if provider.accepts_arbitrary_models() {
@@ -614,6 +689,20 @@ mod tests {
         );
     }
 
+    #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
+    #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
+    #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
+    #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
+    #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
+    #[test_case("deepseek/deepseek-v4-pro",         false ; "deepseek_text_only")]
+    #[test_case("mistral/mistral-medium-latest",    true  ; "mistral_medium")]
+    #[test_case("mistral/ministral-14b-latest",     false ; "ministral_text_only")]
+    #[test_case("anthropic/claude-nonexistent-99",  true  ; "unknown_model_uses_family_fallback")]
+    #[test_case("deepseek/my-custom-model",         false ; "unknown_generic_defaults_off")]
+    fn vision_resolved_from_entry_or_family(spec: &str, expected: bool) {
+        assert_eq!(Model::from_spec(spec).unwrap().vision, expected);
+    }
+
     #[test_case("claude-opus-4-6" ; "opus_4_6")]
     #[test_case("claude-opus-4-7" ; "opus_4_7")]
     #[test_case("claude-opus-4-8" ; "opus_4_8")]
@@ -665,6 +754,8 @@ mod tests {
                     context_window: Some(expected_window),
                     max_output_tokens: None,
                     pricing: None,
+                    supports_thinking: None,
+                    provider_info: None,
                 }],
             );
         }

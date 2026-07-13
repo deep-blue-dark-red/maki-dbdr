@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use futures_lite::StreamExt;
 use futures_lite::io::AsyncBufRead;
 use isahc::config::Configurable;
+use isahc::http::request::Builder;
 use serde::Deserialize;
 use tracing::debug;
 
@@ -22,6 +23,7 @@ pub(crate) mod mistral;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
+pub(crate) mod opencode;
 pub(crate) mod openrouter;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;
@@ -67,6 +69,13 @@ impl ResolvedAuth {
             base_url: None,
             headers: vec![("authorization".into(), format!("Bearer {api_key}"))],
         }
+    }
+
+    /// Apply all auth headers to an HTTP request builder.
+    pub fn configure_request(&self, builder: Builder) -> Builder {
+        self.headers.iter().fold(builder, |b, (key, value)| {
+            b.header(key.as_str(), value.as_str())
+        })
     }
 }
 
@@ -161,228 +170,6 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
         .build()
         .expect("failed to build HTTP client")
 }
-
-fn now_ms() -> u64 {
-    jiff::Timestamp::now().as_millisecond().max(0) as u64
-}
-
-/// Path of the current session's `.mlog` file, keyed by the stable session id so
-/// every turn of a session lands in one file. `None` if logs are unavailable or
-/// there's no active session.
-fn log_file_path() -> Option<std::path::PathBuf> {
-    let logs_dir = maki_storage::paths::logs_dir().ok()?;
-    let session_id = maki_config::CURRENT_SESSION_ID
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .filter(|id| !id.is_empty())?;
-    Some(logs_dir.join(format!("{session_id}.mlog")))
-}
-
-/// The `YYYYMMDD-<title>.mlog` symlink path for a session title, dated to the
-/// session's creation (`created_at`, Unix epoch seconds) so the link is stable
-/// across renames on later days. `None` for a placeholder/blank title.
-fn friendly_log_link(
-    logs_dir: &std::path::Path,
-    name: &str,
-    created_at: u64,
-) -> Option<std::path::PathBuf> {
-    if name.is_empty() || name == "Main" {
-        return None;
-    }
-    let sanitized: String = name
-        .chars()
-        .filter_map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                Some(c)
-            } else if c.is_whitespace() {
-                Some('_')
-            } else {
-                None
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        return None;
-    }
-    let yyyymmdd = jiff::Timestamp::from_second(created_at as i64)
-        .unwrap_or_else(|_| jiff::Timestamp::now())
-        .to_string()[..10]
-        .replace('-', "");
-    Some(logs_dir.join(format!("{yyyymmdd}-{sanitized}.mlog")))
-}
-
-/// Remove `path` only if it is a symlink, never a real log file.
-fn remove_if_symlink(path: &std::path::Path) {
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Maintain a friendly-named symlink (`YYYYMMDD-<title>.mlog`, dated to session
-/// creation) pointing at a session's canonical id-based log, so the logs dir is
-/// browsable by title while the real file stays keyed by the stable session id.
-/// Best-effort: drops a stale link from the previous title, and skips silently
-/// if nothing has been logged yet (e.g. API logging disabled), on collision with
-/// a real file, or on FS error.
-pub fn update_api_log_symlink(
-    session_id: &str,
-    old_name: Option<&str>,
-    new_name: &str,
-    created_at: u64,
-) {
-    let Ok(logs_dir) = maki_storage::paths::logs_dir() else {
-        return;
-    };
-
-    if let Some(old) = old_name.and_then(|n| friendly_log_link(&logs_dir, n, created_at)) {
-        remove_if_symlink(&old);
-    }
-
-    let target = logs_dir.join(format!("{session_id}.mlog"));
-    if !target.exists() {
-        return; // nothing logged for this session yet
-    }
-    let Some(link) = friendly_log_link(&logs_dir, new_name, created_at) else {
-        return;
-    };
-    if link == target {
-        return;
-    }
-    remove_if_symlink(&link);
-    // Relative target so the link survives moving the logs directory.
-    #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(format!("{session_id}.mlog"), &link);
-}
-
-fn is_chat_completion_request(method: &str, uri: &str) -> bool {
-    method == "POST" && (
-        uri.contains("/chat/completions")
-        || uri.contains("/messages")
-        || uri.contains("/generateContent")
-        || uri.contains("/streamGenerateContent")
-        || uri.contains("/invoke")
-    )
-}
-
-pub(crate) async fn send_request(
-    client: &isahc::HttpClient,
-    request: isahc::Request<Vec<u8>>,
-) -> Result<isahc::Response<isahc::AsyncBody>, AgentError> {
-    send_request_logged(client, request, None).await
-}
-
-/// Like [`send_request`], but with per-message wire [`Fragments`] for the log so
-/// the request body is deduplicated at message granularity. Fragments are only
-/// used if they reproduce the exact bytes; otherwise the logger byte-diffs.
-pub(crate) async fn send_request_with_fragments(
-    client: &isahc::HttpClient,
-    request: isahc::Request<Vec<u8>>,
-    fragments: Option<crate::wire_log::Fragments>,
-) -> Result<isahc::Response<isahc::AsyncBody>, AgentError> {
-    send_request_logged(client, request, fragments).await
-}
-
-async fn send_request_logged(
-    client: &isahc::HttpClient,
-    request: isahc::Request<Vec<u8>>,
-    fragments: Option<crate::wire_log::Fragments>,
-) -> Result<isahc::Response<isahc::AsyncBody>, AgentError> {
-    let method = request.method().to_string();
-    let uri = request.uri().to_string();
-
-    let file_path = (maki_config::LOG_API.load(Ordering::Relaxed)
-        && is_chat_completion_request(&method, &uri))
-    .then(log_file_path)
-    .flatten();
-
-    let Some(file_path) = file_path else {
-        let (parts, body) = request.into_parts();
-        let req = isahc::Request::from_parts(parts, isahc::AsyncBody::from(body));
-        return client.send_async(req).await.map_err(Into::into);
-    };
-
-    crate::wire_log::log_request(&file_path, now_ms(), &uri, request.body(), fragments);
-
-    let (parts, body) = request.into_parts();
-    let req = isahc::Request::from_parts(parts, isahc::AsyncBody::from(body));
-    let response = client.send_async(req).await?;
-
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-
-    let (res_parts, res_body) = response.into_parts();
-    let logged_body = LoggingBody {
-        inner: res_body,
-        file_path,
-        status,
-        content_type,
-        accumulated_body: Vec::new(),
-        flushed: false,
-    };
-    Ok(isahc::Response::from_parts(
-        res_parts,
-        isahc::AsyncBody::from_reader(logged_body),
-    ))
-}
-
-struct LoggingBody<R> {
-    inner: R,
-    file_path: std::path::PathBuf,
-    status: u16,
-    content_type: String,
-    accumulated_body: Vec<u8>,
-    flushed: bool,
-}
-
-impl<R> LoggingBody<R> {
-    fn flush_log(&mut self) {
-        if self.flushed {
-            return;
-        }
-        self.flushed = true;
-        crate::wire_log::log_response(
-            &self.file_path,
-            now_ms(),
-            self.status,
-            &self.content_type,
-            &self.accumulated_body,
-        );
-    }
-}
-
-impl<R: futures_lite::io::AsyncRead + Unpin> futures_lite::io::AsyncRead for LoggingBody<R> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let res = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
-        match &res {
-            std::task::Poll::Ready(Ok(0)) => {
-                this.flush_log();
-            }
-            std::task::Poll::Ready(Ok(n)) => {
-                this.accumulated_body.extend_from_slice(&buf[..*n]);
-            }
-            _ => {}
-        }
-        res
-    }
-}
-
-impl<R> Drop for LoggingBody<R> {
-    fn drop(&mut self) {
-        self.flush_log();
-    }
-}
-
 
 #[derive(Clone, Debug)]
 pub struct KeyPool {
@@ -599,43 +386,5 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{result:?}");
         assert!(msg.contains(&env_var) || msg.contains(&slug));
-    }
-
-    #[test]
-    fn test_logging_body_accumulates_and_flushes() {
-        use crate::wire_log::{self, Record};
-        use futures_lite::io::AsyncReadExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let log_file = tmp.path().join("api.mlog");
-
-        let input_data = b"hello world streaming data";
-        let reader = futures_lite::io::Cursor::new(input_data);
-
-        let logged_body = LoggingBody {
-            inner: reader,
-            file_path: log_file.clone(),
-            status: 200,
-            content_type: "application/json".to_string(),
-            accumulated_body: Vec::new(),
-            flushed: false,
-        };
-
-        let mut buf = Vec::new();
-        smol::block_on(async {
-            let mut logged_body = logged_body;
-            logged_body.read_to_end(&mut buf).await.unwrap();
-            drop(logged_body);
-        });
-
-        assert_eq!(buf, input_data);
-        assert!(log_file.exists());
-
-        let records = wire_log::read_file(&log_file).unwrap();
-        let Some(Record::Response { status, body, .. }) = records.first() else {
-            panic!("expected a response record");
-        };
-        assert_eq!(*status, 200);
-        assert_eq!(body, input_data);
     }
 }

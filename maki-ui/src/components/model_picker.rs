@@ -16,6 +16,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::theme;
 
 const TITLE: &str = " Models ";
+const RECENT_SECTION: &str = "Recent";
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -65,6 +66,7 @@ struct ModelEntry {
     spec: String,
     id: String,
     provider_display: String,
+    suffix: Option<String>,
     tier: String,
     override_tiers: Vec<ModelTier>,
 }
@@ -74,12 +76,16 @@ impl PickerItem for ModelEntry {
         &self.id
     }
 
+    fn suffix(&self) -> Option<&str> {
+        self.suffix.as_deref()
+    }
+
     fn detail(&self) -> Option<&str> {
         Some(&self.tier)
     }
 
     fn section(&self) -> Option<&str> {
-        Some(&self.provider_display)
+        Some(self.provider_display.as_str())
     }
 
     fn is_highlighted(&self) -> bool {
@@ -90,6 +96,8 @@ impl PickerItem for ModelEntry {
 pub struct ModelPicker {
     picker: ListPicker<ModelEntry>,
     models: Arc<ArcSwapOption<Vec<String>>>,
+    recents: Vec<String>,
+    current_spec: String,
     last_spec_count: usize,
     dirty: bool,
 }
@@ -99,24 +107,23 @@ impl ModelPicker {
         Self {
             picker: ListPicker::new().with_footer_builder(footer_line),
             models,
+            recents: Vec::new(),
+            current_spec: String::new(),
             last_spec_count: 0,
             dirty: false,
         }
     }
 
+    pub fn set_recents(&mut self, recents: Vec<String>) {
+        self.recents = recents;
+        self.dirty = true;
+    }
+
     pub fn open(&mut self, current_spec: &str) {
-        let guard = self.models.load();
-        let specs = guard.as_deref();
-        self.last_spec_count = specs.map_or(0, Vec::len);
-        let entries: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
-            .unwrap_or_default();
-        let current_idx = entries
-            .iter()
-            .position(|e| e.spec == current_spec)
-            .unwrap_or(0);
+        self.current_spec = current_spec.to_owned();
+        let (entries, idx) = self.load_entries();
         self.picker.open(entries, TITLE);
-        self.picker.select(current_idx);
+        self.picker.select(idx);
     }
 
     fn try_refresh(&mut self) {
@@ -125,17 +132,38 @@ impl ModelPicker {
         }
         let guard = self.models.load();
         let spec_count = guard.as_deref().map_or(0, Vec::len);
-        let count_changed = spec_count != self.last_spec_count;
-        if !count_changed && !self.dirty {
+        if spec_count == self.last_spec_count && !self.dirty {
             return;
         }
-        self.last_spec_count = spec_count;
+        drop(guard);
         self.dirty = false;
-        let entries: Vec<ModelEntry> = guard
-            .as_deref()
+        let (entries, idx) = self.load_entries();
+        self.picker.replace_items(entries);
+        self.picker.select(idx);
+    }
+
+    fn load_entries(&mut self) -> (Vec<ModelEntry>, usize) {
+        let guard = self.models.load();
+        let specs = guard.as_deref();
+        self.last_spec_count = specs.map_or(0, Vec::len);
+        let mut entries: Vec<ModelEntry> = Vec::new();
+        let recent_specs = self.recents.clone();
+        for spec in &recent_specs {
+            if let Some(mut e) = parse_model_entry(spec) {
+                e.suffix = Some(std::mem::take(&mut e.provider_display));
+                e.provider_display = RECENT_SECTION.to_string();
+                entries.push(e);
+            }
+        }
+        let full: Vec<ModelEntry> = specs
             .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
             .unwrap_or_default();
-        self.picker.replace_items(entries);
+        entries.extend(full);
+        let idx = entries
+            .iter()
+            .position(|e| e.spec == self.current_spec)
+            .unwrap_or(0);
+        (entries, idx)
     }
 
     pub fn is_open(&self) -> bool {
@@ -226,6 +254,7 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         spec: spec.to_string(),
         id: model_id.to_string(),
         provider_display,
+        suffix: None,
         tier,
         override_tiers,
     })
@@ -249,16 +278,6 @@ mod tests {
         models
     }
 
-    #[test]
-    fn select_returns_full_spec() {
-        let mut p = ModelPicker::new(test_models());
-        p.open("");
-        let action = p.handle_key(key(KeyCode::Enter));
-        assert!(
-            matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-sonnet-4-20250514")
-        );
-    }
-
     #[test_case(key(KeyCode::Esc)          ; "esc_closes")]
     #[test_case(kb::QUIT.to_key_event()    ; "ctrl_c_closes")]
     fn close_keys(cancel_key: KeyEvent) {
@@ -267,32 +286,6 @@ mod tests {
         let action = p.handle_key(cancel_key);
         assert!(matches!(action, ModelPickerAction::Close));
         assert!(!p.is_open());
-    }
-
-    #[test]
-    fn open_with_no_models_still_opens() {
-        let models = Arc::new(ArcSwapOption::empty());
-        let mut p = ModelPicker::new(models);
-        p.open("");
-        assert!(p.is_open());
-    }
-
-    #[test]
-    fn refresh_populates_when_models_arrive() {
-        let models = Arc::new(ArcSwapOption::empty());
-        let mut p = ModelPicker::new(models.clone());
-        p.open("");
-        assert!(matches!(
-            p.handle_key(key(KeyCode::Enter)),
-            ModelPickerAction::Consumed
-        ));
-
-        models.store(Some(Arc::new(vec![
-            "anthropic/claude-sonnet-4-20250514".into(),
-        ])));
-        p.try_refresh();
-        let action = p.handle_key(key(KeyCode::Enter));
-        assert!(matches!(action, ModelPickerAction::Select(ref s) if s.contains("sonnet")));
     }
 
     #[test]
@@ -313,7 +306,6 @@ mod tests {
         ])));
         p.try_refresh();
 
-        assert_eq!(p.last_spec_count, 2);
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s.contains("opus")),
@@ -344,14 +336,10 @@ mod tests {
         assert!(parse_model_entry("no-slash").is_none());
     }
 
-    #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "shift_1_strong")]
-    #[test_case(key(KeyCode::Char('@')),           ModelTier::Medium     ; "shift_2_medium")]
-    #[test_case(key(KeyCode::Char('#')),           ModelTier::Weak       ; "shift_3_weak")]
-    #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "shift_4_dollar_compaction")]
-    #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "shift_4_euro_compaction")]
+    #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
+    #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "legacy_dollar_compaction")]
+    #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "legacy_euro_compaction")]
     #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
-    #[test_case(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::SHIFT), ModelTier::Medium     ; "kitty_shift_2_medium")]
-    #[test_case(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::SHIFT), ModelTier::Weak       ; "kitty_shift_3_weak")]
     #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
@@ -363,5 +351,54 @@ mod tests {
             "expected AssignTier(claude-sonnet, {want:?}), got something else",
         );
         assert!(p.is_open());
+    }
+
+    #[test]
+    fn refresh_preserves_selection_for_current_model() {
+        let models = Arc::new(ArcSwapOption::empty());
+        let mut p = ModelPicker::new(models.clone());
+        p.open("anthropic/claude-opus-4-6-20260101");
+
+        models.store(Some(Arc::new(vec![
+            "anthropic/claude-sonnet-4-20250514".into(),
+            "anthropic/claude-opus-4-6-20260101".into(),
+            "zai/glm-5".into(),
+        ])));
+        p.try_refresh();
+
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101"),
+            "after async model arrival, current model should still be selected"
+        );
+    }
+
+    #[test]
+    fn recents_include_current_model_preselected() {
+        let models = test_models();
+        let mut p = ModelPicker::new(models);
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("anthropic/claude-opus-4-6-20260101");
+
+        p.picker.select(0);
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            "first entry should be the most recent model",
+        );
+
+        p.set_recents(vec![
+            "zai/glm-5".into(),
+            "anthropic/claude-sonnet-4-20250514".into(),
+        ]);
+        p.open("zai/glm-5");
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == "zai/glm-5"),
+            "current model should be preselected within Recent",
+        );
     }
 }

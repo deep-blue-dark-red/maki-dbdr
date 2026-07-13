@@ -1,26 +1,37 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
+use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolInvocation,
+    PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
+    is_tool_enabled, timeout_annotation,
 };
-use maki_agent::{AgentEvent, BufferSnapshot, InstructionBlock, SharedBuf, TextOutput, ToolOutput};
+use maki_agent::{
+    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
+    TextOutput, ToolOutput,
+};
+use maki_config::ToolOutputLines;
 use mlua::{
-    Function, Lua, LuaSerdeExt, RegistryKey, Result as LuaResult, Table, Value as LuaValue,
+    Function, Lua, LuaSerdeExt, MultiValue, RegistryKey, Result as LuaResult, Table,
+    Value as LuaValue,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::api::ui::buf::BufHandle;
+use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, publish_command_snapshot,
 };
+use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::LuaCtx;
 use crate::runtime::{HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request};
 
@@ -29,11 +40,77 @@ const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
+const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
+const PLAIN_HEADER_STYLE: &str = "tool";
+
+type DescribeFn = Box<dyn Fn(&str, &str, &Value) -> Option<String>>;
+
+thread_local! {
+    /// Lives on the Lua runtime thread only. Calling `Request::Describe` from
+    /// that same thread would self-deadlock, so we resolve in-thread instead.
+    static LOCAL_DESCRIBE: RefCell<Option<DescribeFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_describe(f: impl Fn(&str, &str, &Value) -> Option<String> + 'static) {
+    LOCAL_DESCRIBE.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_describe(plugin: &str, tool: &str, dctx: &Value) -> Option<Option<String>> {
+    LOCAL_DESCRIBE.with(|c| c.borrow().as_ref().map(|f| f(plugin, tool, dctx)))
+}
+
+type ToolHandles = (Option<Function>, Option<Function>);
+type ToolHandlesFn = Box<dyn Fn(&str) -> Option<ToolHandles>>;
+
+thread_local! {
+    static LOCAL_TOOL_HANDLES: RefCell<Option<ToolHandlesFn>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_local_tool_handles(f: impl Fn(&str) -> Option<ToolHandles> + 'static) {
+    LOCAL_TOOL_HANDLES.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+}
+
+fn local_tool_handles(tool: &str) -> Option<ToolHandles> {
+    LOCAL_TOOL_HANDLES.with(|c| c.borrow().as_ref().and_then(|f| f(tool)))
+}
+
+fn dctx_json(ctx: &DescriptionContext) -> Value {
+    let mut obj = json!({
+        "audience": ctx.audience.name().unwrap_or("main"),
+        "workflow": ctx.workflow,
+    });
+    match ctx.filter {
+        ToolFilter::All => {}
+        ToolFilter::Only(names) => obj["only"] = json!(names),
+        ToolFilter::AllExcept(names) => obj["except"] = json!(names),
+    }
+    obj
+}
+
+#[derive(Clone)]
+pub(crate) enum StartAnnotation {
+    Count(Arc<str>),
+    Timeout(Arc<str>),
+}
 
 #[derive(Clone)]
 pub(crate) enum PermissionScopeKind {
     Field(Arc<str>),
     Callback,
+}
+
+pub(crate) enum PermissionScopeSpec {
+    Field(Arc<str>),
+    Callback(RegistryKey),
+}
+
+impl PermissionScopeSpec {
+    pub(crate) fn kind(&self) -> PermissionScopeKind {
+        match self {
+            Self::Field(f) => PermissionScopeKind::Field(Arc::clone(f)),
+            Self::Callback(_) => PermissionScopeKind::Callback,
+        }
+    }
 }
 
 pub(crate) struct PendingTool {
@@ -45,11 +122,13 @@ pub(crate) struct PendingTool {
     pub(crate) handler_key: RegistryKey,
     pub(crate) header_key: Option<RegistryKey>,
     pub(crate) restore_key: Option<RegistryKey>,
-    pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
-    pub(crate) permission_scopes_key: Option<RegistryKey>,
+    pub(crate) start_key: Option<RegistryKey>,
+    pub(crate) permission_scopes: Option<PermissionScopeSpec>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
-    pub(crate) start_annotation_array_field: Option<Arc<str>>,
+    pub(crate) start_annotation: Option<StartAnnotation>,
+    pub(crate) examples: Option<Value>,
+    pub(crate) describe_key: Option<RegistryKey>,
 }
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
@@ -63,10 +142,13 @@ pub(crate) struct LuaTool {
     pub(crate) tx: Sender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
+    pub(crate) has_start_fn: bool,
     pub(crate) permission_scope_kind: Option<PermissionScopeKind>,
     pub(crate) mutable_path_field: Option<Arc<str>>,
     pub(crate) timeout: Option<Duration>,
-    pub(crate) start_annotation_array_field: Option<Arc<str>>,
+    pub(crate) start_annotation: Option<StartAnnotation>,
+    pub(crate) examples: Option<Value>,
+    pub(crate) has_describe_fn: bool,
 }
 
 impl Tool for LuaTool {
@@ -74,7 +156,38 @@ impl Tool for LuaTool {
         &self.name
     }
 
-    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+    fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+        if !self.has_describe_fn {
+            return Cow::Borrowed(&self.description);
+        }
+        let dctx = dctx_json(ctx);
+        if let Some(result) = local_describe(&self.plugin, &self.name, &dctx) {
+            return match result {
+                Some(s) => Cow::Owned(s),
+                None => Cow::Borrowed(&self.description),
+            };
+        }
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let sent = self
+            .tx
+            .send(Request::Describe {
+                plugin: Arc::clone(&self.plugin),
+                tool: Arc::clone(&self.name),
+                dctx,
+                reply: reply_tx,
+            })
+            .is_ok();
+        if sent {
+            match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
+                Ok(Some(s)) => return Cow::Owned(s),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    tool = %self.name,
+                    error = %e,
+                    "describe round trip failed; falling back to static description"
+                ),
+            }
+        }
         Cow::Borrowed(&self.description)
     }
 
@@ -90,15 +203,19 @@ impl Tool for LuaTool {
         self.kind.as_deref()
     }
 
+    fn examples(&self) -> Option<Value> {
+        self.examples.clone()
+    }
+
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let validated = validate(self.schema, input.clone())?;
         let permission_state = match &self.permission_scope_kind {
             Some(PermissionScopeKind::Field(field)) => {
-                let scope = validated
-                    .get(field.as_ref())
-                    .and_then(|v| v.as_str())
-                    .map(|s| PermissionScopes::single(s.to_owned()));
-                PermissionState::Ready(scope)
+                let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
+                PermissionState::Ready(Some(match scope {
+                    Some(s) => PermissionScopes::single(s.to_owned()),
+                    None => PermissionScopes::force_prompt(validated.to_string()),
+                }))
             }
             Some(PermissionScopeKind::Callback) => PermissionState::NeedsCompute,
             None => PermissionState::Ready(None),
@@ -107,12 +224,13 @@ impl Tool for LuaTool {
             tool: Arc::clone(&self.name),
             plugin: Arc::clone(&self.plugin),
             has_header_fn: self.has_header_fn,
+            has_start_fn: self.has_start_fn,
             input: validated,
             tx: self.tx.clone(),
             permission_state,
             mutable_path_field: self.mutable_path_field.clone(),
             timeout: self.timeout,
-            start_annotation_array_field: self.start_annotation_array_field.clone(),
+            start_annotation: self.start_annotation.clone(),
         }))
     }
 }
@@ -126,12 +244,13 @@ struct LuaToolInvocation {
     tool: Arc<str>,
     plugin: Arc<str>,
     has_header_fn: bool,
+    has_start_fn: bool,
     input: Value,
     tx: Sender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
-    start_annotation_array_field: Option<Arc<str>>,
+    start_annotation: Option<StartAnnotation>,
 }
 
 impl ToolInvocation for LuaToolInvocation {
@@ -168,16 +287,48 @@ impl ToolInvocation for LuaToolInvocation {
     }
 
     fn start_annotation(&self) -> Option<String> {
-        let field = self.start_annotation_array_field.as_deref()?;
-        let arr = self.input.get(field)?.as_array()?;
-        let n = arr.len();
-        let (singular, plural) = if let Some(stem) = field.strip_suffix('s') {
-            (stem, field)
-        } else {
-            (field, &*format!("{field}s"))
+        match self.start_annotation.as_ref()? {
+            StartAnnotation::Timeout(field) => {
+                let secs = self.input.get(field.as_ref())?.as_u64()?;
+                Some(timeout_annotation(secs))
+            }
+            StartAnnotation::Count(field) => {
+                let field = field.as_ref();
+                let n = self.input.get(field)?.as_array()?.len();
+                let (singular, plural) = if let Some(stem) = field.strip_suffix('s') {
+                    (stem, field)
+                } else {
+                    (field, &*format!("{field}s"))
+                };
+                let label = if n == 1 { singular } else { plural };
+                Some(format!("{n} {label}"))
+            }
+        }
+    }
+
+    fn start<'a>(&'a self, ctx: &'a ToolContext) -> BoxFuture<'a, ()> {
+        let id = ctx.tool_use_id.as_ref().filter(|_| self.has_start_fn);
+        let Some(id) = id else {
+            return Box::pin(std::future::ready(()));
         };
-        let label = if n == 1 { singular } else { plural };
-        Some(format!("{n} {label}"))
+        let (reply_tx, reply_rx) = flume::bounded::<()>(1);
+        let req = Request::StartTool {
+            plugin: Arc::clone(&self.plugin),
+            tool: Arc::clone(&self.tool),
+            input: self.input.clone(),
+            live: LiveCtx {
+                event_tx: ctx.event_tx.clone(),
+                tool_use_id: id.clone(),
+            },
+            ctx: Box::new(LuaCtx::start(ctx)),
+            reply: reply_tx,
+        };
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            if tx.send_async(req).await.is_ok() {
+                let _ = reply_rx.recv_async().await;
+            }
+        })
     }
 
     fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
@@ -246,15 +397,7 @@ impl ToolInvocation for LuaToolInvocation {
                 event_tx: ctx.event_tx.clone(),
                 tool_use_id: id,
             });
-            let lua_ctx = LuaCtx {
-                cancel: ctx.cancel.clone(),
-                config: ctx.config.clone(),
-                tool_output_lines: ctx.tool_output_lines,
-                finish_tx: None,
-                file_tracker: ctx.file_tracker.clone(),
-                loaded_instructions: ctx.loaded_instructions.clone(),
-                agent: Some(crate::api::util::ctx::AgentContext::from(ctx)),
-            };
+            let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
                 .send_async(Request::CallTool {
@@ -312,9 +455,13 @@ impl ToolInvocation for LuaToolInvocation {
                     }
                     let format = reply.format;
                     let instructions = reply.instructions;
+                    let image = reply.image;
+                    let state = reply.state;
                     ToolExecResult {
                         output: reply.result.map(|s| {
-                            if let Some(diff) = reply.diff {
+                            if let Some(source) = image {
+                                ToolOutput::Image { source, text: s }
+                            } else if let Some(diff) = reply.diff {
                                 ToolOutput::Diff {
                                     summary: s,
                                     path: diff.path,
@@ -322,12 +469,10 @@ impl ToolInvocation for LuaToolInvocation {
                                     after: diff.after,
                                 }
                             } else {
-                                let inner = match instructions {
-                                    Some(blocks) if !blocks.is_empty() => TextOutput {
-                                        text: s,
-                                        instructions: Some(blocks),
-                                    },
-                                    _ => s.into(),
+                                let inner = TextOutput {
+                                    text: s,
+                                    instructions: instructions.filter(|b| !b.is_empty()),
+                                    state,
                                 };
                                 match format {
                                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
@@ -513,7 +658,172 @@ pub(crate) fn create_api_table(
         })?,
     )?;
 
+    t.set("get_tools", lua.create_function(get_tools_from_lua)?)?;
+    t.set("get_tool", lua.create_function(get_tool_from_lua)?)?;
+
     Ok(t)
+}
+
+/// Registry snapshot without descriptions (avoids recursion from describe callbacks).
+fn get_tools_from_lua(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tools: tool registry not available"))?;
+    let mut disabled: Vec<String> = Vec::new();
+    if let Some(o) = opts
+        && let Some(config) = o.get::<Option<Table>>("config")?
+    {
+        disabled = config
+            .get::<Option<Vec<String>>>("disabled_tools")?
+            .unwrap_or_default();
+    }
+
+    let out = lua.create_table()?;
+    for (i, entry) in registry.iter().iter().enumerate() {
+        let t = tool_entry_to_lua(lua, entry)?;
+        t.set("enabled", is_tool_enabled(&disabled, entry.name()))?;
+        out.set(i + 1, t)?;
+    }
+    Ok(out)
+}
+
+fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
+    let audience = entry.tool.audience();
+    let audiences = lua.create_table()?;
+    for (flag, name) in maki_agent::tools::registry::AUDIENCE_NAMES {
+        if audience.contains(*flag) {
+            audiences.push(*name)?;
+        }
+    }
+    let t = lua.create_table()?;
+    t.set("name", entry.name())?;
+    t.set("schema", json_to_lua(lua, &entry.tool.schema())?)?;
+    t.set("audiences", audiences)?;
+    if let Some(kind) = entry.tool.tool_kind() {
+        t.set("kind", kind)?;
+    }
+    Ok(t)
+}
+
+/// Single-tool lookup that also hands out `header`/`restore` handles for
+/// Lua tools (nil for MCP or missing tools), wrapped so one broken tool
+/// cannot break a composing caller. Kept apart from `get_tools` so the
+/// listing stays a cheap data-only snapshot.
+fn get_tool_from_lua(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+    let registry = lua
+        .app_data_ref::<Arc<ToolRegistry>>()
+        .map(|r| Arc::clone(&r))
+        .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
+    let Some(entry) = registry.get(&name) else {
+        return Ok(LuaValue::Nil);
+    };
+    let t = tool_entry_to_lua(lua, &entry)?;
+    if let Some((header, restore)) = local_tool_handles(&name) {
+        if let Some(f) = header {
+            t.set("header", wrap_header(lua, name.clone(), f)?)?;
+        }
+        if let Some(f) = restore {
+            t.set("restore", wrap_restore(lua, name, f)?)?;
+        }
+    }
+    Ok(LuaValue::Table(t))
+}
+
+/// The one contract every `get_tool` handle obeys: it never throws; an
+/// error from the wrapped fn is logged and becomes nil.
+fn wrap_nothrow(
+    lua: &Lua,
+    tool: String,
+    handle: &'static str,
+    f: Function,
+    norm: impl Fn(&Lua, LuaValue) -> LuaResult<LuaValue> + Send + 'static,
+) -> LuaResult<Function> {
+    lua.create_function(
+        move |lua, args: MultiValue| match f.call::<LuaValue>(args) {
+            Ok(v) => norm(lua, v),
+            Err(e) => {
+                tracing::warn!(tool, handle, error = %e, "get_tool handle failed");
+                Ok(LuaValue::Nil)
+            }
+        },
+    )
+}
+
+/// Normalizes a header fn to one spans line or nil: a plain string gets
+/// the standalone header style, a buf return contributes its first line.
+fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
+    wrap_nothrow(lua, tool, "header", f, |lua, v| match v {
+        LuaValue::String(s) => {
+            let span = lua.create_table()?;
+            span.raw_set(1, s)?;
+            span.raw_set(2, PLAIN_HEADER_STYLE)?;
+            let line = lua.create_table()?;
+            line.raw_set(1, span)?;
+            Ok(LuaValue::Table(line))
+        }
+        LuaValue::UserData(ud) => {
+            let Ok(h) = ud.borrow::<BufHandle>() else {
+                return Ok(LuaValue::Nil);
+            };
+            match h.buf.read().first() {
+                Some(line) => Ok(LuaValue::Table(line_to_lua(lua, line)?)),
+                None => Ok(LuaValue::Nil),
+            }
+        }
+        _ => Ok(LuaValue::Nil),
+    })
+}
+
+/// Normalizes a restore fn to its body buf or nil (whether it returned
+/// the buf directly or a `{ body = buf }` reply), so callers composing
+/// another tool's rendering need no pcall of their own. The ctx arg may be
+/// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
+/// batch drives child restores); either way the fn sees a restore `LuaCtx`.
+fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
+    let prepped = lua.create_function(move |lua, mut args: MultiValue| {
+        let ctx = normalize_restore_ctx(lua, args.get(3))?;
+        while args.len() < 4 {
+            args.push_back(LuaValue::Nil);
+        }
+        args[3] = ctx;
+        f.call::<MultiValue>(args)
+    })?;
+    wrap_nothrow(lua, tool, "restore", prepped, |_lua, v| {
+        Ok(match &v {
+            LuaValue::UserData(ud) if ud.is::<BufHandle>() => v,
+            LuaValue::Table(t) => t
+                .get::<mlua::AnyUserData>("body")
+                .ok()
+                .filter(|ud| ud.is::<BufHandle>())
+                .map(LuaValue::UserData)
+                .unwrap_or(LuaValue::Nil),
+            _ => LuaValue::Nil,
+        })
+    })
+}
+
+fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue> {
+    if let Some(LuaValue::UserData(ud)) = v
+        && ud.is::<LuaCtx>()
+    {
+        return Ok(LuaValue::UserData(ud.clone()));
+    }
+    let (tol, state) = match v {
+        Some(LuaValue::Table(t)) => (
+            t.get::<LuaValue>("tool_output_lines")
+                .ok()
+                .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
+                .unwrap_or_default(),
+            t.get::<LuaValue>("state")
+                .ok()
+                .and_then(|v| lua_to_json(&v).ok())
+                .filter(|v| !v.is_null()),
+        ),
+        _ => (ToolOutputLines::default(), None),
+    };
+    let ud = lua.create_userdata(LuaCtx::restore(tol, state))?;
+    Ok(LuaValue::UserData(ud))
 }
 
 fn is_valid_tool_name(name: &str) -> bool {
@@ -539,13 +849,8 @@ fn parse_audience(audiences: Option<mlua::Table>) -> LuaResult<ToolAudience> {
         count += 1;
         flags |= match s.as_str() {
             "all" => ToolAudience::all(),
-            "main" => ToolAudience::MAIN,
-            "research_sub" => ToolAudience::RESEARCH_SUB,
-            "general_sub" => ToolAudience::GENERAL_SUB,
-            "interpreter" => ToolAudience::INTERPRETER,
-            _ => {
-                return Err(mlua::Error::runtime(format!("unknown audience: {s}")));
-            }
+            other => ToolAudience::parse_name(other)
+                .ok_or_else(|| mlua::Error::runtime(format!("unknown audience: {other}")))?,
         };
     }
     if count == 0 {
@@ -568,22 +873,59 @@ fn parse_timeout(spec: &Table) -> LuaResult<Option<Duration>> {
     }
 }
 
-fn require_string_field(spec: &Table, key: &str, schema: &Value) -> LuaResult<Option<Arc<str>>> {
-    let field: Option<Arc<str>> = spec.get::<String>(key).ok().map(|s| Arc::from(s.as_str()));
-    if let Some(ref field) = field {
-        let is_string = schema
-            .get("properties")
-            .and_then(|p| p.get(field.as_ref()))
-            .and_then(|s| s.get("type"))
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "string");
-        if !is_string {
-            return Err(mlua::Error::runtime(format!(
-                "register_tool: {key} field '{field}' not in schema properties or not type 'string'"
-            )));
-        }
+fn spec_opt<T: mlua::FromLua>(spec: &Table, key: &str, expected: &str) -> LuaResult<Option<T>> {
+    spec.get::<Option<T>>(key)
+        .map_err(|_| mlua::Error::runtime(format!("register_tool: '{key}' must be {expected}")))
+}
+
+fn check_schema_field(schema: &Value, key: &str, field: &str, expected: &str) -> LuaResult<()> {
+    let matches = schema
+        .get("properties")
+        .and_then(|p| p.get(field))
+        .and_then(|s| s.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == expected);
+    if matches {
+        Ok(())
+    } else {
+        Err(mlua::Error::runtime(format!(
+            "register_tool: {key} field '{field}' not in schema properties or not type '{expected}'"
+        )))
     }
-    Ok(field)
+}
+
+fn require_schema_field(spec: &Table, key: &str, schema: &Value) -> LuaResult<Option<Arc<str>>> {
+    let Some(field) = spec_opt::<String>(spec, key, "a string")? else {
+        return Ok(None);
+    };
+    check_schema_field(schema, key, &field, "string")?;
+    Ok(Some(Arc::from(field.as_str())))
+}
+
+fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<StartAnnotation>> {
+    match spec.get::<Option<LuaValue>>("start_annotation")? {
+        None => Ok(None),
+        Some(LuaValue::String(s)) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(schema, "start_annotation", &field, "array")?;
+            Ok(Some(StartAnnotation::Count(Arc::from(field.as_str()))))
+        }
+        Some(LuaValue::Table(t)) => {
+            let field: String = t.get("field").map_err(|_| {
+                mlua::Error::runtime("register_tool: start_annotation.field required")
+            })?;
+            if t.get::<Option<String>>("kind")?.as_deref() != Some("timeout") {
+                return Err(mlua::Error::runtime(
+                    "register_tool: start_annotation.kind must be 'timeout'",
+                ));
+            }
+            check_schema_field(schema, "start_annotation", &field, "integer")?;
+            Ok(Some(StartAnnotation::Timeout(Arc::from(field.as_str()))))
+        }
+        Some(_) => Err(mlua::Error::runtime(
+            "register_tool: 'start_annotation' must be a string field name or a table",
+        )),
+    }
 }
 
 fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> LuaResult<()> {
@@ -612,49 +954,38 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
 
-    let permission_scope_field = require_string_field(spec, "permission_scope", &schema_val)?;
-    let mutable_path_field = require_string_field(spec, "mutable_path", &schema_val)?;
-
-    let permission_scopes_fn: Option<Function> = spec.get("permission_scopes").ok();
-    if permission_scope_field.is_some() && permission_scopes_fn.is_some() {
+    if !spec.get::<LuaValue>("permission_scope")?.is_nil() {
         return Err(mlua::Error::runtime(
-            "register_tool: cannot specify both 'permission_scope' and 'permission_scopes'",
+            "register_tool: 'permission_scope' was removed; use permission_scopes = \"<field>\" or permission_scopes = function(input) ... end",
         ));
     }
-    let permission_scopes_key = permission_scopes_fn
-        .map(|f| lua.create_registry_value(f))
-        .transpose()?;
-    let permission_scope_kind = if permission_scopes_key.is_some() {
-        Some(PermissionScopeKind::Callback)
-    } else {
-        permission_scope_field.map(PermissionScopeKind::Field)
+    let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
+
+    let permission_scopes = match spec.get::<LuaValue>("permission_scopes")? {
+        LuaValue::Nil => None,
+        LuaValue::String(s) => {
+            let field = s.to_str()?.to_owned();
+            check_schema_field(&schema_val, "permission_scopes", &field, "string")?;
+            Some(PermissionScopeSpec::Field(Arc::from(field.as_str())))
+        }
+        LuaValue::Function(f) => Some(PermissionScopeSpec::Callback(lua.create_registry_value(f)?)),
+        _ => {
+            return Err(mlua::Error::runtime(
+                "register_tool: 'permission_scopes' must be a string field name or a function",
+            ));
+        }
     };
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
+    let start_fn: Option<Function> = spec.get("start").ok();
     let kind: Option<Arc<str>> = spec
         .get::<String>("kind")
         .ok()
         .map(|s| Arc::from(s.as_str()));
     let audience = parse_audience(audiences)?;
     let timeout = parse_timeout(spec)?;
-    let start_annotation_array_field: Option<Arc<str>> = spec
-        .get::<String>("start_annotation")
-        .ok()
-        .map(|s| Arc::from(s.as_str()));
-    if let Some(ref field) = start_annotation_array_field {
-        let is_array = schema_val
-            .get("properties")
-            .and_then(|p| p.get(field.as_ref()))
-            .and_then(|s| s.get("type"))
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "array");
-        if !is_array {
-            return Err(mlua::Error::runtime(format!(
-                "register_tool: start_annotation field '{field}' not in schema properties or not type 'array'"
-            )));
-        }
-    }
+    let start_annotation = parse_start_annotation(spec, &schema_val)?;
     let handler_key: RegistryKey = lua.create_registry_value(handler)?;
     let header_key = header_fn
         .map(|f| lua.create_registry_value(f))
@@ -662,6 +993,19 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
     let restore_key = restore_fn
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
+    let start_key = start_fn.map(|f| lua.create_registry_value(f)).transpose()?;
+
+    let describe_fn: Option<Function> = spec.get("describe").ok();
+    let describe_key = describe_fn
+        .map(|f| lua.create_registry_value(f))
+        .transpose()?;
+
+    let examples: Option<Value> =
+        spec_opt::<Table>(spec, "examples", "a table (array of example inputs)")?
+            .map(|t| lua.from_value(LuaValue::Table(t)))
+            .transpose()
+            .map_err(|e| mlua::Error::runtime(format!("register_tool: invalid examples: {e}")))?;
+
     let name: Arc<str> = Arc::from(name.as_str());
 
     pending
@@ -676,11 +1020,13 @@ fn register_tool_from_lua(lua: &Lua, spec: &Table, pending: PendingTools) -> Lua
             handler_key,
             header_key,
             restore_key,
-            permission_scope_kind,
-            permission_scopes_key,
+            start_key,
+            permission_scopes,
             mutable_path_field,
             timeout,
-            start_annotation_array_field,
+            start_annotation,
+            examples,
+            describe_key,
         });
 
     Ok(())
@@ -756,11 +1102,15 @@ pub(crate) struct ToolCallReply {
     pub instructions: Option<Vec<InstructionBlock>>,
     pub written_path: Option<String>,
     pub diff: Option<DiffPayload>,
+    /// Set via `image = { media_type = "image/png", data = <base64> }` in the
+    /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
+    pub image: Option<ImageSource>,
+    pub state: Option<Value>,
 }
 
 impl ToolCallReply {
     pub fn from_lua_value(val: &LuaValue) -> Self {
-        let result = coerce_tool_result(val);
+        let mut result = coerce_tool_result(val);
         let LuaValue::Table(t) = val else {
             return Self::plain(result);
         };
@@ -778,6 +1128,21 @@ impl ToolCallReply {
             before: t.get::<String>("diff_before").ok().unwrap_or_default(),
             after: t.get::<String>("diff_after").ok().unwrap_or_default(),
         });
+        // A malformed image fails the call; dropping it silently would leave
+        // a caption claiming pixels the model never receives.
+        let image = match extract_image(t) {
+            Ok(image) => image,
+            Err(e) => {
+                result = Err(e);
+                None
+            }
+        };
+        let state = match t.get::<LuaValue>("state") {
+            Ok(LuaValue::Nil) | Err(_) => None,
+            Ok(v) => crate::api::util::convert::lua_to_json(&v)
+                .inspect_err(|e| tracing::warn!(error = %e, "tool state is not JSON-serializable, dropping it"))
+                .ok(),
+        };
         Self {
             result,
             snapshot,
@@ -788,6 +1153,8 @@ impl ToolCallReply {
             instructions,
             written_path,
             diff,
+            image,
+            state,
         }
     }
 
@@ -819,6 +1186,8 @@ impl ToolCallReply {
             instructions: None,
             written_path: None,
             diff: None,
+            image: None,
+            state: None,
         }
     }
 
@@ -839,6 +1208,41 @@ fn extract_format(t: &mlua::Table) -> LuaOutputFormat {
         LUA_FORMAT_PLAIN => LuaOutputFormat::Plain,
         _ => LuaOutputFormat::default(),
     }
+}
+
+fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
+    let entry = match t.get::<LuaValue>("image") {
+        Ok(LuaValue::Table(entry)) => entry,
+        Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(other) => {
+            return Err(format!(
+                "tool 'image' field must be a table {{ media_type, data }}, got {}",
+                other.type_name()
+            ));
+        }
+    };
+    let media_type = entry
+        .get::<String>("media_type")
+        .map_err(|_| "tool image is missing 'media_type'".to_owned())?;
+    let media_type = ImageMediaType::from_mime(&media_type).ok_or_else(|| {
+        let supported: Vec<&str> = ImageMediaType::ALL.iter().map(|m| m.mime()).collect();
+        format!(
+            "unsupported tool image media_type '{media_type}' ({})",
+            supported.join(", ")
+        )
+    })?;
+    let data = entry
+        .get::<String>("data")
+        .map_err(|_| "tool image is missing base64 'data'".to_owned())?;
+    // Bad base64 would land in history and fail every later request;
+    // validate once at the boundary.
+    if data.is_empty() {
+        return Err("tool image 'data' is empty".to_owned());
+    }
+    BASE64
+        .decode(data.as_bytes())
+        .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
+    Ok(Some(ImageSource::new(media_type, Arc::from(data))))
 }
 
 fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
@@ -911,6 +1315,33 @@ mod tests {
         assert_eq!(is_valid_tool_name(name), expected);
     }
 
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { data = "aGVsbG8=" } }"#,
+        "missing 'media_type'" ; "missing_media_type")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png" } }"#,
+        "missing base64 'data'" ; "missing_data")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png", data = "" } }"#,
+        "'data' is empty" ; "empty_data")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = "nope" }"#,
+        "must be a table" ; "image_not_a_table")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/bmp", data = "aGVsbG8=" } }"#,
+        "unsupported tool image media_type" ; "unsupported_media_type")]
+    #[test_case::test_case(
+        r#"{ llm_output = "c", image = { media_type = "image/png", data = "!!!not base64!!!" } }"#,
+        "not valid base64" ; "data_not_base64")]
+    fn malformed_image_reply_fails_the_call(src: &str, expected: &str) {
+        let lua = Lua::new();
+        let val: LuaValue = lua.load(format!("return {src}")).eval().unwrap();
+        let reply = ToolCallReply::from_lua_value(&val);
+        assert!(reply.image.is_none());
+        let err = reply.result.expect_err("malformed image must error");
+        assert!(err.contains(expected), "got: {err}");
+    }
+
     fn invocation(input: Value) -> LuaToolInvocation {
         let (tx, _rx) = flume::unbounded();
         LuaToolInvocation {
@@ -922,8 +1353,33 @@ mod tests {
             permission_state: PermissionState::Ready(None),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
-            start_annotation_array_field: None,
+            start_annotation: None,
+            has_start_fn: false,
         }
+    }
+
+    #[test_case::test_case(serde_json::json!({"timeout": 90}), Some(timeout_annotation(90)) ; "present")]
+    #[test_case::test_case(serde_json::json!({}),              None                        ; "absent")]
+    fn start_annotation_timeout(input: Value, expected: Option<String>) {
+        let inv = LuaToolInvocation {
+            start_annotation: Some(StartAnnotation::Timeout(Arc::from("timeout"))),
+            ..invocation(input)
+        };
+        assert_eq!(inv.start_annotation(), expected);
+    }
+
+    #[test]
+    fn describe_falls_back_to_static_description_when_runtime_unavailable() {
+        use maki_agent::tools::ToolFilter;
+
+        let mut tool = make_lua_tool(None);
+        tool.has_describe_fn = true;
+        let ctx = DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+        };
+        assert_eq!(tool.description(&ctx), "test");
     }
 
     fn make_lua_tool(permission_scope_kind: Option<PermissionScopeKind>) -> LuaTool {
@@ -932,6 +1388,7 @@ mod tests {
             "properties": {
                 "url": { "type": "string" },
                 "format": { "type": "string" },
+                "count": { "type": "integer" },
             },
             "required": ["url"],
         }))
@@ -949,7 +1406,10 @@ mod tests {
             permission_scope_kind,
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),
-            start_annotation_array_field: None,
+            start_annotation: None,
+            has_start_fn: false,
+            examples: None,
+            has_describe_fn: false,
         }
     }
 
@@ -966,13 +1426,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn permission_scope_none_when_field_absent_or_unconfigured() {
-        let absent = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from("format"))))
-            .parse(&serde_json::json!({"url": "https://example.com"}))
+    #[test_case::test_case("format" ; "absent_field")]
+    #[test_case::test_case("count" ; "non_string_field")]
+    fn permission_scope_field_invalid_forces_prompt(field: &str) {
+        let input = serde_json::json!({"url": "https://example.com", "count": 42});
+        let inv = make_lua_tool(Some(PermissionScopeKind::Field(Arc::from(field))))
+            .parse(&input)
             .unwrap();
-        assert!(smol::block_on(absent.permission_scopes()).is_none());
+        let scopes = smol::block_on(inv.permission_scopes()).expect("should fail closed");
+        assert!(scopes.force_prompt);
+        assert_eq!(scopes.scopes, vec![input.to_string()]);
+    }
 
+    #[test]
+    fn permission_scope_none_when_unconfigured() {
         let unconfigured = make_lua_tool(None)
             .parse(&serde_json::json!({"url": "https://example.com"}))
             .unwrap();
@@ -1043,7 +1510,8 @@ mod tests {
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
-            start_annotation_array_field: None,
+            start_annotation: None,
+            has_start_fn: false,
         };
         let scopes = smol::block_on(inv.permission_scopes()).expect("should fallback");
         assert!(scopes.force_prompt);
@@ -1060,7 +1528,8 @@ mod tests {
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
-            start_annotation_array_field: None,
+            start_annotation: None,
+            has_start_fn: false,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
@@ -1083,7 +1552,8 @@ mod tests {
             permission_state: PermissionState::NeedsCompute,
             mutable_path_field: None,
             timeout: None,
-            start_annotation_array_field: None,
+            start_annotation: None,
+            has_start_fn: false,
         };
         std::thread::spawn(move || {
             if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
@@ -1097,35 +1567,6 @@ mod tests {
         let scopes = result.unwrap();
         assert_eq!(scopes.scopes, vec!["cargo", "test"]);
         assert!(!scopes.force_prompt);
-    }
-
-    #[test]
-    fn permission_scope_field_non_string_value_returns_none() {
-        let schema = try_from_json(&serde_json::json!({
-            "type": "object",
-            "properties": {
-                "count": { "type": "integer" },
-            },
-            "required": ["count"],
-        }))
-        .unwrap();
-        let (tx, _rx) = flume::unbounded();
-        let tool = LuaTool {
-            name: Arc::from("test_tool"),
-            description: "test".into(),
-            schema,
-            audience: ToolAudience::default(),
-            kind: None,
-            tx,
-            plugin: Arc::from("test"),
-            has_header_fn: false,
-            permission_scope_kind: Some(PermissionScopeKind::Field(Arc::from("count"))),
-            mutable_path_field: None,
-            timeout: Some(Duration::from_secs(60)),
-            start_annotation_array_field: None,
-        };
-        let inv = tool.parse(&serde_json::json!({"count": 42})).unwrap();
-        assert!(smol::block_on(inv.permission_scopes()).is_none());
     }
 
     fn timeout_spec(lua: &Lua, value: LuaValue) -> Table {
@@ -1294,15 +1735,37 @@ mod tests {
         assert_eq!(no_field.start_annotation(), None);
 
         let not_array = LuaToolInvocation {
-            start_annotation_array_field: Some(Arc::from("edit")),
+            start_annotation: Some(StartAnnotation::Count(Arc::from("edit"))),
             ..invocation(serde_json::json!({"edit": "not an array"}))
         };
         assert_eq!(not_array.start_annotation(), None);
 
         let wrong_key = LuaToolInvocation {
-            start_annotation_array_field: Some(Arc::from("edit")),
+            start_annotation: Some(StartAnnotation::Count(Arc::from("edit"))),
             ..invocation(serde_json::json!({"other_field": [1, 2]}))
         };
         assert_eq!(wrong_key.start_annotation(), None);
+    }
+
+    #[test_case::test_case("edits", serde_json::json!({"edits": [1]}),      Some("1 edit")   ; "singular")]
+    #[test_case::test_case("edits", serde_json::json!({"edits": [1, 2, 3]}), Some("3 edits")  ; "plural")]
+    #[test_case::test_case("item",  serde_json::json!({"item": [1, 2]}),     Some("2 items")  ; "field_without_trailing_s")]
+    #[test_case::test_case("edits", serde_json::json!({"edits": []}),        Some("0 edits")  ; "empty_array")]
+    fn start_annotation_count(field: &str, input: Value, expected: Option<&str>) {
+        let inv = LuaToolInvocation {
+            start_annotation: Some(StartAnnotation::Count(Arc::from(field))),
+            ..invocation(input)
+        };
+        assert_eq!(inv.start_annotation(), expected.map(String::from));
+    }
+
+    #[test]
+    fn start_without_tool_use_id_is_noop() {
+        let inv = LuaToolInvocation {
+            has_start_fn: true,
+            ..invocation(serde_json::json!({"code": "x"}))
+        };
+        let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+        smol::block_on(inv.start(&ctx));
     }
 }

@@ -24,9 +24,8 @@ const SESSION_VERSION: u32 = 1;
 const LOG_FORMAT_VERSION: u32 = 2;
 pub const SESSIONS_DIR: &str = "sessions";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
-pub const DEFAULT_TITLE: &str = "New session";
-const MAX_TITLE_LEN: usize = 25;
-const MAX_TITLE_WORDS: usize = 3;
+const DEFAULT_TITLE: &str = "New session";
+const MAX_TITLE_LEN: usize = 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -38,6 +37,40 @@ pub enum SessionError {
     IdMismatch { log_id: String, given_id: String },
     #[error("cursor ahead of session (log has {saved}, session has {actual}); compact required")]
     CursorAhead { saved: usize, actual: usize },
+}
+
+/// Per-model token breakdown entry. Mirrors the four usage counters tracked by
+/// the active provider; kept storage-local to avoid a circular dependency on
+/// `maki-providers`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredTokenUsage {
+    #[serde(default)]
+    pub input: u32,
+    #[serde(default)]
+    pub output: u32,
+    #[serde(default)]
+    pub cache_creation: u32,
+    #[serde(default)]
+    pub cache_read: u32,
+}
+
+impl StoredTokenUsage {
+    pub fn total_input(&self) -> u32 {
+        self.input + self.cache_read + self.cache_creation
+    }
+
+    pub fn total(&self) -> u32 {
+        self.input + self.output + self.cache_creation + self.cache_read
+    }
+}
+
+impl std::ops::AddAssign for StoredTokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input += rhs.input;
+        self.output += rhs.output;
+        self.cache_creation += rhs.cache_creation;
+        self.cache_read += rhs.cache_read;
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -63,11 +96,9 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub show_system_prompt: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub show_reasoning: bool,
+    pub workflow: bool,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub usage_by_model: HashMap<String, StoredTokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +124,6 @@ pub struct SessionSummary {
     pub id: String,
     pub title: String,
     pub updated_at: u64,
-    pub context_size: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,8 +195,6 @@ struct LegacyHeader {
     title: String,
     cwd: String,
     updated_at: u64,
-    #[serde(default)]
-    context_size: u32,
 }
 
 pub trait TitleSource {
@@ -180,29 +208,16 @@ pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
         return DEFAULT_TITLE.into();
     };
 
-    // Strip punctuation, lowercase, take first MAX_TITLE_WORDS words, join with hyphens.
-    let words: Vec<String> = text
-        .split_whitespace()
-        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase())
-        .filter(|w| !w.is_empty())
-        .take(MAX_TITLE_WORDS)
-        .collect();
-
-    if words.is_empty() {
-        return DEFAULT_TITLE.into();
+    if text.len() <= MAX_TITLE_LEN {
+        return text.to_string();
     }
 
-    let mut title = words.join("-");
-    if title.len() > MAX_TITLE_LEN {
-        let boundary = title.floor_char_boundary(MAX_TITLE_LEN);
-        let truncated = &title[..boundary];
-        title = match truncated.rfind('-') {
-            Some(pos) if pos > 0 => truncated[..pos].to_string(),
-            _ => truncated.to_string(),
-        };
+    let boundary = text.floor_char_boundary(MAX_TITLE_LEN);
+    let truncated = &text[..boundary];
+    match truncated.rfind(' ') {
+        Some(pos) if pos > MAX_TITLE_LEN / 2 => format!("{}…", &truncated[..pos]),
+        _ => format!("{truncated}…"),
     }
-
-    if title.is_empty() { DEFAULT_TITLE.into() } else { title }
 }
 
 // -- JSONL record types --
@@ -242,7 +257,6 @@ pub struct SessionLog {
     saved_msg_count: usize,
     saved_tool_ids: HashSet<String>,
     saved_sub_msg_counts: HashMap<String, usize>,
-    last_saved_title: String,
 }
 
 fn sub_msg_snapshot<M>(map: &HashMap<String, Vec<M>>) -> HashMap<String, usize> {
@@ -362,8 +376,7 @@ impl SessionLog {
             }
         }
 
-        let title_changed = session.title != self.last_saved_title;
-        if buf.is_empty() && !title_changed {
+        if buf.is_empty() {
             return Ok(());
         }
 
@@ -382,7 +395,6 @@ impl SessionLog {
 
         self.saved_msg_count = new_msg_count;
         self.saved_tool_ids.extend(new_tool_ids);
-        self.last_saved_title = session.title.clone();
         for (sub_id, count) in new_sub_counts {
             self.saved_sub_msg_counts.insert(sub_id, count);
         }
@@ -423,7 +435,6 @@ impl SessionLog {
         self.saved_msg_count = session.messages.len();
         self.saved_tool_ids = session.tool_outputs.keys().cloned().collect();
         self.saved_sub_msg_counts = sub_msg_snapshot(&session.subagent_messages);
-        self.last_saved_title = session.title.clone();
 
         Ok(())
     }
@@ -435,7 +446,6 @@ impl SessionLog {
             saved_msg_count: session.messages.len(),
             saved_tool_ids: session.tool_outputs.keys().cloned().collect(),
             saved_sub_msg_counts: sub_msg_snapshot(&session.subagent_messages),
-            last_saved_title: session.title.clone(),
         }
     }
 }
@@ -660,14 +670,12 @@ enum ScanRecord {
     Meta {
         title: String,
         updated_at: u64,
-        #[serde(default)]
-        context_size: u32,
     },
     #[serde(other)]
     Other,
 }
 
-fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
+fn scan_headers(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, StorageError> {
     let mut out = Vec::new();
     for path in session_entries(dir)? {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -690,7 +698,7 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
 
 const TAIL_BUF: u64 = 4096;
 
-fn scan_jsonl_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> {
+fn scan_jsonl_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
     let mut file = File::open(path).ok()?;
     let header: JsonlHeader = {
         let mut reader = BufReader::new(&file);
@@ -698,27 +706,21 @@ fn scan_jsonl_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> {
         reader.read_line(&mut line).ok()?;
         serde_json::from_str(line.trim_end()).ok()?
     };
-    if header.v != LOG_FORMAT_VERSION {
-        return None;
-    }
-    if let Some(c) = cwd
-        && header.cwd != c
-    {
+    if header.v != LOG_FORMAT_VERSION || header.cwd != cwd {
         return None;
     }
 
-    let (title, updated_at, context_size) =
-        read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0, 0));
+    let (title, updated_at) =
+        read_last_meta(&mut file).unwrap_or_else(|| (DEFAULT_TITLE.to_string(), 0));
 
     Some(SessionSummary {
         id: header.id,
         title,
         updated_at,
-        context_size,
     })
 }
 
-fn read_last_meta(file: &mut File) -> Option<(String, u64, u32)> {
+fn read_last_meta(file: &mut File) -> Option<(String, u64)> {
     let len = file.seek(SeekFrom::End(0)).ok()?;
     let mut tail = TAIL_BUF.min(len);
     loop {
@@ -729,8 +731,8 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64, u32)> {
         let content = buf.strip_suffix(b"\n").unwrap_or(&buf);
         if let Some(nl) = content.iter().rposition(|&b| b == b'\n') {
             let last_line = &content[nl + 1..];
-            if let Ok(ScanRecord::Meta { title, updated_at, context_size }) = serde_json::from_slice(last_line) {
-                return Some((title, updated_at, context_size));
+            if let Ok(ScanRecord::Meta { title, updated_at }) = serde_json::from_slice(last_line) {
+                return Some((title, updated_at));
             }
             return None;
         }
@@ -742,22 +744,16 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64, u32)> {
     }
 }
 
-fn scan_legacy_header(cwd: Option<&str>, path: &Path) -> Option<SessionSummary> {
+fn scan_legacy_header(cwd: &str, path: &Path) -> Option<SessionSummary> {
     let data = fs::read(path).ok()?;
     let h: LegacyHeader = serde_json::from_slice(&data).ok()?;
-    if h.version != SESSION_VERSION {
-        return None;
-    }
-    if let Some(c) = cwd
-        && h.cwd != c
-    {
+    if h.version != SESSION_VERSION || h.cwd != cwd {
         return None;
     }
     Some(SessionSummary {
         id: h.id,
         title: h.title,
         updated_at: h.updated_at,
-        context_size: h.context_size,
     })
 }
 
@@ -811,6 +807,29 @@ where
         }
     }
 
+    /// After `messages` is truncated (rewind), state keyed by tool_use_id can
+    /// point at calls that no longer exist. On restore that shows up as ghost
+    /// subagent tabs and leaked tool outputs, so this drops everything not
+    /// reachable from `messages`.
+    ///
+    /// If you add another field keyed by tool_use_id, prune it here too.
+    pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
+        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        self.subagent_messages.retain(|id, _| main_ids.contains(id));
+        self.meta
+            .subagents
+            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+
+        let live: HashSet<String> = self
+            .subagent_messages
+            .values()
+            .flatten()
+            .flat_map(&tool_ids)
+            .chain(main_ids)
+            .collect();
+        self.tool_outputs.retain(|id, _| live.contains(id));
+    }
+
     pub fn save(&mut self, dir: &StateDir) -> Result<(), SessionError> {
         let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
         self.save_to(&sessions_dir)
@@ -854,18 +873,7 @@ where
     }
 
     pub fn list_in(cwd: &str, dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-        let mut summaries = scan_headers(Some(cwd), dir)?;
-        summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
-        Ok(summaries)
-    }
-
-    pub fn list_all(dir: &StateDir) -> Result<Vec<SessionSummary>, SessionError> {
-        let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
-        Self::list_all_in(&sessions_dir)
-    }
-
-    pub fn list_all_in(dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-        let mut summaries = scan_headers(None, dir)?;
+        let mut summaries = scan_headers(cwd, dir)?;
         summaries.sort_unstable_by_key(|s| Reverse(s.updated_at));
         Ok(summaries)
     }
@@ -882,7 +890,7 @@ where
         {
             return Ok(Some(s));
         }
-        let summaries = scan_headers(Some(cwd), dir)?;
+        let summaries = scan_headers(cwd, dir)?;
         let latest = summaries.into_iter().max_by_key(|s| s.updated_at);
         match latest {
             Some(s) => Self::load_from(&s.id, dir).map(Some),
@@ -925,8 +933,8 @@ mod tests {
     use super::StoredThinking;
     use super::ThinkingParseError;
     use super::{
-        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, TAIL_BUF, generate_title,
-        load_cwd_index, update_cwd_index,
+        CWD_INDEX_FILE, DEFAULT_TITLE, MAX_TITLE_LEN, SESSION_VERSION, StoredSubagent, TAIL_BUF,
+        generate_title, load_cwd_index, update_cwd_index,
     };
     use super::{Session, SessionError, SessionLog, StorageError, TitleSource};
     use serde_json::Value;
@@ -970,6 +978,51 @@ mod tests {
     }
 
     #[test]
+    fn prune_orphans_drops_unreachable_tool_state() {
+        fn ids(m: &Value) -> Vec<String> {
+            vec![m.as_str().unwrap().to_owned()]
+        }
+        fn subagent(id: &str) -> StoredSubagent {
+            StoredSubagent {
+                tool_use_id: id.into(),
+                name: "sub".into(),
+                prompt: None,
+                model: None,
+            }
+        }
+
+        let mut session: TestSession = Session::new("model", "/p");
+        session.messages.push("task-live".into());
+        session
+            .subagent_messages
+            .insert("task-live".into(), vec!["sub-tool".into()]);
+        session
+            .subagent_messages
+            .insert("task-stale".into(), vec!["stale-sub-tool".into()]);
+        session.meta.subagents = vec![subagent("task-live"), subagent("task-stale")];
+        for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
+            session.tool_outputs.insert(id.into(), Value::Null);
+        }
+
+        session.prune_orphans(ids);
+
+        assert_eq!(
+            session.subagent_messages.keys().collect::<Vec<_>>(),
+            ["task-live"]
+        );
+        let subagent_ids: Vec<_> = session
+            .meta
+            .subagents
+            .iter()
+            .map(|sa| sa.tool_use_id.as_str())
+            .collect();
+        assert_eq!(subagent_ids, ["task-live"]);
+        let mut outputs: Vec<_> = session.tool_outputs.keys().cloned().collect();
+        outputs.sort();
+        assert_eq!(outputs, ["sub-tool", "task-live"]);
+    }
+
+    #[test]
     fn roundtrip_save_load() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -989,6 +1042,50 @@ mod tests {
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.version, SESSION_VERSION);
         assert_eq!(loaded.subagent_messages["tool-1"].len(), 2);
+    }
+
+    #[test]
+    fn roundtrip_usage_by_model() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("anthropic/claude-sonnet-4", "/project");
+        session.meta.usage_by_model.insert(
+            "claude-sonnet-4".into(),
+            super::StoredTokenUsage {
+                input: 100,
+                output: 20,
+                cache_creation: 5,
+                cache_read: 40,
+            },
+        );
+        session.meta.usage_by_model.insert(
+            "claude-haiku-4".into(),
+            super::StoredTokenUsage {
+                input: 30,
+                output: 10,
+                ..Default::default()
+            },
+        );
+        session.save_to(dir).unwrap();
+
+        let loaded = TestSession::load_from(&session.id, dir).unwrap();
+        let sonnet = &loaded.meta.usage_by_model["claude-sonnet-4"];
+        assert_eq!(sonnet.input, 100);
+        assert_eq!(sonnet.output, 20);
+        assert_eq!(sonnet.cache_read, 40);
+        assert_eq!(sonnet.total_input(), 145);
+        assert_eq!(loaded.meta.usage_by_model["claude-haiku-4"].total(), 40);
+    }
+
+    #[test]
+    fn usage_by_model_absent_on_legacy_session() {
+        let json = r#"{"t":"header","v":2,"id":"x","model":"m","cwd":"/","created_at":0}
+{"t":"meta","title":"t","token_usage":null,"updated_at":0}"#;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("x.jsonl");
+        fs::write(&path, json).unwrap();
+        let loaded = TestSession::load_from("x", tmp.path()).unwrap();
+        assert!(loaded.meta.usage_by_model.is_empty());
     }
 
     #[test]
@@ -1175,13 +1272,13 @@ mod tests {
         assert_eq!(latest.id, session.id);
     }
 
-    #[test_case("short title", "short-title" ; "two_words_hyphenated")]
-    #[test_case("Fix the auth bug", "fix-the-auth" ; "three_words_max")]
-    #[test_case("debug auth middleware now", "debug-auth-middleware" ; "four_words_truncated_to_three")]
-    #[test_case("What's the best way?", "whats-the-best" ; "punctuation_stripped")]
-    #[test_case("UPPERCASE INPUT", "uppercase-input" ; "lowercased")]
+    #[test_case("short title", "short title" ; "short_passthrough")]
     #[test_case("", DEFAULT_TITLE ; "empty_defaults")]
-    #[test_case("!!!", DEFAULT_TITLE ; "only_punctuation_defaults")]
+    #[test_case(
+        "This is a very long title that exceeds the sixty character limit and should be truncated at a word boundary",
+        "This is a very long title that exceeds the sixty character…"
+        ; "long_truncates_at_word"
+    )]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
             vec![]
@@ -1221,7 +1318,7 @@ mod tests {
     fn title_unicode_safe() {
         let input = "あ".repeat(100);
         let title = generate_title(&[user_message(&input)]);
-        assert!(title.len() <= MAX_TITLE_LEN);
+        assert!(title.len() <= MAX_TITLE_LEN * 4);
         assert!(title.is_char_boundary(title.len()));
     }
 
@@ -1330,6 +1427,7 @@ mod tests {
         let meta: super::SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
         assert!(!meta.fast);
+        assert!(!meta.workflow);
     }
 
     #[test]
@@ -1339,6 +1437,7 @@ mod tests {
         let mut session: TestSession = Session::new("m", "/project");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
         session.meta.fast = true;
+        session.meta.workflow = true;
         session.save_to(dir).unwrap();
 
         let loaded = TestSession::load_from(&session.id, dir).unwrap();
@@ -1347,6 +1446,7 @@ mod tests {
             Some(StoredThinking::Budget { tokens: 8192 })
         );
         assert!(loaded.meta.fast);
+        assert!(loaded.meta.workflow);
     }
 
     #[test]

@@ -5,7 +5,8 @@ use crate::components::Overlay;
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
-use crate::components::status_bar::{StatusBarContext, UsageStats, StreamingInfo};
+use crate::components::status_bar::{StatusBarContext, UsageStats};
+use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
@@ -255,13 +256,10 @@ impl App {
         }
 
         render_if_open!(self.rewind_picker);
-        render_if_open!(self.goto_picker);
         render_if_open!(self.theme_picker);
-        render_if_open!(self.settings_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
-        render_if_open!(self.export_picker);
 
         overlay_rect
     }
@@ -276,13 +274,19 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        let r = self.plugins_modal.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
-        }
-        let r = self.skills_modal.view(frame, full);
-        if r.width > 0 {
-            overlay_rect = r;
+        if self.usage_modal.is_open() {
+            let quota = self.usage_slot.load();
+            let ctx = UsageModalContext {
+                total: &self.state.token_usage,
+                by_model: &self.state.session.meta.usage_by_model,
+                model: &self.state.model,
+                fast: self.state.fast,
+                quota: quota.as_deref(),
+            };
+            let r = self.usage_modal.view(frame, full, &ctx);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
         }
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
@@ -294,35 +298,7 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
-        let session_name = {
-            let t = self.state.session.title.as_str();
-            (t != maki_storage::sessions::DEFAULT_TITLE).then_some(t)
-        };
         let (mode_label, mode_style) = self.mode_label();
-        let is_streaming = self.status == Status::Streaming;
-        let streaming_info = if is_streaming || self.active_run_duration.is_some() {
-            let duration = if is_streaming {
-                self.active_run_start.map(|t| t.elapsed()).unwrap_or(std::time::Duration::ZERO)
-            } else {
-                self.active_run_duration.unwrap_or(std::time::Duration::ZERO)
-            };
-            let input_tokens = self.active_run_input_tokens;
-            let output_tokens = self.active_run_output_chars / 4;
-            let active_tools = if is_streaming {
-                chat.in_progress_tools()
-            } else {
-                Vec::new()
-            };
-            Some(StreamingInfo {
-                duration,
-                input_tokens,
-                output_tokens,
-                active_tools,
-            })
-        } else {
-            None
-        };
-
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
@@ -341,16 +317,11 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            session_name,
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
+            workflow: self.state.workflow,
             restoring: self.restoring.load(Ordering::Relaxed),
-            streaming_info,
-            streaming_active: is_streaming,
-            verbose: self.verbose,
-            last_turn_stats: self.last_turn_stats.as_ref(),
-            show_token_stats: self.show_token_stats,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
@@ -472,14 +443,10 @@ impl App {
             contexts.push(KeybindContext::SessionPicker);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
-        } else if self.goto_picker.is_open() {
-            contexts.push(KeybindContext::GotoPicker);
         } else if self.task_picker.is_open() {
             contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
-        } else if self.settings_picker.is_open() {
-            contexts.push(KeybindContext::SettingsPicker);
         } else if self.model_picker.is_open() {
             contexts.push(KeybindContext::ModelPicker);
         } else if self.command_palette.is_active() {

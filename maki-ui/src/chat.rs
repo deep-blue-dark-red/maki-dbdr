@@ -6,20 +6,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::components::messages::MessagesPanel;
-use crate::components::render_hints::RenderHintsRegistry;
-use crate::components::tool_display::{
-    append_annotation, output_limits_from_hints, tool_output_annotation,
-};
+use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
-use maki_agent::{
-    AgentEvent, BatchToolStatus, BufferSnapshot, SharedBuf, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
-};
-use maki_config::{ToolOutputLines, UiConfig};
+use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
+use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -39,7 +33,7 @@ pub enum ChatEventResult {
     Error(String),
     PermissionRequest {
         id: String,
-        tool: String,
+        tool: ToolKey,
         scopes: Vec<String>,
     },
     AuthRequired,
@@ -70,10 +64,6 @@ impl Chat {
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
         self.pending_turn_usage = Some(usage);
-    }
-
-    pub fn in_progress_tools(&self) -> Vec<String> {
-        self.messages_panel.in_progress_tools()
     }
 
     pub(crate) fn set_restore_channel(
@@ -108,15 +98,6 @@ impl Chat {
                         .push(DisplayMessage::plan(content, pp.display().to_string()));
                 }
             }
-            AgentEvent::BatchProgress(e) => {
-                self.messages_panel.batch_progress(
-                    &e.batch_id,
-                    e.index,
-                    e.status,
-                    e.output,
-                    e.summary.as_deref(),
-                );
-            }
             AgentEvent::TurnComplete(_) => {}
             AgentEvent::ToolResultsSubmitted { .. } => {
                 if let Some(usage) = self.pending_turn_usage.take() {
@@ -129,9 +110,6 @@ impl Chat {
                     DisplayRole::Assistant,
                     "Auto-compacting conversation...".into(),
                 ));
-            }
-            AgentEvent::CompactionStart { checkpoint } => {
-                self.messages_panel.begin_compaction(checkpoint);
             }
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
@@ -166,9 +144,14 @@ impl Chat {
                 self.messages_panel
                     .tool_header_snapshot(&id, snapshot, theme_gen);
             }
+            AgentEvent::Nudge => {
+                self.messages_panel.flush();
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    "Model stalled after tool calls, nudging...".into(),
+                ));
+            }
             AgentEvent::SubagentHistory { .. } => {}
-            AgentEvent::SystemPrompt { .. } => {}
-            AgentEvent::RenameResult { .. } => unreachable!("handled before handle_event"),
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
@@ -236,12 +219,8 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
-    pub fn handle_click(
-        &mut self,
-        row: u16,
-        area: Rect,
-    ) -> super::components::messages::ClickResult {
-        self.messages_panel.handle_click(row, area)
+    pub fn handle_click(&mut self, row: u16, area: Rect) {
+        self.messages_panel.handle_click(row, area);
     }
 
     pub fn tool_snapshot(
@@ -262,27 +241,6 @@ impl Chat {
     ) {
         self.messages_panel
             .tool_header_snapshot(tool_id, snapshot, theme_gen);
-    }
-
-    pub fn set_system_prompt(&mut self, show: bool, prompt: Option<String>) {
-        self.messages_panel.show_system_prompt = show;
-        self.messages_panel.system_prompt = prompt;
-        self.messages_panel.clear_cache();
-    }
-
-    pub fn set_verbose(&mut self, verbose: bool) {
-        self.messages_panel.verbose = verbose;
-        self.messages_panel.clear_expanded_tools();
-        self.messages_panel.clear_cache();
-    }
-
-    pub fn set_show_reasoning(&mut self, show: bool) {
-        self.messages_panel.show_reasoning = show;
-        self.messages_panel.clear_cache();
-    }
-
-    pub fn register_live_buf(&mut self, id: String, buf: Arc<SharedBuf>) {
-        self.messages_panel.register_live_buf(id, buf);
     }
 
     pub fn stream_reset(&mut self) {
@@ -336,9 +294,8 @@ impl Chat {
             .push(DisplayMessage::new(DisplayRole::User, text.into()));
     }
 
-    /// Flush any in-flight stream, push the bubble, then re-pin auto-scroll.
-    /// Doing all three together keeps the bubble from briefly landing in the
-    /// wrong row, which is what caused the one-frame hop after submit.
+    /// Flush, push, and re-pin scroll in one shot to avoid
+    /// the one-frame hop where the bubble briefly lands in the wrong row.
     pub fn show_user_message(&mut self, text: impl Into<String>) {
         self.flush();
         self.push_user_message(text);
@@ -388,7 +345,6 @@ pub fn history_to_display(
     tool_outputs: &HashMap<String, ToolOutput>,
     tool_output_lines: &ToolOutputLines,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
-    let registry = RenderHintsRegistry::new();
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
@@ -411,11 +367,10 @@ pub fn history_to_display(
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let static_name = name.as_str();
-                            let reg = ToolRegistry::native();
+                            let reg = ToolRegistry::global();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
                                 reg.get(name).and_then(|entry| entry.try_parse(input));
                             let summary = reg.resolve_header(name, input);
-                            let tool_input = tool_call.as_deref().and_then(|tc| tc.start_input());
                             let (status, result_text) = results
                                 .get(id.as_str())
                                 .map(|(err, text)| {
@@ -427,35 +382,44 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id).cloned();
+                            let stored = tool_outputs.get(id.as_str());
                             let (text, truncated_lines, tool_output, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
                                     &summary,
-                                    stored,
+                                    stored.cloned(),
                                     result_text,
                                     tool_output_lines,
-                                    &registry,
                                 );
                             if let Some(ta) =
                                 tool_call.as_deref().and_then(|tc| tc.start_annotation())
                             {
                                 append_annotation(&mut annotation, &ta);
                             }
-                            let output = tool_outputs
-                                .get(id.as_str())
+                            let output = stored
                                 .map(|o| o.as_text())
                                 .or_else(|| result_text.map(str::to_owned))
                                 .unwrap_or_default();
-                            restore_items.push(maki_lua::RestoreItem {
-                                tool: Arc::from(static_name),
-                                tool_use_id: id.clone(),
-                                output,
-                                input: input.clone(),
-                                is_error: status == ToolStatus::Error,
-                                tool_output_lines: *tool_output_lines,
-                                theme_gen: None,
-                            });
+                            let state = stored.and_then(|o| o.state().cloned());
+                            // Structured outputs (e.g. Diff) render natively
+                            // in Rust with full fidelity; a Lua restore
+                            // snapshot would replace that with a poorer text
+                            // view.
+                            let rust_rendered =
+                                stored.is_some_and(|o| o.structured_display_text().is_some());
+                            if !rust_rendered {
+                                restore_items.push(maki_lua::RestoreItem {
+                                    tool: Arc::from(static_name),
+                                    tool_use_id: id.clone(),
+                                    output,
+                                    input: input.clone(),
+                                    is_error: status == ToolStatus::Error,
+                                    tool_output_lines: *tool_output_lines,
+                                    theme_gen: None,
+                                    clicks: Vec::new(),
+                                    state,
+                                });
+                            }
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),
@@ -463,7 +427,7 @@ pub fn history_to_display(
                                     name: static_name.into(),
                                 })),
                                 text,
-                                tool_input: tool_input.map(Arc::new),
+                                tool_input: None,
                                 tool_raw_input: Some(Arc::new(input.clone())),
                                 tool_output,
                                 live_output: None,
@@ -475,6 +439,7 @@ pub fn history_to_display(
                                 render_snapshot: None,
                                 render_header: None,
                                 snapshot_theme_gen: 0,
+                                thinking_collapsed: false,
                             });
                         }
                         _ => {}
@@ -486,8 +451,8 @@ pub fn history_to_display(
     (display, restore_items)
 }
 
-/// The original `ToolResult` is gone after session load, so we rebuild a
-/// `RestoreItem` from whatever the `DisplayMessage` kept.
+/// `ToolResult` is gone after session load, so we rebuild from
+/// whatever the `DisplayMessage` kept.
 pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: maki_config::ToolOutputLines,
@@ -497,7 +462,12 @@ pub(crate) fn restore_item_for(
         return None;
     };
     let input = msg.tool_raw_input.as_deref()?;
-    let output = msg.tool_output.as_ref().map(|o| o.as_text())?;
+    let stored = msg.tool_output.as_deref()?;
+    if stored.structured_display_text().is_some() {
+        return None;
+    }
+    let output = stored.as_text();
+    let state = stored.state().cloned();
     Some(maki_lua::RestoreItem {
         tool: role.name.clone(),
         tool_use_id: role.id.clone(),
@@ -506,84 +476,36 @@ pub(crate) fn restore_item_for(
         is_error: role.status == ToolStatus::Error,
         tool_output_lines,
         theme_gen: Some(theme_gen),
+        clicks: Vec::new(),
+        state,
     })
 }
 
-/// Batch variant of `restore_item_for`.
-pub(crate) fn restore_item_for_batch_entry(
-    entry: &maki_agent::BatchToolEntry,
-    child_id: String,
-    tool_output_lines: maki_config::ToolOutputLines,
-    theme_gen: u64,
-) -> Option<maki_lua::RestoreItem> {
-    let raw_input = entry.raw_input.clone()?;
-    let output = entry.output.as_ref().map(|o| o.as_text())?;
-    Some(maki_lua::RestoreItem {
-        tool: Arc::from(entry.tool.as_str()),
-        tool_use_id: child_id,
-        output,
-        input: raw_input,
-        is_error: entry.status == BatchToolStatus::Error,
-        tool_output_lines,
-        theme_gen: Some(theme_gen),
-    })
-}
-
-/// Builds a loaded tool the same way the live `tool_done` path does, so
-/// restored sessions look identical to streamed ones.
+/// Mirrors the live `tool_done` path so restored sessions
+/// look the same as streamed ones.
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
     reconstructed: Option<ToolOutput>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
-    registry: &RenderHintsRegistry,
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
-    let hints = registry.get(tool);
     match reconstructed {
-        Some(ref output @ ToolOutput::GrepResult { .. }) => {
-            let annotation = tool_output_annotation(output);
-            (
-                summary.to_owned(),
-                0,
-                reconstructed.map(Arc::new),
-                annotation,
-            )
-        }
-        Some(ToolOutput::Batch { ref entries, .. }) => {
-            let failed = entries
-                .iter()
-                .filter(|e| e.status == BatchToolStatus::Error)
-                .count();
-            let text = if failed > 0 {
-                let total = entries.len();
-                format!("{}/{total} tools succeeded", total - failed)
-            } else {
-                summary.to_owned()
-            };
-            (text, 0, reconstructed.map(Arc::new), None)
-        }
-        Some(ref output) => {
-            let annotation = tool_output_annotation(output);
-            (
-                summary.to_owned(),
-                0,
-                reconstructed.map(Arc::new),
-                annotation,
-            )
+        Some(output) => {
+            let annotation = output.annotation();
+            (summary.to_owned(), 0, Some(Arc::new(output)), annotation)
         }
         None => {
             let result = result_text.unwrap_or("");
             let annotation = if !result.is_empty() {
-                tool_output_annotation(&ToolOutput::Plain(result.into()))
+                ToolOutput::Plain(result.into()).annotation()
             } else {
                 None
             };
             if result.is_empty() {
                 (summary.to_owned(), 0, None, annotation)
             } else {
-                let limits = output_limits_from_hints(tool, hints, tool_output_lines);
-                let tr = truncate_output(result, limits.max_lines, limits.keep);
+                let tr = truncate_output(result, tool_output_lines.get(tool));
                 (
                     format!("{}\n{}", summary, tr.kept),
                     tr.skipped,
@@ -618,9 +540,7 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::{
-        AgentEvent, BatchToolEntry, BatchToolStatus, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    };
+    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
     use maki_config::UiConfig;
     use test_case::test_case;
 
@@ -928,42 +848,6 @@ mod tests {
         );
     }
     #[test]
-    fn history_stored_batch_with_errors_shows_count() {
-        let batch_output = ToolOutput::Batch {
-            entries: vec![
-                BatchToolEntry {
-                    tool: "read".into(),
-                    summary: "/a.rs".into(),
-                    status: BatchToolStatus::Success,
-                    input: None,
-                    raw_input: None,
-                    output: None,
-                    annotation: None,
-                },
-                BatchToolEntry {
-                    tool: "read".into(),
-                    summary: "/missing".into(),
-                    status: BatchToolStatus::Error,
-                    input: None,
-                    raw_input: None,
-                    output: None,
-                    annotation: None,
-                },
-            ],
-            text: String::new(),
-        };
-        let msgs = tool_use_pair("batch", serde_json::json!({"tool_calls": []}), "", false);
-        let outputs = HashMap::from([("t1".into(), batch_output)]);
-        let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
-        let ToolOutput::Batch { entries, .. } = display[0].tool_output.as_deref().unwrap() else {
-            panic!("expected Batch output");
-        };
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1].status, BatchToolStatus::Error);
-        assert!(display[0].text.contains("1/2"));
-    }
-
-    #[test]
     fn history_no_stored_output_falls_back_to_plain_text() {
         let msgs = tool_use_pair(
             "read",
@@ -1029,6 +913,29 @@ mod tests {
     }
 
     #[test]
+    fn restore_item_for_skips_structured_outputs_rust_renders() {
+        let mut msg = tool_msg_with_input("edit");
+        msg.tool_output = Some(Arc::new(edit_output("/src/main.rs")));
+        assert!(restore_item_for(&msg, ToolOutputLines::default(), RESTORE_THEME_GEN).is_none());
+    }
+
+    #[test]
+    fn history_structured_output_produces_no_restore_item() {
+        let msgs = tool_use_pair(
+            "edit",
+            serde_json::json!({"path": "a", "old_string": "x", "new_string": "y"}),
+            "edited a",
+            false,
+        );
+        let outputs = HashMap::from([("t1".to_owned(), edit_output("a"))]);
+        let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
+        assert!(items.is_empty(), "Rust owns Diff rendering on restore");
+
+        let (_, items) = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default());
+        assert_eq!(items.len(), 1, "text-only history still restores via Lua");
+    }
+
+    #[test]
     fn restore_item_for_returns_none_when_data_missing() {
         let tol = ToolOutputLines::default();
 
@@ -1042,66 +949,5 @@ mod tests {
         let mut no_output = tool_msg_with_input("bash");
         no_output.tool_output = None;
         assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
-    }
-
-    #[test]
-    fn restore_item_for_batch_entry_round_trips_fields() {
-        const CHILD_ID: &str = "child-123";
-        let entry = BatchToolEntry {
-            tool: "bash".into(),
-            summary: String::new(),
-            status: BatchToolStatus::Error,
-            input: None,
-            raw_input: Some(serde_json::json!({"cmd": "ls"})),
-            output: Some(ToolOutput::Plain("output".into())),
-            annotation: None,
-        };
-        let item = restore_item_for_batch_entry(
-            &entry,
-            CHILD_ID.into(),
-            ToolOutputLines::default(),
-            RESTORE_THEME_GEN,
-        )
-        .expect("entry with raw_input and output must produce a RestoreItem");
-        assert_eq!(&*item.tool, "bash");
-        assert_eq!(item.tool_use_id, CHILD_ID);
-        assert_eq!(item.output, "output");
-        assert_eq!(item.input, serde_json::json!({"cmd": "ls"}));
-        assert!(item.is_error);
-        assert_eq!(item.theme_gen, Some(RESTORE_THEME_GEN));
-    }
-
-    #[test_case(
-        None,
-        Some(ToolOutput::Plain("output".into()))
-        ; "missing_raw_input"
-    )]
-    #[test_case(
-        Some(serde_json::json!({"cmd": "ls"})),
-        None
-        ; "missing_output"
-    )]
-    fn restore_item_for_batch_entry_returns_none(
-        raw_input: Option<serde_json::Value>,
-        output: Option<ToolOutput>,
-    ) {
-        let entry = BatchToolEntry {
-            tool: "bash".into(),
-            summary: String::new(),
-            status: BatchToolStatus::Success,
-            input: None,
-            raw_input,
-            output,
-            annotation: None,
-        };
-        assert!(
-            restore_item_for_batch_entry(
-                &entry,
-                "id".into(),
-                ToolOutputLines::default(),
-                RESTORE_THEME_GEN
-            )
-            .is_none()
-        );
     }
 }

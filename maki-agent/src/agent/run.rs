@@ -3,9 +3,10 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{error, info, warn};
 
-use maki_providers::ContentBlock;
 use maki_providers::provider::Provider;
-use maki_providers::{Message, Model, RequestOptions, StopReason, StreamResponse, TokenUsage};
+use maki_providers::{
+    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+};
 
 use super::compaction::{self, CONTINUE_AFTER_COMPACT};
 use super::history::{History, sanitize_cancelled_history};
@@ -15,7 +16,7 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpHandle;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, ToolContext};
+use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
     InterruptSource, TurnCompleteEvent,
@@ -23,6 +24,7 @@ use crate::{
 use maki_config::ToolOutputLines;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -46,6 +48,7 @@ enum TurnOutcome {
     Done(Option<StopReason>),
 }
 
+#[derive(Clone)]
 pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
@@ -57,6 +60,8 @@ pub struct AgentParams {
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub subagent_cancels: Arc<CancelMap<String>>,
+    pub registry: Arc<crate::tools::ToolRegistry>,
+    pub audience: ToolAudience,
 }
 
 pub struct AgentRunParams<'h> {
@@ -88,6 +93,7 @@ pub struct Agent<'h> {
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
+    post_tool_empty_retried: bool,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<String>,
@@ -95,6 +101,10 @@ pub struct Agent<'h> {
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
+    registry: Arc<crate::tools::ToolRegistry>,
+    audience: ToolAudience,
+    workflow: bool,
+    local_tools: LocalTools,
 }
 
 impl<'h> Agent<'h> {
@@ -123,11 +133,16 @@ impl<'h> Agent<'h> {
             rollback_len: 0,
             mcp: None,
             reauth_attempts: 0,
+            post_tool_empty_retried: false,
             opts: RequestOptions::default(),
             session_id: params.session_id,
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
+            registry: params.registry,
+            audience: params.audience,
+            workflow: false,
+            local_tools: LocalTools::default(),
         }
     }
 
@@ -154,6 +169,11 @@ impl<'h> Agent<'h> {
         self
     }
 
+    pub fn with_local_tools(mut self, local_tools: LocalTools) -> Self {
+        self.local_tools = local_tools;
+        self
+    }
+
     pub fn with_loaded_instructions(mut self, loaded: LoadedInstructions) -> Self {
         self.loaded_instructions = loaded;
         self
@@ -164,6 +184,7 @@ impl<'h> Agent<'h> {
         let msg = Message::user_with_images(input.message.clone(), input.images);
         self.history.push(msg);
         self.mode = input.mode;
+        self.workflow = input.workflow;
         self.opts = RequestOptions {
             thinking: input.thinking,
             fast: input.fast,
@@ -259,6 +280,24 @@ impl<'h> Agent<'h> {
             self.context_size +=
                 estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
         } else {
+            let has_text = response.message.first_text_content().is_some();
+
+            if !has_text && !self.post_tool_empty_retried && self.history.has_recent_tool_results(5)
+            {
+                self.post_tool_empty_retried = true;
+                warn!("empty response after tool calls, nudging model to continue");
+                self.event_tx.send(AgentEvent::Nudge)?;
+                self.history.push(Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "(empty)".into(),
+                    }],
+                    ..Default::default()
+                });
+                self.history.push(Message::synthetic(NUDGE_PROMPT.into()));
+                return Ok(TurnOutcome::Continue);
+            }
+
             self.history.push(response.message);
 
             if stop_reason == Some(StopReason::MaxTokens)
@@ -335,6 +374,7 @@ impl<'h> Agent<'h> {
     }
 
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
+        self.post_tool_empty_retried = false;
         let ctx = self.tool_context();
         tool_dispatch::process_tool_calls(
             response,
@@ -367,6 +407,11 @@ impl<'h> Agent<'h> {
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
+            registry: Arc::clone(&self.registry),
+            workflow: self.workflow,
+            audience: self.audience,
+            local_tools: Arc::clone(&self.local_tools),
+            live_sink: None,
         }
     }
 
@@ -398,27 +443,11 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
-            None,
         )
         .await?;
         self.rollback_len = self.history.len();
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
-        Ok(())
-    }
-
-    async fn do_checkpoint(&mut self) -> Result<(), AgentError> {
-        let (provider, model) =
-            resolve_compaction_model(&self.provider, &self.model, self.timeouts);
-        self.total_usage += compaction::checkpoint_history(
-            &*provider,
-            &model,
-            self.history,
-            &self.event_tx,
-            &self.cancel,
-            None,
-        )
-        .await?;
         Ok(())
     }
 
@@ -448,9 +477,6 @@ impl<'h> Agent<'h> {
             ExtractedCommand::Compact(_) => {
                 self.do_compact().await?;
             }
-            ExtractedCommand::Checkpoint(_) => {
-                self.do_checkpoint().await?;
-            }
         }
         Ok(true)
     }
@@ -458,7 +484,10 @@ impl<'h> Agent<'h> {
 
 const CHARS_PER_TOKEN: usize = 4;
 
-fn estimate_message_tokens(messages: &[Message]) -> u32 {
+pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
+    if messages.is_empty() {
+        return 0;
+    }
     let total_bytes: usize = messages
         .iter()
         .flat_map(|m| &m.content)
@@ -560,6 +589,18 @@ mod tests {
         }
     }
 
+    fn empty_response() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }
+    }
+
     fn make_agent(
         provider: MockProvider,
         history: &mut History,
@@ -584,6 +625,8 @@ mod tests {
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+                registry: Arc::new(crate::tools::ToolRegistry::new()),
+                audience: ToolAudience::MAIN,
             },
             AgentRunParams {
                 history,
@@ -599,7 +642,12 @@ mod tests {
         AgentInput {
             message: "hello".into(),
             mode: AgentMode::Build,
-            ..Default::default()
+            images: Vec::new(),
+            preamble: Vec::new(),
+            thinking: Default::default(),
+            fast: false,
+            workflow: false,
+            prompt: None,
         }
     }
 
@@ -840,6 +888,8 @@ mod tests {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                     subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
+                    registry: Arc::new(crate::tools::ToolRegistry::new()),
+                    audience: ToolAudience::MAIN,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -879,6 +929,54 @@ mod tests {
                 e,
                 AgentEvent::ToolDone(done) if done.is_error && done.id == expected_error_id
             )));
+        });
+    }
+
+    #[test_case(
+        vec![
+            tool_call_response("glob", "t1"),
+            empty_response(),
+            text_response(StopReason::EndTurn),
+        ],
+        3, true
+        ; "nudge_on_empty_after_tools"
+    )]
+    #[test_case(
+        vec![
+            tool_call_response("glob", "t1"),
+            text_response(StopReason::EndTurn),
+        ],
+        2, false
+        ; "no_nudge_when_text_after_tools"
+    )]
+    #[test_case(
+        vec![
+            empty_response(),
+            text_response(StopReason::EndTurn),
+        ],
+        1, false
+        ; "no_nudge_without_recent_tools"
+    )]
+    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expect_nudge: bool) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            let _ = agent.run(default_input()).await;
+            drop(agent);
+            let events = drain_events(&event_rx);
+
+            assert_eq!(
+                has_event(&events, |e| matches!(e, AgentEvent::Nudge)),
+                expect_nudge,
+            );
+            let done = events
+                .iter()
+                .find_map(|e| match &e.event {
+                    AgentEvent::Done { num_turns, .. } => Some(*num_turns),
+                    _ => None,
+                })
+                .expect("expected Done event");
+            assert_eq!(done, expected_turns);
         });
     }
 }

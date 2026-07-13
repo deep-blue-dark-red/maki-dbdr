@@ -13,7 +13,11 @@ end
 maki.api.register_tool({
   name = "glob",
   kind = "search",
-  description = [[Find files by glob pattern (respects .gitignore), newest first. Search speculatively in parallel rather than in sequential rounds.]],
+  description = [[Find files by glob pattern.
+
+- Respects .gitignore.
+- Returns absolute paths sorted by modification time (newest first).
+- Prefer speculative parallel searches over sequential rounds of glob+grep.]],
 
   schema = {
     type = "object",
@@ -44,17 +48,20 @@ maki.api.register_tool({
       return "error: pattern is required"
     end
 
-    local config = ctx:config()
-    local limit = (config and config.search_result_limit) or DEFAULT_SEARCH_LIMIT
-    local max_lines = (config and config.max_output_lines) or 2000
-    local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
+    local limit = ctx:config("search_result_limit", DEFAULT_SEARCH_LIMIT)
+    local max_lines = ctx:config("max_output_lines", 2000)
+    local max_bytes = ctx:config("max_output_bytes", (50 * 1024))
 
-    local files = maki.fs.glob(pattern, {
+    local files, err = maki.fs.glob(pattern, {
       path = input.path,
       gitignore = true,
       sort = "mtime",
       limit = limit,
     })
+
+    if not files then
+      return "error: " .. err
+    end
 
     if #files == 0 then
       return { llm_output = NO_FILES_FOUND }

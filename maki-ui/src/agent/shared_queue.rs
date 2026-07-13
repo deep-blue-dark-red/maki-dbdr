@@ -11,14 +11,12 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
-use maki_providers::Message;
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
-const CHECKPOINT_LABEL: &str = "/checkpoint";
 
 type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 
@@ -50,34 +48,17 @@ pub(crate) enum QueueItem {
     },
     Compact {
         run_id: u64,
-        target_tokens: Option<usize>,
-    },
-    Checkpoint {
-        run_id: u64,
-    },
-    Rename {
-        messages: Vec<Message>,
-        run_id: u64,
     },
 }
 
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. }
-            | Self::Compact { run_id, .. }
-            | Self::Checkpoint { run_id }
-            | Self::Rename { run_id, .. } => *run_id,
+            Self::Message { run_id, .. } | Self::Compact { run_id } => *run_id,
         }
     }
 
     fn as_queue_entry(&self) -> QueueEntry<'static> {
-        let accent = || {
-            theme::current()
-                .queue
-                .fg
-                .unwrap_or(theme::current().foreground)
-        };
         match self {
             Self::Message { text, .. } => QueueEntry {
                 text: Cow::Owned(text.clone()),
@@ -85,15 +66,10 @@ impl QueueItem {
             },
             Self::Compact { .. } => QueueEntry {
                 text: Cow::Borrowed(COMPACT_LABEL),
-                color: accent(),
-            },
-            Self::Checkpoint { .. } => QueueEntry {
-                text: Cow::Borrowed(CHECKPOINT_LABEL),
-                color: accent(),
-            },
-            Self::Rename { .. } => QueueEntry {
-                text: Cow::Borrowed("/rename"),
-                color: accent(),
+                color: theme::current()
+                    .queue
+                    .fg
+                    .unwrap_or(theme::current().foreground),
             },
         }
     }
@@ -101,10 +77,7 @@ impl QueueItem {
     fn into_extracted_command(self) -> ExtractedCommand {
         match self {
             Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
-            Self::Compact { run_id, .. } => ExtractedCommand::Compact(run_id),
-            Self::Checkpoint { run_id } => ExtractedCommand::Checkpoint(run_id),
-            // Rename items are never exposed as interrupts — see InterruptSource impl.
-            Self::Rename { .. } => unreachable!("Rename must not be polled as an interrupt"),
+            Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
         }
     }
 
@@ -114,8 +87,7 @@ impl QueueItem {
     fn visible_in_panel(&self) -> bool {
         match self {
             Self::Message { displayed, .. } => !displayed,
-            Self::Compact { .. } | Self::Checkpoint { .. } => true,
-            Self::Rename { .. } => false,
+            Self::Compact { .. } => true,
         }
     }
 }
@@ -177,7 +149,7 @@ impl QueueSender {
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
-                QueueItem::Compact { .. } | QueueItem::Checkpoint { .. } | QueueItem::Rename { .. } => None,
+                QueueItem::Compact { .. } => None,
             })
             .collect()
     }
@@ -210,14 +182,7 @@ impl QueueReceiver {
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
-        // Rename items are background operations that should not interrupt an
-        // active agent run. Leave them in the queue for the outer agent-loop
-        // to process after the current entry finishes.
-        let mut items = lock(&self.items);
-        if matches!(items.front(), Some(QueueItem::Rename { .. })) {
-            return None;
-        }
-        items.pop_front().map(QueueItem::into_extracted_command)
+        self.pop().map(QueueItem::into_extracted_command)
     }
 }
 
@@ -230,7 +195,16 @@ mod tests {
         QueueItem::Message {
             text: "t".into(),
             image_count: 0,
-            input: AgentInput::default(),
+            input: AgentInput {
+                message: String::new(),
+                mode: Default::default(),
+                images: Vec::new(),
+                preamble: Vec::new(),
+                thinking: Default::default(),
+                fast: false,
+                workflow: false,
+                prompt: None,
+            },
             run_id: 0,
             displayed,
         }
@@ -238,7 +212,7 @@ mod tests {
 
     #[test_case(msg(false),                       true  ; "deferred_message_visible")]
     #[test_case(msg(true),                        false ; "displayed_message_hidden")]
-    #[test_case(QueueItem::Compact { run_id: 0, target_tokens: None }, true  ; "compact_visible")]
+    #[test_case(QueueItem::Compact { run_id: 0 }, true  ; "compact_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let (tx, _rx) = queue();
         tx.push(item);

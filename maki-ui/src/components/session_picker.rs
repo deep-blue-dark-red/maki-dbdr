@@ -1,7 +1,6 @@
 use std::thread;
 
 use crate::AppSession;
-use crate::components::settings_picker::UserSettings;
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -11,11 +10,10 @@ use jiff::Timestamp;
 use maki_storage::StateDir;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::text::Line;
 
 const TITLE: &str = " Sessions ";
-const NO_SESSIONS_MSG: &str = "no sessions in path; enable global sessions";
-
+const NO_SESSIONS_MSG: &str = "No previous sessions";
+const FOOTER_HINTS: &[(&str, &str)] = &[("Enter", "open"), (key::DELETE.label, "delete")];
 
 pub enum SessionPickerAction {
     Consumed,
@@ -50,7 +48,7 @@ pub struct SessionPicker {
 impl SessionPicker {
     pub fn new() -> Self {
         Self {
-            picker: ListPicker::new(),
+            picker: ListPicker::new().with_footer(FOOTER_HINTS),
             confirming: None,
             pending_rx: None,
             flash: None,
@@ -58,33 +56,21 @@ impl SessionPicker {
     }
 
     pub fn open(&mut self, cwd: &str, current_session_id: &str, dir: &StateDir) {
-        let footer_spans = crate::components::hint_line(&[("Enter", "open"), (key::DELETE.label(), "delete")]).spans;
-        self.picker.set_static_footer(Line::from(footer_spans));
         self.picker.open_loading(TITLE);
         let cwd = cwd.to_owned();
         let current_session_id = current_session_id.to_owned();
         let dir = dir.clone();
         let (tx, rx) = flume::bounded(1);
-        let settings = UserSettings::load();
         thread::spawn(move || {
-            let list_res = if settings.global_sessions {
-                AppSession::list_all(&dir)
-            } else {
-                AppSession::list(&cwd, &dir)
-            };
-            let result = list_res
+            let result = AppSession::list(&cwd, &dir)
                 .map(|summaries| {
                     summaries
                         .into_iter()
                         .filter(|s| s.id != current_session_id)
-                        .map(|s| {
-                            let time_str = format_relative_time(s.updated_at);
-                            let ctx_str = format_context_size(s.context_size);
-                            SessionEntry {
-                                id: s.id,
-                                title: s.title,
-                                relative_time: format!("ctx: {ctx_str} · {time_str}"),
-                            }
+                        .map(|s| SessionEntry {
+                            id: s.id,
+                            title: s.title,
+                            relative_time: format_relative_time(s.updated_at),
                         })
                         .collect()
                 })
@@ -213,16 +199,6 @@ fn format_relative_time(epoch_secs: u64) -> String {
     humanize_secs(secs)
 }
 
-fn format_context_size(tokens: u32) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1_000 {
-        format!("{:.1}K", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
 fn humanize_secs(secs: u64) -> String {
     const MINUTE: u64 = 60;
     const HOUR: u64 = 3600;
@@ -256,15 +232,5 @@ mod tests {
     #[test_case(31536000, "1y ago" ; "year_boundary")]
     fn relative_time_formatting(secs: u64, expected: &str) {
         assert_eq!(humanize_secs(secs), expected);
-    }
-
-    #[test_case(0, "0" ; "zero")]
-    #[test_case(999, "999" ; "triple_digit")]
-    #[test_case(1000, "1.0K" ; "kilo_boundary")]
-    #[test_case(34400, "34.4K" ; "kilo_fractional")]
-    #[test_case(1000000, "1.0M" ; "mega_boundary")]
-    #[test_case(1500000, "1.5M" ; "mega_fractional")]
-    fn context_size_formatting(tokens: u32, expected: &str) {
-        assert_eq!(format_context_size(tokens), expected);
     }
 }

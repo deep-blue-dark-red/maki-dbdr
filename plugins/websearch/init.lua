@@ -14,7 +14,13 @@ end
 maki.api.register_tool({
   name = "websearch",
   kind = "fetch",
-  description = [[Web search (Exa) for current info, docs, or anything not in local files. Prefer specific queries.]],
+  description = "Search the web for real-time information using Exa AI.\n\n"
+    .. "Today's date is "
+    .. os.date("%Y-%m-%d")
+    .. ".\n\n"
+    .. "- Use for current events, documentation, APIs, or anything not in local files.\n"
+    .. "- Prefer specific, targeted queries over broad ones.\n"
+    .. "- Results include page titles, URLs, and content snippets.",
 
   schema = {
     type = "object",
@@ -23,8 +29,10 @@ maki.api.register_tool({
       num_results = { type = "integer", description = "Number of results to return (default 8)" },
     },
   },
-  permission_scope = "query",
-  audiences = { "main", "interpreter" },
+  permission_scopes = "query",
+  -- research/general included so subagents keep web search now that the
+  -- interpreter only exposes tools the host audience could see itself.
+  audiences = { "main", "research_sub", "general_sub", "interpreter" },
 
   header = function(input)
     return input.query

@@ -51,7 +51,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- **memory** the moment you learn a non-obvious project fact or architecture decision.",
+  content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
 })
 
 local function render_content(content, path, ctx)
@@ -135,7 +135,9 @@ end
 
 maki.api.register_tool({
   name = "memory",
-  description = [[Project-scoped scratchpad for decisions and gotchas that persist across sessions. Keep entries short and current.]],
+  description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
+    .. "- Save important context before compaction or to build up project knowledge.\n"
+    .. "- Keep entries concise and current. Delete outdated information.",
 
   schema = {
     type = "object",
@@ -154,7 +156,8 @@ maki.api.register_tool({
   end,
 
   restore = function(input, output, _is_error, ctx)
-    return render_content(output, input.path or "file.md", ctx)
+    local content = (input.command == "write" and input.content) or output
+    return render_content(content, input.path or "file.md", ctx)
   end,
 
   handler = function(input, ctx)

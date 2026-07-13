@@ -1,8 +1,3 @@
-use crate::markdown::Keep;
-use maki_agent::tools::{
-    CODE_EXECUTION_TOOL_NAME, EDIT_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, MULTIEDIT_TOOL_NAME,
-    QUESTION_TOOL_NAME, READ_TOOL_NAME, TASK_TOOL_NAME, WRITE_TOOL_NAME,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,15 +15,6 @@ pub enum OutputKeep {
     #[default]
     Head,
     Tail,
-}
-
-impl From<OutputKeep> for Keep {
-    fn from(k: OutputKeep) -> Self {
-        match k {
-            OutputKeep::Head => Keep::Head,
-            OutputKeep::Tail => Keep::Tail,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,6 +38,15 @@ impl Default for ToolRenderHints {
     }
 }
 
+impl ToolRenderHints {
+    pub const DEFAULT: Self = Self {
+        header_style: HeaderStyle::Plain,
+        body_format: BodyFormat::Plain,
+        truncate_lines: None,
+        truncate_at: OutputKeep::Head,
+    };
+}
+
 macro_rules! hint {
     ($name:expr $(, $field:ident : $val:expr)* $(,)?) => {
         ($name, {
@@ -63,33 +58,24 @@ macro_rules! hint {
     };
 }
 
-impl ToolRenderHints {
-    pub const DEFAULT: Self = Self {
-        header_style: HeaderStyle::Plain,
-        body_format: BodyFormat::Plain,
-        truncate_lines: None,
-        truncate_at: OutputKeep::Head,
-    };
-}
-
 const DEFAULT_HINTS: &[(&str, ToolRenderHints)] = &[
-    hint!(CODE_EXECUTION_TOOL_NAME,
+    hint!("code_execution",
         truncate_at: OutputKeep::Tail,
     ),
-    hint!(TASK_TOOL_NAME,
+    hint!("task",
         body_format: BodyFormat::Markdown,
     ),
-    hint!(GREP_TOOL_NAME,
+    hint!("grep",
         header_style: HeaderStyle::Grep,
     ),
-    hint!(GLOB_TOOL_NAME,
+    hint!("glob",
         header_style: HeaderStyle::Command,
     ),
-    hint!(READ_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(WRITE_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(EDIT_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(MULTIEDIT_TOOL_NAME, header_style: HeaderStyle::Path),
-    hint!(QUESTION_TOOL_NAME, truncate_lines: Some(100)),
+    hint!("read", header_style: HeaderStyle::Path),
+    hint!("write", header_style: HeaderStyle::Path),
+    hint!("edit", header_style: HeaderStyle::Path),
+    hint!("multiedit", header_style: HeaderStyle::Path),
+    hint!("question", truncate_lines: Some(100)),
 ];
 
 pub struct RenderHintsRegistry {

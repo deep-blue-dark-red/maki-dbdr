@@ -12,7 +12,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   BINARY_NAME: maki
-  VIEWER_NAME: mlog
 
 permissions:
   contents: write
@@ -70,8 +69,7 @@ jobs:
           tag="${{ needs.create-release.outputs.tag }}"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          cp "target/${{ matrix.target }}/release/${VIEWER_NAME}" "${VIEWER_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}" "${VIEWER_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -113,8 +111,7 @@ jobs:
           tag="${{ needs.create-release.outputs.tag }}"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          cp "target/${{ matrix.target }}/release/${VIEWER_NAME}" "${VIEWER_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}" "${VIEWER_NAME}"
+          tar czf "${archive}" "${BINARY_NAME}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -124,8 +121,7 @@ jobs:
           tag="${{ needs.create-release.outputs.tag }}"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          cp "target/${{ matrix.target }}/release/${VIEWER_NAME}.exe" "${VIEWER_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe" "${VIEWER_NAME}.exe"
+          7z a "${archive}" "${BINARY_NAME}.exe"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact

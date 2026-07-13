@@ -149,15 +149,15 @@ pub(crate) async fn do_stream(
     })?;
     let json_body = serde_json::to_vec(body)?;
 
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri(format!("{base}{RESPONSES_PATH}"))
-        .header("content-type", "application/json")
-        .header("user-agent", super::super::user_agent());
-    for (key, value) in &auth.headers {
-        builder = builder.header(key.as_str(), value.as_str());
-    }
-    let request = builder.body(json_body)?;
+    let request = auth
+        .configure_request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{base}{RESPONSES_PATH}"))
+                .header("content-type", "application/json")
+                .header("user-agent", super::super::user_agent()),
+        )
+        .body(json_body)?;
 
     debug!(
         model = %model.id,
@@ -165,7 +165,7 @@ pub(crate) async fn do_stream(
         "sending Responses API request"
     );
 
-    let response = super::super::send_request(client, request).await?;
+    let response = client.send_async(request).await?;
     let status = response.status().as_u16();
 
     if status == 200 {

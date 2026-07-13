@@ -13,17 +13,47 @@ use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
+use crate::model::Model;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
-    #[serde(rename = "image/png")]
     Png,
-    #[serde(rename = "image/jpeg")]
     Jpeg,
-    #[serde(rename = "image/gif")]
     Gif,
-    #[serde(rename = "image/webp")]
     Webp,
+}
+
+impl ImageMediaType {
+    pub const ALL: [Self; 4] = [Self::Png, Self::Jpeg, Self::Gif, Self::Webp];
+
+    /// Single source of truth for media-type strings: serde, data URLs,
+    /// wire formats, and the Lua bridge all go through here.
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    pub fn from_mime(mime: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.mime() == mime)
+    }
+}
+
+impl Serialize for ImageMediaType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.mime())
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageMediaType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::from_mime(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown image media type '{s}'")))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,14 +79,40 @@ impl ImageSource {
     }
 
     pub fn to_data_url(&self) -> String {
-        let mime = match self.media_type {
-            ImageMediaType::Png => "image/png",
-            ImageMediaType::Jpeg => "image/jpeg",
-            ImageMediaType::Gif => "image/gif",
-            ImageMediaType::Webp => "image/webp",
-        };
-        format!("data:{mime};base64,{}", self.data)
+        format!("data:{};base64,{}", self.media_type.mime(), self.data)
     }
+}
+
+pub const IMAGE_OMITTED_NOTE: &str =
+    "[image omitted: the current model does not support image input]";
+
+/// For models without vision, image blocks become a text note instead of a
+/// wire block the API would reject. History keeps the pixels, so switching
+/// back to a vision-capable model restores them.
+pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow<'a, [Message]> {
+    let has_image = |m: &Message| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Image { .. }))
+    };
+    if model.vision || !messages.iter().any(has_image) {
+        return Cow::Borrowed(messages);
+    }
+    let adapted = messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            for block in &mut m.content {
+                if matches!(block, ContentBlock::Image { .. }) {
+                    *block = ContentBlock::Text {
+                        text: IMAGE_OMITTED_NOTE.into(),
+                    };
+                }
+            }
+            m
+        })
+        .collect();
+    Cow::Owned(adapted)
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -159,7 +215,7 @@ impl Message {
         }
     }
 
-    fn first_text_content(&self) -> Option<&str> {
+    pub fn first_text_content(&self) -> Option<&str> {
         self.content.iter().find_map(|b| match b {
             ContentBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
             _ => None,
@@ -238,6 +294,22 @@ impl StopReason {
 }
 
 const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<budget\u{2265}1024>]";
+const GLM_XHIGH_THRESHOLD: u32 = 8192;
+
+/// Each provider speaks a different dialect of `reasoning_effort`.
+/// New providers get a variant here instead of a new body-mutating method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortScale {
+    /// low / medium / high. Adaptive = medium.
+    Standard,
+    /// low / medium / high. Adaptive = high.
+    PreferHigh,
+    /// Always "high", ignores budget.
+    HighOnly,
+    /// none / high / xhigh. GLM reasons by default, so Off sends "none"
+    /// explicitly. Only use behind `Model::supports_thinking`.
+    Glm,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThinkingConfig {
@@ -293,13 +365,46 @@ impl ThinkingConfig {
         (major, minor) >= (4, 7)
     }
 
-    pub fn apply_reasoning_effort(self, body: &mut Value) {
-        let effort = match self {
-            Self::Off => return,
-            Self::Adaptive => "medium",
-            Self::Budget(n) => Self::budget_to_effort(n),
+    pub fn apply_reasoning_effort(self, body: &mut Value, scale: EffortScale) {
+        let effort = match (self, scale) {
+            (Self::Off, EffortScale::Glm) => "none",
+            (Self::Off, _) => return,
+            (Self::Adaptive, EffortScale::Standard) => "medium",
+            (Self::Adaptive, _) => "high",
+            (Self::Budget(_), EffortScale::HighOnly) => "high",
+            (Self::Budget(n), EffortScale::Glm) => {
+                if n >= GLM_XHIGH_THRESHOLD {
+                    "xhigh"
+                } else {
+                    "high"
+                }
+            }
+            (Self::Budget(n), EffortScale::Standard | EffortScale::PreferHigh) => {
+                Self::budget_to_effort(n)
+            }
         };
         body["reasoning_effort"] = json!(effort);
+    }
+
+    pub fn apply_google_thinking(self, body: &mut Value) {
+        match self {
+            Self::Off => {}
+            Self::Adaptive => {
+                body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
+            }
+            Self::Budget(n) => {
+                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
+            }
+        }
+    }
+
+    pub fn apply_local_thinking(self, body: &mut Value) {
+        let budget = match self {
+            Self::Off => 0,
+            Self::Adaptive => -1,
+            Self::Budget(n) => n as i64,
+        };
+        body["thinking_budget_tokens"] = json!(budget);
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
@@ -357,9 +462,24 @@ impl From<ThinkingConfig> for StoredThinking {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RequestOptions {
     pub thinking: ThinkingConfig,
-    /// Just what the user asked for. The provider re-checks `supports_fast()`
-    /// before sending it, so a stale flag never bills an ineligible model.
+    /// Raw user preference, reconciled by [`RequestOptions::clamped`] before use.
     pub fast: bool,
+}
+
+impl RequestOptions {
+    /// Strips options the model does not support. Called once before every
+    /// request so UI state, restored sessions, and subagent flags all go
+    /// through the same gate.
+    pub fn clamped(self, model: &crate::model::Model) -> Self {
+        Self {
+            thinking: if model.supports_thinking() {
+                self.thinking
+            } else {
+                ThinkingConfig::Off
+            },
+            fast: self.fast && model.supports_fast(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -367,6 +487,31 @@ pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+}
+
+/// Provider-reported usage quota, independent of local token accounting. Not every
+/// provider exposes a programmatic quota endpoint; check `Provider::fetch_usage`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    /// Subscription/plan level when the provider reports one (e.g. "lite").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    pub limits: Vec<UsageLimit>,
+}
+
+/// A single quota window (e.g. a 5-hour or weekly token quota).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageLimit {
+    /// Human-readable label for the window, provided by the provider.
+    pub label: String,
+    /// Usage percentage within the window, 0-100.
+    pub percentage: u32,
+    /// When the window resets, as epoch milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<u64>,
+    /// Extra provider-supplied context, e.g. "$2.33 spent" for usage credits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[cfg(test)]
@@ -419,6 +564,66 @@ mod tests {
         assert_eq!(source.to_data_url(), format!("data:{mime};base64,dGVzdA=="));
     }
 
+    #[test_case("image/png",  Some(ImageMediaType::Png)  ; "png")]
+    #[test_case("image/webp", Some(ImageMediaType::Webp) ; "webp")]
+    #[test_case("image/bmp",  None                       ; "unsupported")]
+    fn media_type_from_mime(mime: &str, expected: Option<ImageMediaType>) {
+        assert_eq!(ImageMediaType::from_mime(mime), expected);
+    }
+
+    #[test]
+    fn adapt_images_borrows_when_model_has_vision_or_no_images() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let with_image = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
+            }],
+            ..Default::default()
+        }];
+        assert!(matches!(
+            adapt_images_for_model(&model, &with_image),
+            Cow::Borrowed(_)
+        ));
+
+        let mut text_only_model = model;
+        text_only_model.vision = false;
+        let no_images = vec![Message::user("hi".into())];
+        assert!(matches!(
+            adapt_images_for_model(&text_only_model, &no_images),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn adapt_images_replaces_blocks_for_text_only_model() {
+        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        model.vision = false;
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "[image: pic.png 1KB]".into(),
+                    is_error: false,
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
+                },
+            ],
+            ..Default::default()
+        }];
+        let adapted = adapt_images_for_model(&model, &messages);
+        assert_eq!(adapted[0].content.len(), 2);
+        assert!(matches!(
+            &adapted[0].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+        assert!(
+            matches!(&adapted[0].content[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE)
+        );
+    }
+
     #[test]
     fn image_source_serde_injects_type_base64() {
         let source = ImageSource::new(ImageMediaType::Png, Arc::from("abc123"));
@@ -445,18 +650,92 @@ mod tests {
         assert_eq!(body, expected);
     }
 
-    #[test_case(ThinkingConfig::Off,          None            ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,     Some("medium")  ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(1024), Some("low")     ; "budget_low")]
-    #[test_case(ThinkingConfig::Budget(4096), Some("medium")  ; "budget_medium")]
-    #[test_case(ThinkingConfig::Budget(8192), Some("high")    ; "budget_high")]
-    fn thinking_apply_reasoning_effort(config: ThinkingConfig, expected: Option<&str>) {
+    use EffortScale::{Glm, HighOnly, PreferHigh, Standard};
+
+    #[test_case(Standard,   ThinkingConfig::Off,          None            ; "off_noop")]
+    #[test_case(Standard,   ThinkingConfig::Adaptive,     Some("medium")  ; "standard_adaptive")]
+    #[test_case(Standard,   ThinkingConfig::Budget(1024), Some("low")     ; "standard_budget_low")]
+    #[test_case(Standard,   ThinkingConfig::Budget(4096), Some("medium")  ; "standard_budget_medium")]
+    #[test_case(Standard,   ThinkingConfig::Budget(8192), Some("high")    ; "standard_budget_high")]
+    #[test_case(PreferHigh, ThinkingConfig::Adaptive,     Some("high")    ; "prefer_high_adaptive")]
+    #[test_case(PreferHigh, ThinkingConfig::Budget(1024), Some("low")     ; "prefer_high_budget_low")]
+    #[test_case(HighOnly,   ThinkingConfig::Adaptive,     Some("high")    ; "high_only_adaptive")]
+    #[test_case(HighOnly,   ThinkingConfig::Budget(1024), Some("high")    ; "high_only_budget")]
+    #[test_case(Glm,        ThinkingConfig::Off,          Some("none")    ; "glm_off_explicit_none")]
+    #[test_case(Glm,        ThinkingConfig::Adaptive,     Some("high")    ; "glm_adaptive")]
+    #[test_case(Glm,        ThinkingConfig::Budget(1024), Some("high")    ; "glm_budget_low")]
+    #[test_case(Glm,        ThinkingConfig::Budget(8192), Some("xhigh")   ; "glm_budget_xhigh")]
+    fn thinking_apply_reasoning_effort(
+        scale: EffortScale,
+        config: ThinkingConfig,
+        expected: Option<&str>,
+    ) {
         let mut body = json!({"model": "test"});
-        config.apply_reasoning_effort(&mut body);
+        config.apply_reasoning_effort(&mut body, scale);
         match expected {
             Some(e) => assert_eq!(body["reasoning_effort"], e),
             None => assert!(body.get("reasoning_effort").is_none()),
         }
+    }
+
+    #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
+    fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
+        let mut body = json!({});
+        config.apply_google_thinking(&mut body);
+        assert_eq!(body, expected);
+    }
+
+    #[test_case(ThinkingConfig::Off,          0    ; "off")]
+    #[test_case(ThinkingConfig::Adaptive,     -1   ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), 4096 ; "budget")]
+    fn thinking_apply_local_thinking(config: ThinkingConfig, expected: i64) {
+        let mut body = json!({});
+        config.apply_local_thinking(&mut body);
+        assert_eq!(body["thinking_budget_tokens"], expected);
+    }
+
+    fn clamp_test_model(provider: crate::provider::ProviderKind) -> crate::model::Model {
+        crate::model::Model {
+            id: "test-model".into(),
+            provider,
+            dynamic_slug: None,
+            tier: crate::model::ModelTier::Medium,
+            family: provider.family(),
+            supports_tool_examples_override: None,
+            supports_thinking_override: None,
+            vision: provider.family().supports_vision(),
+            pricing: crate::model::ModelPricing::default(),
+            max_output_tokens: 8192,
+            context_window: 200_000,
+        }
+    }
+
+    #[test_case(None,        ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "provider_default_keeps")]
+    #[test_case(Some(false), ThinkingConfig::Adaptive, ThinkingConfig::Off      ; "override_false_clamps")]
+    fn request_options_clamped_thinking(
+        supports: Option<bool>,
+        thinking: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        model.supports_thinking_override = supports;
+        let opts = RequestOptions {
+            thinking,
+            fast: false,
+        };
+        assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    #[test]
+    fn request_options_clamped_fast_requires_model_support() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Google);
+        let opts = RequestOptions {
+            thinking: ThinkingConfig::Off,
+            fast: true,
+        };
+        assert!(!opts.clamped(&model).fast);
     }
 
     #[test_case("",         ThinkingConfig::Off,      Ok(ThinkingConfig::Adaptive)  ; "toggle_on")]
