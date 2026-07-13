@@ -154,7 +154,11 @@ impl App {
         self.status = super::Status::Streaming;
         self.active_run_start = Some(std::time::Instant::now());
         self.active_run_duration = None;
-        self.active_run_input_tokens = self.main_chat().context_size;
+        let mut input_tokens = self.main_chat().context_size;
+        if input_tokens == 0 && let Some(ref sys) = self.state.session.meta.system_prompt {
+            input_tokens = (sys.len() / 4) as u32;
+        }
+        self.active_run_input_tokens = input_tokens + (msg.text.len() / 4) as u32;
         self.active_run_output_chars = 0;
         self.turn_api_sent_at = Some(std::time::Instant::now());
         self.turn_first_token_at = None;

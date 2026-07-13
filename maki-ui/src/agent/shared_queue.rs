@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
+use maki_providers::Message;
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
@@ -54,6 +55,10 @@ pub(crate) enum QueueItem {
     Checkpoint {
         run_id: u64,
     },
+    Rename {
+        messages: Vec<Message>,
+        run_id: u64,
+    },
 }
 
 impl QueueItem {
@@ -61,7 +66,8 @@ impl QueueItem {
         match self {
             Self::Message { run_id, .. }
             | Self::Compact { run_id, .. }
-            | Self::Checkpoint { run_id } => *run_id,
+            | Self::Checkpoint { run_id }
+            | Self::Rename { run_id, .. } => *run_id,
         }
     }
 
@@ -85,6 +91,10 @@ impl QueueItem {
                 text: Cow::Borrowed(CHECKPOINT_LABEL),
                 color: accent(),
             },
+            Self::Rename { .. } => QueueEntry {
+                text: Cow::Borrowed("/rename"),
+                color: accent(),
+            },
         }
     }
 
@@ -93,6 +103,8 @@ impl QueueItem {
             Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
             Self::Compact { run_id, .. } => ExtractedCommand::Compact(run_id),
             Self::Checkpoint { run_id } => ExtractedCommand::Checkpoint(run_id),
+            // Rename items are never exposed as interrupts — see InterruptSource impl.
+            Self::Rename { .. } => unreachable!("Rename must not be polled as an interrupt"),
         }
     }
 
@@ -103,6 +115,7 @@ impl QueueItem {
         match self {
             Self::Message { displayed, .. } => !displayed,
             Self::Compact { .. } | Self::Checkpoint { .. } => true,
+            Self::Rename { .. } => false,
         }
     }
 }
@@ -164,7 +177,7 @@ impl QueueSender {
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
-                QueueItem::Compact { .. } | QueueItem::Checkpoint { .. } => None,
+                QueueItem::Compact { .. } | QueueItem::Checkpoint { .. } | QueueItem::Rename { .. } => None,
             })
             .collect()
     }
@@ -197,7 +210,14 @@ impl QueueReceiver {
 
 impl InterruptSource for QueueReceiver {
     fn poll(&self) -> Option<ExtractedCommand> {
-        self.pop().map(QueueItem::into_extracted_command)
+        // Rename items are background operations that should not interrupt an
+        // active agent run. Leave them in the queue for the outer agent-loop
+        // to process after the current entry finishes.
+        let mut items = lock(&self.items);
+        if matches!(items.front(), Some(QueueItem::Rename { .. })) {
+            return None;
+        }
+        items.pop_front().map(QueueItem::into_extracted_command)
     }
 }
 

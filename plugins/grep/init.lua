@@ -180,7 +180,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **grep** tool when searching for specific content across files.",
+  content = "- **grep** to find a known string or regex across files; don't double-escape the pattern.",
 })
 
 maki.api.register_tool({

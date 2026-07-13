@@ -27,7 +27,6 @@ Maki is an AI coding agent (like Claude Code and opencode), that is built bottom
 - No inline magic numbers or strings
 - In tests const error/status messages and assert against the shared constant
 - Add #[derive(Copy)] only on structs with 1 primitive field
-- NO TRIVIAL COMMENTS
 
 ## Testing
 
@@ -49,7 +48,7 @@ Rust workspace, key crates in root dir:
 - maki-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - maki-acp: ACP ndjson stdio server
 
-Built-in lua plugins in ./plugins: index (return a compact skeleton of a source file using tree-sitter), bash, glob, question, skill, memory, webfetch, websearch, todo_write, read, write, edit, task.
+Built-in tools are lua plugins in ./plugins.
 
 ## Docs
 

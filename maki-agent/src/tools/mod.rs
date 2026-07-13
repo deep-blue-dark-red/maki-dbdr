@@ -20,7 +20,6 @@ pub use registry::{
     ToolRegistry, ToolSource,
 };
 
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -329,62 +328,6 @@ pub(crate) fn truncate_output(text: String, max_lines: usize, max_bytes: usize) 
     result
 }
 
-fn format_tool_signature(name: &str, schema: &Value) -> String {
-    let empty_props = serde_json::Map::new();
-    let props = schema
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .unwrap_or(&empty_props);
-    let required: HashSet<&str> = schema
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
-    let params: Vec<String> = props
-        .iter()
-        .map(|(pname, pschema)| {
-            let ptype = pschema
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("any");
-            let ptype_py = match ptype {
-                "string" => "str",
-                "integer" => "int",
-                "boolean" => "bool",
-                "array" => "list",
-                _ => "any",
-            };
-            if required.contains(pname.as_str()) {
-                format!("{pname}: {ptype_py}")
-            } else {
-                format!("{pname}: {ptype_py} = None")
-            }
-        })
-        .collect();
-
-    format!("- {name}({}) -> str", params.join(", "))
-}
-
-/// Walks the registry so adding a new `INTERPRETER` tool shows up automatically.
-pub(crate) fn build_interpreter_tools_description(filter: &ToolFilter) -> String {
-    let mut desc =
-        String::from("\n\nAvailable tools (called as Python functions with keyword arguments):\n");
-    let registry = ToolRegistry::native();
-    for entry in registry.iter().iter() {
-        let name = entry.name();
-        if !entry.tool.audience().contains(ToolAudience::INTERPRETER) {
-            continue;
-        }
-        if !filter.matches(name) {
-            continue;
-        }
-        let schema = entry.tool.schema();
-        desc.push_str(&format_tool_signature(name, &schema));
-        desc.push('\n');
-    }
-    desc
-}
 
 pub(crate) fn sanitize_tool_input(input: &Value) -> Value {
     let obj = match input.as_object() {

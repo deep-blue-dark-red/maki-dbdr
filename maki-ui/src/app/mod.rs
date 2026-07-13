@@ -1140,22 +1140,16 @@ impl App {
     pub(crate) fn apply_rename(&mut self, title: String) {
         let old_name = self.state.session.title.clone();
         let session_id = self.state.session.id.clone();
-        let old_log = maki_providers::api_log_path_for(Some(&old_name), Some(&session_id));
-
         self.state.session.title = title.clone();
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(title.clone());
         self.save_session();
-
-        // Move any existing API log file to the new session-name path.
-        let new_log = maki_providers::api_log_path_for(Some(&title), Some(&session_id));
-        if let (Some(old), Some(new)) = (old_log, new_log)
-            && old != new
-            && old.exists()
-            && let Err(e) = std::fs::rename(&old, &new)
-        {
-            tracing::warn!(error = %e, "failed to rename api log");
-        }
-
+        // Logs stay keyed by session id; point a friendly <title>.mlog symlink at it.
+        maki_providers::update_api_log_symlink(
+            &session_id,
+            Some(&old_name),
+            &title,
+            self.state.session.created_at,
+        );
         self.status_bar.flash(format!("Session renamed to: {title}"));
     }
 
@@ -1305,6 +1299,10 @@ impl App {
 
         if let AgentEvent::SystemPrompt { text } = envelope.event {
             self.state.session.meta.system_prompt = Some(text.clone());
+            if chat_idx == 0 {
+                let estimated_tokens = (text.len() / 4) as u32;
+                self.active_run_input_tokens = self.active_run_input_tokens.max(estimated_tokens);
+            }
             self.chats[chat_idx].set_system_prompt(
                 self.state.session.meta.show_system_prompt,
                 Some(text),
@@ -1363,10 +1361,19 @@ impl App {
                     }
                 }
             }
-            AgentEvent::ToolResultsSubmitted { .. } => {
+            AgentEvent::ToolResultsSubmitted { message } => {
                 if chat_idx == 0 {
                     self.active_run_start = Some(Instant::now());
-                    self.active_run_input_tokens = self.chats[0].context_size;
+                    let message_len: usize = message.content.iter().map(|block| {
+                        match block {
+                            maki_providers::ContentBlock::Text { text } => text.len(),
+                            maki_providers::ContentBlock::Thinking { thinking, .. } => thinking.len(),
+                            maki_providers::ContentBlock::RedactedThinking { data } => data.len(),
+                            maki_providers::ContentBlock::ToolResult { content, .. } => content.len(),
+                            _ => 0,
+                        }
+                    }).sum();
+                    self.active_run_input_tokens = self.chats[0].context_size + (message_len / 4) as u32;
                     self.active_run_output_chars = 0;
                     self.turn_api_sent_at = Some(Instant::now());
                     self.turn_first_token_at = None;
@@ -1478,6 +1485,9 @@ impl App {
                     }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
+                    }
+                    if self.state.session.title == maki_storage::sessions::DEFAULT_TITLE {
+                        return self.start_rename();
                     }
                 }
                 ChatEventResult::Error(message) => {
@@ -1748,7 +1758,13 @@ impl App {
             self.status = Status::Streaming;
             self.active_run_start = Some(Instant::now());
             self.active_run_duration = None;
-            self.active_run_input_tokens = self.main_chat().context_size;
+            let mut input_tokens = self.main_chat().context_size;
+            if input_tokens == 0 {
+                if let Some(ref sys) = self.state.session.meta.system_prompt {
+                    input_tokens = (sys.len() / 4) as u32;
+                }
+            }
+            self.active_run_input_tokens = input_tokens + (display_text.len() / 4) as u32;
             self.active_run_output_chars = 0;
             self.turn_api_sent_at = Some(Instant::now());
             self.turn_first_token_at = None;

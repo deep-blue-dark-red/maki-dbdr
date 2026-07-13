@@ -46,7 +46,7 @@ maki.api.register_tool({
       min_points = { type = "integer", description = "Minimum points threshold" },
     },
   },
-  permission_scope = "url",
+  permission_scope = "query",
 
   header = function(input)
     if input.query and input.query ~= "" then

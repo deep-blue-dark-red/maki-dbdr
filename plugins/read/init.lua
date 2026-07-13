@@ -221,8 +221,7 @@ end
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
-- When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
+- **read** only the sections you need; for a large file, check `wc -l` first to pick a line limit.]],
 })
 
 maki.api.register_tool({

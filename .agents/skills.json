@@ -2,6 +2,7 @@
   "entries": [],
   "inherits": [],
   "exclude": [
-    "hackernews"
+    "hackernews",
+    "ssh"
   ]
 }

@@ -508,14 +508,8 @@ impl ToolRegistry {
                 "description": description,
                 "input_schema": entry.tool.schema(),
             });
-            if let Some(examples) = entry.tool.examples() {
-                if supports_examples {
-                    def["input_examples"] = examples;
-                } else if let Some(text) = format_examples_as_text(&examples) {
-                    let merged =
-                        format!("{}\n\n{}", def["description"].as_str().unwrap_or(""), text);
-                    def["description"] = Value::String(merged);
-                }
+            if supports_examples && let Some(examples) = entry.tool.examples() {
+                def["input_examples"] = examples;
             }
             out.push(def);
         }
@@ -543,21 +537,6 @@ impl RegistrySnapshot {
     }
 }
 
-fn format_examples_as_text(examples: &Value) -> Option<String> {
-    let arr = examples.as_array()?;
-    if arr.is_empty() {
-        return None;
-    }
-    let mut text = String::from("Examples:");
-    for ex in arr {
-        if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
-            text.push_str("\n```\n");
-            text.push_str(code);
-            text.push_str("\n```");
-        }
-    }
-    Some(text)
-}
 
 /// `impl_tool!` wires up the `Tool` trait on this wrapper using consts from
 /// `#[derive(Tool)]`. Tool files only need to write their actual logic.

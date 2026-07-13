@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::template::Vars;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
@@ -201,12 +202,18 @@ fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
 
 /// Fill each `{{slot}}` marker in the template with its rendered content and
 /// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
-pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
+/// If `vars` is provided, a final pass substitutes any remaining `{key}` placeholders
+/// (e.g. `{date}`) so custom system.md templates can use them directly.
+pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str, vars: Option<&Vars>) -> String {
     let mut out = id.template();
     for slot in Slot::iter() {
         out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
     }
-    out.replace(INSTRUCTIONS_MARKER, instructions)
+    let mut out = out.replace(INSTRUCTIONS_MARKER, instructions);
+    if let Some(vars) = vars {
+        out = vars.apply(&out).into_owned();
+    }
+    out
 }
 
 /// Replace a slot marker with its content. When the content is empty, also drop
@@ -250,7 +257,7 @@ mod tests {
 
     #[test]
     fn empty_slots_emit_template_without_unfilled_markers() {
-        let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
+        let out = assemble(PromptId::System, &ResolvedSlots::default(), "", None);
         assert!(out.starts_with("You are Maki"));
         assert!(
             !out.contains("{{"),
@@ -260,7 +267,7 @@ mod tests {
 
     #[test]
     fn research_template_emits_native_efficient_line() {
-        let out = assemble(PromptId::Research, &ResolvedSlots::default(), "");
+        let out = assemble(PromptId::Research, &ResolvedSlots::default(), "", None);
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}.")));
     }
 
@@ -276,7 +283,7 @@ mod tests {
                 (Slot::AfterInstructions, "AFTER"),
             ],
         );
-        let out = assemble(PromptId::System, &s, "INSTR");
+        let out = assemble(PromptId::System, &s, "INSTR", None);
         let positions = ["TOOL_USAGE", "CONVENTIONS", "INSTR", "AFTER"]
             .map(|needle| at(&out, needle));
         assert!(
@@ -291,10 +298,10 @@ mod tests {
     fn tool_usage_hint_lands_inside_tool_usage_section() {
         const HINT: &str = "- HINT_LINE";
         let s = slots(PromptId::System, &[(Slot::ToolUsage, HINT)]);
-        let out = assemble(PromptId::System, &s, "");
+        let out = assemble(PromptId::System, &s, "", None);
         let hint = at(&out, HINT);
         assert!(
-            at(&out, "# Tool selection") < hint,
+            at(&out, "# Search") < hint,
             "hint before its section:\n{out}"
         );
         assert!(
@@ -312,7 +319,7 @@ mod tests {
                 (Slot::EfficientTools, "foo"),
             ],
         );
-        let out = assemble(PromptId::Research, &s, "");
+        let out = assemble(PromptId::Research, &s, "", None);
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index, foo.")));
     }
 
@@ -322,7 +329,7 @@ mod tests {
             PromptId::System,
             &[(Slot::ToolUsage, "FIRST"), (Slot::ToolUsage, "SECOND")],
         );
-        let out = assemble(PromptId::System, &s, "");
+        let out = assemble(PromptId::System, &s, "", None);
         assert!(at(&out, "FIRST") < at(&out, "SECOND"));
     }
 
@@ -341,9 +348,9 @@ mod tests {
                 },
             );
         }
-        assert!(assemble(PromptId::System, &s, "").contains("AFTER"));
-        assert!(!assemble(PromptId::Research, &s, "").contains("AFTER"));
-        assert!(!assemble(PromptId::General, &s, "").contains("AFTER"));
+        assert!(assemble(PromptId::System, &s, "", None).contains("AFTER"));
+        assert!(!assemble(PromptId::Research, &s, "", None).contains("AFTER"));
+        assert!(!assemble(PromptId::General, &s, "", None).contains("AFTER"));
     }
 
     #[test]
@@ -355,7 +362,7 @@ mod tests {
                 (Slot::EfficientTools, "EXTRA"),
             ],
         );
-        let out = assemble(PromptId::Research, &s, "");
+        let out = assemble(PromptId::Research, &s, "", None);
         assert!(!out.contains("DROPPED"));
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, EXTRA.")));
     }
@@ -403,7 +410,7 @@ mod tests {
 
     #[test]
     fn singleton_default_used_when_empty() {
-        let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
+        let out = assemble(PromptId::System, &ResolvedSlots::default(), "", None);
         assert!(out.starts_with("You are Maki"));
     }
 
@@ -418,7 +425,7 @@ mod tests {
                 content: "Custom identity".into(),
             },
         );
-        let out = assemble(PromptId::System, &s, "");
+        let out = assemble(PromptId::System, &s, "", None);
         assert!(out.contains("Custom identity"));
         assert!(!out.contains("You are Maki"));
     }
@@ -442,7 +449,7 @@ mod tests {
                 content: "SECOND".into(),
             },
         );
-        let out = assemble(PromptId::System, &s, "");
+        let out = assemble(PromptId::System, &s, "", None);
         assert!(out.contains("SECOND"));
         assert!(!out.contains("FIRST"));
         assert!(!out.contains("You are Maki"));
@@ -473,8 +480,22 @@ mod tests {
                 content: "- Extra rule".into(),
             },
         );
-        let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains("Confirm a library exists"));
+        let out = assemble(PromptId::System, &s, "", None);
+        assert!(out.contains("Confirm a library is in"));
         assert!(out.contains("- Extra rule"));
+    }
+
+    #[test]
+    fn vars_substitute_date_in_assembled_prompt() {
+        let s = ResolvedSlots::default();
+        let vars = crate::template::Vars::new()
+            .set("{date}", "2025-03-15")
+            .set("{cwd}", "/project");
+        // Instructions contain {date} placeholder (as in real usage via env block)
+        let instructions = "Project rules\nCreation date: {date}\nWorking dir: {cwd}";
+        let out = assemble(PromptId::System, &s, instructions, Some(&vars));
+        assert!(out.contains("2025-03-15"), "date should be substituted");
+        assert!(out.contains("/project"), "cwd should be substituted");
+        assert!(!out.contains("{date}"), "unsubstituted placeholder should not remain");
     }
 }

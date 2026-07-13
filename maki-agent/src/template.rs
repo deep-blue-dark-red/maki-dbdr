@@ -4,15 +4,24 @@ use std::env;
 use jiff::Timestamp;
 
 pub fn env_vars() -> Vars {
+    env_vars_with_creation_time(None)
+}
+
+pub fn env_vars_with_creation_time(creation_time: Option<u64>) -> Vars {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    let date = Timestamp::now().strftime("%Y-%m-%d").to_string();
+    let ts = match creation_time {
+        Some(secs) => Timestamp::from_second(secs as i64).unwrap_or_else(|_| Timestamp::now()),
+        None => Timestamp::now(),
+    };
+    let date = ts.strftime("%Y-%m-%d").to_string();
     Vars::new()
         .set("{cwd}", cwd)
         .set("{platform}", env::consts::OS)
         .set("{date}", date)
 }
+
 
 #[derive(Default)]
 pub struct Vars(Vec<(&'static str, String)>);
@@ -73,5 +82,12 @@ mod tests {
         let vars = env_vars();
         let result = vars.apply("{date}");
         assert_ne!(result.as_ref(), "{date}");
+    }
+
+    #[test]
+    fn env_vars_with_creation_time_includes_date() {
+        let vars = env_vars_with_creation_time(Some(1_740_700_800));
+        let result = vars.apply("{date}");
+        assert_eq!(result.as_ref(), "2025-02-28");
     }
 }

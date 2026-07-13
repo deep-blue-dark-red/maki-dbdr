@@ -41,6 +41,12 @@ impl App {
         );
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
         self.sync_ephemeral_state();
+        maki_providers::update_api_log_symlink(
+            &self.state.session.id,
+            None,
+            &self.state.session.title,
+            self.state.session.created_at,
+        );
         if !self.has_content() {
             return;
         }

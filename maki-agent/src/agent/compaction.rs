@@ -159,6 +159,45 @@ pub async fn compact(
     Ok(())
 }
 
+/// Generate a session name from user messages using an isolated LLM call.
+/// Emits `AgentEvent::RenameResult` with the trimmed title, or nothing if the
+/// response is empty. Does not mutate history and does not emit `Done`.
+pub async fn rename_session(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    messages: &[Message],
+    event_tx: &EventSender,
+) -> Result<(), AgentError> {
+    use maki_providers::ProviderEvent;
+
+    let system = include_str!("../prompts/session_name.md");
+    let (prov_tx, prov_rx) = flume::unbounded::<ProviderEvent>();
+    let _ = provider
+        .stream_message(
+            model,
+            messages,
+            system,
+            &serde_json::Value::Null,
+            &prov_tx,
+            RequestOptions::default(),
+            None,
+        )
+        .await;
+    drop(prov_tx);
+
+    let mut title = String::new();
+    while let Ok(event) = prov_rx.try_recv() {
+        if let ProviderEvent::TextDelta { text } = event {
+            title.push_str(&text);
+        }
+    }
+    let title = title.trim().to_string();
+    if !title.is_empty() {
+        let _ = event_tx.send(AgentEvent::RenameResult { title });
+    }
+    Ok(())
+}
+
 /// Emit a re-anchoring checkpoint: stream a CHECKPOINT-mode delta summary and
 /// append it to history, keeping the full conversation intact — unlike `compact`,
 /// which replaces it. Checkpoints are append-only (interleaved), so each new one

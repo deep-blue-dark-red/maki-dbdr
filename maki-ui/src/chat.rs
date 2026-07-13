@@ -168,6 +168,7 @@ impl Chat {
             }
             AgentEvent::SubagentHistory { .. } => {}
             AgentEvent::SystemPrompt { .. } => {}
+            AgentEvent::RenameResult { .. } => unreachable!("handled before handle_event"),
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }

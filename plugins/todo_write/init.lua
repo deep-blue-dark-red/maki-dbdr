@@ -77,7 +77,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use todo_write to plan and track multi-step tasks (must be 3+ steps). Update after EACH step, not only all at once.",
+  content = "- **todo_write** to plan any task of 3+ steps; update it after each step, not all at once.",
 })
 
 maki.api.register_tool({

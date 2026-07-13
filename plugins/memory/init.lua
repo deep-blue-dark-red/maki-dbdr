@@ -51,7 +51,7 @@ maki.api.register_prompt_hint({
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Proactively save non-obvious project gotchas and architecture decisions to **memory**.",
+  content = "- **memory** the moment you learn a non-obvious project fact or architecture decision.",
 })
 
 local function render_content(content, path, ctx)

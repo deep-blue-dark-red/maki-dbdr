@@ -977,6 +977,7 @@ impl EventPump {
             AgentEvent::Error { message } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
             }
+            AgentEvent::RenameResult { .. } => {}
         }
         Ok(())
     }

@@ -235,7 +235,7 @@ local description = [[Run git, build, test, and system commands. Not for reading
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
+  content = "- **bash** runs anything, but prefer an explicit tool over its shell equivalent where one exists.",
 })
 
 maki.api.register_tool({

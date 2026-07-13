@@ -141,7 +141,7 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
+  content = "- **index** a source file for its skeleton first, then **read** with offset/limit for the section you need.",
 })
 
 maki.api.register_prompt_hint({

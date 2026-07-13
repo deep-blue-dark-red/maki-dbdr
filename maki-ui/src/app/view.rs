@@ -294,6 +294,10 @@ impl App {
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
+        let session_name = {
+            let t = self.state.session.title.as_str();
+            (t != maki_storage::sessions::DEFAULT_TITLE).then_some(t)
+        };
         let (mode_label, mode_style) = self.mode_label();
         let is_streaming = self.status == Status::Streaming;
         let streaming_info = if is_streaming || self.active_run_duration.is_some() {
@@ -337,6 +341,7 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
+            session_name,
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,

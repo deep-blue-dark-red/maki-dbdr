@@ -77,6 +77,8 @@ pub struct HeadlessParams {
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
     pub fast: bool,
+    pub system_prompt_override: Option<String>,
+    pub append_system_prompt: Option<String>,
 }
 
 pub struct HeadlessHandle {
@@ -93,13 +95,19 @@ struct AgentSetup {
     tools: Value,
 }
 
+fn get_session_created_at(session_id: &str) -> Option<u64> {
+    let dir = StateDir::resolve().ok()?;
+    StoredSession::load(session_id, &dir).ok().map(|s| s.created_at)
+}
+
 fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     mcp_handle: Option<&McpHandle>,
+    created_at: Option<u64>,
 ) -> AgentSetup {
-    let vars = template::env_vars();
+    let vars = template::env_vars_with_creation_time(created_at);
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
     let tools = tool_definitions(&vars, model, config, excluded_tools, mcp_handle);
 
@@ -140,15 +148,24 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
+        None,
     );
 
-    let system = agent::build_system_prompt(
-        &vars,
-        &mode,
-        &instructions.text,
-        &params.prompt_slots,
-        &params.model,
-    );
+    let system = if let Some(override_prompt) = params.system_prompt_override.as_deref() {
+        override_prompt.to_string()
+    } else {
+        let mut s = agent::build_system_prompt(
+            &vars,
+            &mode,
+            &instructions.text,
+            &params.prompt_slots,
+        );
+        if let Some(append) = &params.append_system_prompt {
+            s.push('\n');
+            s.push_str(append);
+        }
+        s
+    };
 
     let tool_names = extract_tool_names(&tools);
 
@@ -263,6 +280,13 @@ pub struct InteractiveHandle {
 }
 
 pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
+    let session_id = params
+        .session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let created_at = get_session_created_at(&session_id);
+
     let AgentSetup {
         vars,
         instructions,
@@ -272,6 +296,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.config,
         &params.excluded_tools,
         params.mcp_handle.as_ref(),
+        created_at,
     );
 
     let tool_names = extract_tool_names(&tools);
@@ -281,10 +306,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
-
-    let session_id = params
-        .session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -354,7 +375,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         &input.mode,
                         &instructions.text,
                         &params.prompt_slots,
-                        &model,
                     )
                 });
                 if let Some(append) = &params.append_system_prompt {

@@ -67,6 +67,7 @@ impl AgentHandles {
         permissions: &Arc<PermissionManager>,
         cwd: PathBuf,
         session_id: Option<String>,
+        session_created_at: Option<u64>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
     ) -> Self {
@@ -80,6 +81,7 @@ impl AgentHandles {
             mcp_handle,
             mcp_config_errors,
             session_id,
+            session_created_at,
             timeouts,
             lua_handle,
         )
@@ -141,6 +143,7 @@ impl AgentHandles {
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
             Some(app.state.session.id.clone()),
+            Some(app.state.session.created_at),
             self.timeouts,
             lua_handle,
         );
@@ -190,6 +193,7 @@ fn spawn_agent_internal(
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     session_id: Option<String>,
+    session_created_at: Option<u64>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
 ) -> AgentHandles {
@@ -229,6 +233,7 @@ fn spawn_agent_internal(
         cancel_map,
         init_cancel,
         session_id,
+        session_created_at,
         timeouts,
         lua_handle,
         subagent_cancels,

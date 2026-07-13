@@ -102,32 +102,28 @@ local function discover_skills()
   return skills
 end
 
-local boot_skills = discover_skills()
-local description = "Load a task-specific playbook."
-  .. build_skill_list(boot_skills)
-
 maki.api.register_tool({
   name = "skill",
   kind = "read",
-  description = description,
+  description = "Load a task-specific playbook by name.",
 
   schema = {
     type = "object",
     properties = {
-      name = { type = "string", description = "Name of the skill to load", required = true },
+      name = { type = "string", description = "Skill name; omit to list available skills" },
     },
   },
 
   header = function(input)
-    return input.name
+    return input.name or "list"
   end,
 
   handler = function(input, ctx)
-    if not input.name then
-      return "error: name is required"
+    local skills = discover_skills()
+    if not input.name or input.name == "" then
+      return "Available skills:" .. build_skill_list(skills)
     end
 
-    local skills = discover_skills()
     local skill = skills[input.name]
     if not skill then
       local available = build_skill_list(skills)
@@ -173,6 +169,22 @@ maki.api.register_tool({
 })
 
 -- ── skill_test ────────────────────────────────────────────────────────────────
+
+local function has_project_skills()
+  for _, ancestor in ipairs(find_project_ancestors()) do
+    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
+      local entries = maki.fs.dir(maki.fs.joinpath(ancestor, rel))
+      if entries then
+        for _, entry in ipairs(entries) do
+          if entry[2] == "directory" then
+            return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
 
 local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
@@ -256,6 +268,7 @@ local function find_maki_bin()
   return "maki"
 end
 
+if has_project_skills() then
 maki.api.register_tool({
   name        = "skill_test",
   kind        = "fetch",
@@ -337,3 +350,4 @@ maki.api.register_tool({
     }
   end,
 })
+end

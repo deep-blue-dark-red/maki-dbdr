@@ -113,8 +113,8 @@ async fn system_prompt(
         _ => return Err(mlua::Error::runtime("instructions must be bool or string")),
     };
 
-    let assembled = maki_agent::prompt::assemble(prompt_id, &agent_ctx.prompt_slots, &instructions);
-    Ok(vars.apply(&assembled).into_owned())
+    let assembled = maki_agent::prompt::assemble(prompt_id, &agent_ctx.prompt_slots, &instructions, Some(&vars));
+    Ok(assembled)
 }
 
 async fn tools(

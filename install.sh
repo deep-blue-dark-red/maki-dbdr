@@ -3,6 +3,7 @@ set -eu
 
 REPO="tontinton/maki"
 BINARY="maki"
+VIEWER="mlog"
 INSTALL_DIR="${MAKI_INSTALL_DIR:-/usr/local/bin}"
 
 main() {
@@ -33,15 +34,19 @@ main() {
     echo "downloading ${BINARY} ${tag} for ${target}..."
     curl -fsSL "${url}" | tar xz -C "${tmp}"
 
+    # The .mlog log viewer ships alongside maki; install it too if present.
+    bins="${BINARY}"
+    [ -f "${tmp}/${VIEWER}" ] && bins="${bins} ${VIEWER}"
+
     if [ -w "${INSTALL_DIR}" ]; then
-        mv "${tmp}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        for b in ${bins}; do mv "${tmp}/${b}" "${INSTALL_DIR}/${b}"; done
     else
         echo "installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo mv "${tmp}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        for b in ${bins}; do sudo mv "${tmp}/${b}" "${INSTALL_DIR}/${b}"; done
     fi
 
-    chmod +x "${INSTALL_DIR}/${BINARY}"
-    echo "${BINARY} ${tag} installed to ${INSTALL_DIR}/${BINARY}"
+    for b in ${bins}; do chmod +x "${INSTALL_DIR}/${b}"; done
+    echo "${bins} ${tag} installed to ${INSTALL_DIR}"
     echo ""
 }
 

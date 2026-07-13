@@ -214,6 +214,7 @@ pub enum Action {
     EditSystemPrompt,
     RunLogsCommand,
     Btw(String),
+    RenameSession(Vec<maki_providers::Message>),
     Suspend,
     Quit,
 }

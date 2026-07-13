@@ -138,6 +138,10 @@ struct SessionLog {
     next_id: u32,
 }
 
+/// Keyed by the session's current log file. Renaming the file (on session
+/// rename, in the UI layer) orphans the old entry; the next request starts a
+/// fresh interning table under the new path, which is byte-exact but re-DEFs
+/// shared blobs once — an acceptable cost for a debug log.
 static SESSIONS: LazyLock<Mutex<HashMap<PathBuf, SessionLog>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -200,7 +204,13 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 /// Log a request. `fragments` (verified byte-exact by the caller) enables
 /// message interning; otherwise the request is diffed against the previous one.
 /// Errors are swallowed — logging must never break a request.
-pub fn log_request(path: &Path, ts_ms: u64, uri: &str, raw_body: &[u8], fragments: Option<Fragments>) {
+pub fn log_request(
+    path: &Path,
+    ts_ms: u64,
+    uri: &str,
+    raw_body: &[u8],
+    fragments: Option<Fragments>,
+) {
     // Never trust fragments that don't reproduce the exact bytes: fall back to
     // a byte-exact diff/full record instead.
     let fragments = fragments.filter(|f| f.reconstruct() == raw_body);
@@ -548,10 +558,20 @@ mod tests {
         assert_eq!(frags.reconstruct(), expected);
     }
 
+    fn request_bodies(records: &[Record]) -> Vec<Vec<u8>> {
+        records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Request { body, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn file_roundtrip_dedups_and_recovers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("s.mlog");
+        let path = dir.path().join("roundtrip.mlog");
         SESSIONS.lock().unwrap().remove(&path);
 
         // A realistically large, identical tool block: the whole point is that
@@ -584,14 +604,7 @@ mod tests {
 
         log_response(&path, 2500, 200, "text/event-stream", b"data: {\"x\":1}\n");
 
-        let records = read_file(&path).unwrap();
-        let requests: Vec<_> = records
-            .iter()
-            .filter_map(|r| match r {
-                Record::Request { body, .. } => Some(body.clone()),
-                _ => None,
-            })
-            .collect();
+        let requests = request_bodies(&read_file(&path).unwrap());
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], raw1);
         assert_eq!(requests[1], raw2);
@@ -607,7 +620,7 @@ mod tests {
     #[test]
     fn diff_path_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("d.mlog");
+        let path = dir.path().join("diff.mlog");
         SESSIONS.lock().unwrap().remove(&path);
 
         let raw1 = br#"{"messages":[{"role":"user","content":"aaaa"}],"model":"gpt"}"#.to_vec();
@@ -617,14 +630,7 @@ mod tests {
         log_request(&path, 1, "https://api/chat", &raw1, None);
         log_request(&path, 2, "https://api/chat", &raw2, None);
 
-        let records = read_file(&path).unwrap();
-        let requests: Vec<_> = records
-            .iter()
-            .filter_map(|r| match r {
-                Record::Request { body, .. } => Some(body.clone()),
-                _ => None,
-            })
-            .collect();
+        let requests = request_bodies(&read_file(&path).unwrap());
         assert_eq!(requests, vec![raw1, raw2]);
         SESSIONS.lock().unwrap().remove(&path);
     }

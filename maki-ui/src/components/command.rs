@@ -138,6 +138,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/plugins",
+        description: "Enable or disable built-in Lua plugins",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/rewind",
         description: "Show rewind menu to delete turns",
         max_args: 0,
@@ -150,6 +155,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/reload",
         description: "Reload user configuration file (maki.config) and update keybindings",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/rename",
+        description: "Generate a session name from the conversation using AI",
         max_args: 0,
     },
 ];

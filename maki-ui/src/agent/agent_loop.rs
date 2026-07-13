@@ -41,6 +41,7 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     session_id: Option<String>,
+    session_created_at: Option<u64>,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -63,6 +64,7 @@ impl AgentLoop {
         cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
         session_id: Option<String>,
+        session_created_at: Option<u64>,
         timeouts: maki_providers::Timeouts,
         lua_handle: Option<EventHandle>,
         subagent_cancels: Arc<CancelMap<String>>,
@@ -86,6 +88,7 @@ impl AgentLoop {
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
             session_id,
+            session_created_at,
             timeouts,
             lua_handle,
             subagent_cancels,
@@ -126,6 +129,7 @@ impl AgentLoop {
             }
             QueueItem::Compact { target_tokens, .. } => self.do_compact(&event_tx, target_tokens).await,
             QueueItem::Checkpoint { .. } => self.do_checkpoint(&event_tx).await,
+            QueueItem::Rename { messages, .. } => self.do_rename(&event_tx, messages).await,
         };
 
         if let Err(e) = result {
@@ -134,7 +138,7 @@ impl AgentLoop {
     }
 
     async fn initialize(&mut self) -> bool {
-        self.vars = template::env_vars();
+        self.vars = template::env_vars_with_creation_time(self.session_created_at);
         self.reload_instructions().await;
         if self.init_cancel.is_cancelled() {
             return false;
@@ -164,6 +168,14 @@ impl AgentLoop {
         agent::checkpoint(&*provider, &model, &mut self.history, event_tx, None).await
     }
 
+    async fn do_rename(&mut self, event_tx: &EventSender, messages: Vec<Message>) -> Result<(), AgentError> {
+        let slot = self.model_slot.load();
+        let model = slot.model.clone();
+        let provider = Arc::clone(&slot.provider);
+        drop(slot);
+        agent::rename_session(&*provider, &model, &messages, event_tx).await
+    }
+
     async fn do_agent_run(
         &mut self,
         mut input: AgentInput,
@@ -173,7 +185,7 @@ impl AgentLoop {
         let slot = self.model_slot.load();
 
         let old_cwd = self.vars.apply("{cwd}").into_owned();
-        self.vars = template::env_vars();
+        self.vars = template::env_vars_with_creation_time(self.session_created_at);
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
@@ -220,7 +232,6 @@ impl AgentLoop {
             &input.mode,
             &self.instructions.text,
             &prompt_slots,
-            &slot.model,
         );
         let _ = event_tx.send(AgentEvent::SystemPrompt { text: system.clone() });
         self.publish_btw_system(&prompt_slots);
@@ -290,13 +301,12 @@ impl AgentLoop {
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
     /// the model. Everything else matches the live prompt.
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
-        let slot = self.model_slot.load();
+        let _slot = self.model_slot.load();
         let system = agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
-            &slot.model,
         );
         self.btw_system.store(Arc::new(system));
     }

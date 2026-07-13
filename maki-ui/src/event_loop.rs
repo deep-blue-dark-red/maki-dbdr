@@ -208,6 +208,7 @@ impl<'t> EventLoop<'t> {
             &permissions,
             cwd,
             Some(session.id.clone()),
+            Some(session.created_at),
             timeouts,
             lua_event_handle.clone(),
         );
@@ -362,6 +363,8 @@ impl<'t> EventLoop<'t> {
                 }
             }
         }
+
+
 
         had_agent_msg
     }
@@ -582,6 +585,12 @@ impl<'t> EventLoop<'t> {
                 let slot = self.model_slot.load();
                 self.app
                     .start_btw(question, Arc::clone(&slot.provider), slot.model.clone());
+            }
+            Action::RenameSession(messages) => {
+                self.handles.queue.push(QueueItem::Rename {
+                    messages,
+                    run_id: self.app.run_id,
+                });
             }
             Action::Suspend => terminal::suspend(self.terminal),
             Action::RefreshModels => self.refresh_models(),

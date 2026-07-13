@@ -3,7 +3,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use maki_providers::model::Model;
 
 use crate::AgentMode;
 use crate::template::Vars;
@@ -55,14 +54,13 @@ pub fn build_system_prompt(
     mode: &AgentMode,
     instructions: &str,
     slots: &crate::prompt::ResolvedSlots,
-    model: &Model,
 ) -> String {
-    let env = vars.apply(
-        "\nWorking directory: {cwd}\nPlatform: {platform}\nDate: {date}",
-    );
-    let env = format!("{env}\nModel: {}", model.spec());
-    let instructions = format!("{env}{instructions}");
-    let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions);
+    // Volatile env goes after the instructions so the large, stable system +
+    // AGENTS.md prefix stays cacheable across turns. Creation date is stable for
+    // the session lifetime, not today's date.
+    let env = vars.apply("\nWorking directory: {cwd}\nPlatform: {platform}\nCreation date: {date}");
+    let instructions = format!("{instructions}{env}");
+    let mut out = crate::prompt::assemble(crate::prompt::PromptId::System, slots, &instructions, Some(vars));
 
     if let AgentMode::Plan(plan_path) = mode {
         let plan_vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
@@ -185,8 +183,7 @@ mod tests {
     fn plan_section_presence(mode: &AgentMode, expect_plan: bool) {
         let vars = Vars::new().set("{cwd}", "/tmp").set("{platform}", "linux");
         let slots = crate::prompt::ResolvedSlots::default();
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let prompt = build_system_prompt(&vars, mode, "", &slots, &model);
+        let prompt = build_system_prompt(&vars, mode, "", &slots);
         assert_eq!(prompt.contains("Plan Mode"), expect_plan);
         if expect_plan {
             assert!(prompt.contains(PLAN_PATH));
@@ -213,7 +210,6 @@ mod tests {
             &AgentMode::Plan(PathBuf::from("plan.md")),
             &format!("\n{INSTR}"),
             &slots,
-            &Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
         );
         let positions = [INSTR, EXTRA, "Plan Mode"].map(|n| prompt.find(n).unwrap());
         assert!(

@@ -504,6 +504,10 @@ pub enum AgentEvent {
     CompactionStart {
         checkpoint: bool,
     },
+    /// Emitted by the rename subagent with the LLM-generated session title.
+    RenameResult {
+        title: String,
+    },
     Retry {
         attempt: u32,
         message: String,

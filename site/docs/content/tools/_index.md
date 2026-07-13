@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 17 built-in tools. This is the full reference.
+Maki ships with 18 built-in tools. This is the full reference.
 
 ## File Operations
 
@@ -97,6 +97,7 @@ Compact skeleton of a source file — imports, types, signatures with [line numb
 
 Run independent tool calls in parallel (1–25). Not for dependent or output-filtering chains — use code_execution. Don't nest batch in batch.
 
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `tool_calls` | array | yes | Array of tool calls to execute in parallel |
@@ -104,6 +105,7 @@ Run independent tool calls in parallel (1–25). Not for dependent or output-fil
 ### `code_execution`
 
 Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency via asyncio.gather. Libs: re, asyncio, sys, os, json. No imports, no network. 30s default timeout.
+
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -127,7 +129,7 @@ Delegate a self-contained subgoal to a subagent; combine with batch to run sever
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
+| `model_tier` | string | no | weak/medium/strong — scales cost vs. reasoning depth (omit to inherit current tier) |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
 
@@ -151,21 +153,21 @@ Project-scoped scratchpad for decisions and gotchas that persist across sessions
 
 ### `skill` *(lua plugin)*
 
-Load a task-specific playbook.
+Load a task-specific playbook by name.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | yes | Name of the skill to load |
+| `name` | string | no | Skill name; omit to list available skills |
 
 ## Web
 
 ### `webfetch` *(lua plugin)*
 
-Fetch a URL as markdown (default), text, or html. Best called inside code_execution with filtering to avoid dumping the whole page into context.
+Fetch a URL as markdown (default), text, html, or json. Best called inside code_execution with filtering to avoid dumping the whole page into context.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `format` | string | no |  | Output format: markdown (default), text, or html |
+| `format` | string | no |  | Output format: markdown (default), text, html, or json |
 | `timeout` | integer | no | 30, max 120 | Timeout in seconds |
 | `url` | string | yes |  | URL to fetch (http:// or https://) |
 

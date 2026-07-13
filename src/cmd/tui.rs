@@ -171,6 +171,8 @@ pub fn run(cli: Cli) -> Result<()> {
             timeouts,
             plugin_host.event_handle(),
             fast,
+            cli.system_prompt.filter(|s| !s.is_empty()),
+            cli.append_system_prompt.filter(|s| !s.is_empty()),
         )
         .context("run print mode")?;
     } else {

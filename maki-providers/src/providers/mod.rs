@@ -166,48 +166,93 @@ fn now_ms() -> u64 {
     jiff::Timestamp::now().as_millisecond().max(0) as u64
 }
 
-/// Path of the current session's `.mlog` file, or `None` if logs are unavailable.
+/// Path of the current session's `.mlog` file, keyed by the stable session id so
+/// every turn of a session lands in one file. `None` if logs are unavailable or
+/// there's no active session.
 fn log_file_path() -> Option<std::path::PathBuf> {
     let logs_dir = maki_storage::paths::logs_dir().ok()?;
-    let now = jiff::Timestamp::now();
-    let yyyymmdd = now.to_string()[..10].replace('-', "");
-
-    let session_name = maki_config::CURRENT_SESSION_NAME
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .filter(|name| name != "Main" && !name.is_empty());
     let session_id = maki_config::CURRENT_SESSION_ID
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
-        .filter(|id| !id.is_empty());
+        .filter(|id| !id.is_empty())?;
+    Some(logs_dir.join(format!("{session_id}.mlog")))
+}
 
-    let name_or_id = match &session_name {
-        Some(name) => {
-            let sanitized: String = name
-                .chars()
-                .map(|c| {
-                    if c.is_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else if c.is_whitespace() {
-                        '_'
-                    } else {
-                        '\0'
-                    }
-                })
-                .filter(|c| *c != '\0')
-                .collect();
-            if sanitized.is_empty() {
-                session_id.unwrap_or_else(|| "unknown".to_string())
+/// The `YYYYMMDD-<title>.mlog` symlink path for a session title, dated to the
+/// session's creation (`created_at`, Unix epoch seconds) so the link is stable
+/// across renames on later days. `None` for a placeholder/blank title.
+fn friendly_log_link(
+    logs_dir: &std::path::Path,
+    name: &str,
+    created_at: u64,
+) -> Option<std::path::PathBuf> {
+    if name.is_empty() || name == "Main" {
+        return None;
+    }
+    let sanitized: String = name
+        .chars()
+        .filter_map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                Some(c)
+            } else if c.is_whitespace() {
+                Some('_')
             } else {
-                sanitized
+                None
             }
-        }
-        None => session_id.unwrap_or_else(|| "unknown".to_string()),
+        })
+        .collect();
+    if sanitized.is_empty() {
+        return None;
+    }
+    let yyyymmdd = jiff::Timestamp::from_second(created_at as i64)
+        .unwrap_or_else(|_| jiff::Timestamp::now())
+        .to_string()[..10]
+        .replace('-', "");
+    Some(logs_dir.join(format!("{yyyymmdd}-{sanitized}.mlog")))
+}
+
+/// Remove `path` only if it is a symlink, never a real log file.
+fn remove_if_symlink(path: &std::path::Path) {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Maintain a friendly-named symlink (`YYYYMMDD-<title>.mlog`, dated to session
+/// creation) pointing at a session's canonical id-based log, so the logs dir is
+/// browsable by title while the real file stays keyed by the stable session id.
+/// Best-effort: drops a stale link from the previous title, and skips silently
+/// if nothing has been logged yet (e.g. API logging disabled), on collision with
+/// a real file, or on FS error.
+pub fn update_api_log_symlink(
+    session_id: &str,
+    old_name: Option<&str>,
+    new_name: &str,
+    created_at: u64,
+) {
+    let Ok(logs_dir) = maki_storage::paths::logs_dir() else {
+        return;
     };
 
-    Some(logs_dir.join(format!("{yyyymmdd}-{name_or_id}.mlog")))
+    if let Some(old) = old_name.and_then(|n| friendly_log_link(&logs_dir, n, created_at)) {
+        remove_if_symlink(&old);
+    }
+
+    let target = logs_dir.join(format!("{session_id}.mlog"));
+    if !target.exists() {
+        return; // nothing logged for this session yet
+    }
+    let Some(link) = friendly_log_link(&logs_dir, new_name, created_at) else {
+        return;
+    };
+    if link == target {
+        return;
+    }
+    remove_if_symlink(&link);
+    // Relative target so the link survives moving the logs directory.
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(format!("{session_id}.mlog"), &link);
 }
 
 fn is_chat_completion_request(method: &str, uri: &str) -> bool {

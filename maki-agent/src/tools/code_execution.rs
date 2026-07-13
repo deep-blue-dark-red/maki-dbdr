@@ -149,9 +149,6 @@ super::impl_tool!(
     audience = super::ToolAudience::MAIN
         | super::ToolAudience::RESEARCH_SUB
         | super::ToolAudience::GENERAL_SUB,
-    augment = |desc: &mut String, ctx: &super::DescriptionContext| {
-        desc.push_str(&super::build_interpreter_tools_description(ctx.filter));
-    },
 );
 
 impl super::ToolInvocation for CodeExecution {
