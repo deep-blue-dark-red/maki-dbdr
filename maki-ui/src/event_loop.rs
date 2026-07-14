@@ -573,13 +573,19 @@ impl<'t> EventLoop<'t> {
                 }
             }
             Action::RunLogsCommand => {
-                let dir = maki_storage::paths::config_dir().ok();
-                if let Some(d) = dir {
-                    let logs_dir = d.join("logs");
-                    let _ = std::fs::create_dir_all(&logs_dir);
-                    if let Err(e) = terminal::open_in_editor(&logs_dir, self.terminal) {
-                        self.app.flash(e);
-                    }
+                let settings = crate::components::settings_picker::UserSettings::load();
+                let log_path = self.app.storage.path().join("maki.log");
+                let log_path_str = log_path.to_string_lossy();
+                let cmd_string = match &settings.log_command {
+                    Some(cmd) if !cmd.trim().is_empty() => cmd.clone(),
+                    _ => "less +G {}".to_string(),
+                };
+                let cmd_string = cmd_string
+                    .replace("<path>", &log_path_str)
+                    .replace("alog", &log_path_str)
+                    .replace("{}", &log_path_str);
+                if let Err(e) = terminal::run_shell_command(&cmd_string, self.terminal) {
+                    self.app.flash(e);
                 }
             }
         }

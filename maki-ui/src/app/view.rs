@@ -256,10 +256,13 @@ impl App {
         }
 
         render_if_open!(self.rewind_picker);
+        render_if_open!(self.goto_picker);
         render_if_open!(self.theme_picker);
+        render_if_open!(self.settings_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
+        render_if_open!(self.export_picker);
 
         overlay_rect
     }
@@ -271,6 +274,14 @@ impl App {
             overlay_rect = r;
         }
         let r = self.help_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.plugins_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.skills_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }

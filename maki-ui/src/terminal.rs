@@ -161,6 +161,25 @@ pub(crate) fn open_in_editor(
     }
 }
 
+pub(crate) fn run_shell_command(
+    cmd: &str,
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<(), String> {
+    teardown();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+    resume(terminal);
+    match status {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to run command: {e}")),
+    }
+}
+
 pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut sequence = String::new();
     CopyToClipboard::to_clipboard_from(text)

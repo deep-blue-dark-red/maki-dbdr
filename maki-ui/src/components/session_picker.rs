@@ -26,7 +26,7 @@ pub enum SessionPickerAction {
 struct SessionEntry {
     id: String,
     title: String,
-    relative_time: String,
+    detail_str: String,
 }
 
 impl PickerItem for SessionEntry {
@@ -34,7 +34,7 @@ impl PickerItem for SessionEntry {
         &self.title
     }
     fn detail(&self) -> Option<&str> {
-        Some(&self.relative_time)
+        Some(&self.detail_str)
     }
 }
 
@@ -67,10 +67,18 @@ impl SessionPicker {
                     summaries
                         .into_iter()
                         .filter(|s| s.id != current_session_id)
-                        .map(|s| SessionEntry {
-                            id: s.id,
-                            title: s.title,
-                            relative_time: format_relative_time(s.updated_at),
+                        .map(|s| {
+                            let time_str = format_relative_time(s.updated_at);
+                            let detail_str = if s.context_size > 0 {
+                                format!("ctx: {} · {}", format_context_size(s.context_size), time_str)
+                            } else {
+                                time_str
+                            };
+                            SessionEntry {
+                                id: s.id,
+                                title: s.title,
+                                detail_str,
+                            }
                         })
                         .collect()
                 })
@@ -189,6 +197,16 @@ impl Overlay for SessionPicker {
 
     fn close(&mut self) {
         self.close()
+    }
+}
+
+fn format_context_size(tokens: u32) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 

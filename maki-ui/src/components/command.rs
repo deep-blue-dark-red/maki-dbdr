@@ -33,6 +33,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/checkpoint",
+        description: "Insert a summary checkpoint without discarding history",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
@@ -119,7 +124,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/settings",
-        description: "Show settings menu",
+        description: "Open config file in editor",
         max_args: 0,
     },
     BuiltinCommand {
@@ -145,6 +150,31 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/logs",
         description: "Open logs directory",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/export",
+        description: "Export session transcript as Markdown or JSON",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/skills",
+        description: "Manage global and project AI agent skills",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/plugins",
+        description: "Enable or disable built-in Lua plugins",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/rewind",
+        description: "Show rewind menu to delete turns",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/rename",
+        description: "Generate a session name from the conversation using AI",
         max_args: 0,
     },
 ];

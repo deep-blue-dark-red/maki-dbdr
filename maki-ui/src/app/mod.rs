@@ -786,7 +786,10 @@ impl App {
         if self.goto_picker.is_open() {
             return Some(match self.goto_picker.handle_key(key) {
                 GotoPickerAction::Consumed => vec![],
-                GotoPickerAction::Select(entry) => self.scroll_to_turn(entry),
+                GotoPickerAction::Select(entry) => {
+                    self.goto_picker.close();
+                    self.scroll_to_turn(entry)
+                }
                 GotoPickerAction::Close => vec![],
             });
         }
@@ -850,6 +853,24 @@ impl App {
                     self.settings_picker.close();
                     if let Ok(path) = crate::config::config_path() {
                         vec![Action::OpenEditor(path)]
+                    } else {
+                        vec![]
+                    }
+                }
+                SettingsPickerAction::OpenUserConfig => {
+                    self.settings_picker.close();
+                    if let Ok(path) = crate::config::config_path() {
+                        vec![Action::OpenEditor(path)]
+                    } else {
+                        vec![]
+                    }
+                }
+                SettingsPickerAction::OpenSystemConfig => {
+                    self.settings_picker.close();
+                    let path = maki_config::global_config_dir()
+                        .map(|d| d.join("init.lua"));
+                    if let Some(p) = path {
+                        vec![Action::OpenEditor(p)]
                     } else {
                         vec![]
                     }

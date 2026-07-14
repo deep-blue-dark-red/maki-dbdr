@@ -10,17 +10,17 @@ use crate::theme;
 const TITLE: &str = " Settings ";
 const MAX_VISIBLE: u16 = 10;
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserSettings {
     #[serde(default)]
     pub show_system_prompt: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub api_logging: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_reasoning: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_token_stats: bool,
-    #[serde(default)]
+    #[serde(default = "default_log_command")]
     pub log_command: Option<String>,
     #[serde(default)]
     pub compact_tokens: Option<usize>,
@@ -32,6 +32,31 @@ pub struct UserSettings {
     pub disabled_plugins: Vec<String>,
     #[serde(default)]
     pub global_sessions: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_log_command() -> Option<String> {
+    Some("tail -n 30 alog | jlf -c | less -R".to_string())
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            show_system_prompt: false,
+            api_logging: true,
+            show_reasoning: true,
+            show_token_stats: true,
+            log_command: Some("tail -n 30 alog | jlf -c | less -R".to_string()),
+            compact_tokens: None,
+            skills_dirs: Vec::new(),
+            export_path: None,
+            disabled_plugins: Vec::new(),
+            global_sessions: false,
+        }
+    }
 }
 
 impl UserSettings {
@@ -80,6 +105,8 @@ pub enum SettingsPickerAction {
     ToggleShowReasoning(bool),
     ToggleShowTokenStats(bool),
     EditLogCommand,
+    OpenUserConfig,
+    OpenSystemConfig,
     Closed,
     ToggleGlobalSessions(bool),
 }
@@ -111,21 +138,11 @@ impl SettingsPicker {
         settings: &UserSettings,
     ) {
         let items = vec![
-            SettingItem {
-                name: "show-system-prompt".to_string(),
-            },
-            SettingItem {
-                name: "api-logging".to_string(),
-            },
-            SettingItem {
-                name: "show-reasoning".to_string(),
-            },
-            SettingItem {
-                name: "show-token-stats".to_string(),
-            },
-            SettingItem {
-                name: "global-sessions".to_string(),
-            },
+            SettingItem { name: "show-system-prompt".to_string() },
+            SettingItem { name: "api-logging".to_string() },
+            SettingItem { name: "show-reasoning".to_string() },
+            SettingItem { name: "show-token-stats".to_string() },
+            SettingItem { name: "global-sessions".to_string() },
             SettingItem {
                 name: format!("log-command: {}", settings.log_command.as_deref().unwrap_or("less +G {}")),
             },
@@ -137,6 +154,8 @@ impl SettingsPicker {
                         .unwrap_or_else(|| "none".to_string())
                 ),
             },
+            SettingItem { name: "open user.config in editor".to_string() },
+            SettingItem { name: "open maki init.lua in editor".to_string() },
         ];
         let enabled = vec![
             settings.show_system_prompt,
@@ -146,16 +165,18 @@ impl SettingsPicker {
             settings.global_sessions,
             false,
             false,
+            false,
+            false,
         ];
 
         let path_str = if let Ok(path) = crate::config::config_path() {
             path.to_string_lossy().to_string()
         } else {
-            "maki.config".to_string()
+            "user.config".to_string()
         };
         let t = theme::current();
         let mut spans = crate::components::hint_line(&[("Enter", "toggle/edit")]).spans;
-        spans.push(Span::styled(", maki.config at ", t.tool_dim));
+        spans.push(Span::styled(", user.config at ", t.tool_dim));
         spans.push(Span::styled(path_str, t.item_desc));
         self.picker.set_static_footer(Line::from(spans));
 
@@ -180,6 +201,8 @@ impl SettingsPicker {
                 4 => SettingsPickerAction::ToggleGlobalSessions(val),
                 5 => SettingsPickerAction::EditLogCommand,
                 6 => SettingsPickerAction::EditLogCommand,
+                7 => SettingsPickerAction::OpenUserConfig,
+                8 => SettingsPickerAction::OpenSystemConfig,
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,
