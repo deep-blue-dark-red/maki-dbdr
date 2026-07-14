@@ -111,6 +111,9 @@ impl Chat {
                     "Auto-compacting conversation...".into(),
                 ));
             }
+            AgentEvent::CompactionStart { checkpoint } => {
+                self.messages_panel.begin_compaction(checkpoint);
+            }
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }
@@ -129,21 +132,7 @@ impl Chat {
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
             }
-            AgentEvent::ToolSnapshot {
-                id,
-                snapshot,
-                theme_gen,
-            } => {
-                self.messages_panel.tool_snapshot(&id, snapshot, theme_gen);
-            }
-            AgentEvent::ToolHeaderSnapshot {
-                id,
-                snapshot,
-                theme_gen,
-            } => {
-                self.messages_panel
-                    .tool_header_snapshot(&id, snapshot, theme_gen);
-            }
+            AgentEvent::RenameResult { .. } => {}
             AgentEvent::Nudge => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
@@ -155,6 +144,8 @@ impl Chat {
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
+            AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. } => {}
+            AgentEvent::BatchProgress(_) => {}
         }
         ChatEventResult::Continue
     }

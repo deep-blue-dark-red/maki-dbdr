@@ -2,13 +2,38 @@ use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 
 use crossterm::event::KeyEvent;
-use maki_providers::{Message, Role};
+use maki_providers::{ContentBlock, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
 pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
+
+/// Maps a message index in the History messages vec to the corresponding
+/// display segment index (0-based across user + assistant text + tool blocks).
+pub(crate) fn display_msg_index_for_turn(messages: &[Message], turn_msg_idx: usize) -> usize {
+    let mut display_idx = 0;
+    for (i, msg) in messages.iter().enumerate() {
+        if i == turn_msg_idx {
+            return display_idx;
+        }
+        match msg.role {
+            Role::User => display_idx += 1,
+            Role::Assistant => {
+                for block in &msg.content {
+                    let non_empty = match block {
+                        ContentBlock::Text { text } => !text.is_empty(),
+                        ContentBlock::ToolUse { .. } => true,
+                        _ => false,
+                    };
+                    display_idx += non_empty as usize;
+                }
+            }
+        }
+    }
+    display_idx
+}
 
 pub enum RewindPickerAction {
     Consumed,
@@ -18,6 +43,7 @@ pub enum RewindPickerAction {
 
 pub struct RewindEntry {
     pub turn_index: usize,
+    pub segment_index: usize,
     pub prompt_preview: String,
     pub prompt_text: String,
 }
@@ -61,6 +87,7 @@ impl RewindPicker {
             };
             entries.push(RewindEntry {
                 turn_index: msg_idx,
+                segment_index: display_msg_index_for_turn(messages, msg_idx),
                 prompt_preview: preview,
                 prompt_text: full_text.to_owned(),
             });

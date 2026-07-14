@@ -242,7 +242,7 @@ impl Overlay for PluginsModal {
 }
 
 fn build_plugin_list() -> Vec<PluginInfo> {
-    let registry = ToolRegistry::native();
+    let registry = ToolRegistry::global();
     let snapshot = registry.iter();
     let loaded_plugins: std::collections::HashSet<String> = snapshot
         .iter()

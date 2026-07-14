@@ -44,6 +44,7 @@ const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 
 pub struct MessagesPanel {
     messages: Vec<DisplayMessage>,
+    streaming_role: Option<DisplayRole>,
     streaming_thinking: StreamingContent,
     streaming_text: StreamingContent,
     started_at: Instant,
@@ -79,6 +80,7 @@ impl MessagesPanel {
         let ms = ui_config.typewriter_ms_per_char;
         Self {
             messages: Vec::new(),
+            streaming_role: None,
             streaming_thinking: StreamingContent::new(
                 thinking.prefix,
                 thinking.text_style,
@@ -348,6 +350,7 @@ impl MessagesPanel {
     }
 
     pub fn stream_reset(&mut self) {
+        self.streaming_role = None;
         self.streaming_thinking.clear();
         self.streaming_text.clear();
         self.thinking_collapsed = !self.show_thinking;
@@ -469,11 +472,17 @@ impl MessagesPanel {
     pub fn flush(&mut self) {
         self.flush_thinking();
         if !self.streaming_text.is_empty() {
+            let role = self.streaming_role.take().unwrap_or(DisplayRole::Assistant);
             self.messages.push(DisplayMessage::new(
-                DisplayRole::Assistant,
+                role,
                 self.streaming_text.take_all(),
             ));
         }
+    }
+
+    pub fn begin_compaction(&mut self, checkpoint: bool) {
+        self.flush();
+        self.streaming_role = Some(DisplayRole::Compaction { checkpoint });
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -1131,6 +1140,7 @@ impl MessagesPanel {
                     DisplayRole::Error => error_style(),
                     DisplayRole::Done => done_style(),
                     DisplayRole::Tool(_) => unreachable!(),
+                    DisplayRole::Compaction { .. } => assistant_style(),
                 };
                 let prefix = if msg.plan_path.is_some() {
                     ""

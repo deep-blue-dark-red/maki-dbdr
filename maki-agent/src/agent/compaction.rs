@@ -13,30 +13,56 @@ use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
 
-pub(super) async fn compact_history(
+/// Framing line prepended to an interleaved checkpoint summary in history. Not a
+/// locator: checkpoints are append-only, so nothing is ever matched or removed.
+pub(super) const CHECKPOINT_INTRO: &str = "Progress summary since last checkpoint:";
+
+/// Stream a summary of `history` under the compaction system prompt using
+/// `user_prompt` as the final instruction. Mutates nothing; the caller decides
+/// what to do with the response (replace history vs. append a checkpoint).
+///
+/// `strip` removes images/thinking/old tool-results to shrink the request. It's
+/// right for compaction (history is about to be discarded) but not for
+/// checkpoint: an unstripped request shares the main conversation's cached
+/// prefix, so it rides the prompt cache instead of forcing a full reprocess.
+#[allow(clippy::too_many_arguments)]
+async fn run_summary_stream(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
-    history: &mut History,
+    history: &History,
+    user_prompt: &str,
+    strip: bool,
     event_tx: &EventSender,
     cancel: &CancelToken,
-) -> Result<TokenUsage, AgentError> {
-    let compact_start = std::time::Instant::now();
+    target_tokens: Option<usize>,
+) -> Result<StreamResponse, AgentError> {
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
-    strip_images(&mut compaction_history);
-    strip_thinking(&mut compaction_history);
-    strip_old_tool_results(&mut compaction_history);
-    compaction_history.push(Message::user(crate::prompt::COMPACTION_USER.to_string()));
+    if strip {
+        strip_images(&mut compaction_history);
+        strip_thinking(&mut compaction_history);
+        strip_old_tool_results(&mut compaction_history);
+    }
+    compaction_history.push(Message::user(user_prompt.to_string()));
 
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
     let mut last_error = None;
+
+    let mut system_prompt = crate::prompt::COMPACTION_SYSTEM.to_string();
+    if let Some(target) = target_tokens {
+        let approx_words = (target as f64 * 0.75).round() as usize;
+        system_prompt.push_str(&format!(
+            "\n\nLENGTH CONSTRAINT: keep the whole block under ~{} words (~{} tokens). Shed detail in the FIDELITY order; never drop MISSION, GIT, or the final [NEXT].",
+            approx_words, target
+        ));
+    }
 
     for attempt in 0..max_attempts {
         match stream_with_retry(
             provider,
             model,
             &compaction_history,
-            crate::prompt::COMPACTION_SYSTEM,
+            &system_prompt,
             &empty_tools,
             event_tx,
             cancel,
@@ -47,18 +73,9 @@ pub(super) async fn compact_history(
         {
             Ok(response) => {
                 if attempt > 0 {
-                    info!(
-                        attempt,
-                        "compaction succeeded after truncating oldest rounds"
-                    );
+                    info!(attempt, "summary succeeded after truncating oldest rounds");
                 }
-                return Ok(finish_compact(
-                    response,
-                    history,
-                    event_tx,
-                    compact_start,
-                    model,
-                ));
+                return Ok(response);
             }
             Err(e) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -69,6 +86,29 @@ pub(super) async fn compact_history(
     }
 
     Err(last_error.unwrap())
+}
+
+pub(super) async fn compact_history(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    target_tokens: Option<usize>,
+) -> Result<TokenUsage, AgentError> {
+    let compact_start = std::time::Instant::now();
+    let response = run_summary_stream(
+        provider,
+        model,
+        history,
+        crate::prompt::COMPACTION_USER,
+        true,
+        event_tx,
+        cancel,
+        target_tokens,
+    )
+    .await?;
+    Ok(finish_compact(response, history, event_tx, compact_start, model))
 }
 
 fn finish_compact(
@@ -104,9 +144,11 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
+    target_tokens: Option<usize>,
 ) -> Result<(), AgentError> {
+    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: false });
     let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel).await?;
+    let usage = compact_history(provider, model, history, event_tx, &cancel, target_tokens).await?;
 
     event_tx.send(AgentEvent::Done {
         usage,
@@ -115,6 +157,101 @@ pub async fn compact(
     })?;
 
     Ok(())
+}
+
+/// Generate a session name from user messages using an isolated LLM call.
+/// Emits `AgentEvent::RenameResult` with the trimmed title, or nothing if the
+/// response is empty. Does not mutate history and does not emit `Done`.
+pub async fn rename_session(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    messages: &[Message],
+    event_tx: &EventSender,
+) -> Result<(), AgentError> {
+    use maki_providers::ProviderEvent;
+
+    let system = include_str!("../prompts/session_name.md");
+    let (prov_tx, prov_rx) = flume::unbounded::<ProviderEvent>();
+    let _ = provider
+        .stream_message(
+            model,
+            messages,
+            system,
+            &serde_json::Value::Null,
+            &prov_tx,
+            RequestOptions::default(),
+            None,
+        )
+        .await;
+    drop(prov_tx);
+
+    let mut title = String::new();
+    while let Ok(event) = prov_rx.try_recv() {
+        if let ProviderEvent::TextDelta { text } = event {
+            title.push_str(&text);
+        }
+    }
+    let title = title.trim().to_string();
+    if !title.is_empty() {
+        let _ = event_tx.send(AgentEvent::RenameResult { title });
+    }
+    Ok(())
+}
+
+/// Emit a re-anchoring checkpoint: stream a CHECKPOINT-mode delta summary and
+/// append it to history, keeping the full conversation intact — unlike `compact`,
+/// which replaces it. Checkpoints are append-only (interleaved), so each new one
+/// covers only new work and the prompt cache prefix is never invalidated.
+pub async fn checkpoint(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    target_tokens: Option<usize>,
+) -> Result<(), AgentError> {
+    let usage =
+        checkpoint_history(provider, model, history, event_tx, &CancelToken::none(), target_tokens)
+            .await?;
+
+    event_tx.send(AgentEvent::Done {
+        usage,
+        num_turns: 1,
+        stop_reason: None,
+    })?;
+
+    Ok(())
+}
+
+/// Stream a CHECKPOINT-mode delta summary and append it to `history`
+/// (append-only: nothing is removed, so the cached prefix stays intact). Sends
+/// unstripped history so the request rides the main conversation's prompt cache.
+/// Emits the labeling `CompactionStart` but not `Done`, so it is safe to call
+/// mid-run (unlike `checkpoint`).
+pub(super) async fn checkpoint_history(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    target_tokens: Option<usize>,
+) -> Result<TokenUsage, AgentError> {
+    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: true });
+    let response = run_summary_stream(
+        provider,
+        model,
+        history,
+        crate::prompt::CHECKPOINT_USER,
+        false,
+        event_tx,
+        cancel,
+        target_tokens,
+    )
+    .await?;
+
+    history.push(Message::user(CHECKPOINT_INTRO.into()));
+    history.push(response.message);
+
+    Ok(response.usage)
 }
 
 pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, compaction_buffer: u32) -> bool {
@@ -312,6 +449,7 @@ mod tests {
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                None,
             )
             .await
             .unwrap();
@@ -320,6 +458,48 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    #[test]
+    fn checkpoint_appends_without_removing() {
+        smol::block_on(async {
+            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
+                vec![text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)],
+            ));
+            let model = default_model();
+            let (raw_tx, _rx) = flume::unbounded();
+            let tx = EventSender::new(raw_tx, 0);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text: "reply".into() }],
+                    ..Default::default()
+                },
+            ]);
+
+            // First checkpoint: history retained, intro+summary appended at the end.
+            checkpoint(&*provider, &model, &mut history, &tx, None)
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 4, "original 2 kept + intro + summary");
+            assert_eq!(history.as_slice()[2].user_text(), Some(CHECKPOINT_INTRO));
+
+            // Second checkpoint: append-only — prior checkpoint is NOT removed, so
+            // the prefix is unchanged and the cache stays warm.
+            checkpoint(&*provider, &model, &mut history, &tx, None)
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 6, "checkpoints interleave, not supersede");
+            let intros = history
+                .as_slice()
+                .iter()
+                .filter(|m| m.user_text() == Some(CHECKPOINT_INTRO))
+                .count();
+            assert_eq!(intros, 2, "both checkpoints retained in order");
+            // Original turns still at the front — prefix preserved.
+            assert_eq!(history.as_slice()[0].user_text(), Some("first"));
         });
     }
 

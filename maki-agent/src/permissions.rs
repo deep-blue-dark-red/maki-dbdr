@@ -535,7 +535,8 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
-        let norm_prefix = maki_storage::paths::canonicalize_clean(Path::new(prefix));
+        let norm_prefix = maki_storage::paths::incremental_canonicalize(Path::new(prefix))
+            .unwrap_or_else(|| maki_storage::paths::canonicalize_clean(Path::new(prefix)));
         // Use incremental canonicalization for the value so symlinks in
         // existing path components are resolved before any `..` traversal.
         // `canonicalize_clean` falls back to lexical normalization when the

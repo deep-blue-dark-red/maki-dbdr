@@ -107,6 +107,10 @@ pub enum Request {
         plugin: Arc<str>,
         reply: flume::Sender<()>,
     },
+    LoadBuiltin {
+        name: Arc<str>,
+        reply: flume::Sender<()>,
+    },
     RunInitLua {
         source: String,
         source_name: String,
@@ -1834,6 +1838,33 @@ pub fn spawn(
                         Request::ClearPlugin { plugin, reply } => {
                             gate.drain().await;
                             rt.clear_plugin(&plugin);
+                            let _ = reply.send(());
+                        }
+                        Request::LoadBuiltin { name, reply } => {
+                            gate.drain().await;
+                            let found = crate::loader::BUNDLED_PLUGINS.iter().find(|p| p.name == name.as_ref());
+                            let res = match found {
+                                Some(bp) => {
+                                    let init = bp.dir.get_file("init.lua")
+                                        .and_then(|f| f.contents_utf8())
+                                        .map(|s| s.to_owned());
+                                    if let Some(src) = init {
+                                        rt.load_source(Arc::clone(&name), &src, None, &PluginPermissions::trusted(), None).await
+                                    } else {
+                                        Err(PluginError::Lua {
+                                            plugin: name.to_string(),
+                                            source: mlua::Error::runtime("bundled plugin missing init.lua"),
+                                        })
+                                    }
+                                }
+                                None => Err(PluginError::Lua {
+                                    plugin: name.to_string(),
+                                    source: mlua::Error::runtime("unknown bundled plugin"),
+                                }),
+                            };
+                            if let Err(e) = res {
+                                tracing::warn!(plugin = %name, error = %e, "failed to load builtin");
+                            }
                             let _ = reply.send(());
                         }
                         Request::RunCommand {

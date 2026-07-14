@@ -26,6 +26,9 @@ fn label_str(label: KeyLabel) -> String {
             .map(|s| format!("`{s}`"))
             .collect::<Vec<_>>()
             .join(ALT_SEP),
+        KeyLabel::Action(_) => "configurable".to_string(),
+        KeyLabel::ActionAlt(_, _) => "configurable".to_string(),
+        KeyLabel::ActionMacAlt(_, _) => "configurable".to_string(),
     }
 }
 

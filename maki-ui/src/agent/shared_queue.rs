@@ -11,12 +11,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::{AgentInput, ExtractedCommand, ImageSource, InterruptSource};
+use maki_providers::Message;
 
 use crate::components::input::Submission;
 use crate::components::queue_panel::QueueEntry;
 use crate::theme;
 
 const COMPACT_LABEL: &str = "/compact";
+const CHECKPOINT_LABEL: &str = "/checkpoint";
 
 type Items = Arc<Mutex<VecDeque<QueueItem>>>;
 
@@ -49,12 +51,22 @@ pub(crate) enum QueueItem {
     Compact {
         run_id: u64,
     },
+    Checkpoint {
+        run_id: u64,
+    },
+    Rename {
+        messages: Vec<Message>,
+        run_id: u64,
+    },
 }
 
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. } | Self::Compact { run_id } => *run_id,
+            Self::Message { run_id, .. }
+            | Self::Compact { run_id }
+            | Self::Checkpoint { run_id }
+            | Self::Rename { run_id, .. } => *run_id,
         }
     }
 
@@ -71,6 +83,20 @@ impl QueueItem {
                     .fg
                     .unwrap_or(theme::current().foreground),
             },
+            Self::Checkpoint { .. } => QueueEntry {
+                text: Cow::Borrowed(CHECKPOINT_LABEL),
+                color: theme::current()
+                    .queue
+                    .fg
+                    .unwrap_or(theme::current().foreground),
+            },
+            Self::Rename { .. } => QueueEntry {
+                text: Cow::Borrowed("/rename"),
+                color: theme::current()
+                    .queue
+                    .fg
+                    .unwrap_or(theme::current().foreground),
+            },
         }
     }
 
@@ -78,6 +104,8 @@ impl QueueItem {
         match self {
             Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
+            Self::Checkpoint { run_id } => ExtractedCommand::Checkpoint(run_id),
+            Self::Rename { .. } => unreachable!("Rename is not dispatched via interrupt source"),
         }
     }
 
@@ -87,7 +115,7 @@ impl QueueItem {
     fn visible_in_panel(&self) -> bool {
         match self {
             Self::Message { displayed, .. } => !displayed,
-            Self::Compact { .. } => true,
+            Self::Compact { .. } | Self::Checkpoint { .. } | Self::Rename { .. } => true,
         }
     }
 }
@@ -149,7 +177,7 @@ impl QueueSender {
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
-                QueueItem::Compact { .. } => None,
+                QueueItem::Compact { .. } | QueueItem::Checkpoint { .. } | QueueItem::Rename { .. } => None,
             })
             .collect()
     }
@@ -213,6 +241,7 @@ mod tests {
     #[test_case(msg(false),                       true  ; "deferred_message_visible")]
     #[test_case(msg(true),                        false ; "displayed_message_hidden")]
     #[test_case(QueueItem::Compact { run_id: 0 }, true  ; "compact_visible")]
+    #[test_case(QueueItem::Checkpoint { run_id: 0 }, true  ; "checkpoint_visible")]
     fn panel_visibility(item: QueueItem, visible: bool) {
         let (tx, _rx) = queue();
         tx.push(item);

@@ -1,7 +1,9 @@
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
+pub(crate) mod export_picker;
 pub(crate) mod file_picker;
+pub(crate) mod goto_picker;
 pub(crate) mod form;
 pub(crate) mod help_modal;
 pub mod input;
@@ -16,10 +18,14 @@ pub(crate) mod model_picker;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub mod queue_panel;
+pub(crate) mod render_hints;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod session_picker;
+pub(crate) mod plugins_modal;
+pub(crate) mod settings_picker;
+pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
@@ -203,12 +209,16 @@ pub enum Action {
     RefreshModels,
     RefreshUsage,
     Compact,
+    Checkpoint,
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
     Btw(String),
+    RenameSession(Vec<maki_providers::Message>),
     Suspend,
     Quit,
+    EditSystemPrompt,
+    RunLogsCommand,
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
@@ -355,6 +365,11 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// A manual `/compact` (checkpoint=false) or `/checkpoint` (checkpoint=true)
+    /// summary block, labeled distinctly in the transcript.
+    Compaction {
+        checkpoint: bool,
+    },
 }
 
 impl DisplayRole {

@@ -118,6 +118,29 @@ pub enum ToolInput {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BatchToolStatus {
+    Pending,
+    InProgress,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchToolEntry {
+    pub tool: String,
+    pub summary: String,
+    pub status: BatchToolStatus,
+    pub input: Option<ToolInput>,
+    /// Lua plugins need the full JSON to re-run their snapshot on theme switch.
+    /// `input` only covers code_execution, so this stores the original call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<serde_json::Value>,
+    pub output: Option<ToolOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotation: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstructionBlock {
     pub path: String,
@@ -224,9 +247,10 @@ pub enum ToolOutput {
         entries: Vec<GrepFileEntry>,
     },
     /// Only here so legacy sessions still deserialize. Batch is a Lua
-    /// plugin now and stores plain text plus a `state` payload, so the old
-    /// per-child `entries` are dropped on load: nothing can render them.
+    /// plugin now and stores per-child `entries` plus a `text` payload.
     Batch {
+        #[serde(default)]
+        entries: Vec<BatchToolEntry>,
         text: String,
     },
     Instructions {
@@ -437,7 +461,7 @@ impl ToolOutput {
                 }
                 out
             }
-            Self::Batch { text } | Self::Image { text, .. } => text.clone(),
+            Self::Batch { text, .. } | Self::Image { text, .. } => text.clone(),
             Self::Instructions { blocks } => {
                 let mut out = String::new();
                 append_instructions(&mut out, blocks);
@@ -559,6 +583,15 @@ pub enum AgentEvent {
         stop_reason: Option<StopReason>,
     },
     AutoCompacting,
+    /// Emitted before a manual `/compact` or `/checkpoint` streams its summary,
+    /// so the UI can label the resulting block. `checkpoint` selects the label.
+    CompactionStart {
+        checkpoint: bool,
+    },
+    /// Emitted by the rename subagent with the LLM-generated session title.
+    RenameResult {
+        title: String,
+    },
     Retry {
         attempt: u32,
         message: String,
@@ -595,6 +628,7 @@ pub enum AgentEvent {
         id: String,
         body: Arc<SharedBuf>,
     },
+    BatchProgress(Box<BatchProgressEvent>),
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
@@ -813,6 +847,16 @@ pub struct TurnCompleteEvent {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchProgressEvent {
+    pub batch_id: String,
+    pub index: usize,
+    pub tool: String,
+    pub status: BatchToolStatus,
+    pub output: Option<ToolOutput>,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

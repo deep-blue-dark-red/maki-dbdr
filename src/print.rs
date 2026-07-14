@@ -242,6 +242,9 @@ pub fn run(
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
+            | AgentEvent::CompactionStart { .. }
+            | AgentEvent::RenameResult { .. }
+            | AgentEvent::BatchProgress(_)
             | AgentEvent::Nudge => {}
             AgentEvent::Retry {
                 attempt,

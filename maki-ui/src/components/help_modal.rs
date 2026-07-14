@@ -33,20 +33,20 @@ fn key_spans(label: ResolvedLabel, pad: usize, prefix: &str) -> Vec<Span<'static
     let theme = theme::current();
     match label {
         ResolvedLabel::Single(s) => {
-            let w = UnicodeWidthStr::width(s);
+            let w = UnicodeWidthStr::width(s.as_str());
             let trailing = pad.saturating_sub(w);
             vec![Span::styled(
                 format!("{prefix}{s}{:trailing$}", ""),
                 theme.keybind_key,
             )]
         }
-        ResolvedLabel::Alt(a, b) => multi_key_spans(&[a, b], pad, prefix, &theme),
-        ResolvedLabel::Multi(keys) => multi_key_spans(keys, pad, prefix, &theme),
+        ResolvedLabel::Alt(a, b) => multi_key_spans(&[a.as_str(), b.as_str()], pad, prefix, &theme),
+        ResolvedLabel::Multi(keys) => multi_key_spans(&keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(), pad, prefix, &theme),
     }
 }
 
 fn multi_key_spans(
-    keys: &[&'static str],
+    keys: &[&str],
     pad: usize,
     prefix: &str,
     theme: &crate::theme::Theme,
@@ -190,7 +190,7 @@ impl HelpModal {
                 )));
                 for &(pfx, desc) in INPUT_PREFIXES {
                     let mut spans = key_spans(
-                        ResolvedLabel::Single(pfx),
+                        ResolvedLabel::Single(pfx.to_string()),
                         key_col_width - KEY_COL_GAP,
                         PREFIX_CHILD,
                     );

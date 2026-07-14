@@ -26,7 +26,11 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
+use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
+use crate::components::plugins_modal::{PluginsModal, PluginsAction};
+use crate::components::skills_modal::{SkillsModal, SkillsAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
@@ -41,6 +45,7 @@ use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionPickerAction};
+use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
@@ -142,7 +147,11 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
+    pub(super) goto_picker: GotoPicker,
     pub(super) help_modal: HelpModal,
+    pub(super) export_picker: ExportPicker,
+    pub(super) plugins_modal: PluginsModal,
+    pub(super) skills_modal: SkillsModal,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -150,6 +159,7 @@ pub struct App {
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
+    pub(super) settings_picker: SettingsPicker,
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -165,6 +175,8 @@ pub struct App {
     pub(super) selection_state: Option<SelectionState>,
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
+    pub(super) last_turn_stats: Option<crate::components::status_bar::TurnStats>,
+    turn_start: Option<Instant>,
 
     pub(crate) storage: StateDir,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
@@ -175,6 +187,7 @@ pub struct App {
     storage_writer: Arc<StorageWriter>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
+    pub(super) show_token_stats: bool,
     pub(crate) permissions: Arc<PermissionManager>,
     pub(crate) lua_event_handle: Option<EventHandle>,
     pub(super) keymap_reader: KeymapReader,
@@ -182,6 +195,7 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    pub(crate) verbose: bool,
 }
 
 impl App {
@@ -222,7 +236,11 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
+            goto_picker: GotoPicker::new(),
             help_modal: HelpModal::new(),
+            export_picker: ExportPicker::new(),
+            plugins_modal: PluginsModal::new(),
+            skills_modal: SkillsModal::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
@@ -230,6 +248,7 @@ impl App {
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
+            settings_picker: SettingsPicker::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
             status: Status::Idle,
             state,
@@ -245,6 +264,8 @@ impl App {
             selection_state: None,
             clipboard: ClipboardState::new(),
             last_esc: None,
+            last_turn_stats: None,
+            turn_start: None,
             storage,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
@@ -254,6 +275,7 @@ impl App {
             storage_writer,
             shell: shell::ShellState::default(),
             ui_config,
+            show_token_stats: UserSettings::load().show_token_stats,
             permissions,
             lua_event_handle: None,
             keymap_reader,
@@ -261,9 +283,12 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            verbose: false,
         };
         app.model_picker
             .set_recents(maki_storage::model::read_recents(&app.storage));
+        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.clone());
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(app.state.session.title.clone());
         app
     }
 
@@ -423,6 +448,33 @@ impl App {
         if !is_ctrl(&key) {
             return None;
         }
+        if key::DELETE_CURRENT_SESSION.matches(key) {
+            let session_id = self.state.session.id.clone();
+
+            // 1. Delete the session from storage
+            if let Err(e) = AppSession::delete(&session_id, &self.storage) {
+                self.status_bar.flash(format!("Failed to delete session: {e}"));
+            } else {
+                self.status_bar.flash("Session deleted".into());
+                self.session_picker.remove_entry(&session_id);
+
+                // 2. Open the sessions list popup window directly
+                self.open_session_picker();
+            }
+            return Some(vec![]);
+        }
+        if key::TOGGLE_GLOBAL_SESSIONS.matches(key) {
+            let mut settings = UserSettings::load();
+            settings.global_sessions = !settings.global_sessions;
+            settings.save();
+            self.status_bar.flash(
+                if settings.global_sessions { "Global sessions enabled" } else { "Global sessions disabled" }.into(),
+            );
+            if self.session_picker.is_open() {
+                self.open_session_picker();
+            }
+            return Some(vec![]);
+        }
         if key::QUIT.matches(key) {
             self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
@@ -476,6 +528,10 @@ impl App {
             self.plan_form.toggle();
             return Some(vec![]);
         }
+        if key::TOGGLE_VERBOSE.matches(key) {
+            self.verbose = !self.verbose;
+            return Some(vec![]);
+        }
         None
     }
 
@@ -500,6 +556,98 @@ impl App {
 
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.plugins_modal.is_open() {
+            match self.plugins_modal.handle_key(key) {
+                PluginsAction::EditPlugin(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                PluginsAction::None => {
+                    return Some(vec![]);
+                }
+            }
+        }
+
+        if self.skills_modal.is_open() {
+            match self.skills_modal.handle_key(key) {
+                SkillsAction::CreateSkill(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                SkillsAction::EditSkillsJson(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                SkillsAction::EditSkill(path) => {
+                    return Some(vec![Action::OpenEditor(path)]);
+                }
+                SkillsAction::None => {
+                    return Some(vec![]);
+                }
+            }
+        }
+
+        if self.export_picker.is_open() {
+            match self.export_picker.handle_key(key) {
+                ExportPickerAction::Select(entry) => {
+                    let settings = UserSettings::load();
+                    let base_path = settings.resolved_export_path(std::path::Path::new(&self.state.session.cwd));
+                    match entry.export_type {
+                        ExportType::MarkdownClipboard => {
+                            let text = self.export_session_to_markdown();
+                            match self.clipboard.copy_text(&text) {
+                                Ok(crate::clipboard::CopyResult::Copied) => {
+                                    self.flash("Copied transcript to clipboard".into());
+                                }
+                                Ok(crate::clipboard::CopyResult::Noop) => {}
+                                Err(e) => {
+                                    self.flash(format!("Copy failed: {e}"));
+                                }
+                            }
+                        }
+                        ExportType::MarkdownSave => {
+                            let text = self.export_session_to_markdown();
+                            let filepath = if base_path.is_file() {
+                                base_path
+                            } else {
+                                let _ = std::fs::create_dir_all(&base_path);
+                                base_path.join(format!("session-{}.md", self.state.session.id))
+                            };
+                            match std::fs::write(&filepath, text) {
+                                Ok(_) => self.flash(format!("Saved transcript to {}", filepath.display())),
+                                Err(e) => self.flash(format!("Failed to save transcript: {e}")),
+                            }
+                        }
+                        ExportType::JsonClipboard => {
+                            let text = self.export_session_to_json();
+                            match self.clipboard.copy_text(&text) {
+                                Ok(crate::clipboard::CopyResult::Copied) => {
+                                    self.flash("Copied JSON session to clipboard".into());
+                                }
+                                Ok(crate::clipboard::CopyResult::Noop) => {}
+                                Err(e) => {
+                                    self.flash(format!("Copy failed: {e}"));
+                                }
+                            }
+                        }
+                        ExportType::JsonSave => {
+                            let text = self.export_session_to_json();
+                            let filepath = if base_path.is_file() {
+                                base_path
+                            } else {
+                                let _ = std::fs::create_dir_all(&base_path);
+                                base_path.join(format!("session-{}.json", self.state.session.id))
+                            };
+                            match std::fs::write(&filepath, text) {
+                                Ok(_) => self.flash(format!("Saved JSON session to {}", filepath.display())),
+                                Err(e) => self.flash(format!("Failed to save JSON session: {e}")),
+                            }
+                        }
+                    }
+                }
+                ExportPickerAction::Consumed => {}
+                ExportPickerAction::Close => {}
+            }
             return Some(vec![]);
         }
 
@@ -635,6 +783,14 @@ impl App {
             });
         }
 
+        if self.goto_picker.is_open() {
+            return Some(match self.goto_picker.handle_key(key) {
+                GotoPickerAction::Consumed => vec![],
+                GotoPickerAction::Select(entry) => self.scroll_to_turn(entry),
+                GotoPickerAction::Close => vec![],
+            });
+        }
+
         if self.model_picker.is_open() {
             return Some(match self.model_picker.handle_key(key) {
                 ModelPickerAction::Consumed => vec![],
@@ -648,6 +804,57 @@ impl App {
                     vec![Action::UnassignTier(spec, tier)]
                 }
                 ModelPickerAction::Close => vec![],
+            });
+        }
+
+        if self.settings_picker.is_open() {
+            return Some(match self.settings_picker.handle_key(key) {
+                SettingsPickerAction::Consumed => vec![],
+                SettingsPickerAction::ToggleShowSystemPrompt(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_system_prompt = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleApiLogging(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.api_logging = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleShowReasoning(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_reasoning = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleShowTokenStats(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_token_stats = val;
+                    settings.save();
+                    self.show_token_stats = val;
+                    vec![]
+                }
+                SettingsPickerAction::ToggleGlobalSessions(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.global_sessions = val;
+                    settings.save();
+                    if val {
+                        self.status_bar.flash("Global sessions enabled".into());
+                    } else {
+                        self.status_bar.flash("Global sessions disabled".into());
+                    }
+                    vec![]
+                }
+                SettingsPickerAction::EditLogCommand => {
+                    self.settings_picker.close();
+                    if let Ok(path) = crate::config::config_path() {
+                        vec![Action::OpenEditor(path)]
+                    } else {
+                        vec![]
+                    }
+                }
+                SettingsPickerAction::Closed => vec![],
             });
         }
 
@@ -734,20 +941,33 @@ impl App {
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        if key::EDIT_SYSTEM_PROMPT.matches(key) {
+            return vec![Action::EditSystemPrompt];
+        }
+        if key::SESSIONS.matches(key) {
+            return self.open_session_picker();
+        }
+        if key::SHIFT_SESSION_DOWN.matches(key) {
+            return self.shift_session(-1);
+        }
+        if key::SHIFT_SESSION_UP.matches(key) {
+            return self.shift_session(1);
+        }
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
+        }
+        if key::OPEN_EDITOR.matches(key) {
+            return match self.state.plan.path() {
+                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                None => {
+                    self.flash(FLASH_NO_PLAN.into());
+                    vec![]
+                }
+            };
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);
-            } else if key::OPEN_EDITOR.matches(key) {
-                return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                    None => {
-                        self.flash(FLASH_NO_PLAN.into());
-                        vec![]
-                    }
-                };
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
@@ -838,6 +1058,62 @@ impl App {
         vec![Action::Quit]
     }
 
+    pub fn reload_config(&mut self) {
+        let settings = UserSettings::load();
+        self.show_token_stats = settings.show_token_stats;
+        self.status_bar.flash("Configuration reloaded".to_string());
+    }
+
+    fn start_rename(&mut self) -> Vec<Action> {
+        let user_texts: Vec<String> = self
+            .state
+            .session
+            .messages
+            .iter()
+            .filter_map(|m| m.user_text().map(str::to_string))
+            .take(3)
+            .collect();
+
+        if user_texts.is_empty() {
+            self.flash("Nothing to rename yet — send a message first".into());
+            return vec![];
+        }
+
+        let mut total_words = 0usize;
+        let mut parts: Vec<String> = Vec::new();
+        'outer: for text in &user_texts {
+            let mut words: Vec<&str> = Vec::new();
+            for word in text.split_whitespace() {
+                if total_words >= 200 {
+                    break 'outer;
+                }
+                words.push(word);
+                total_words += 1;
+            }
+            parts.push(words.join(" "));
+        }
+
+        let context = parts.join("\n\n");
+        let msg = Message::user(context);
+        self.flash("Renaming session…".into());
+        vec![Action::RenameSession(vec![msg])]
+    }
+
+    pub(crate) fn apply_rename(&mut self, title: String) {
+        let old_name = self.state.session.title.clone();
+        let session_id = self.state.session.id.clone();
+        self.state.session.title = title.clone();
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(title.clone());
+        self.save_session();
+        maki_providers::update_api_log_symlink(
+            &session_id,
+            Some(&old_name),
+            &title,
+            self.state.session.created_at,
+        );
+        self.status_bar.flash(format!("Session renamed to: {title}"));
+    }
+
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { subagent_id } => {
@@ -920,6 +1196,11 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+        if let AgentEvent::RenameResult { title } = envelope.event {
+            self.apply_rename(title);
+            return vec![];
+        }
+
         if envelope.run_id == RESTORE_RUN_ID {
             let (id, snapshot, theme_gen, is_header) = match envelope.event {
                 AgentEvent::ToolSnapshot {
@@ -1043,7 +1324,29 @@ impl App {
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
+                if let Some(start) = self.turn_start.take() {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let total = tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
+                    let (pp_tps, tg_tps) = if elapsed > 0.0 {
+                        (total as f64 / elapsed, tc.usage.output as f64 / elapsed)
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let cache_rate = if total > 0 {
+                        tc.usage.cache_read as f64 / total as f64
+                    } else {
+                        0.0
+                    };
+                    self.last_turn_stats = Some(
+                        crate::components::status_bar::TurnStats {
+                            pp_tps,
+                            tg_tps,
+                            cache_rate,
+                        },
+                    );
+                }
             }
+            *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
             let formatted =
                 format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
             self.chats[chat_idx].set_pending_turn_usage(formatted);
@@ -1092,6 +1395,9 @@ impl App {
                     }
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
+                    }
+                    if self.state.session.title == "New session" {
+                        return self.start_rename();
                     }
                 }
                 ChatEventResult::Error(message) => {
@@ -1159,8 +1465,28 @@ impl App {
                 self.status = Status::Streaming;
                 vec![Action::Compact]
             }
+            "/checkpoint" => {
+                if self.status == Status::Streaming {
+                    self.queue_checkpoint();
+                    return vec![];
+                }
+                self.status = Status::Streaming;
+                vec![Action::Checkpoint]
+            }
             "/help" => {
                 self.help_modal.toggle();
+                vec![]
+            }
+            "/plugins" => {
+                self.plugins_modal.open(&self.lua_event_handle);
+                vec![]
+            }
+            "/skills" => {
+                self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
+                vec![]
+            }
+            "/export" => {
+                self.export_picker.open(std::path::Path::new(&self.state.session.cwd));
                 vec![]
             }
             "/usage" => {
@@ -1186,6 +1512,11 @@ impl App {
                 vec![]
             }
             "/sessions" => self.open_session_picker(),
+            "/settings" => {
+                let settings = UserSettings::load();
+                self.settings_picker.open(&settings);
+                vec![]
+            }
             "/model" => {
                 self.model_picker.open(&self.state.model.spec());
                 vec![Action::RefreshModels]
@@ -1193,6 +1524,13 @@ impl App {
             "/theme" => {
                 self.theme_picker.open();
                 vec![]
+            }
+            "/goto" => {
+                if cmd.args.trim().is_empty() {
+                    self.open_goto_picker()
+                } else {
+                    self.goto_turn(cmd.args.trim())
+                }
             }
             "/mcp" => {
                 self.mcp_picker.open();
@@ -1255,7 +1593,30 @@ impl App {
                 );
                 vec![]
             }
-            "/exit" => self.quit(),
+            "/verbose" => {
+                self.verbose = !self.verbose;
+                self.flash(
+                    if self.verbose {
+                        "Verbose mode on"
+                    } else {
+                        "Verbose mode off"
+                    }
+                    .into(),
+                );
+                vec![]
+            }
+            "/system_prompt" => {
+                vec![Action::EditSystemPrompt]
+            }
+            "/logs" => {
+                vec![Action::RunLogsCommand]
+            }
+            "/exit" | "/q" => self.quit(),
+            "/reload" | "/reload_config" => {
+                self.reload_config();
+                vec![]
+            }
+            "/rename" => self.start_rename(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1316,6 +1677,7 @@ impl App {
         } else {
             self.run_id += 1;
             self.status = Status::Streaming;
+            self.turn_start = Some(Instant::now());
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
@@ -1393,9 +1755,12 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 19] {
         [
             &self.help_modal,
+            &self.export_picker,
+            &self.plugins_modal,
+            &self.skills_modal,
             &self.usage_modal,
             &self.btw_modal,
             &self.float_mgr,
@@ -1404,17 +1769,22 @@ impl App {
             &self.task_picker,
             &self.session_picker,
             &self.rewind_picker,
+            &self.goto_picker,
             &self.theme_picker,
             &self.model_picker,
+            &self.settings_picker,
             &self.login_picker,
             &self.mcp_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
         [
             &mut self.help_modal,
+            &mut self.export_picker,
+            &mut self.plugins_modal,
+            &mut self.skills_modal,
             &mut self.usage_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
@@ -1423,8 +1793,10 @@ impl App {
             &mut self.task_picker,
             &mut self.session_picker,
             &mut self.rewind_picker,
+            &mut self.goto_picker,
             &mut self.theme_picker,
             &mut self.model_picker,
+            &mut self.settings_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.permission_prompt,
@@ -1499,6 +1871,7 @@ impl App {
         try_picker!(self.task_picker);
         try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
+        try_picker!(self.goto_picker);
         try_picker!(self.theme_picker);
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);

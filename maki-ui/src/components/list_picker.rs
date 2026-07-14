@@ -105,6 +105,7 @@ pub struct ListPicker<T> {
 enum FooterSpec {
     Pairs(&'static [(&'static str, &'static str)]),
     Builder(fn() -> Line<'static>),
+    Static(Line<'static>),
 }
 
 impl FooterSpec {
@@ -112,6 +113,7 @@ impl FooterSpec {
         match self {
             Self::Pairs(hints) => hint_line(hints),
             Self::Builder(b) => b(),
+            Self::Static(line) => line.clone(),
         }
     }
 }
@@ -299,6 +301,10 @@ impl<T: PickerItem> ListPicker<T> {
     pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
         self.footer = Some(FooterSpec::Builder(builder));
         self
+    }
+
+    pub fn set_static_footer(&mut self, line: Line<'static>) {
+        self.footer = Some(FooterSpec::Static(line));
     }
 
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {

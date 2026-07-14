@@ -112,6 +112,41 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Exit the application",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/q",
+        description: "Exit the application (shortcut for /exit)",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/settings",
+        description: "Show settings menu",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/goto",
+        description: "Scroll to a specific turn",
+        max_args: 1,
+    },
+    BuiltinCommand {
+        name: "/reload",
+        description: "Reload configuration from disk",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/verbose",
+        description: "Toggle verbose output mode",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/system_prompt",
+        description: "Edit the system prompt template in default editor",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/logs",
+        description: "Open logs directory",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {

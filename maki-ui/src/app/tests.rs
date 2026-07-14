@@ -14,7 +14,7 @@ use maki_agent::{
 };
 use maki_config::{PermissionsConfig, UiConfig};
 use maki_lua::{HintReader, KeymapReader, LuaCommandReader};
-use maki_providers::{ContentBlock, Role, TokenUsage};
+use maki_providers::{ContentBlock, Message, Role, TokenUsage};
 use maki_storage::sessions::StoredThinking;
 use ratatui::layout::Rect;
 use std::env;
@@ -870,6 +870,11 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 }
 
 #[test]
+fn splash_logo_shows_fork_branch() {
+    assert_eq!(crate::splash::LOGO, "maki (mcp fork)", "logo should be 'maki (mcp fork)' on the maki-mcp branch");
+}
+
+#[test]
 fn compact_command_sets_streaming() {
     let mut app = test_app();
     let actions = app.execute_command(cmd("/compact"));
@@ -1642,10 +1647,11 @@ fn rewind_to_middle_truncates_and_populates_input() {
     app.state.context_size = 100_000;
     let old_run_id = app.run_id;
     let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 2,
-        prompt_preview: "2: second".into(),
-        prompt_text: "second prompt".into(),
-    };
+            turn_index: 2,
+            segment_index: 0,
+            prompt_preview: "2: second".into(),
+            prompt_text: "second prompt".into(),
+        };
     let actions = app.rewind_to(entry);
 
     assert_eq!(app.state.session.messages.len(), 2);
@@ -1670,10 +1676,11 @@ fn rewind_to_first_turn_clears_everything() {
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
-        turn_index: 0,
-        prompt_preview: "1: first".into(),
-        prompt_text: "first prompt".into(),
-    };
+            turn_index: 0,
+            segment_index: 0,
+            prompt_preview: "1: first".into(),
+            prompt_text: "first prompt".into(),
+        };
     let actions = app.rewind_to(entry);
 
     assert!(app.state.session.messages.is_empty());
@@ -2746,4 +2753,47 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     assert_eq!(app.active_chat, 0);
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
+}
+
+#[test]
+fn q_command_exits() {
+    let mut app = test_app();
+    app.execute_command(cmd("/q"));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+#[test]
+fn exit_command_exits() {
+    let mut app = test_app();
+    app.execute_command(cmd("/exit"));
+    assert_eq!(app.exit_request, ExitRequest::Success);
+}
+
+#[test]
+fn settings_command_opens_picker() {
+    let mut app = test_app();
+    assert!(!app.settings_picker.is_open());
+    app.execute_command(cmd("/settings"));
+    assert!(app.settings_picker.is_open());
+}
+
+#[test]
+fn goto_command_flashes_on_empty_args() {
+    let mut app = test_app();
+    app.status_bar.clear_flash();
+    app.execute_command(cmd("/goto"));
+    assert!(app.status_bar.flash_text().is_some());
+}
+
+#[test]
+fn goto_command_with_turn_number() {
+    let mut app = test_app();
+    app.state.session.messages.push(Message::user("first prompt".into()));
+    app.state.session.messages.push(Message::user("second prompt".into()));
+    app.execute_command(ParsedCommand {
+        name: "/goto".into(),
+        args: "2".into(),
+    });
+    // should succeed (no flash)
+    assert!(app.status_bar.flash_text().is_none());
 }

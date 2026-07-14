@@ -443,11 +443,27 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
+            None,
         )
         .await?;
         self.rollback_len = self.history.len();
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
+        Ok(())
+    }
+
+    async fn do_checkpoint(&mut self) -> Result<(), AgentError> {
+        let (provider, model) =
+            resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+        self.total_usage += compaction::checkpoint_history(
+            &*provider,
+            &model,
+            self.history,
+            &self.event_tx,
+            &self.cancel,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -476,6 +492,9 @@ impl<'h> Agent<'h> {
             }
             ExtractedCommand::Compact(_) => {
                 self.do_compact().await?;
+            }
+            ExtractedCommand::Checkpoint(_) => {
+                self.do_checkpoint().await?;
             }
         }
         Ok(true)

@@ -254,7 +254,7 @@ fn resolve_output<'a>(
         Some(ToolOutput::Plain(t) | ToolOutput::Markdown(t) | ToolOutput::ReadDir(t)) => {
             Some(Cow::Borrowed(t.text.as_str()))
         }
-        Some(ToolOutput::Batch { text }) => Some(Cow::Borrowed(text.as_str())),
+        Some(ToolOutput::Batch { text, .. }) => Some(Cow::Borrowed(text.as_str())),
         _ => None,
     };
 
@@ -1302,7 +1302,7 @@ mod tests {
         ; "empty_plain_resolves_to_none"
     )]
     #[test_case(
-        Some(ToolOutput::Batch { text: "legacy batch text".into() }),
+        Some(ToolOutput::Batch { text: "legacy batch text".into(), entries: vec![] }),
         None, "batch", true
         ; "legacy_batch_falls_back_to_text"
     )]

@@ -87,6 +87,10 @@ pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines"];
 
+pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
     Bool(bool),
@@ -291,6 +295,7 @@ pub struct UiFileConfig {
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
+    pub show_token_stats: Option<bool>,
 }
 
 impl UiFileConfig {
@@ -303,7 +308,8 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
-            show_thinking
+            show_thinking,
+            show_token_stats
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -745,6 +751,9 @@ pub struct UiConfig {
 
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
+
+    #[config(default = false, desc = "Show token statistics (tokens/sec, cache rate) in status bar")]
+    pub show_token_stats: bool,
 }
 
 impl UiConfig {
@@ -763,6 +772,7 @@ impl UiConfig {
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
+            show_token_stats: f.show_token_stats.unwrap_or(false),
         }
     }
 

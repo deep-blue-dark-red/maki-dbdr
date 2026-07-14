@@ -501,6 +501,11 @@ impl<'t> EventLoop<'t> {
                     run_id: self.app.run_id,
                 });
             }
+            Action::Checkpoint => {
+                self.handles.queue.push(QueueItem::Checkpoint {
+                    run_id: self.app.run_id,
+                });
+            }
             Action::ToggleMcp(server_name, enabled) => {
                 self.handles.send_mcp(McpCommand::Toggle {
                     server: server_name,
@@ -540,10 +545,43 @@ impl<'t> EventLoop<'t> {
                 self.app
                     .start_btw(question, Arc::clone(&slot.provider), slot.model.clone());
             }
+            Action::RenameSession(messages) => {
+                self.handles.queue.push(QueueItem::Rename {
+                    messages,
+                    run_id: self.app.run_id,
+                });
+            }
             Action::Suspend => terminal::suspend(self.terminal),
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
             Action::Quit => {}
+            Action::EditSystemPrompt => {
+                match maki_storage::paths::config_dir() {
+                    Ok(config_dir) => {
+                        let path = config_dir.join("system.md");
+                        if !path.exists()
+                            && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
+                        {
+                            self.app.flash(format!("Failed to create system.md: {e}"));
+                            return;
+                        }
+                        if let Err(e) = terminal::open_in_editor(&path, self.terminal) {
+                            self.app.flash(e);
+                        }
+                    }
+                    Err(e) => self.app.flash(format!("Failed to get config directory: {e}")),
+                }
+            }
+            Action::RunLogsCommand => {
+                let dir = maki_storage::paths::config_dir().ok();
+                if let Some(d) = dir {
+                    let logs_dir = d.join("logs");
+                    let _ = std::fs::create_dir_all(&logs_dir);
+                    if let Err(e) = terminal::open_in_editor(&logs_dir, self.terminal) {
+                        self.app.flash(e);
+                    }
+                }
+            }
         }
     }
 

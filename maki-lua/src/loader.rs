@@ -18,14 +18,14 @@ use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct BundledPlugin {
-    name: &'static str,
-    dir: Dir<'static>,
+pub(crate) struct BundledPlugin {
+    pub(crate) name: &'static str,
+    pub(crate) dir: Dir<'static>,
 }
 
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
-static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "index",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
@@ -104,6 +104,16 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
     Vec::leak(dirs)
 });
+
+/// Returns an iterator over (name, source_path) for all bundled plugins.
+pub fn bundled_plugins() -> impl Iterator<Item = (&'static str, String)> {
+    BUNDLED_PLUGINS.iter().map(|p| {
+        // The include_dir! path is relative to the manifest dir. We store a
+        // reasonable display path (the plugin dir name under plugins/).
+        let path = format!("plugins/{}", p.name);
+        (p.name, path)
+    })
+}
 
 pub struct PluginHost {
     inner: Option<LuaThread>,
@@ -385,6 +395,24 @@ impl EventHandle {
 
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
+    }
+
+    /// Unload a loaded plugin by name. This is a synchronous request.
+    pub fn unload_plugin(&self, name: &str) {
+        let (reply, _rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::ClearPlugin {
+            plugin: Arc::from(name),
+            reply,
+        });
+    }
+
+    /// Load a builtin plugin by name. This is a synchronous request.
+    pub fn load_builtin(&self, name: &str) {
+        let (reply, _rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::LoadBuiltin {
+            name: Arc::from(name),
+            reply,
+        });
     }
 }
 
