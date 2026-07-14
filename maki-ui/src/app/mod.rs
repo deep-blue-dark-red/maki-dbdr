@@ -1553,6 +1553,7 @@ impl App {
                     self.goto_turn(cmd.args.trim())
                 }
             }
+            "/rewind" => self.open_rewind_picker(),
             "/mcp" => {
                 self.mcp_picker.open();
                 vec![]

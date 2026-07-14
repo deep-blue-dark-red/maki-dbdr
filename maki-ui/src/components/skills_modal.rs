@@ -772,4 +772,28 @@ mod tests {
         assert_eq!(name, "my-skill");
         assert_eq!(desc, "does some things");
     }
+
+    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    #[test]
+    fn test_find_project_ancestors_stops_at_git() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let sub = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Without .git, should go all the way to root
+        let ancestors = find_project_ancestors(&sub);
+        assert!(ancestors.contains(&root.to_path_buf()));
+
+        // Create .git in sub/a
+        let git_dir = root.join("a").join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let ancestors = find_project_ancestors(&sub);
+        assert!(ancestors.contains(&root.join("a").join("b").join("c")));
+        assert!(ancestors.contains(&root.join("a").join("b")));
+        assert!(ancestors.contains(&root.join("a")));
+        // Should NOT contain root since parent has .git
+        assert!(!ancestors.contains(&root.to_path_buf()));
+    }
 }

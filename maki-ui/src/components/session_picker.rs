@@ -251,4 +251,12 @@ mod tests {
     fn relative_time_formatting(secs: u64, expected: &str) {
         assert_eq!(humanize_secs(secs), expected);
     }
+
+    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    #[test_case(500, "500" ; "raw_tokens")]
+    #[test_case(1500, "1.5K" ; "kilo_tokens")]
+    #[test_case(2500000, "2.5M" ; "mega_tokens")]
+    fn context_size_formatting(tokens: u32, expected: &str) {
+        assert_eq!(format_context_size(tokens), expected);
+    }
 }

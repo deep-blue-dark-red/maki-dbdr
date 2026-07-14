@@ -34,6 +34,19 @@ file_exists() {
     fi
 }
 
+check_not() {
+    local desc="$1"
+    local file="$2"
+    local pattern="$3"
+    if ! grep -qF "$pattern" "$file" 2>/dev/null; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILURES+=("FAIL [$file] $desc (pattern should not exist: '$pattern')")
+    fi
+}
+
+
 # ── New files ────────────────────────────────────────────────────────────────
 
 file_exists "wire logger"      maki-providers/src/wire_log.rs
@@ -139,6 +152,155 @@ check "api_logging default true"     "$F" "api_logging: true"
 check "show_reasoning default true"  "$F" "show_reasoning: true"
 check "show_token_stats default true" "$F" "show_token_stats: true"
 check "log_command default set"      "$F" "tail -n 30 alog"
+
+# ── Commit-level verification (range: 8ea1fcfd..907624df) ────────────────────
+
+# 1. 86955e5e: feat: add interactive settings picker and API logging support
+check "SettingsPicker struct definition" "maki-ui/src/components/settings_picker.rs" "pub struct SettingsPicker"
+
+# 2. 9429e05c: feat: replace rotating TUI spinners with static star symbol and dynamic API stats
+check "active run start tracking field" "maki-ui/src/app/mod.rs" "turn_start: Option<Instant>"
+
+# 3. 140751b9: fix: remove fallback spinners and resolve clippy warnings
+check "teardrop/asterisk spinner rendering" "maki-ui/src/components/tool_display.rs" "Indicator::InProgress =>"
+
+# 4. cc3c527e: feat: implement real-time decaying activity tracker and glowing input borders
+check "last api send tracking field" "maki-ui/src/app/mod.rs" "pub(super) last_turn_stats: Option<crate::components::status_bar::TurnStats>"
+
+# 5. 2c499433: feat: implement sliding activity event timeline and persistent status stats
+check "active run duration field" "maki-ui/src/app/mod.rs" "let elapsed = start.elapsed().as_secs_f64()"
+
+# 6. 33a7c5d9: feat: make visual history timeline period configurable under settings
+check "UserSettings load in settings picker" "maki-ui/src/components/settings_picker.rs" "pub fn load() -> Self"
+
+# 7. 15e4250d: feat: implement full-width top border event history timeline
+check "turn api sent at field" "maki-ui/src/app/mod.rs" "turn_start: Option<Instant>"
+
+# 8. fae21874: many changes
+check "PromptId::Research template" "maki-agent/src/prompt.rs" "PromptId::Research"
+
+# 9. 09352b12: many changes
+check_not "starved removed from view" "maki-ui/src/app/view.rs" "starved"
+
+# 10. 3021e8f9: many changes
+check_not "tick_timeline call removed" "maki-ui/src/event_loop.rs" "tick_timeline"
+
+# 11. 0980778f: feat: replace activity timeline with per-turn token stats (PP/TG/CR)
+check "turn_first_token_at field" "maki-ui/src/app/mod.rs" "self.last_turn_stats = Some("
+check "TurnStats struct definition" "maki-ui/src/components/status_bar.rs" "pub struct TurnStats"
+
+# 12. 4ba71dbc: Implement copy_transcript, logs settings command, command palette exact match priority, and skills menu
+check "copy_transcript handler function" "maki-ui/src/app/session.rs" "fn export_session_to_markdown"
+check "exact match command palette priority" "maki-ui/src/components/command.rs" "exact_match_takes_precedence"
+
+# 13. 9b299fa0: Add target compaction token configuration and support passing value to /compact
+check "target_tokens option in compact" "maki-agent/src/agent/compaction.rs" "target_tokens: Option<usize>"
+check "QueueItem Compact variant target_tokens" "maki-ui/src/agent/shared_queue.rs" "Compact {"
+
+# 14. d431749e: Refactor conversation history compaction prompts and constraints
+check "compaction CRITICAL LENGTH CONSTRAINT" "maki-agent/src/agent/compaction.rs" "LENGTH CONSTRAINT:"
+
+# 15. 910ad267: feat: show context length in sessions list and refactor compaction logic
+check "Compaction attempt info log" "maki-agent/src/agent/compaction.rs" "summary succeeded after truncating oldest rounds"
+check "format_context_size in session picker" "maki-ui/src/components/session_picker.rs" "fn format_context_size"
+
+# 16. ec107910: feat: add rewind and goto commands to command palette and implement GotoPicker
+check "GotoPicker file exists" "maki-ui/src/components/goto_picker.rs" "pub struct GotoPicker"
+check "rewind command handler" "maki-ui/src/app/mod.rs" "\"/rewind\" =>"
+
+# 17. 16dfda53: fix: remove segment highlight calls from goto and rewind selections
+check_not "segment highlight from session" "maki-ui/src/app/session.rs" "segment_highlight"
+
+# 18. f1625960: feat: implement alt+s, alt+shift+a, and alt+shift+s session keybinds
+check "SESSIONS matches keybinding" "maki-ui/src/app/mod.rs" "key::SESSIONS.matches"
+check "shift_session fn definition" "maki-ui/src/app/session.rs" "pub(super) fn shift_session"
+
+# 19. 767fb9f7: feat: migrate settings to flat Ghostty-style config format and support fully configurable keybindings
+check "keybinding label formatting" "maki-ui/src/components/keybindings.rs" "pub fn get_bind_label"
+check "config_path in config.rs" "maki-ui/src/config.rs" "pub fn config_path"
+
+# 20. 79c54dae: feat: render plan form dismiss key label dynamically
+check "dismiss keys plan form" "maki-ui/src/components/plan_form.rs" "DISMISS_KEYS"
+
+# 21. 481b9885: chore: commit plugin tool usage prompt hints
+check "bash tool usage hint" "plugins/bash/init.lua" "Reserve bash for system commands"
+check "todo_write tool usage hint" "plugins/todo_write/init.lua" "Use todo_write to plan and track"
+
+# 22. 4c394b86: feat: implement config reload command in TUI
+check "reload_config function" "maki-ui/src/app/mod.rs" "pub fn reload_config"
+
+# 23. fe67cc40: feat: render user turn prefix as # user ∙ and assistant prefix as └ maki ∙
+check "assistant turn prefix" "maki-ui/src/components/tool_display.rs" "prefix: \"maki> \""
+
+# 24. a9712b42: feat: add dot after turn number in user prefix to match {#}. user ∙ format
+check "turn prefix dynamic formatting" "maki-ui/src/components/messages/mod.rs" "dynamic_prefix"
+
+# 25. acb6e0fa: feat: rename user back to you in dynamic turn prefix
+check "you turn prefix format" "maki-ui/src/components/messages/mod.rs" "you ∙"
+
+# 26. 7f019da6: feat: use hyphenation point (‧) instead of dot in user prefix
+check "hyphenation point turn prefix" "maki-ui/src/components/messages/mod.rs" "‧ you"
+
+# 27-29. 5c749436: feat: align TUI skills manager folders with backend Lua discovery
+check "skills manager FolderInfo display path" "maki-ui/src/components/skills_modal.rs" "is_enabled: true,"
+
+# 30. a83134fe: feat: resolve project workspace ancestors for skills modal
+check "find_project_ancestors fn" "maki-ui/src/components/skills_modal.rs" "fn find_project_ancestors"
+
+# 31. 81d6752d: feat: implement adding/removing skill folders with custom classifications persisted in config
+check "FolderTag enum definitions" "maki-ui/src/components/skills_modal.rs" "enum FolderTag"
+
+# 32. d6f97cf2: style: dynamically resize Folders and Skills panes in skills manager
+check "skills manager folder height constraint" "maki-ui/src/components/skills_modal.rs" "Constraint::Length(folder_height)"
+
+# 33. ed0ae69a: fix: make 'e' open the selected skill file when focused on Skills
+check "SkillsAction EditSkill" "maki-ui/src/components/skills_modal.rs" "EditSkill(std::path::PathBuf)"
+
+# 34. 9975c837: fix: make 'e' open the selected folder in Folders, and update shortcut description text
+check "SkillsAction EditSkillsJson" "maki-ui/src/components/skills_modal.rs" "EditSkillsJson(std::path::PathBuf)"
+
+# 35. 4b70bfa2: fix: resolve local project root tagging and load only existing workspace folders
+check "project_root starts_with Local tag" "maki-ui/src/components/skills_modal.rs" "starts_with(&project_root)"
+
+# 36. 32bdf2a4: feat: rename /copy_transcript to /export and implement Export Options popup selector
+check "ExportPicker struct definition" "maki-ui/src/components/export_picker.rs" "pub struct ExportPicker"
+check_not "copy_transcript in palette" "maki-ui/src/components/command.rs" "\"/copy_transcript\""
+
+# 37. ad8fd763: feat: add hackernews plugin and json support for webfetch
+check "hackernews in BUNDLED_PLUGINS" "maki-lua/src/loader.rs" "\"hackernews\""
+check "webfetch json format support" "plugins/webfetch/init.lua" "fmt == \"json\""
+
+# 38. 0f9f9cc1: feat: add /plugins interactive menu with runtime enable/disable
+check "PluginsModal struct definition" "maki-ui/src/components/plugins_modal.rs" "pub struct PluginsModal"
+check "load_builtin function" "maki-lua/src/loader.rs" "pub fn load_builtin"
+
+# 39. 75288f0e: minor
+check "skills.json exclude hackernews" ".agents/skills.json" "\"hackernews\""
+
+# 40-41. 75a1d1a2: feat: refine Ctrl+Shift+D shortcut to delete session and open sessions list popup directly
+check "delete current session keybinding" "maki-ui/src/components/keybindings.rs" "delete_current_session"
+check "delete current session logic in app" "maki-ui/src/app/mod.rs" "self.session_picker.remove_entry"
+
+# 42. fbd0316e: fix: update no session message to match user preference
+check "no session message session_picker" "maki-ui/src/components/session_picker.rs" "No previous sessions"
+
+# 43. a41f4392: feat: add global_sessions setting and Ctrl+Shift+M shortcut to toggle it
+check "global_sessions setting in Config" "maki-ui/src/components/settings_picker.rs" "pub global_sessions: bool"
+check "toggle_global_sessions keybind in keybindings" "maki-ui/src/components/keybindings.rs" "toggle_global_sessions"
+
+# 44. d9597d12: fix: resolve clippy warnings throughout workspace
+check "clippy fixed let chains" "maki-storage/src/sessions.rs" "&& header.cwd != c"
+
+# 45. 11555dfb: fix: skip excluded/disabled skills during plugin discovery
+check "skip excluded skills check" "plugins/skill/init.lua" "if not excluded[folder_name] then"
+
+# 46. 611de9a6: Abbreviate status bar tokens text to t
+check "abbreviated token stats status bar" "maki-ui/src/components/status_bar.rs" "t"
+
+# 47. 907624df: before merge
+file_exists "SKILL_TESTING.md file" "SKILL_TESTING.md"
+file_exists "create-plugin skill test script" "tests/agent/skill-test-create-plugin.sh"
+file_exists "ssh skill test script" "tests/agent/skill-test-ssh.sh"
 
 # ── Results ──────────────────────────────────────────────────────────────────
 

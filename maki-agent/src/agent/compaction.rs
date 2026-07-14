@@ -369,12 +369,14 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
+        system_prompts: Mutex<Vec<String>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<StreamResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                system_prompts: Mutex::new(vec![]),
             }
         }
     }
@@ -384,12 +386,13 @@ mod tests {
             &'a self,
             _: &'a Model,
             _: &'a [Message],
-            _: &'a str,
+            system_prompt: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&str>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.system_prompts.lock().unwrap().push(system_prompt.to_string());
             Box::pin(async {
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
@@ -748,5 +751,31 @@ mod tests {
         truncate_oldest_round(&mut messages);
         assert!(!messages.is_empty());
         assert!(matches!(messages[0].role, Role::User));
+    }
+
+    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    #[test]
+    fn compact_appends_length_constraint_to_system_prompt() {
+        smol::block_on(async {
+            let provider = std::sync::Arc::new(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+            let model = default_model();
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("hi".into())]);
+
+            compact(
+                &*provider,
+                &model,
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                Some(100),
+            )
+            .await
+            .unwrap();
+
+            let prompts = provider.system_prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(prompts[0].contains("LENGTH CONSTRAINT:"));
+            assert!(prompts[0].contains("~100 tokens"));
+        });
     }
 }

@@ -31,6 +31,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
     },
     BundledPlugin {
+        name: "hackernews",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/hackernews"),
+    },
+    BundledPlugin {
         name: "webfetch",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/webfetch"),
     },

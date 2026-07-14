@@ -1484,3 +1484,17 @@ fn stream_reset_clears_thinking_expand_state() {
         "new stream must stay hidden; got: {text}"
     );
 }
+
+// ── maki-mcp fork tests ───────────────────────────────────────────────────────
+#[test]
+fn user_turn_dynamic_prefix() {
+    let mut panel = MessagesPanel::new(UiConfig::default());
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello first".into()));
+    panel.push(DisplayMessage::new(DisplayRole::User, "hello second".into()));
+    panel.flush();
+
+    let terminal = render(&mut panel, 80, 20);
+    let text = buffer_text(&terminal);
+    assert!(text.contains("1‧ you ∙ hello first"), "first turn prefix should be '1‧ you ∙ hello first'; got: {text}");
+    assert!(text.contains("2‧ you ∙ hello second"), "second turn prefix should be '2‧ you ∙ hello second'; got: {text}");
+}

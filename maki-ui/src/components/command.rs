@@ -397,6 +397,13 @@ impl CommandPalette {
 
         // Tick to get matches
         self.tick();
+
+        let input_cmd = format!("/{}", cmd_word);
+        if let Some(exact_idx) = self.filtered.iter().position(|m| {
+            self.item_name(m).eq_ignore_ascii_case(&input_cmd)
+        }) {
+            self.selected = exact_idx;
+        }
     }
 
     fn tick(&mut self) {
@@ -682,6 +689,14 @@ mod tests {
 
         let with_prompts = synced_with_prompts("/");
         assert_eq!(with_prompts.filtered.len(), builtin_count + 2);
+    }
+
+    #[test]
+    fn exact_match_takes_precedence() {
+        let p = synced("/help");
+        assert!(p.is_active());
+        let selected_name = p.item_name(&p.filtered[p.selected]);
+        assert_eq!(selected_name, "/help");
     }
 
     #[test]

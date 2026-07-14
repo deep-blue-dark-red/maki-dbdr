@@ -2797,3 +2797,73 @@ fn goto_command_with_turn_number() {
     // should succeed (no flash)
     assert!(app.status_bar.flash_text().is_none());
 }
+
+// ── maki-mcp fork tests ───────────────────────────────────────────────────────
+
+#[test]
+fn export_command_opens_picker() {
+    let mut app = test_app();
+    assert!(!app.export_picker.is_open());
+    app.execute_command(cmd("/export"));
+    assert!(app.export_picker.is_open());
+}
+
+#[test]
+fn skills_command_opens_picker() {
+    let mut app = test_app();
+    assert!(!app.skills_modal.is_open());
+    app.execute_command(cmd("/skills"));
+    assert!(app.skills_modal.is_open());
+}
+
+#[test]
+fn plugins_command_opens_picker() {
+    let mut app = test_app();
+    assert!(!app.plugins_modal.is_open());
+    app.execute_command(cmd("/plugins"));
+    assert!(app.plugins_modal.is_open());
+}
+
+#[test]
+fn rewind_command_opens_picker() {
+    let mut app = test_app();
+    app.state.session.messages.push(Message::user("test".into()));
+    assert!(!app.rewind_picker.is_open());
+    app.execute_command(cmd("/rewind"));
+    assert!(app.rewind_picker.is_open());
+}
+
+#[test]
+fn reload_config_command_updates_state() {
+    let mut app = test_app();
+    app.execute_command(cmd("/reload"));
+    assert_eq!(app.status_bar.flash_text(), Some("Configuration reloaded"));
+}
+
+#[test]
+fn delete_current_session_opens_picker() {
+    let mut app = test_app();
+    app.state.session.save(&app.storage).unwrap();
+    assert!(!app.session_picker.is_open());
+    let actions = app.update(Msg::Key(kb::DELETE_CURRENT_SESSION.to_key_event()));
+    assert!(actions.is_empty());
+    assert!(app.session_picker.is_open());
+}
+
+#[test]
+fn toggle_global_sessions_shortcut() {
+    let mut app = test_app();
+    let initial = UserSettings::load().global_sessions;
+    app.update(Msg::Key(kb::TOGGLE_GLOBAL_SESSIONS.to_key_event()));
+    assert_ne!(UserSettings::load().global_sessions, initial);
+}
+
+#[test]
+fn settings_picker_options() {
+    let mut picker = crate::components::settings_picker::SettingsPicker::new();
+    assert!(!picker.is_open());
+    let settings = UserSettings::default();
+    picker.open(&settings);
+    assert!(picker.is_open());
+}
+
