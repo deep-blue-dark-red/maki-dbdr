@@ -1759,6 +1759,7 @@ fn rewind_to_middle_truncates_and_populates_input() {
     let old_run_id = app.run_id;
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 2,
+        segment_index: 0,
         prompt_preview: "2: second".into(),
         prompt_text: "second prompt".into(),
     };
@@ -1787,6 +1788,7 @@ fn rewind_to_first_turn_clears_everything() {
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 0,
+        segment_index: 0,
         prompt_preview: "1: first".into(),
         prompt_text: "first prompt".into(),
     };
