@@ -45,6 +45,20 @@ pub(crate) async fn stream_with_retry(
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
+
+    let mut model = model.clone();
+    let input_tokens = estimate_input_tokens(messages, system, tools);
+    let remaining = model
+        .context_window
+        .saturating_sub(input_tokens)
+        .saturating_sub(1000);
+    model.max_output_tokens = Some(
+        model
+            .max_output_tokens
+            .map_or(remaining, |max| max.min(remaining))
+            .max(1),
+    );
+
     let mut retry = RetryState::new();
     loop {
         let (ptx, prx) = flume::unbounded();
@@ -53,7 +67,7 @@ pub(crate) async fn stream_with_retry(
             async move { forward_provider_events(prx, &event_tx).await }
         });
         let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
+            provider.stream_message(&model, messages, system, tools, &ptx, opts, session_id),
             async {
                 cancel.cancelled().await;
                 Err(AgentError::Cancelled)
@@ -97,3 +111,35 @@ pub(crate) async fn stream_with_retry(
         }
     }
 }
+
+fn estimate_input_tokens(messages: &[Message], system: &str, tools: &Value) -> u32 {
+    let mut total_bytes = system.len();
+    if !tools.is_null() {
+        total_bytes += tools.to_string().len();
+    }
+    for m in messages {
+        for b in &m.content {
+            match b {
+                maki_providers::ContentBlock::Text { text } => {
+                    total_bytes += text.len();
+                }
+                maki_providers::ContentBlock::ToolResult { content, .. } => {
+                    total_bytes += content.len();
+                }
+                maki_providers::ContentBlock::ToolUse { input, .. } => {
+                    total_bytes += input.to_string().len();
+                }
+                maki_providers::ContentBlock::Thinking { thinking, .. } => {
+                    total_bytes += thinking.len();
+                }
+                maki_providers::ContentBlock::RedactedThinking { data } => {
+                    total_bytes += data.len();
+                }
+                _ => {}
+            }
+        }
+    }
+    const CHARS_PER_TOKEN: usize = 4;
+    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+}
+
