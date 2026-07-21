@@ -280,7 +280,7 @@ maki.api.register_tool({
       skill = { type = "string", description = "Skill name to test", required = true },
     },
   },
-  permission_scope = "skill",
+  permission_scopes = "skill",
 
   header = function(input)
     return "skill_test: " .. (input.skill or "?")

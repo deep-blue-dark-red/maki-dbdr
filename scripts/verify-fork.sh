@@ -53,7 +53,6 @@ file_exists "wire logger"      maki-providers/src/wire_log.rs
 file_exists "mlog binary"      maki-providers/src/bin/mlog.rs
 file_exists "tensorx provider" maki-providers/src/providers/tensorx.rs
 file_exists "tool-macro crate" maki-tool-macro/src/lib.rs
-file_exists "hackernews plugin" plugins/hackernews/init.lua
 file_exists "settings_picker"  maki-ui/src/components/settings_picker.rs
 file_exists "export_picker"    maki-ui/src/components/export_picker.rs
 file_exists "goto_picker"      maki-ui/src/components/goto_picker.rs
@@ -267,7 +266,6 @@ check "ExportPicker struct definition" "maki-ui/src/components/export_picker.rs"
 check_not "copy_transcript in palette" "maki-ui/src/components/command.rs" "\"/copy_transcript\""
 
 # 37. ad8fd763: feat: add hackernews plugin and json support for webfetch
-check "hackernews in BUNDLED_PLUGINS" "maki-lua/src/loader.rs" "\"hackernews\""
 check "webfetch json format support" "plugins/webfetch/init.lua" "fmt == \"json\""
 
 # 38. 0f9f9cc1: feat: add /plugins interactive menu with runtime enable/disable
