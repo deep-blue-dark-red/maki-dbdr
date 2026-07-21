@@ -544,8 +544,8 @@ fn search_text_includes_role_prefix() {
     panel.push(DisplayMessage::new(DisplayRole::Thinking, "hmm".into()));
     rebuild(&mut panel);
     let texts = panel.segment_search_texts();
-    assert_eq!(texts[0], "you> hello");
-    assert_eq!(texts[2], format!("maki> {md}"));
+    assert_eq!(texts[0], "1‧ you ∙ hello");
+    assert_eq!(texts[2], format!("└ maki ∙ {md}"));
     assert_eq!(texts[4], "thinking> hmm");
 }
 
@@ -630,7 +630,7 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
 
-const MAKI_PREFIX_LEN: u16 = 6;
+const MAKI_PREFIX_LEN: u16 = 9;
 
 fn make_sel(area: Rect, anchor: (u32, u16), cursor: (u32, u16)) -> Selection {
     let mut sel = Selection::start(

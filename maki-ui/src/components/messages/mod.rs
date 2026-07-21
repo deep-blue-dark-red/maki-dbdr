@@ -1235,6 +1235,7 @@ impl MessagesPanel {
                         .push(Segment::with_lines(lines, search_text, Some(i)));
                     continue;
                 }
+                let dynamic_prefix;
                 let style = match &msg.role {
                     DisplayRole::User => user_style(),
                     DisplayRole::Assistant => assistant_style(),
@@ -1245,6 +1246,13 @@ impl MessagesPanel {
                 };
                 let prefix = if msg.plan_path.is_some() {
                     ""
+                } else if msg.role == DisplayRole::User {
+                    let turn_num = self.messages[..=i]
+                        .iter()
+                        .filter(|m| m.role == DisplayRole::User)
+                        .count();
+                    dynamic_prefix = format!("{turn_num}‧ you ∙ ");
+                    &dynamic_prefix
                 } else {
                     style.prefix
                 };

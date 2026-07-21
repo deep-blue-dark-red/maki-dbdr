@@ -52,7 +52,7 @@ pub struct RoleStyle {
 
 pub fn assistant_style() -> RoleStyle {
     RoleStyle {
-        prefix: "maki> ",
+        prefix: "└ maki ∙ ",
         text_style: theme::current().assistant,
         prefix_style: theme::current().assistant_prefix,
         use_markdown: true,
@@ -62,7 +62,7 @@ pub fn assistant_style() -> RoleStyle {
 
 pub fn user_style() -> RoleStyle {
     RoleStyle {
-        prefix: "you> ",
+        prefix: "you ∙ ",
         text_style: theme::current().assistant,
         prefix_style: theme::current().user,
         use_markdown: true,
