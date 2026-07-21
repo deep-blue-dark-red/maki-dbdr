@@ -244,6 +244,7 @@ impl App {
             };
         }
 
+        render_if_open!(self.export_picker);
         render_if_open!(self.rewind_picker);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
@@ -306,11 +307,17 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
+            session_name: None,
             retry_info: self.retry_info.as_ref(),
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
             workflow: self.state.workflow,
             restoring: self.restoring.load(Ordering::Relaxed),
+            streaming_info: None,
+            streaming_active: false,
+            verbose: false,
+            last_turn_stats: None,
+            show_token_stats: false,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

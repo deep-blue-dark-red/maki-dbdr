@@ -245,4 +245,129 @@ impl App {
         let loaded = self.apply_loaded_session(session, &self.state.model.clone());
         vec![Action::LoadSession(Box::new(loaded))]
     }
+
+    pub(crate) fn export_session_to_markdown(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let _ = writeln!(out, "# Session: {}", self.state.session.title);
+        let _ = writeln!(out, "- **Model:** `{}`", self.state.session.model);
+        let _ = writeln!(out, "- **CWD:** `{}`", self.state.session.cwd);
+        let _ = writeln!(out, "\n---\n");
+
+        let main_msgs = format_messages(&self.state.session.messages, &self.state.session.tool_outputs);
+        out.push_str(&main_msgs);
+
+        if !self.state.session.subagent_messages.is_empty() {
+            let _ = writeln!(out, "\n## Subagents\n");
+            let mut subagents: Vec<_> = self.state.session.subagent_messages.keys().collect();
+            subagents.sort();
+
+            for tool_use_id in subagents {
+                if let Some(messages) = self.state.session.subagent_messages.get(tool_use_id) {
+                    let name = self.state.session.meta.subagents.iter()
+                        .find(|sa| sa.tool_use_id == *tool_use_id)
+                        .map(|sa| sa.name.as_str())
+                        .unwrap_or("Subagent");
+                    let _ = writeln!(out, "### {} ({})\n", name, tool_use_id);
+                    let sub_msgs = format_messages(messages, &self.state.session.tool_outputs);
+                    out.push_str(&sub_msgs);
+                }
+            }
+        }
+
+        out
+    }
+
+    pub(crate) fn export_session_to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.state.session).unwrap_or_default()
+    }
+}
+
+fn format_messages(
+    messages: &[maki_providers::Message],
+    tool_outputs: &std::collections::HashMap<String, maki_agent::ToolOutput>,
+) -> String {
+    use std::fmt::Write;
+    use maki_providers::{ContentBlock, Role};
+    let mut out = String::new();
+    for message in messages {
+        match message.role {
+            Role::User => {
+                let has_non_tool_result = message.content.iter().any(|block| {
+                    !matches!(block, ContentBlock::ToolResult { .. })
+                });
+                if !has_non_tool_result {
+                    continue;
+                }
+
+                let _ = writeln!(out, "### User\n");
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if !text.is_empty() {
+                                let _ = writeln!(out, "{}\n", text.trim_end());
+                            }
+                        }
+                        ContentBlock::Image { source } => {
+                            let _ = writeln!(out, "![Image]({})\n", source.to_data_url());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Role::Assistant => {
+                let _ = writeln!(out, "### Assistant\n");
+                for block in &message.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if !text.is_empty() {
+                                let _ = writeln!(out, "{}\n", text.trim_end());
+                            }
+                        }
+                        ContentBlock::Thinking { thinking, .. } => {
+                            if !thinking.is_empty() {
+                                let _ = writeln!(
+                                    out,
+                                    "<details>\n<summary>Thinking</summary>\n\n{}\n</details>\n",
+                                    thinking.trim()
+                                );
+                            }
+                        }
+                        ContentBlock::RedactedThinking { data } => {
+                            if !data.is_empty() {
+                                let _ = writeln!(
+                                    out,
+                                    "<details>\n<summary>Thinking (Redacted)</summary>\n\n{}\n</details>\n",
+                                    data.trim()
+                                );
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            let _ = writeln!(out, "**Tool Call:** `{}`", name);
+                            let input_pretty = serde_json::to_string_pretty(input)
+                                .unwrap_or_else(|_| input.to_string());
+                            let _ = writeln!(out, "```json\n{}\n```", input_pretty.trim());
+
+                            if let Some(tool_output) = tool_outputs.get(id) {
+                                let output_text = tool_output.as_text();
+                                if !output_text.is_empty() {
+                                    let _ = writeln!(out, "**Output:**");
+                                    if tool_output.is_markdown() {
+                                        let _ = writeln!(out, "{}", output_text.trim_end());
+                                    } else {
+                                        let _ = writeln!(out, "```\n{}\n```", output_text.trim_end());
+                                    }
+                                }
+                            } else {
+                                let _ = writeln!(out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
 }

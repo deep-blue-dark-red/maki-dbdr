@@ -17,6 +17,7 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
+pub(crate) mod export_picker;
 pub(crate) mod goto_picker;
 pub(crate) mod plugins_modal;
 pub(crate) mod rewind_picker;

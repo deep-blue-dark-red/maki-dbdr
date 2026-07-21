@@ -1,4 +1,4 @@
-use crate::components::settings_picker::UserSettings;
+pub use crate::components::settings_picker::UserSettings;
 use crate::components::keybindings::{update_bind, get_configured_bind, key_event_to_string};
 use std::fs;
 use std::path::PathBuf;

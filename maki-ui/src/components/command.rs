@@ -103,6 +103,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/q",
+        description: "Exit the application",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,
@@ -332,6 +337,13 @@ impl CommandPalette {
 
         // Tick to get matches
         self.tick();
+
+        let input_cmd = format!("/{}", cmd_word);
+        if let Some(exact_idx) = self.filtered.iter().position(|m| {
+            self.item_name(m).eq_ignore_ascii_case(&input_cmd)
+        }) {
+            self.selected = exact_idx;
+        }
     }
 
     fn tick(&mut self) {
