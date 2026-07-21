@@ -6,8 +6,9 @@
 pub mod animation;
 pub mod app;
 pub mod chat;
-mod clipboard;
-mod components;
+pub mod clipboard;
+pub mod components;
+pub mod config;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;

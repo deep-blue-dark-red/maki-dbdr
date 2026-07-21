@@ -6,27 +6,31 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use std::time::Instant;
 
-const LOGO: &str = "maki";
+const LOGO: &str = "maki (mcp fork)";
 const TAGLINE: &str = "the efficient coder";
-const HELP_SEGMENTS: &[(&str, bool)] = &[
-    (key::HELP.label, true),
-    (" help", false),
-    (" · ", false),
-    ("/help", true),
-    (" in chat", false),
-];
+fn get_help_segments() -> Vec<(String, bool)> {
+    vec![
+        (key::HELP.label().to_string(), true),
+        (" help".to_string(), false),
+        (" · ".to_string(), false),
+        ("/help".to_string(), true),
+        (" in chat".to_string(), false),
+    ]
+}
 
-const TIPS: &[(&str, &str)] = &[
-    (
-        key::FILE_PICKER.label,
-        "to grab file paths with fuzzy search",
-    ),
-    (key::TASKS.label, "to see what your subagents are up to"),
-    (key::SEARCH.label, "to find things in the conversation"),
-    ("/btw", "to ask something without interrupting the session"),
-    ("/memory", "to view, edit, and delete persistent notes"),
-    ("/cd", "to switch to a different directory"),
-];
+fn get_tips() -> Vec<(String, String)> {
+    vec![
+        (
+            key::FILE_PICKER.label().to_string(),
+            "to grab file paths with fuzzy search".to_string(),
+        ),
+        (key::TASKS.label().to_string(), "to see what your subagents are up to".to_string()),
+        (key::SEARCH.label().to_string(), "to find things in the conversation".to_string()),
+        ("/btw".to_string(), "to ask something without interrupting the session".to_string()),
+        ("/memory".to_string(), "to view, edit, and delete persistent notes".to_string()),
+        ("/cd".to_string(), "to switch to a different directory".to_string()),
+    ]
+}
 
 const COLOR_TRANSITION_SECS: f32 = 0.4;
 
@@ -131,7 +135,7 @@ impl Splash {
     pub fn new(animate: bool) -> Self {
         let mut rng = [0u8; 8];
         getrandom::fill(&mut rng).ok();
-        let tip_idx = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize % TIPS.len();
+        let tip_idx = u32::from_le_bytes([rng[4], rng[5], rng[6], rng[7]]) as usize % get_tips().len();
         Self {
             start: Instant::now(),
             field_offset: (u64::from_le_bytes(rng) % 10_000) as f32,
@@ -351,14 +355,15 @@ impl Splash {
         let fg = extract_rgb(theme.foreground, (200, 200, 200));
         let bg_rgb = extract_rgb(bg, (15, 15, 25));
 
-        let total_width: u16 = HELP_SEGMENTS.iter().map(|(s, _)| s.len() as u16).sum();
+        let help_segments = get_help_segments();
+        let total_width: u16 = help_segments.iter().map(|(s, _)| s.len() as u16).sum();
         let x_start = area.x + area.width.saturating_sub(total_width) / 2;
 
-        let segments: Vec<_> = HELP_SEGMENTS
+        let segments: Vec<_> = help_segments
             .iter()
-            .map(|&(text, highlighted)| {
-                let (target, alpha) = if highlighted { (ac, 0.75) } else { (fg, 0.5) };
-                (text, faded_style(bg_rgb, target, alpha * fade, bg))
+            .map(|(text, highlighted)| {
+                let (target, alpha) = if *highlighted { (ac, 0.75) } else { (fg, 0.5) };
+                (text.as_str(), faded_style(bg_rgb, target, alpha * fade, bg))
             })
             .collect();
 
@@ -380,7 +385,8 @@ impl Splash {
         let fg = extract_rgb(theme.foreground, (200, 200, 200));
         let bg_rgb = extract_rgb(bg, (15, 15, 25));
 
-        let (label, desc) = TIPS[self.tip_idx];
+        let tips = get_tips();
+        let (label, desc) = &tips[self.tip_idx];
         let total_width = (5 + label.len() + 1 + desc.len()) as u16;
         let x_start = area.x + area.width.saturating_sub(total_width) / 2;
 
@@ -389,9 +395,9 @@ impl Splash {
                 "tip: ",
                 faded_style(bg_rgb, tip_rgb, 0.75 * fade, bg).add_modifier(Modifier::BOLD),
             ),
-            (label, faded_style(bg_rgb, ac, 0.75 * fade, bg)),
+            (label.as_str(), faded_style(bg_rgb, ac, 0.75 * fade, bg)),
             (" ", Style::default()),
-            (desc, faded_style(bg_rgb, fg, 0.5 * fade, bg)),
+            (desc.as_str(), faded_style(bg_rgb, fg, 0.5 * fade, bg)),
         ];
 
         render_segments(area, buf, tip_y, x_start, segments);

@@ -733,17 +733,18 @@ impl App {
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
         }
+        if key::OPEN_EDITOR.matches(key) {
+            return match self.state.plan.path() {
+                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                None => {
+                    self.flash(FLASH_NO_PLAN.into());
+                    vec![]
+                }
+            };
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 self.queue.remove(0);
-            } else if key::OPEN_EDITOR.matches(key) {
-                return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                    None => {
-                        self.flash(FLASH_NO_PLAN.into());
-                        vec![]
-                    }
-                };
             } else if key::SEARCH.matches(key) {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();

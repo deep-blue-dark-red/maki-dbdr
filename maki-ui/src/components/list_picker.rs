@@ -1,10 +1,16 @@
+//! Modal list picker with search. Supports immediate (`open`) or lazy loading
+//! (`open_loading` → `resolve`) where a spinner is shown until items arrive.
+
 use std::collections::HashSet;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
-use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::animation::{spinner_frame, spinner_str};
 use crate::components::Overlay;
+use crate::components::hint_line;
 use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
@@ -21,16 +27,21 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NO_MATCHES: &str = "No matches";
+const LOADING_LABEL: &str = "Loading...";
 const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
 
+/// Spinners need a consistent time reference. Using a static epoch avoids
+/// passing Instant through every render call.
+fn animation_elapsed_ms() -> u128 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+}
+
 pub trait PickerItem {
     fn label(&self) -> &str;
-    fn suffix(&self) -> Option<&str> {
-        None
-    }
     fn detail(&self) -> Option<&str> {
         None
     }
@@ -42,6 +53,9 @@ pub trait PickerItem {
     }
     fn is_highlighted(&self) -> bool {
         false
+    }
+    fn suffix(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -58,12 +72,51 @@ pub enum PickerAction<T> {
     Close,
 }
 
+enum PickerState<T> {
+    Loading,
+    Ready(State<T>),
+}
+
+impl<T> PickerState<T> {
+    fn ready(&self) -> Option<&State<T>> {
+        match self {
+            Self::Ready(s) => Some(s),
+            Self::Loading => None,
+        }
+    }
+
+    fn ready_mut(&mut self) -> Option<&mut State<T>> {
+        match self {
+            Self::Ready(s) => Some(s),
+            Self::Loading => None,
+        }
+    }
+}
+
 pub struct ListPicker<T> {
-    state: Option<State<T>>,
+    state: Option<PickerState<T>>,
     title: String,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    generation: u64,
+    footer: Option<FooterSpec>,
     error_text: Option<String>,
+}
+
+#[allow(dead_code)]
+enum FooterSpec {
+    Pairs(&'static [(&'static str, &'static str)]),
+    Builder(fn() -> Line<'static>),
+    Static(Line<'static>),
+}
+
+impl FooterSpec {
+    fn build(&self) -> Line<'static> {
+        match self {
+            Self::Pairs(hints) => hint_line(hints),
+            Self::Builder(b) => b(),
+            Self::Static(line) => line.clone(),
+        }
+    }
 }
 
 struct State<T> {
@@ -160,26 +213,6 @@ impl<T: PickerItem> State<T> {
         self.ensure_visible();
     }
 
-    fn page_up(&mut self) {
-        let len = self.filtered.len();
-        if len == 0 {
-            return;
-        }
-        let step = self.viewport_height.max(1);
-        self.selected = self.selected.saturating_sub(step);
-        self.ensure_visible();
-    }
-
-    fn page_down(&mut self) {
-        let len = self.filtered.len();
-        if len == 0 {
-            return;
-        }
-        let step = self.viewport_height.max(1);
-        self.selected = (self.selected + step).min(len - 1);
-        self.ensure_visible();
-    }
-
     fn move_down(&mut self) {
         let len = self.filtered.len();
         if len == 0 {
@@ -230,6 +263,7 @@ impl<T: PickerItem> ListPicker<T> {
             state: None,
             title: String::new(),
             max_visible: None,
+            generation: 0,
             footer: None,
             error_text: None,
         }
@@ -240,9 +274,21 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
-        self.footer = Some(builder);
+    #[allow(dead_code)]
+    pub fn with_footer(mut self, hints: &'static [(&'static str, &'static str)]) -> Self {
+        self.footer = Some(FooterSpec::Pairs(hints));
         self
+    }
+
+    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
+        self.footer = Some(FooterSpec::Builder(builder));
+        self
+    }
+
+
+
+    pub fn set_static_footer(&mut self, line: Line<'static>) {
+        self.footer = Some(FooterSpec::Static(line));
     }
 
     pub fn open_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>, title: impl Into<String>) {
@@ -251,19 +297,36 @@ impl<T: PickerItem> ListPicker<T> {
             enabled.len(),
             "items and enabled must have same length"
         );
+        self.generation += 1;
         self.title = title.into();
         let mut state = State::new(items);
         state.enabled = Some(enabled);
-        self.state = Some(state);
+        self.state = Some(PickerState::Ready(state));
     }
 
     pub fn open(&mut self, items: Vec<T>, title: impl Into<String>) {
+        self.generation += 1;
         self.title = title.into();
-        self.state = Some(State::new(items));
+        self.state = Some(PickerState::Ready(State::new(items)));
+    }
+
+    pub fn open_loading(&mut self, title: impl Into<String>) {
+        self.generation += 1;
+        self.title = title.into();
+        self.state = Some(PickerState::Loading);
+    }
+
+    pub fn resolve(&mut self, items: Vec<T>) {
+        if !self.is_loading() {
+            return;
+        }
+        self.generation += 1;
+        self.state = Some(PickerState::Ready(State::new(items)));
     }
 
     pub fn select(&mut self, index: usize) {
-        if let Some(s) = self.state.as_mut() {
+        if let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) {
+            self.generation += 1;
             s.selected = index.min(s.filtered.len().saturating_sub(1));
             s.ensure_visible();
         }
@@ -274,36 +337,86 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn replace_items(&mut self, items: Vec<T>) {
-        if let Some(s) = self.state.as_mut() {
+        if let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) {
+            self.generation += 1;
             s.replace_items(items);
         }
     }
 
     pub fn replace_toggleable(&mut self, items: Vec<T>, enabled: Vec<bool>) {
-        if let Some(s) = self.state.as_mut() {
+        if let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) {
+            self.generation += 1;
             s.enabled = Some(enabled);
             s.replace_items(items);
         }
+    }
+
+    pub fn retain(&mut self, f: impl Fn(&T) -> bool) {
+        let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) else {
+            return;
+        };
+        self.generation += 1;
+        if let Some(ref mut enabled) = s.enabled {
+            let mut new_enabled = Vec::with_capacity(enabled.len());
+            let mut i = 0;
+            s.items.retain(|item| {
+                let keep = f(item);
+                if keep {
+                    new_enabled.push(enabled[i]);
+                }
+                i += 1;
+                keep
+            });
+            *enabled = new_enabled;
+        } else {
+            s.items.retain(|item| f(item));
+        }
+        if s.items.is_empty() {
+            self.state = None;
+            return;
+        }
+        s.rebuild_filter();
+        s.clamp_selection();
     }
 
     pub fn is_open(&self) -> bool {
         self.state.is_some()
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn close(&mut self) {
+        self.generation += 1;
         self.state = None;
+    }
+
+    pub fn is_loading(&self) -> bool {
+        matches!(self.state, Some(PickerState::Loading))
     }
 
     pub fn contains(&self, pos: Position) -> bool {
         self.state
             .as_ref()
+            .and_then(PickerState::ready)
             .is_some_and(|s| s.inner_area.contains(pos))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerAction<T> {
-        if self.state.is_none() {
-            return PickerAction::Close;
+        match &self.state {
+            None => return PickerAction::Close,
+            Some(PickerState::Loading) => {
+                if key::QUIT.matches(key) || key.code == KeyCode::Esc {
+                    self.generation += 1;
+                    self.state = None;
+                    return PickerAction::Close;
+                }
+                return PickerAction::Consumed;
+            }
+            Some(PickerState::Ready(_)) => {}
         }
+        self.generation += 1;
         self.handle_ready_key(key)
     }
 
@@ -311,7 +424,8 @@ impl<T: PickerItem> ListPicker<T> {
         let s = self
             .state
             .as_mut()
-            .expect("handle_ready_key called without state");
+            .and_then(PickerState::ready_mut)
+            .expect("handle_ready_key called without Ready state");
 
         if key::QUIT.matches(key) {
             self.state = None;
@@ -320,14 +434,6 @@ impl<T: PickerItem> ListPicker<T> {
         if key::DELETE_WORD.matches(key) {
             s.search.remove_word_before_cursor();
             s.update_search_and_clamp();
-            return PickerAction::Consumed;
-        }
-        if key::SCROLL_HALF_UP.matches(key) {
-            s.page_up();
-            return PickerAction::Consumed;
-        }
-        if key::SCROLL_HALF_DOWN.matches(key) {
-            s.page_down();
             return PickerAction::Consumed;
         }
         if is_ctrl(&key) {
@@ -342,14 +448,6 @@ impl<T: PickerItem> ListPicker<T> {
                 s.move_down();
                 PickerAction::Consumed
             }
-            KeyCode::PageUp => {
-                s.page_up();
-                PickerAction::Consumed
-            }
-            KeyCode::PageDown => {
-                s.page_down();
-                PickerAction::Consumed
-            }
             KeyCode::Enter => {
                 let idx = s.selected_item_index();
                 if let (Some(enabled), Some(idx)) = (&mut s.enabled, idx) {
@@ -361,7 +459,9 @@ impl<T: PickerItem> ListPicker<T> {
                 }
                 match idx {
                     Some(idx) => {
-                        let mut state = self.state.take().unwrap();
+                        let PickerState::Ready(mut state) = self.state.take().unwrap() else {
+                            unreachable!("handle_ready_key guarantees Ready state")
+                        };
                         PickerAction::Select(idx, state.items.swap_remove(idx))
                     }
                     None => PickerAction::Consumed,
@@ -402,31 +502,39 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn selected_item(&self) -> Option<&T> {
-        let s = self.state.as_ref()?;
+        let s = self.state.as_ref().and_then(PickerState::ready)?;
         s.selected_item_index().map(|i| &s.items[i])
     }
 
     pub fn selected_index(&self) -> Option<usize> {
-        self.state.as_ref().and_then(|s| s.selected_item_index())
+        self.state
+            .as_ref()
+            .and_then(PickerState::ready)
+            .and_then(|s| s.selected_item_index())
     }
 
     pub fn item(&self, idx: usize) -> Option<&T> {
-        self.state.as_ref().and_then(|s| s.items.get(idx))
+        self.state
+            .as_ref()
+            .and_then(PickerState::ready)
+            .and_then(|s| s.items.get(idx))
     }
 
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        let Some(s) = self.state.as_mut() else {
-            return false;
+        let Some(Some(s)) = self.state.as_mut().map(PickerState::ready_mut) else {
+            return self.is_open();
         };
+        self.generation += 1;
         s.search.insert_text(text);
         s.update_search_and_clamp();
         true
     }
 
     pub fn scroll(&mut self, delta: i32) {
-        let Some(s) = self.state.as_mut() else {
+        let Some(s) = self.state.as_mut().and_then(PickerState::ready_mut) else {
             return;
         };
+        self.generation += 1;
         if delta > 0 {
             s.scroll_offset = s.scroll_offset.saturating_sub(delta as usize);
         } else {
@@ -441,10 +549,37 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
-        let footer = self.footer;
+        let footer = self.footer.as_ref();
+        let footer_rows = if footer.is_some() { 1u16 } else { 0 };
         match self.state.as_mut() {
             None => Rect::default(),
-            Some(s) => render_ready(
+            Some(PickerState::Loading) => {
+                let modal = Modal {
+                    title: &self.title,
+                    width_percent: MIN_WIDTH_PERCENT,
+                    max_height_percent: MAX_HEIGHT_PERCENT,
+                };
+                let (popup, inner) = modal.render(frame, area, 1 + SEARCH_ROW + footer_rows);
+                let mut constraints = vec![Constraint::Min(1), Constraint::Length(1)];
+                if footer.is_some() {
+                    constraints.push(Constraint::Length(1));
+                }
+                let areas = Layout::vertical(constraints).split(inner);
+                let list_area = areas[0];
+                let search_area = areas[1];
+                let ch = spinner_frame(animation_elapsed_ms());
+                let line = Line::from(Span::styled(
+                    format!("  {ch} {LOADING_LABEL}"),
+                    theme::current().item_desc,
+                ));
+                frame.render_widget(Paragraph::new(vec![line]), list_area);
+                render_search(frame, search_area, &TextBuffer::new(String::new()));
+                if let Some(spec) = footer {
+                    render_footer(frame, areas[2], spec);
+                }
+                popup
+            }
+            Some(PickerState::Ready(s)) => render_ready(
                 frame,
                 area,
                 s,
@@ -473,7 +608,7 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &str,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Option<&FooterSpec>,
     error_text: Option<&str>,
 ) -> Rect {
     let footer_rows = if footer.is_some() { 1u16 } else { 0 };
@@ -544,8 +679,8 @@ fn render_ready<T: PickerItem>(
     );
     render_search(frame, search_area, &s.search);
 
-    if let Some(build) = footer {
-        frame.render_widget(Paragraph::new(build()), areas[area_idx]);
+    if let Some(spec) = footer {
+        render_footer(frame, areas[area_idx], spec);
     }
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
@@ -611,6 +746,14 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
         return 0;
     }
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
+}
+
+fn max_label_width(detail: &str, area_width: u16) -> usize {
+    area_width.saturating_sub(detail.width() as u16 + 1 + DETAIL_RIGHT_PAD) as usize
+}
+
+fn detail_padding(label: &str, detail: &str, area_width: u16) -> usize {
+    max_label_width(detail, area_width).saturating_sub(label.width())
 }
 
 fn truncate_label(label: &str, max_width: usize) -> String {
@@ -686,7 +829,8 @@ fn render_list<T: PickerItem>(
 
         let highlighted = item.is_highlighted();
         let t = theme::current();
-        let (style, detail_style) = match (i == selected, highlighted) {
+        let is_enabled = enabled.is_some_and(|en| en[item_idx]);
+        let (mut style, mut detail_style) = match (i == selected, highlighted) {
             (true, true) => {
                 let s = t.item_selected.fg(t.accent.fg.unwrap_or_default());
                 (s, theme::dim_style(s, 0.4))
@@ -695,61 +839,36 @@ fn render_list<T: PickerItem>(
             (false, true) => (t.accent, theme::dim_style(t.accent, 0.4)),
             (false, false) => (t.item, t.item_desc),
         };
-        let checkbox = enabled.map(|en| {
-            let sym = if en[item_idx] { "✓ " } else { "✗ " };
-            let sty = if i == selected {
-                style
-            } else if en[item_idx] {
-                theme::current().item
-            } else {
-                theme::current().item_desc
-            };
-            Span::styled(sym, sty)
-        });
+        if is_enabled {
+            style = style.add_modifier(ratatui::style::Modifier::BOLD);
+        }
+        if enabled.is_some() {
+            detail_style = detail_style.add_modifier(ratatui::style::Modifier::BOLD);
+        }
         let label = format!("  {}", item.label());
-        let suffix = item.suffix();
+        let detail_str: Option<String>;
         let detail: Option<&str> = if item.is_spinning() {
             Some(spinner_str(animation_elapsed_ms()))
+        } else if enabled.is_some() {
+            detail_str = Some(if is_enabled { "true".to_string() } else { "false".to_string() });
+            detail_str.as_deref()
         } else {
             item.detail()
         };
-        let suffix_gap = 2usize;
-        let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
-        let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
         let line = match detail {
             Some(detail) => {
-                let max_label = area.width.saturating_sub(
-                    detail.width() as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD,
-                ) as usize;
-                let label = truncate_label(&label, max_label);
-                let pad = (area.width as usize).saturating_sub(
-                    label.width() + trailing_gap + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
-                );
-                let mut spans = Vec::with_capacity(7);
-                if let Some(cb) = checkbox {
-                    spans.push(cb);
-                }
-                spans.push(Span::styled(label, style));
-                if let Some(s) = suffix {
-                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
-                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
-                }
-                spans.push(Span::styled(" ".repeat(pad), style));
-                spans.push(Span::styled(detail.to_string(), detail_style));
-                spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
+                let label = truncate_label(&label, max_label_width(detail, area.width));
+                let pad = detail_padding(&label, detail, area.width);
+                let spans = vec![
+                    Span::styled(label, style),
+                    Span::styled(" ".repeat(pad), style),
+                    Span::styled(detail.to_string(), detail_style),
+                    Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style),
+                ];
                 Line::from(spans)
             }
             None => {
-                let mut spans: Vec<Span> = Vec::with_capacity(4);
-                if let Some(cb) = checkbox {
-                    spans.push(cb);
-                }
-                spans.push(Span::styled(label, style));
-                if let Some(s) = suffix {
-                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
-                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
-                }
-                Line::from(spans)
+                Line::from(Span::styled(label, style))
             }
         };
         lines.push(line);
@@ -777,6 +896,10 @@ fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
     frame.render_widget(Paragraph::new(vec![line]), area);
 }
 
+fn render_footer(frame: &mut Frame, area: Rect, spec: &FooterSpec) {
+    frame.render_widget(Paragraph::new(spec.build()), area);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -786,11 +909,17 @@ mod tests {
     use test_case::test_case;
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
-        p.state.as_ref().expect("expected open state")
+        p.state
+            .as_ref()
+            .and_then(PickerState::ready)
+            .expect("expected Ready state")
     }
 
     fn ready_state_mut<T>(p: &mut ListPicker<T>) -> &mut State<T> {
-        p.state.as_mut().expect("expected open state")
+        p.state
+            .as_mut()
+            .and_then(PickerState::ready_mut)
+            .expect("expected Ready state")
     }
 
     struct Entry {
@@ -829,54 +958,6 @@ mod tests {
         assert_eq!(ready_state(&p).selected, 2);
 
         p.handle_key(key(KeyCode::Down));
-        assert_eq!(ready_state(&p).selected, 0);
-    }
-
-    #[test]
-    fn page_down_advances_and_clamps() {
-        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
-        let mut p = ListPicker::new();
-        p.open(items, " Test ");
-        ready_state_mut(&mut p).viewport_height = 10;
-
-        p.handle_key(key(KeyCode::PageDown));
-        assert_eq!(ready_state(&p).selected, 10);
-
-        for _ in 0..10 {
-            p.handle_key(key(KeyCode::PageDown));
-        }
-        assert_eq!(ready_state(&p).selected, 49);
-    }
-
-    #[test]
-    fn page_up_retreats_and_clamps() {
-        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
-        let mut p = ListPicker::new();
-        p.open(items, " Test ");
-        let s = ready_state_mut(&mut p);
-        s.viewport_height = 10;
-        s.selected = 25;
-
-        p.handle_key(key(KeyCode::PageUp));
-        assert_eq!(ready_state(&p).selected, 15);
-
-        for _ in 0..5 {
-            p.handle_key(key(KeyCode::PageUp));
-        }
-        assert_eq!(ready_state(&p).selected, 0);
-    }
-
-    #[test]
-    fn ctrl_d_and_ctrl_u_page_like_page_keys() {
-        let items: Vec<Entry> = (0..50).map(|i| Entry::new(&format!("Item {i}"))).collect();
-        let mut p = ListPicker::new();
-        p.open(items, " Test ");
-        ready_state_mut(&mut p).viewport_height = 10;
-
-        p.handle_key(key::SCROLL_HALF_DOWN.to_key_event());
-        assert_eq!(ready_state(&p).selected, 10);
-
-        p.handle_key(key::SCROLL_HALF_UP.to_key_event());
         assert_eq!(ready_state(&p).selected, 0);
     }
 
@@ -1046,6 +1127,49 @@ mod tests {
         assert_eq!(s.scroll_offset, 0);
     }
 
+    #[test_case(key(KeyCode::Esc) ; "esc_closes_loading")]
+    #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_closes_loading")]
+    fn loading_cancel_keys(cancel_key: KeyEvent) {
+        let mut p: ListPicker<Entry> = ListPicker::new();
+        p.open_loading(" Test ");
+        let action = p.handle_key(cancel_key);
+        assert!(matches!(action, PickerAction::Close));
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn loading_swallows_other_keys() {
+        let mut p: ListPicker<Entry> = ListPicker::new();
+        p.open_loading(" Test ");
+        let action = p.handle_key(key(KeyCode::Char('a')));
+        assert!(matches!(action, PickerAction::Consumed));
+        assert!(p.is_loading());
+    }
+
+    #[test]
+    fn resolve_transitions_to_ready() {
+        let mut p = ListPicker::new();
+        p.open_loading(" Test ");
+        p.resolve(entries(&["A", "B"]));
+        assert!(p.is_open());
+        assert!(!p.is_loading());
+        assert_eq!(ready_state(&p).items.len(), 2);
+    }
+
+    #[test]
+    fn resolve_ignored_when_not_loading() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["A"]), " Test ");
+        let gen_before = p.generation();
+        p.resolve(entries(&["B", "C"]));
+        assert_eq!(p.generation(), gen_before);
+        assert_eq!(ready_state(&p).items.len(), 1);
+
+        let mut p2: ListPicker<Entry> = ListPicker::new();
+        p2.resolve(entries(&["A"]));
+        assert!(!p2.is_open());
+    }
+
     #[test]
     fn toggle_mode_enter_flips_enabled() {
         let mut p = ListPicker::new();
@@ -1064,6 +1188,24 @@ mod tests {
         assert!(matches!(action, PickerAction::Toggle(1, false)));
     }
 
+    #[test]
+    fn retain_syncs_enabled_vec() {
+        let mut p = ListPicker::new();
+        p.open_toggleable(entries(&["A", "B", "C"]), vec![true, false, true], " Test ");
+        p.retain(|e| e.label() != "B");
+        let s = ready_state(&p);
+        assert_eq!(s.items.len(), 2);
+        assert_eq!(s.enabled.as_ref().unwrap(), &[true, true]);
+    }
+
+    #[test]
+    fn retain_all_removed_closes_picker() {
+        let mut p = ListPicker::new();
+        p.open_toggleable(entries(&["A"]), vec![true], " Test ");
+        p.retain(|_| false);
+        assert!(!p.is_open());
+    }
+
     #[test_case("short", 10 => "short" ; "no_truncation_needed")]
     #[test_case("abcdefghijklmno", 10 => "abcdefghi\u{2026}" ; "long_ascii_truncated")]
     #[test_case("ab\u{4e16}\u{754c}cde", 6 => "ab\u{4e16}\u{2026}" ; "wide_chars_truncated")]
@@ -1075,26 +1217,18 @@ mod tests {
     fn detail_right_edge_consistent_for_long_and_short_labels() {
         let width: u16 = 40;
         let detail = "2h ago";
-        let suffix_gap = 2usize;
+        let max_w = max_label_width(detail, width);
 
-        let end_col = |label: &str, suffix_w: usize| -> usize {
-            let trailing = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
-            let max_label = width
-                .saturating_sub(detail.width() as u16 + trailing as u16 + 1 + DETAIL_RIGHT_PAD)
-                as usize;
-            let t = truncate_label(label, max_label);
-            let pad = (width as usize).saturating_sub(
-                t.width() + trailing + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
-            );
-            t.width() + trailing + pad + detail.width() + DETAIL_RIGHT_PAD as usize
+        let end_col = |label: &str| -> usize {
+            let t = truncate_label(label, max_w);
+            t.width()
+                + detail_padding(&t, detail, width)
+                + detail.width()
+                + DETAIL_RIGHT_PAD as usize
         };
 
         let long = "  ".to_string() + &"x".repeat(60);
-        assert_eq!(end_col(&long, 0), end_col("  hi", 0));
-        assert!(end_col(&long, 0) <= width as usize);
-
-        let sfx = "Anthropic".width();
-        assert_eq!(end_col(&long, sfx), end_col("  hi", sfx));
-        assert!(end_col(&long, sfx) <= width as usize);
+        assert_eq!(end_col(&long), end_col("  hi"));
+        assert!(end_col(&long) <= width as usize);
     }
 }
