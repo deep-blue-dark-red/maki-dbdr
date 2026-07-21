@@ -175,6 +175,7 @@ agent-client-protocol-schema = "0.13"
 
 wait-timeout = "0.2"
 inventory = "0.3"
+zstd = "0.13"
 
 [profile.bench]
 debug = true

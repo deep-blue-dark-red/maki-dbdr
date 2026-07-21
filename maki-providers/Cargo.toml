@@ -23,7 +23,12 @@ wait-timeout = { workspace = true }
 fastrand = { workspace = true }
 maki-config = { workspace = true }
 inventory = { workspace = true }
+zstd = { workspace = true }
 jiff = { workspace = true }
+
+[[bin]]
+name = "mlog"
+path = "src/bin/mlog.rs"
 
 [dev-dependencies]
 test-case = { workspace = true }
