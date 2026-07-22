@@ -98,6 +98,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/logs",
+        description: "Show last 30 lines of application logs",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/system_prompt",
+        description: "Edit the system prompt template in default editor",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,

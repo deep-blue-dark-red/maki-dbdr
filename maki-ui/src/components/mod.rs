@@ -211,6 +211,8 @@ pub enum Action {
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
+    EditSystemPrompt,
+    RunLogsCommand,
     Btw(String),
     Suspend,
 }

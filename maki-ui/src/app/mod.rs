@@ -1298,6 +1298,12 @@ impl App {
                 );
                 vec![]
             }
+            "/logs" => {
+                vec![Action::RunLogsCommand]
+            }
+            "/system_prompt" => {
+                vec![Action::EditSystemPrompt]
+            }
             "/workflow" => {
                 self.state.workflow = !self.state.workflow;
                 self.flash(

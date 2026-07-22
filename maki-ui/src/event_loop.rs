@@ -1006,6 +1006,42 @@ impl<'t> EventLoop<'t> {
                     Err(e) => self.sessions[idx].app.flash(e),
                 }
             }
+            Action::EditSystemPrompt => {
+                match maki_storage::paths::config_dir() {
+                    Ok(config_dir) => {
+                        let path = config_dir.join("system.md");
+                        if !path.exists()
+                            && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
+                        {
+                            self.sessions[idx].app.flash(format!("Failed to create system.md: {e}"));
+                            return;
+                        }
+                        let _pause = self.input.pause();
+                        if let Err(e) = terminal::open_in_editor(&path, self.terminal) {
+                            self.sessions[idx].app.flash(e);
+                        }
+                    }
+                    Err(e) => self.sessions[idx].app.flash(format!("Failed to get config directory: {e}")),
+                }
+            }
+            Action::RunLogsCommand => {
+                let settings = crate::components::settings_picker::UserSettings::load();
+                let log_path = self.sessions[idx].app.storage.path().join("maki.log");
+                let log_path_str = log_path.to_string_lossy();
+                let cmd_string = match &settings.log_command {
+                    Some(cmd) if !cmd.trim().is_empty() => cmd.clone(),
+                    _ => "less +G {}".to_string(),
+                };
+                let cmd_string = cmd_string
+                    .replace("<path>", &log_path_str)
+                    .replace("alog", &log_path_str)
+                    .replace("{}", &log_path_str);
+
+                let _pause = self.input.pause();
+                if let Err(e) = terminal::run_view_log_command(&cmd_string, self.terminal) {
+                    self.sessions[idx].app.flash(e);
+                }
+            }
             Action::Btw(question) => {
                 let slot = self.ctx.model_slot.load();
                 self.sessions[idx].app.start_btw(
