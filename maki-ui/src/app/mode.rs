@@ -138,8 +138,8 @@ impl App {
             "[BASH]".into()
         } else {
             match self.state.mode {
-                Mode::Build => "[BUILD]".into(),
-                Mode::Plan => "[PLAN]".into(),
+                Mode::Build => "[build]".into(),
+                Mode::Plan => "[plan]".into(),
             }
         };
         let style = Style::new()

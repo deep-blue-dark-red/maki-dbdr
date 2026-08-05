@@ -2700,7 +2700,7 @@ fn bash_prefix_overrides_mode() {
     );
 
     app.input_box.set_input("ls".into());
-    assert_eq!(&*app.mode_label().0, "[BUILD]");
+    assert_eq!(&*app.mode_label().0, "[build]");
 }
 
 #[test]
