@@ -245,6 +245,10 @@ impl App {
         }
 
         render_if_open!(self.export_picker);
+        render_if_open!(self.settings_picker);
+        render_if_open!(self.skills_modal);
+        render_if_open!(self.plugins_modal);
+        render_if_open!(self.goto_picker);
         render_if_open!(self.rewind_picker);
         render_if_open!(self.theme_picker);
         render_if_open!(self.model_picker);
@@ -282,6 +286,18 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        if self.skills_modal.is_open() {
+            let r = self.skills_modal.view(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
+        if self.plugins_modal.is_open() {
+            let r = self.plugins_modal.view(frame, full);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         overlay_rect
     }
 
@@ -316,8 +332,8 @@ impl App {
             streaming_info: None,
             streaming_active: false,
             verbose: false,
-            last_turn_stats: None,
-            show_token_stats: false,
+            last_turn_stats: self.turn_stats.as_ref(),
+            show_token_stats: self.show_token_stats,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

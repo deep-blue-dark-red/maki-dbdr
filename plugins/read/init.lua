@@ -5,17 +5,17 @@ local output_limits = require("maki.output_limits")
 local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- **Always include offset and limit** if possible. Defaults: no offset = start at 1; no limit = up to 2000 lines.
+- **Required: offset and limit**. Max limit value = 500 (auto truncated).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit unless known already.
+- `wc -l` can tell you the total number of lines.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
-local DEFAULT_MAX_OUTPUT_LINES = 2000
+local DEFAULT_MAX_OUTPUT_LINES = 500
 
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },

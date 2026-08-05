@@ -208,6 +208,8 @@ pub enum Action {
     RefreshModels,
     RefreshUsage,
     Compact,
+    Checkpoint,
+    RenameSession(Vec<maki_providers::Message>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,

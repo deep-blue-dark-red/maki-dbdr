@@ -18,6 +18,9 @@ pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
 pub const COMPACTION_USER: &str = include_str!("prompts/compaction_user.md");
+pub const CHECKPOINT_USER: &str = include_str!("prompts/checkpoint_user.md");
+pub const CHECKPOINT_INTRO: &str = "Progress summary since last checkpoint:";
+pub const SESSION_NAME_SYSTEM: &str = include_str!("prompts/session_name.md");
 
 pub const DEFAULT_IDENTITY: &str = r#"You are Maki, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
 

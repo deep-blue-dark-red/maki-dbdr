@@ -969,6 +969,16 @@ impl<'t> EventLoop<'t> {
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Compact { run_id });
             }
+            Action::Checkpoint => {
+                let rt = &mut self.sessions[idx];
+                let run_id = rt.app.run_id;
+                rt.handles.queue.push(QueueItem::Checkpoint { run_id });
+            }
+            Action::RenameSession(messages) => {
+                let rt = &mut self.sessions[idx];
+                let run_id = rt.app.run_id;
+                rt.handles.queue.push(QueueItem::Rename { messages, run_id });
+            }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
                     server: server_name,

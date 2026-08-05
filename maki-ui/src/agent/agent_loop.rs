@@ -128,6 +128,8 @@ impl AgentLoop {
                 self.do_agent_run(input, event_tx, run_id).await
             }
             QueueItem::Compact { .. } => self.do_compact(&event_tx).await,
+            QueueItem::Checkpoint { .. } => self.do_checkpoint(&event_tx).await,
+            QueueItem::Rename { messages, .. } => self.do_rename(&event_tx, messages).await,
         };
 
         if let Err(e) = result {
@@ -157,6 +159,24 @@ impl AgentLoop {
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
         agent::compact(&*provider, &model, &mut self.history, event_tx).await
+    }
+
+    async fn do_checkpoint(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
+        let slot = self.model_slot.load();
+        let (provider, model) =
+            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
+        agent::checkpoint(&*provider, &model, &mut self.history, event_tx).await
+    }
+
+    async fn do_rename(
+        &mut self,
+        event_tx: &EventSender,
+        messages: Vec<maki_providers::Message>,
+    ) -> Result<(), AgentError> {
+        let slot = self.model_slot.load();
+        let (provider, model) =
+            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
+        agent::rename_session(&*provider, &model, &messages, event_tx).await
     }
 
     async fn do_agent_run(

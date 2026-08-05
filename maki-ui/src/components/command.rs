@@ -127,6 +127,46 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Reload plugins and config",
         max_args: 0,
     },
+    BuiltinCommand {
+        name: "/checkpoint",
+        description: "Save a summary checkpoint without compacting",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/export",
+        description: "Export transcript (markdown or json)",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/settings",
+        description: "Open the interactive settings menu",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/skills",
+        description: "Open the skills manager",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/plugins",
+        description: "Open the plugins menu",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/rewind",
+        description: "Delete turns and rewind the conversation",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/rename",
+        description: "AI-generate a session name",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/goto",
+        description: "Jump to a specific turn",
+        max_args: 0,
+    },
 ];
 
 pub struct ParsedCommand {

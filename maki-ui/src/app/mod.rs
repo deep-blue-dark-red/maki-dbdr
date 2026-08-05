@@ -12,6 +12,8 @@ pub(crate) mod session_state;
 pub(crate) mod shell;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod fork_features_test;
 pub(crate) mod view;
 
 use std::collections::HashMap;
@@ -28,6 +30,10 @@ use crate::components::btw_modal::BtwModal;
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
+use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
+use crate::components::plugins_modal::{PluginsModal, PluginsAction};
+use crate::components::skills_modal::{SkillsModal, SkillsAction};
+use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
@@ -38,10 +44,12 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
-use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::rewind_picker::{
+    RewindEntry, RewindPicker, RewindPickerAction, display_msg_index_for_turn,
+};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
-use crate::components::status_bar::StatusBar;
+use crate::components::status_bar::{StatusBar, TurnStats};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
@@ -144,6 +152,10 @@ pub struct App {
     pub(super) rewind_picker: RewindPicker,
     pub(super) help_modal: HelpModal,
     pub(super) export_picker: ExportPicker,
+    pub(super) settings_picker: SettingsPicker,
+    pub(super) skills_modal: SkillsModal,
+    pub(super) plugins_modal: PluginsModal,
+    pub(super) goto_picker: GotoPicker,
     pub(super) usage_modal: UsageModal,
     pub(super) btw_modal: BtwModal,
     pub(super) float_mgr: FloatManager,
@@ -152,6 +164,9 @@ pub struct App {
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) status_bar: StatusBar,
+    pub(super) show_token_stats: bool,
+    pub(super) turn_start: Option<Instant>,
+    pub(super) turn_stats: Option<TurnStats>,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
@@ -224,6 +239,10 @@ impl App {
             rewind_picker: RewindPicker::new(),
             help_modal: HelpModal::new(),
             export_picker: ExportPicker::new(),
+            settings_picker: SettingsPicker::new(),
+            skills_modal: SkillsModal::new(),
+            plugins_modal: PluginsModal::new(),
+            goto_picker: GotoPicker::new(),
             usage_modal: UsageModal::new(),
             btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
             float_mgr: FloatManager::new(),
@@ -232,6 +251,9 @@ impl App {
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(ui_config.flash_duration()),
+            show_token_stats: UserSettings::load().show_token_stats,
+            turn_start: None,
+            turn_stats: None,
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
@@ -724,6 +746,75 @@ impl App {
             return Some(vec![]);
         }
 
+        if self.settings_picker.is_open() {
+            return Some(match self.settings_picker.handle_key(key) {
+                SettingsPickerAction::Consumed => vec![],
+                SettingsPickerAction::ToggleShowSystemPrompt(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_system_prompt = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleApiLogging(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.api_logging = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleShowReasoning(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_reasoning = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::ToggleShowTokenStats(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.show_token_stats = val;
+                    settings.save();
+                    self.show_token_stats = val;
+                    vec![]
+                }
+                SettingsPickerAction::ToggleGlobalSessions(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.global_sessions = val;
+                    settings.save();
+                    vec![]
+                }
+                SettingsPickerAction::EditLogCommand => {
+                    self.settings_picker.close();
+                    match crate::config::config_path() {
+                        Ok(path) => vec![Action::OpenEditor(path)],
+                        Err(_) => vec![],
+                    }
+                }
+                SettingsPickerAction::Closed => vec![],
+            });
+        }
+
+        if self.skills_modal.is_open() {
+            return Some(match self.skills_modal.handle_key(key) {
+                SkillsAction::None => vec![],
+                SkillsAction::CreateSkill(path) => vec![Action::OpenEditor(path)],
+                SkillsAction::EditSkillsJson(path) => vec![Action::OpenEditor(path)],
+                SkillsAction::EditSkill(path) => vec![Action::OpenEditor(path)],
+            });
+        }
+
+        if self.plugins_modal.is_open() {
+            return Some(match self.plugins_modal.handle_key(key) {
+                PluginsAction::None => vec![],
+                PluginsAction::EditPlugin(path) => vec![Action::OpenEditor(path)],
+            });
+        }
+
+        if self.goto_picker.is_open() {
+            return Some(match self.goto_picker.handle_key(key) {
+                GotoPickerAction::Consumed => vec![],
+                GotoPickerAction::Select(entry) => self.rewind_to(entry),
+                GotoPickerAction::Close => vec![],
+            });
+        }
+
         if self.mcp_picker.is_open() {
             return Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
@@ -1104,6 +1195,23 @@ impl App {
             let formatted =
                 format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
             self.chats[chat_idx].set_pending_turn_usage(formatted);
+
+            if let Some(start) = self.turn_start.take() {
+                let elapsed = start.elapsed().as_secs_f64().max(1e-3);
+                let input = tc.usage.input as f64;
+                let output = tc.usage.output as f64;
+                let cache_read = tc.usage.cache_read as f64;
+                let total_input = (input + cache_read + tc.usage.cache_creation as f64).max(1.0);
+                self.turn_stats = Some(TurnStats {
+                    pp_tps: input / elapsed,
+                    tg_tps: output / elapsed,
+                    cache_rate: if total_input > 0.0 {
+                        cache_read / total_input
+                    } else {
+                        0.0
+                    },
+                });
+            }
         }
 
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
@@ -1133,6 +1241,11 @@ impl App {
                 ));
             }
             self.pending_input = PendingInput::AuthRetry { subagent_id };
+            return vec![];
+        }
+
+        if let ChatEventResult::RenameResult(title) = result {
+            self.apply_rename(title);
             return vec![];
         }
 
@@ -1169,7 +1282,8 @@ impl App {
                 }
                 ChatEventResult::AuthRequired
                 | ChatEventResult::PermissionRequest { .. }
-                | ChatEventResult::QueueItemConsumed { .. } => unreachable!(),
+                | ChatEventResult::QueueItemConsumed { .. }
+                | ChatEventResult::RenameResult(_) => unreachable!(),
                 ChatEventResult::Continue => {}
             }
         }
@@ -1213,6 +1327,8 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
+                self.turn_start = Some(Instant::now());
+                self.turn_stats = None;
                 vec![Action::Compact]
             }
             "/help" => {
@@ -1318,6 +1434,40 @@ impl App {
             }
             "/q" | "/exit" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
+            "/settings" => {
+                let settings = UserSettings::load();
+                self.settings_picker.open(&settings);
+                vec![]
+            }
+            "/plugins" => {
+                self.plugins_modal.open(&self.lua_event_handle);
+                vec![]
+            }
+            "/skills" => {
+                self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
+                vec![]
+            }
+            "/export" => {
+                self.export_picker
+                    .open(std::path::Path::new(&self.state.session.cwd));
+                vec![]
+            }
+            "/rewind" => self.open_rewind_picker(),
+            "/goto" => {
+                if cmd.args.trim().is_empty() {
+                    match self.goto_picker.open(&self.state.session.messages) {
+                        Ok(()) => vec![],
+                        Err(msg) => {
+                            self.flash(msg);
+                            vec![]
+                        }
+                    }
+                } else {
+                    self.goto_turn(cmd.args.trim())
+                }
+            }
+            "/checkpoint" => self.queue_checkpoint(),
+            "/rename" => self.start_rename(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1330,6 +1480,88 @@ impl App {
             }
             _ => vec![],
         }
+    }
+
+    fn goto_turn(&mut self, arg: &str) -> Vec<Action> {
+        let Ok(turn_num) = arg.parse::<usize>() else {
+            self.flash("Usage: /goto <turn number>".into());
+            return vec![];
+        };
+        let messages = &self.state.session.messages;
+        let user_turns: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m.role, maki_providers::Role::User))
+            .map(|(i, _)| i)
+            .collect();
+        if turn_num == 0 || turn_num > user_turns.len() {
+            self.flash(format!("No turn {turn_num} (have {} turns)", user_turns.len()));
+            return vec![];
+        }
+        let turn_index = user_turns[turn_num - 1];
+        let entry = RewindEntry {
+            turn_index,
+            segment_index: display_msg_index_for_turn(messages, turn_index),
+            prompt_preview: String::new(),
+            prompt_text: messages[turn_index]
+                .user_text()
+                .unwrap_or_default()
+                .to_string(),
+        };
+        self.rewind_to(entry)
+    }
+
+    fn queue_checkpoint(&mut self) -> Vec<Action> {
+        if self.status == Status::Streaming {
+            self.flash("Agent is busy, try again later".into());
+            return vec![];
+        }
+        self.run_id += 1;
+        self.status = Status::Streaming;
+        self.turn_start = Some(Instant::now());
+        self.turn_stats = None;
+        vec![Action::Checkpoint]
+    }
+
+    fn start_rename(&mut self) -> Vec<Action> {
+        let user_texts: Vec<String> = self
+            .state
+            .session
+            .messages
+            .iter()
+            .filter_map(|m| m.user_text().map(str::to_string))
+            .take(3)
+            .collect();
+
+        if user_texts.is_empty() {
+            self.flash("Nothing to rename yet — send a message first".into());
+            return vec![];
+        }
+
+        let mut total_words = 0usize;
+        let mut parts: Vec<String> = Vec::new();
+        'outer: for text in &user_texts {
+            let mut words: Vec<&str> = Vec::new();
+            for word in text.split_whitespace() {
+                if total_words >= 200 {
+                    break 'outer;
+                }
+                words.push(word);
+                total_words += 1;
+            }
+            parts.push(words.join(" "));
+        }
+
+        let context = parts.join("\n\n");
+        let msg = Message::user(context);
+        self.flash("Renaming session…".into());
+        vec![Action::RenameSession(vec![msg])]
+    }
+
+    pub(crate) fn apply_rename(&mut self, title: String) {
+        self.state.session.title = title.clone();
+        self.save_session();
+        self.status_bar.flash(format!("Session renamed to: {title}"));
     }
 
     fn run_lua_command(&self, name: &str, args: String) {
@@ -1378,6 +1610,8 @@ impl App {
         } else {
             self.run_id += 1;
             self.status = Status::Streaming;
+            self.turn_start = Some(Instant::now());
+            self.turn_stats = None;
             self.main_chat().show_user_message(display_text);
             vec![Action::SendMessage(Box::new(input))]
         }
@@ -1447,7 +1681,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 14] {
+    fn overlays(&self) -> [&dyn Overlay; 18] {
         [
             &self.help_modal,
             &self.export_picker,
@@ -1463,10 +1697,14 @@ impl App {
             &self.login_picker,
             &self.mcp_picker,
             &self.permission_prompt,
+            &self.settings_picker,
+            &self.skills_modal,
+            &self.plugins_modal,
+            &self.goto_picker,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 14] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
         [
             &mut self.help_modal,
             &mut self.export_picker,
@@ -1482,6 +1720,10 @@ impl App {
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.permission_prompt,
+            &mut self.settings_picker,
+            &mut self.skills_modal,
+            &mut self.plugins_modal,
+            &mut self.goto_picker,
         ]
     }
 

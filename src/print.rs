@@ -238,6 +238,7 @@ pub fn run(
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
+            | AgentEvent::CompactionStart { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
@@ -245,7 +246,8 @@ pub fn run(
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. } => {}
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::RenameResult { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,

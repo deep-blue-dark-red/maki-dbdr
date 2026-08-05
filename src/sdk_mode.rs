@@ -933,13 +933,15 @@ impl EventPump {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
+            | AgentEvent::CompactionStart { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. } => {}
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::RenameResult { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,

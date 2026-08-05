@@ -57,6 +57,8 @@ impl AgentMode {
 pub enum ExtractedCommand {
     Interrupt(AgentInput, u64),
     Compact(u64),
+    Checkpoint(u64),
+    Rename(Vec<maki_providers::Message>, u64),
 }
 
 pub trait InterruptSource: Send + Sync {

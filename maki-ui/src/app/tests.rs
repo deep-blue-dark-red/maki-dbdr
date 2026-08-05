@@ -19,7 +19,7 @@ use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use test_case::test_case;
 
@@ -666,6 +666,33 @@ fn turn_complete_tracks_usage_and_context_per_chat() {
     assert_eq!(app.chats[1].token_usage.input, 200);
     assert_eq!(app.chats[0].context_size, main_usage.context_tokens());
     assert_eq!(app.chats[1].context_size, sub_usage.context_tokens());
+}
+
+#[test]
+fn turn_complete_feeds_turn_stats_for_status_bar() {
+    let mut app = app_with_subagent();
+    let usage = TokenUsage {
+        input: 200,
+        output: 100,
+        cache_read: 40,
+        ..Default::default()
+    };
+    app.turn_start = Some(Instant::now() - Duration::from_secs(2));
+
+    app.update(agent_msg(AgentEvent::TurnComplete(Box::new(
+        TurnCompleteEvent {
+            message: Default::default(),
+            usage,
+            model: "test".into(),
+            context_size: None,
+        },
+    ))));
+
+    eprintln!("DBG run_id={} turn_start_set={} token_input={}", app.run_id, app.turn_start.is_some(), app.state.token_usage.input);
+    let stats = app.turn_stats.expect("turn_stats should be populated on TurnComplete");
+    assert!((stats.pp_tps - 100.0).abs() < 5.0, "pp_tps ~ input/elapsed");
+    assert!((stats.tg_tps - 50.0).abs() < 5.0, "tg_tps ~ output/elapsed");
+    assert!((stats.cache_rate - 0.2).abs() < 1e-6, "cache_rate = cache_read/total_input");
 }
 
 #[test]

@@ -560,6 +560,12 @@ pub enum AgentEvent {
     },
     AutoCompacting,
     CompactionDone,
+    CompactionStart {
+        checkpoint: bool,
+    },
+    RenameResult {
+        title: String,
+    },
     Retry {
         attempt: u32,
         message: String,

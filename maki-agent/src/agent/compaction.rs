@@ -118,6 +118,96 @@ pub async fn compact(
     Ok(())
 }
 
+/// Emit a re-anchoring checkpoint: stream a CHECKPOINT-mode delta summary and
+/// append it to `history`, keeping the full conversation intact — unlike
+/// `compact`, which replaces it. Checkpoints are append-only (interleaved), so
+/// each new one covers only new work and the prompt cache prefix is never
+/// invalidated. Does not emit `Done` here; the agent loop sends it.
+pub async fn checkpoint(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+) -> Result<(), AgentError> {
+    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: true });
+    let cancel = CancelToken::none();
+
+    let mut checkpoint_history: Vec<Message> = history.as_slice().to_vec();
+    strip_images(&mut checkpoint_history);
+    strip_thinking(&mut checkpoint_history);
+    strip_old_tool_results(&mut checkpoint_history);
+    checkpoint_history.push(Message::user(crate::prompt::CHECKPOINT_USER.to_string()));
+
+    let empty_tools = serde_json::json!([]);
+    let response = stream_with_retry(
+        provider,
+        model,
+        &checkpoint_history,
+        crate::prompt::COMPACTION_SYSTEM,
+        &empty_tools,
+        event_tx,
+        &cancel,
+        RequestOptions::default(),
+        None,
+    )
+    .await?;
+
+    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: response.message.clone(),
+        usage: response.usage,
+        model: model.id.clone(),
+        context_size: Some(response.usage.output),
+    })));
+
+    history.push(Message::user(crate::prompt::CHECKPOINT_INTRO.to_string()));
+    history.push(response.message);
+
+    event_tx.send(AgentEvent::Done {
+        usage: response.usage,
+        num_turns: 1,
+        stop_reason: None,
+    })?;
+
+    Ok(())
+}
+
+/// Generate a session name from user messages using an isolated LLM call.
+/// Emits `AgentEvent::RenameResult` with the trimmed title, or nothing if the
+/// response is empty. Does not mutate history and does not emit `Done`.
+pub async fn rename_session(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    messages: &[Message],
+    event_tx: &EventSender,
+) -> Result<(), AgentError> {
+    let empty_tools = serde_json::json!([]);
+    let (prov_tx, prov_rx) = flume::unbounded::<maki_providers::ProviderEvent>();
+    let _ = provider
+        .stream_message(
+            model,
+            messages,
+            crate::prompt::SESSION_NAME_SYSTEM,
+            &empty_tools,
+            &prov_tx,
+            RequestOptions::default(),
+            None,
+        )
+        .await;
+    drop(prov_tx);
+
+    let mut title = String::new();
+    while let Ok(event) = prov_rx.try_recv() {
+        if let maki_providers::ProviderEvent::TextDelta { text } = event {
+            title.push_str(&text);
+        }
+    }
+    let title = title.trim().to_string();
+    if !title.is_empty() {
+        let _ = event_tx.send(AgentEvent::RenameResult { title });
+    }
+    Ok(())
+}
+
 pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
     let usable = model
         .context_window

@@ -37,6 +37,7 @@ pub enum ChatEventResult {
         scopes: Vec<String>,
     },
     AuthRequired,
+    RenameResult(String),
 }
 
 pub struct Chat {
@@ -119,6 +120,21 @@ impl Chat {
             }
             AgentEvent::CompactionDone => {
                 self.messages_panel.flush();
+            }
+            AgentEvent::CompactionStart { checkpoint } => {
+                self.messages_panel.flush();
+                let label = if checkpoint {
+                    "Checkpointing conversation..."
+                } else {
+                    "Compacting conversation..."
+                };
+                self.messages_panel.push(DisplayMessage::new(
+                    DisplayRole::Assistant,
+                    label.into(),
+                ));
+            }
+            AgentEvent::RenameResult { title } => {
+                return ChatEventResult::RenameResult(title);
             }
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };

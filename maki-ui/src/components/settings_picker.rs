@@ -10,7 +10,7 @@ use crate::theme;
 const TITLE: &str = " Settings ";
 const MAX_VISIBLE: u16 = 10;
 
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserSettings {
     #[serde(default)]
     pub show_system_prompt: bool,
@@ -32,6 +32,23 @@ pub struct UserSettings {
     pub disabled_plugins: Vec<String>,
     #[serde(default)]
     pub global_sessions: bool,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            show_system_prompt: false,
+            api_logging: true,
+            show_reasoning: true,
+            show_token_stats: true,
+            log_command: Some("tail -n 30 alog | jlf -c | less -R".to_string()),
+            compact_tokens: None,
+            skills_dirs: Vec::new(),
+            export_path: None,
+            disabled_plugins: Vec::new(),
+            global_sessions: false,
+        }
+    }
 }
 
 impl UserSettings {

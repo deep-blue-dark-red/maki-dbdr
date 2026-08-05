@@ -825,4 +825,41 @@ mod tests {
         assert_eq!(wrapped.spec(), format!("my-ollama-wrap/{model_id}"));
         assert_eq!(wrapped.context_window, expected_window);
     }
+
+    #[test]
+    fn openrouter_pricing_mapping_is_correct() {
+        // ModelPricing fields are $/1M tokens. OpenRouter's per-token prices are
+        // scaled by 1e6 when parsed (prompt -> input, completion -> output,
+        // input_cache_write -> cache_write, input_cache_read -> cache_read).
+        let pricing = ModelPricing {
+            input: 0.50,
+            output: 1.50,
+            cache_write: 0.10,
+            cache_read: 0.05,
+            fast: None,
+        };
+        let usage = TokenUsage {
+            input: 2_000_000,
+            output: 1_000_000,
+            cache_creation: 500_000,
+            cache_read: 4_000_000,
+        };
+        let cost = usage.cost(&pricing, false);
+        // 2M*0.5/1M + 1M*1.5/1M + 0.5M*0.1/1M + 4M*0.05/1M
+        let expected = 1.0 + 1.5 + 0.05 + 0.2;
+        assert!((cost - expected).abs() < 1e-9, "got {cost}, expected {expected}");
+    }
+
+    #[test]
+    fn openrouter_zero_pricing_yields_zero_cost() {
+        let pricing = ModelPricing::ZERO;
+        let usage = TokenUsage {
+            input: 1_000,
+            output: 1_000,
+            cache_creation: 1_000,
+            cache_read: 1_000,
+        };
+        assert_eq!(usage.cost(&pricing, false), 0.0);
+        assert!(pricing.is_zero());
+    }
 }

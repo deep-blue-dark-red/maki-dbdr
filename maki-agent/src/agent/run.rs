@@ -26,6 +26,8 @@ use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+/// Tokens of expected-vs-actual cache_read deviation that flags a prompt-cache miss.
+const CACHE_MISS_DEVIANCE: u32 = 10_000;
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -86,6 +88,7 @@ pub struct Agent<'h> {
     total_usage: TokenUsage,
     context_size: u32,
     num_turns: u32,
+    last_cache_baseline: u32,
     recent_calls: RecentCalls,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
@@ -128,6 +131,7 @@ impl<'h> Agent<'h> {
             total_usage: TokenUsage::default(),
             context_size: 0,
             num_turns: 0,
+            last_cache_baseline: 0,
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
@@ -258,6 +262,25 @@ impl<'h> Agent<'h> {
 
         let has_tools = response.message.has_tool_calls();
         let stop_reason = response.stop_reason;
+        let usage = response.usage;
+        // expected = previous turn's uncached input + cache_creation (the prefix
+        // that should be served from cache this turn). A large shortfall vs the
+        // actual cache_read means a prompt-cache miss (history changed or the
+        // provider evicted the cache, e.g. >5 min idle).
+        if self.num_turns >= 2 {
+            let actual = usage.cache_read;
+            if self.last_cache_baseline.saturating_sub(actual) >= CACHE_MISS_DEVIANCE {
+                warn!(
+                    self.num_turns,
+                    expected = self.last_cache_baseline,
+                    actual,
+                    "cache miss detected (expected - actual >= {}); \
+                     history may have changed or the cache expired (>5 min)",
+                    CACHE_MISS_DEVIANCE
+                );
+            }
+        }
+        self.last_cache_baseline = usage.input + usage.cache_creation;
         info!(
             input_tokens = response.usage.input,
             output_tokens = response.usage.output,
@@ -271,10 +294,8 @@ impl<'h> Agent<'h> {
         );
 
         self.emit_turn_complete(&response)?;
-        let usage = response.usage;
         self.total_usage += usage;
         self.context_size = usage.total_input();
-
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
@@ -478,6 +499,28 @@ impl<'h> Agent<'h> {
             }
             ExtractedCommand::Compact(_) => {
                 self.do_compact().await?;
+            }
+            ExtractedCommand::Checkpoint(_) => {
+                let (compact_provider, compact_model) =
+                    resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+                compaction::checkpoint(
+                    &*compact_provider,
+                    &compact_model,
+                    self.history,
+                    &self.event_tx,
+                )
+                .await?;
+            }
+            ExtractedCommand::Rename(messages, _) => {
+                let (compact_provider, compact_model) =
+                    resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+                compaction::rename_session(
+                    &*compact_provider,
+                    &compact_model,
+                    &messages,
+                    &self.event_tx,
+                )
+                .await?;
             }
         }
         Ok(true)
