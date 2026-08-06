@@ -98,6 +98,10 @@ impl Typewriter {
         self.buffer.is_empty()
     }
 
+    pub fn visible_len(&self) -> usize {
+        self.visible_len
+    }
+
     pub fn buffer_line_count(&self) -> usize {
         if self.buffer.is_empty() {
             0

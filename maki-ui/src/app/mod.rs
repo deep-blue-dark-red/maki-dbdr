@@ -64,7 +64,7 @@ use maki_agent::{
 };
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
-use maki_providers::{Message, Model, ThinkingConfig, add_cost};
+use maki_providers::{Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -97,6 +97,8 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
+/// Idle time after which a prompt cache is likely evicted by the provider.
+const CACHE_MISS_IDLE: Duration = Duration::from_secs(300);
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
@@ -180,7 +182,14 @@ pub struct App {
     pub(super) clipboard: ClipboardState,
     pub(super) last_esc: Option<Instant>,
     pub(super) last_turn_stats: Option<crate::components::status_bar::TurnStats>,
+    /// Last completed turn's streaming summary, shown as `Done` in the status bar
+    /// after the run ends (status returns to Idle).
+    pub(super) last_done_info: Option<crate::components::status_bar::StreamingInfo>,
+    /// Warning shown when idle >5 min with a large context (cache likely dropped).
+    pub(super) cache_miss_warning: Option<String>,
     turn_start: Option<Instant>,
+    /// When the last turn completed; used to detect stale-cache risk on idle.
+    last_turn_at: Option<Instant>,
 
     pub(crate) storage: StateDir,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
@@ -280,7 +289,10 @@ impl App {
             clipboard: ClipboardState::new(),
             last_esc: None,
             last_turn_stats: None,
+            last_done_info: None,
+            cache_miss_warning: None,
             turn_start: None,
+            last_turn_at: None,
             storage,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
@@ -346,6 +358,32 @@ impl App {
     pub fn tick_error_expiry(&mut self) {
         if self.status.is_error_expired() {
             self.status = Status::Idle;
+        }
+    }
+
+    /// Sets `cache_miss_warning` when the session has been idle past the cache
+    /// eviction window with a context larger than the configured threshold, so the
+    /// next turn will likely pay full (uncached) input cost.
+    pub(super) fn update_cache_miss_warning(&mut self) {
+        let threshold = self
+            .ui_config
+            .cache_miss_warn_context
+            .unwrap_or(self.state.model.context_window);
+        let idle_too_long = self
+            .last_turn_at
+            .is_some_and(|t| t.elapsed() >= CACHE_MISS_IDLE);
+        if idle_too_long && self.state.context_size > threshold {
+            let extra = TokenUsage {
+                input: self.state.context_size,
+                ..Default::default()
+            }
+            .cost(&self.state.model.pricing, self.state.fast);
+            self.cache_miss_warning = Some(format!(
+                "cache miss likely — extra cost ${:.2} · Enter to resend, or /new",
+                extra
+            ));
+        } else {
+            self.cache_miss_warning = None;
         }
     }
 
@@ -1367,20 +1405,43 @@ impl App {
                     } else {
                         (0.0, 0.0)
                     };
-                    let cache_rate = if total > 0 {
-                        tc.usage.cache_read as f64 / total as f64
+                    let cum = &self.state.token_usage;
+                    let cum_total = cum.input + cum.cache_creation + cum.cache_read;
+                    let cache_rate = if cum_total > 0 {
+                        cum.cache_read as f64 / cum_total as f64
                     } else {
                         0.0
                     };
+                    let cache_hit_cost = TokenUsage {
+                        cache_read: tc.usage.cache_read,
+                        ..Default::default()
+                    }
+                    .cost(&self.state.model.pricing, self.state.fast);
+                    let cache_miss_cost = TokenUsage {
+                        input: total,
+                        ..Default::default()
+                    }
+                    .cost(&self.state.model.pricing, self.state.fast);
                     self.last_turn_stats = Some(
                         crate::components::status_bar::TurnStats {
                             pp_tps,
                             tg_tps,
                             cache_rate,
+                            last_turn_cache_miss: tc.usage.cache_read == 0,
+                            cache_hit_cost,
+                            cache_miss_cost,
                         },
                     );
+                    self.last_done_info = Some(crate::components::status_bar::StreamingInfo {
+                        duration: start.elapsed(),
+                        input_tokens: total,
+                        output_tokens: tc.usage.output,
+                        active_tools: Vec::new(),
+                    });
                 }
             }
+            self.last_turn_at = Some(Instant::now());
+            self.update_cache_miss_warning();
             *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
@@ -1508,6 +1569,7 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
+                self.turn_start = Some(Instant::now());
                 vec![Action::Compact]
             }
             "/checkpoint" => {
@@ -1516,6 +1578,7 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
+                self.turn_start = Some(Instant::now());
                 vec![Action::Checkpoint]
             }
             "/help" => {

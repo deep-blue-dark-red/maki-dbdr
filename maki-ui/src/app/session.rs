@@ -449,8 +449,8 @@ impl App {
             None => 0,
         };
 
-        let target_id = summaries[target_idx].id.clone();
-        let target_title = summaries[target_idx].title.clone();
+        let target_id = summaries[target_idx].id;
+        let target_title = &summaries[target_idx].title;
 
         let actions = self.load_session(target_id);
         self.status_bar.flash(format!("Switched to session: {target_title}"));

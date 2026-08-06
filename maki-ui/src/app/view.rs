@@ -5,7 +5,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
-use crate::components::status_bar::{StatusBarContext, UsageStats};
+use crate::components::status_bar::{StatusBarContext, StreamingInfo, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
@@ -296,9 +296,25 @@ impl App {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
+        self.update_cache_miss_warning();
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
+        let is_streaming = self.status == Status::Streaming;
+        let streaming_info = if is_streaming {
+            let duration = self
+                .turn_start
+                .map(|s| s.elapsed())
+                .unwrap_or(std::time::Duration::ZERO);
+            Some(StreamingInfo {
+                duration,
+                input_tokens: chat.prompt_progress_tokens().unwrap_or(0),
+                output_tokens: chat.streaming_output_tokens(),
+                active_tools: Vec::new(),
+            })
+        } else {
+            self.last_done_info.clone()
+        };
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
@@ -310,7 +326,12 @@ impl App {
             stats: UsageStats {
                 global_usage: &self.state.token_usage,
                 context_size: chat.context_size,
-                cost: chat.cost,
+                // `chat.cost` stays `None` until the first priced turn completes; show
+                // `$0.000` from the start for any model with known (non-zero) pricing,
+                // rather than waiting for a turn to establish that the model is priced.
+                cost: chat
+                    .cost
+                    .or_else(|| (!self.state.model.pricing.is_zero()).then_some(0.0)),
                 pricing: &self.state.model.pricing,
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
@@ -323,11 +344,12 @@ impl App {
             fast: self.state.fast,
             workflow: self.state.workflow,
             restoring: self.restoring.load(Ordering::Relaxed),
-            streaming_info: None,
-            streaming_active: false,
+            streaming_info,
+            streaming_active: is_streaming,
             verbose: self.verbose,
             last_turn_stats: self.last_turn_stats.as_ref(),
             show_token_stats: self.ui_config.show_token_stats,
+            cache_miss_warning: self.cache_miss_warning.clone(),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

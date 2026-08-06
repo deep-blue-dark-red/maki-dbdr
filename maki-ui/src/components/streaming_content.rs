@@ -122,6 +122,10 @@ impl StreamingContent {
         self.typewriter.is_empty()
     }
 
+    pub fn visible_len(&self) -> usize {
+        self.typewriter.visible_len()
+    }
+
     pub fn line_count(&self) -> usize {
         self.typewriter.buffer_line_count()
     }

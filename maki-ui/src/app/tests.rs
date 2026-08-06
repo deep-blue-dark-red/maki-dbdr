@@ -4272,3 +4272,79 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .collect();
     assert_eq!(ids, [FINISHED_TASK_ID]);
 }
+
+fn status_bar_text(app: &mut App) -> String {
+    let area = Rect::new(0, 0, 200, 3);
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
+/// `duration` in the status bar's "✻ Waiting (Ns)" indicator is computed
+/// fresh from `turn_start.elapsed()` on every render, with no timer or
+/// cached snapshot — an event-less re-render must still show it advance.
+#[test]
+fn waiting_duration_advances_across_event_less_renders() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+    app.update(agent_msg(AgentEvent::Retry {
+        attempt: 2,
+        message: "Server error (502)".into(),
+        delay_ms: 30_000,
+    }));
+
+    let text1 = status_bar_text(&mut app);
+    assert!(text1.contains("5s"), "expected ~5s elapsed, got: {text1}");
+    assert!(text1.contains("retrying in 29s (#2)"), "got: {text1}");
+
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let text2 = status_bar_text(&mut app);
+
+    assert_ne!(text1, text2, "event-less render should still show advanced time");
+    assert!(text2.contains("6s"), "expected duration to advance to 6s, got: {text2}");
+}
+
+/// Every path that sets `Status::Streaming` must also set `turn_start`, or
+/// the status bar's "(Ns)" duration reads a `None` forever and renders a
+/// permanently frozen "(0s)" — regression test for the three paths that used
+/// to skip it: a message picked up from the shared queue, `/compact`, and
+/// `/checkpoint`.
+#[test]
+fn queued_message_pickup_sets_turn_start() {
+    let mut app = test_app();
+    app.on_queue_item_consumed("hi", 0);
+    assert!(app.turn_start.is_some());
+}
+
+#[test]
+fn compact_command_sets_turn_start() {
+    let mut app = test_app();
+    app.execute_command(cmd("/compact"));
+    assert!(app.turn_start.is_some());
+}
+
+#[test]
+fn checkpoint_command_sets_turn_start() {
+    let mut app = test_app();
+    app.execute_command(cmd("/checkpoint"));
+    assert!(app.turn_start.is_some());
+}
+
+/// `chat.cost` stays `None` until the first priced turn completes, but a
+/// model with known pricing should show `$0.000` from turn zero rather than
+/// omitting the cost segment entirely until something has been spent.
+#[test]
+fn cost_shows_zero_before_any_turn_completes_for_priced_model() {
+    let mut app = test_app();
+    let text = status_bar_text(&mut app);
+    assert!(text.contains("$0.000"), "expected $0.000 before any turn, got: {text}");
+}

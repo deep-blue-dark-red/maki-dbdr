@@ -60,11 +60,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
-        name: "/queue",
-        description: "Remove items from queue",
-        max_args: 0,
-    },
-    BuiltinCommand {
         name: "/model",
         description: "Switch model",
         max_args: 0,

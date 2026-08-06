@@ -348,6 +348,17 @@ impl Chat {
         self.messages_panel.in_progress_count()
     }
 
+    /// Live output-token estimate from the streaming assistant text (chars / 4),
+    /// matching the convention used elsewhere for token approximation.
+    pub fn streaming_output_tokens(&self) -> u32 {
+        (self.messages_panel.streaming_text_len() / 4) as u32
+    }
+
+    /// Live input-token count while the prompt is being uploaded, if known.
+    pub fn prompt_progress_tokens(&self) -> Option<u32> {
+        self.messages_panel.prompt_progress().map(|p| p.processed)
+    }
+
     #[cfg(test)]
     pub fn last_message_text(&self) -> &str {
         self.messages_panel.last_message_text()

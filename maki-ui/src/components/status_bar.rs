@@ -27,6 +27,7 @@ pub struct UsageStats<'a> {
     pub show_global: bool,
 }
 
+#[derive(Clone)]
 pub struct StreamingInfo {
     pub duration: Duration,
     pub input_tokens: u32,
@@ -37,7 +38,14 @@ pub struct StreamingInfo {
 pub struct TurnStats {
     pub pp_tps: f64,
     pub tg_tps: f64,
+    /// Cumulative cache hit rate across the session.
     pub cache_rate: f64,
+    /// Whether the most recent turn was a cache miss (cache_read == 0).
+    pub last_turn_cache_miss: bool,
+    /// Cumulative cost paid for the cached portion of the context (cache_read tokens).
+    pub cache_hit_cost: f64,
+    /// Cost to re-send the current context uncached (full input at input rate).
+    pub cache_miss_cost: f64,
 }
 
 pub struct StatusBarContext<'a> {
@@ -59,6 +67,9 @@ pub struct StatusBarContext<'a> {
     pub verbose: bool,
     pub last_turn_stats: Option<&'a TurnStats>,
     pub show_token_stats: bool,
+    /// Warning shown when idle >5 min with a large context (cache likely dropped):
+    /// an estimate of the extra cost to re-send the context uncached.
+    pub cache_miss_warning: Option<String>,
 }
 
 pub struct StatusBar {
@@ -162,6 +173,13 @@ impl StatusBar {
             left_spans.push(Span::styled(" ✻", theme::current().spinner));
         }
 
+        if let Some(ref warn) = ctx.cache_miss_warning {
+            left_spans.push(Span::styled(
+                format!(" ⚠ {warn}"),
+                theme::current().status_retry_error,
+            ));
+        }
+
         if let Some(name) = ctx.session_name {
             left_spans.push(Span::styled(
                 format!(" [{name}]"),
@@ -174,20 +192,25 @@ impl StatusBar {
         if ctx.show_token_stats
             && let Some(stats) = ctx.last_turn_stats
         {
+            let mark = if stats.last_turn_cache_miss { "𐄂" } else { "✓" };
             let abbrev = format!(
-                " (PP {:.0}|TG {:.0}|CR {:.0})",
-                stats.pp_tps,
-                stats.tg_tps,
+                "CR {:.1}% {} CH ${:.2} CM ${:.2}",
                 stats.cache_rate * 100.0,
+                mark,
+                stats.cache_hit_cost,
+                stats.cache_miss_cost,
             );
             token_stats_idx = Some(left_spans.len());
             token_stats_abbrev = Some(abbrev);
             left_spans.push(Span::styled(
                 format!(
-                    " PP {:.1} t/s | TG {:.1} t/s | CR {:.1}%",
+                    " PP {:.1} t/s | TG {:.1} t/s | CR {:.1}% {} CH ${:.2} CM ${:.2}",
                     stats.pp_tps,
                     stats.tg_tps,
                     stats.cache_rate * 100.0,
+                    mark,
+                    stats.cache_hit_cost,
+                    stats.cache_miss_cost,
                 ),
                 theme::current().status_dim,
             ));
@@ -309,17 +332,24 @@ impl StatusBar {
             let span_width = |spans: &[Span]| -> u16 {
                 spans.iter().map(|s| s.width() as u16).sum()
             };
-            let left_w = || -> u16 {
-                left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1)
-            };
 
-            if left_w() + span_width(&right_spans) > area.width {
-                right_spans[cwd_idx] =
-                    Span::styled(abbreviate_path_components(&self.cwd_branch), context_style);
+            let mut left_w = left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1);
+            if left_w + span_width(&right_spans) > area.width {
+                // Compact the left-side token stats first (drop PP/TG, keep
+                // CR + hit/miss marker + CH/CM), mirroring model-name compaction.
+                if let (Some(idx), Some(abbrev)) = (token_stats_idx, token_stats_abbrev) {
+                    left_spans[idx] = Span::styled(abbrev.clone(), theme::current().status_dim);
+                    left_w = left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1);
+                }
 
-                if left_w() + span_width(&right_spans) > area.width {
+                if left_w + span_width(&right_spans) > area.width {
+                    right_spans[cwd_idx] =
+                        Span::styled(abbreviate_path_components(&self.cwd_branch), context_style);
+                }
+
+                if left_w + span_width(&right_spans) > area.width {
                     let overflow =
-                        (left_w() + span_width(&right_spans)).saturating_sub(area.width) as usize;
+                        (left_w + span_width(&right_spans)).saturating_sub(area.width) as usize;
                     let model_width = right_spans[model_idx].width();
                     if overflow + 3 < model_width {
                         let keep = model_width - overflow - 3;
@@ -335,13 +365,6 @@ impl StatusBar {
                     } else {
                         right_spans[model_idx] =
                             Span::styled("...", theme::current().status_dim);
-                    }
-
-                    if left_w() + span_width(&right_spans) > area.width
-                        && let (Some(idx), Some(abbrev)) = (token_stats_idx, token_stats_abbrev)
-                    {
-                        left_spans[idx] =
-                            Span::styled(abbrev, theme::current().status_dim);
                     }
                 }
             }

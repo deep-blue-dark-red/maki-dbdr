@@ -504,6 +504,14 @@ impl MessagesPanel {
         self.streaming_text.is_empty()
     }
 
+    pub fn streaming_text_len(&self) -> usize {
+        self.streaming_text.visible_len()
+    }
+
+    pub fn prompt_progress(&self) -> Option<PromptProgress> {
+        self.prompt_progress
+    }
+
     #[cfg(test)]
     pub fn streaming_thinking_is_empty(&self) -> bool {
         self.streaming_thinking.is_empty()

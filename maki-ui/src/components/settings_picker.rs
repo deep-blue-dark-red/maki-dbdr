@@ -239,9 +239,8 @@ mod tests {
 
     #[test]
     fn test_resolved_export_path_cwd() {
-        let mut settings = UserSettings::default();
-        settings.export_path = None;
         let cwd = Path::new("/my/project");
+        let mut settings = UserSettings::default();
         assert_eq!(settings.resolved_export_path(cwd), cwd);
 
         settings.export_path = Some("cwd".to_string());
@@ -250,8 +249,10 @@ mod tests {
 
     #[test]
     fn test_resolved_export_path_absolute() {
-        let mut settings = UserSettings::default();
-        settings.export_path = Some("/tmp/export".to_string());
+        let settings = UserSettings {
+            export_path: Some("/tmp/export".to_string()),
+            ..Default::default()
+        };
         let cwd = Path::new("/my/project");
         assert_eq!(settings.resolved_export_path(cwd), Path::new("/tmp/export"));
     }

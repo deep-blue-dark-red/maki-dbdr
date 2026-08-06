@@ -209,6 +209,7 @@ impl App {
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
         self.status = Status::Streaming;
+        self.turn_start = Some(Instant::now());
         self.main_chat()
             .show_user_message(format_with_images(text, image_count));
     }
@@ -242,6 +243,8 @@ impl App {
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
         self.turn_start = Some(Instant::now());
+        self.last_done_info = None;
+        self.cache_miss_warning = None;
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));
         if !display.is_empty() {
             self.main_chat().show_user_message(display);
