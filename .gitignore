@@ -6,3 +6,6 @@ bench/results/
 /site/_build/
 /site/.bin/
 /result
+.DS_Store
+/repository_context.txt
+/session-*.md
