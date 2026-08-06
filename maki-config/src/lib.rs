@@ -28,6 +28,7 @@ pub const MIN_MAX_INPUT_LINES: u32 = 1;
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 40_000;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -42,6 +43,7 @@ pub const MIN_OUTPUT_LINES: usize = 10;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
+pub const MIN_MAX_OUTPUT_TOKENS: u32 = 1;
 const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
     r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
@@ -336,6 +338,7 @@ pub struct UiFileConfig {
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub show_token_stats: Option<bool>,
     pub max_input_lines: Option<u32>,
+    pub cache_miss_warn_context: Option<u32>,
 }
 
 impl UiFileConfig {
@@ -351,7 +354,8 @@ impl UiFileConfig {
             show_thinking,
             show_token_stats,
             theme,
-            max_input_lines
+            max_input_lines,
+            cache_miss_warn_context
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -468,6 +472,7 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+    pub max_output_tokens: Option<u32>,
     pub task_max_concurrent: Option<usize>,
     pub stale_read_check: Option<bool>,
 }
@@ -481,6 +486,7 @@ impl AgentFileConfig {
             max_output_lines,
             max_continuation_turns,
             compaction_buffer,
+            max_output_tokens,
             task_max_concurrent,
             stale_read_check
         );
@@ -850,6 +856,9 @@ pub struct UiConfig {
 
     #[config(default = false, desc = "Show token statistics (tokens/sec, cache rate) in status bar")]
     pub show_token_stats: bool,
+
+    #[config(skip, default = "None", desc = "Context size (tokens) above which a >5min idle warns of a likely cache miss. Unset uses the model context window.")]
+    pub cache_miss_warn_context: Option<u32>,
 }
 
 impl UiConfig {
@@ -871,6 +880,7 @@ impl UiConfig {
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             show_token_stats: f.show_token_stats.unwrap_or(false),
+            cache_miss_warn_context: f.cache_miss_warn_context,
         }
     }
 
@@ -999,6 +1009,9 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
     pub compaction_buffer: CompactionBuffer,
 
+    #[config(default = DEFAULT_MAX_OUTPUT_TOKENS, min = MIN_MAX_OUTPUT_TOKENS, desc = "Max LLM response length (tokens)")]
+    pub max_output_tokens: u32,
+
     #[config(
         default = true,
         desc = "Require re-reading a file that changed on disk before editing it"
@@ -1031,6 +1044,7 @@ impl AgentConfig {
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            max_output_tokens: file.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
             task_max_concurrent: file
                 .task_max_concurrent
                 .unwrap_or(DEFAULT_TASK_MAX_CONCURRENT),

@@ -273,9 +273,15 @@ impl<'h> Agent<'h> {
             return Err(AgentError::Cancelled);
         }
         let tools = self.request_tools();
+        let mut model = (*self.model).clone();
+        if let Some(max) = model.max_output_tokens {
+            model.max_output_tokens = Some(max.min(self.config.max_output_tokens));
+        } else {
+            model.max_output_tokens = Some(self.config.max_output_tokens);
+        }
         let response = match stream_with_retry(
             &*self.provider,
-            &self.model,
+            &model,
             self.history.as_slice(),
             &self.system,
             tools.as_ref(),
