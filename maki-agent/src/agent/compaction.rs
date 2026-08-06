@@ -1,11 +1,12 @@
 use std::env;
 
+use maki_config::CompactionBuffer;
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
 use tracing::info;
 
-use super::history::History;
+use super::history::{History, remove_orphaned_tool_results};
 use super::streaming::stream_with_retry;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
@@ -37,6 +38,7 @@ async fn run_summary_stream(
     target_tokens: Option<usize>,
 ) -> Result<StreamResponse, AgentError> {
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
+    remove_orphaned_tool_results(&mut compaction_history);
     if strip {
         strip_images(&mut compaction_history);
         strip_thinking(&mut compaction_history);
@@ -122,6 +124,7 @@ fn finish_compact(
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
+        cost: model.cost_of(&response.usage, false),
         context_size: Some(response.usage.output),
     })));
 
@@ -254,8 +257,10 @@ pub(super) async fn checkpoint_history(
     Ok(response.usage)
 }
 
-pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, compaction_buffer: u32) -> bool {
-    let usable = model.context_window.saturating_sub(compaction_buffer);
+pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
+    let usable = model
+        .context_window
+        .saturating_sub(buffer.resolve(model.context_window));
     usage.context_tokens() >= usable
 }
 
@@ -310,39 +315,26 @@ fn truncate_oldest_round(messages: &mut Vec<Message>) {
         return;
     }
 
-    let mut remove_count = 1;
-
-    if matches!(messages.first().map(|m| &m.role), Some(Role::Assistant)) {
-        let has_tool_calls = messages[0].has_tool_calls();
-        if has_tool_calls {
-            let next_has_tool_results = messages.get(1).is_some_and(|m| {
-                matches!(m.role, Role::User)
-                    && m.content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-            });
-            if next_has_tool_results {
-                remove_count = 2;
-            }
-        }
-    } else if matches!(messages.first().map(|m| &m.role), Some(Role::User))
-        && matches!(messages.get(1).map(|m| &m.role), Some(Role::Assistant))
+    let removed_user = matches!(messages.remove(0).role, Role::User);
+    if removed_user
+        && messages.len() > 1
+        && matches!(
+            messages.first().map(|message| &message.role),
+            Some(Role::Assistant)
+        )
     {
-        // Dropping a lone user message would leave assistant-first, which some providers reject.
-        // Remove the assistant too to keep the conversation well-formed.
-        remove_count = 2;
+        messages.remove(0);
     }
+    remove_orphaned_tool_results(messages);
 
-    messages.drain(..remove_count);
-
-    // After draining, the first message might still be an assistant (e.g. consecutive
-    // assistant messages). Keep draining until the first message is user or we're empty.
-    while messages.len() > 1 && matches!(messages.first().map(|m| &m.role), Some(Role::Assistant)) {
-        let mut drop = 1;
-        if matches!(messages.get(1).map(|m| &m.role), Some(Role::User)) {
-            drop = 2;
-        }
-        messages.drain(..drop);
+    while messages.len() > 1
+        && matches!(
+            messages.first().map(|message| &message.role),
+            Some(Role::Assistant)
+        )
+    {
+        messages.remove(0);
+        remove_orphaned_tool_results(messages);
     }
 }
 
@@ -361,6 +353,7 @@ mod tests {
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, TokenUsage,
     };
+    use maki_storage::id::SessionRef;
     use serde_json::Value;
     use test_case::test_case;
 
@@ -368,14 +361,16 @@ mod tests {
     use crate::AgentConfig;
 
     struct MockProvider {
-        responses: Mutex<Vec<StreamResponse>>,
+        responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
+        requests: Mutex<Vec<Vec<Message>>>,
         system_prompts: Mutex<Vec<String>>,
     }
 
     impl MockProvider {
-        fn new(responses: Vec<StreamResponse>) -> Self {
+        fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
                 system_prompts: Mutex::new(vec![]),
             }
         }
@@ -385,18 +380,19 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             system_prompt: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&str>,
+            _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             self.system_prompts.lock().unwrap().push(system_prompt.to_string());
             Box::pin(async {
+                self.requests.lock().unwrap().push(messages.to_vec());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
-                Ok(responses.remove(0))
+                responses.remove(0)
             })
         }
 
@@ -432,8 +428,9 @@ mod tests {
     #[test]
     fn compact_replaces_history_with_summary() {
         smol::block_on(async {
-            let provider: std::sync::Arc<dyn Provider> =
-                std::sync::Arc::new(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
+                vec![Ok(text_response(StopReason::EndTurn))],
+            ));
             let model = default_model();
             let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(vec![
@@ -468,7 +465,10 @@ mod tests {
     fn checkpoint_appends_without_removing() {
         smol::block_on(async {
             let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
-                vec![text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)],
+                vec![
+                    Ok(text_response(StopReason::EndTurn)),
+                    Ok(text_response(StopReason::EndTurn)),
+                ],
             ));
             let model = default_model();
             let (raw_tx, _rx) = flume::unbounded();
@@ -506,12 +506,74 @@ mod tests {
         });
     }
 
+    #[test]
+    fn compact_preparation_removes_orphan_result_and_tool_image() {
+        use std::sync::Arc;
+
+        use maki_providers::{ImageMediaType, ImageSource};
+
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let image = ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8=")),
+            };
+            let mut orphan = Message {
+                role: Role::User,
+                content: vec![tool_result("orphan"), image.clone()],
+                ..Default::default()
+            };
+            orphan.content.push(ContentBlock::Text {
+                text: "keep text".into(),
+            });
+            let chat_image = Message {
+                role: Role::User,
+                content: vec![image],
+                ..Default::default()
+            };
+            let mut history = History::new(vec![orphan, chat_image]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            let request = &requests[0];
+            assert!(
+                !request
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(
+                        block,
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }
+                    ))
+            );
+            assert!(
+                request.iter().flat_map(|message| &message.content).any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "keep text")
+                )
+            );
+            assert!(request.iter().flat_map(|message| &message.content).any(
+                |block| matches!(block, ContentBlock::Text { text } if text == IMAGE_PLACEHOLDER)
+            ));
+        });
+    }
+
     #[test_case(159_999, 0,       0,       0,      200_000, false ; "below_threshold")]
     #[test_case(160_000, 0,       0,       0,      200_000, true  ; "at_threshold")]
     #[test_case(100,     0,       0,       0,      100,     true  ; "tiny_context_window")]
     #[test_case(5_000,   165_000, 10_000,  0,      200_000, true  ; "cached_tokens_count_toward_overflow")]
     #[test_case(100_000, 0,       0,       80_000, 200_000, true  ; "output_tokens_count_toward_overflow")]
     #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
+    #[test_case(51_199,  0,       0,       0,      64_000,  false ; "small_window_below_scaled_threshold")]
+    #[test_case(51_200,  0,       0,       0,      64_000,  true  ; "small_window_at_scaled_threshold")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,
@@ -531,6 +593,18 @@ mod tests {
             is_overflow(&usage, &model, AgentConfig::default().compaction_buffer),
             expected
         );
+    }
+
+    #[test_case(CompactionBuffer::Tokens(10_000), 53_999, false ; "explicit_tokens_below")]
+    #[test_case(CompactionBuffer::Tokens(10_000), 54_000, true  ; "explicit_tokens_honored")]
+    #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
+    fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
+        let model = small_context_model(64_000);
+        let usage = TokenUsage {
+            input,
+            ..Default::default()
+        };
+        assert_eq!(is_overflow(&usage, &model, buffer), expected);
     }
 
     #[test]
@@ -628,6 +702,151 @@ mod tests {
         );
     }
 
+    fn tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(id, "bash", serde_json::json!({}))],
+            ..Default::default()
+        }
+    }
+
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "output".into(),
+            is_error: false,
+        }
+    }
+
+    #[track_caller]
+    fn assert_tool_results_have_calls(messages: &[Message]) {
+        for (index, message) in messages.iter().enumerate() {
+            for block in &message.content {
+                let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                    continue;
+                };
+                assert!(matches!(message.role, Role::User));
+                assert!(index > 0);
+                assert!(
+                    messages[index - 1]
+                        .tool_uses()
+                        .any(|(id, _, _)| id == tool_use_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_history_retries_without_reproduced_orphan() {
+        smol::block_on(async {
+            const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
+
+            let provider = MockProvider::new(vec![
+                Err(AgentError::Api {
+                    status: 413,
+                    message: "prompt is too long".into(),
+                }),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("request".into()),
+                tool_use(TOOL_USE_ID),
+                Message {
+                    role: Role::User,
+                    content: vec![tool_result(TOOL_USE_ID)],
+                    ..Default::default()
+                },
+                Message::user("prompt".into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0]
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
+            assert!(
+                !requests[1]
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_keeps_observation_before_dependent_reply() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::observation("[monitor] build failed".into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "I will fix it".into(),
+                    }],
+                    ..Default::default()
+                },
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert!(requests[0][0].is_observation());
+            assert!(matches!(requests[0][1].role, Role::Assistant));
+        });
+    }
+
+    #[test]
+    fn truncate_oldest_round_preserves_text_beside_orphan() {
+        let mut messages = vec![
+            Message::user("request".into()),
+            tool_use("expected"),
+            Message {
+                role: Role::User,
+                content: vec![
+                    tool_result("mismatched"),
+                    ContentBlock::Text {
+                        text: "keep me".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            Message::user("prompt".into()),
+        ];
+
+        truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            matches!(&messages[0].content[..], [ContentBlock::Text { text }] if text == "keep me")
+        );
+        assert_tool_results_have_calls(&messages);
+    }
+
     #[test]
     fn truncate_oldest_round_removes_single_user_message() {
         let mut messages = vec![
@@ -635,6 +854,7 @@ mod tests {
             Message::user("second".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "second"));
     }
@@ -644,11 +864,7 @@ mod tests {
         let mut messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }],
+                content: vec![ContentBlock::tool_use("t1", "bash", serde_json::json!({}))],
                 ..Default::default()
             },
             Message {
@@ -663,6 +879,7 @@ mod tests {
             Message::user("keep me".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "keep me")
@@ -674,16 +891,13 @@ mod tests {
         let mut messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }],
+                content: vec![ContentBlock::tool_use("t1", "bash", serde_json::json!({}))],
                 ..Default::default()
             },
             Message::user("no tool result".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "no tool result")
@@ -694,6 +908,7 @@ mod tests {
     fn truncate_oldest_round_noop_on_single_message() {
         let mut messages = vec![Message::user("only".into())];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
     }
 
@@ -710,6 +925,7 @@ mod tests {
             Message::user("keep me".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "keep me")
@@ -730,11 +946,7 @@ mod tests {
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }],
+                content: vec![ContentBlock::tool_use("t1", "bash", serde_json::json!({}))],
                 ..Default::default()
             },
             Message {
@@ -749,15 +961,20 @@ mod tests {
             Message::user("keep me".into()),
         ];
         truncate_oldest_round(&mut messages);
-        assert!(!messages.is_empty());
-        assert!(matches!(messages[0].role, Role::User));
+        assert_tool_results_have_calls(&messages);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(&messages[0].content[..], [ContentBlock::Text { text }] if text == "keep me")
+        );
     }
 
     // ── maki-mcp fork tests ───────────────────────────────────────────────────────
     #[test]
     fn compact_appends_length_constraint_to_system_prompt() {
         smol::block_on(async {
-            let provider = std::sync::Arc::new(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+            let provider = std::sync::Arc::new(MockProvider::new(vec![Ok(text_response(
+                StopReason::EndTurn,
+            ))]));
             let model = default_model();
             let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(vec![Message::user("hi".into())]);

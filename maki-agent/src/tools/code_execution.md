@@ -1,1 +1,0 @@
-Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency via asyncio.gather. Libs: re, asyncio, sys, os, json. No imports, no network. 30s default timeout.

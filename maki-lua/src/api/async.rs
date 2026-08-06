@@ -3,11 +3,11 @@ use std::sync::Arc;
 use async_lock::{Semaphore, SemaphoreGuardArc};
 use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
-use mlua::{
-    Function, Lua, MultiValue, Result as LuaResult, Table, UserData, UserDataMethods, Value,
-};
+use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
 
-use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell};
+use crate::docs::{FnDoc, ParamDoc};
+use crate::runtime::{TaskHandle, enqueue_async_task, lock_cell, register_cancel_hook};
 
 const AWAIT_MIN_ARGS: usize = 2;
 const PERMIT_RELEASED_ERR: &str = "permit already released";
@@ -21,81 +21,285 @@ struct LuaPermit {
     guard: std::sync::Mutex<Option<SemaphoreGuardArc>>,
 }
 
-impl UserData for LuaSemaphore {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_async_method("acquire", |lua, this, ()| async move {
-            let sem = Arc::clone(&this.sem);
-            drop(this);
-            let cancel = lua
-                .app_data_ref::<TaskHandle>()
-                .map(|h| lock_cell(&h).cancel.clone())
-                .unwrap_or_else(CancelToken::none);
-            let guard = cancel
-                .race(sem.acquire_arc())
-                .await
-                .map_err(mlua::Error::runtime)?;
-            Ok(LuaPermit {
-                guard: std::sync::Mutex::new(Some(guard)),
-            })
-        });
-    }
+/// Wait for a permit from the semaphore. Your coroutine suspends until a slot
+/// opens up. If the owning task is cancelled, the acquire is cancelled too.
+///
+/// @return (maki.async.Permit) A permit handle. Call `:release()` when done, or let it be garbage collected.
+/// @example
+/// local sem = maki.async.semaphore(3)
+/// local permit = sem:acquire()
+/// -- do work that needs the slot
+/// permit:release()
+#[lua_fn]
+async fn acquire(lua: Lua, this: mlua::UserDataRef<LuaSemaphore>) -> LuaResult<LuaPermit> {
+    let sem = Arc::clone(&this.sem);
+    drop(this);
+    let cancel = lua
+        .app_data_ref::<TaskHandle>()
+        .map(|h| lock_cell(&h).cancel.clone())
+        .unwrap_or_else(CancelToken::none);
+    let guard = cancel
+        .race(sem.acquire_arc())
+        .await
+        .map_err(mlua::Error::runtime)?;
+    Ok(LuaPermit {
+        guard: std::sync::Mutex::new(Some(guard)),
+    })
 }
 
-impl UserData for LuaPermit {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("release", |_, this, ()| {
-            let released = this
-                .guard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-                .is_some();
-            if !released {
-                return Err(mlua::Error::runtime(PERMIT_RELEASED_ERR));
-            }
-            Ok(())
-        });
+lua_class! {
+    /// A counting semaphore for limiting how many tasks run at once.
+    ///
+    /// Create one with `maki.async.semaphore(n)`, then call `:acquire()` to
+    /// get a permit before doing work. If the task is cancelled, the acquire
+    /// is cancelled too.
+    "maki.async.Semaphore" => LuaSemaphore, SEMAPHORE_DOCS [acquire]
+}
+
+/// Give the permit back to the semaphore so another task can acquire it.
+/// Throws if you already released this permit.
+#[lua_fn]
+fn release(_lua: &Lua, this: &LuaPermit) -> LuaResult<()> {
+    let released = this
+        .guard
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some();
+    if !released {
+        return Err(mlua::Error::runtime(PERMIT_RELEASED_ERR));
     }
+    Ok(())
+}
+
+lua_class! {
+    /// One slot in a semaphore, obtained from `Semaphore:acquire()`.
+    ///
+    /// The slot is held until you call `:release()` or until the permit is
+    /// garbage collected. Releasing early lets other tasks acquire sooner.
+    "maki.async.Permit" => LuaPermit, PERMIT_DOCS [release]
+}
+
+/// Fire off a function as a new async task. It runs in the background and
+/// you do not wait for it. If you need the result, pass an {on_finish}
+/// callback.
+///
+/// @param fn function Zero-argument function to execute.
+/// @param on_finish function? Optional callback `function(err, result)`. Called once {fn} completes.
+/// @example
+/// maki.async.run(function()
+///   local data = expensive_fetch()
+///   process(data)
+/// end)
+#[lua_fn]
+fn run(lua: &Lua, r#fn: Function, on_finish: Option<Function>) -> LuaResult<()> {
+    let actual_work = if let Some(cb) = on_finish {
+        lua.load(
+            r#"
+                local work, finish = ...
+                return function()
+                    local ok, result = pcall(work)
+                    if ok then
+                        finish(nil, result)
+                    else
+                        finish(result)
+                    end
+                end
+            "#,
+        )
+        .call::<Function>((r#fn, cb))?
+    } else {
+        r#fn
+    };
+    let work_key = lua.create_registry_value(actual_work)?;
+    enqueue_async_task(lua, work_key)?;
+    Ok(())
+}
+
+/// Register {fn} to run as soon as the current task is cancelled, without
+/// waiting for whatever it is doing to finish. Use it to paint the
+/// cancelled state: a handler waiting on children (`gather`, `call_tool`)
+/// stays parked until they wind down, so anything after the wait is too
+/// late to reach the screen.
+///
+/// The callback runs outside your coroutine, so it must not yield. It
+/// fires at most once, immediately if the task is already cancelled. An
+/// error inside it is logged and never reaches your handler, and the
+/// other hooks still run.
+///
+/// @param fn function Zero-argument function to run on cancel.
+/// @example
+/// maki.async.on_cancel(function()
+///   view:append({ { "cancelled", "tool_error" } })
+/// end)
+/// maki.async.gather(children)
+#[lua_fn]
+fn on_cancel(lua: &Lua, r#fn: Function) -> LuaResult<()> {
+    register_cancel_hook(lua, r#fn)
+}
+
+/// Run all functions in {fns} at the same time and collect their results.
+/// Unlike `join`, this gives you back the return value (or error) from each
+/// function. The results are in the same order as the input.
+///
+/// Each entry in the result array has `ok` (boolean), and either `value`
+/// (on success) or `err` (string, on failure).
+///
+/// @param fns table Array of zero-argument functions.
+/// @return (table) Array of result tables, one per function.
+/// @example
+/// local results = maki.async.gather({
+///   function() return fetch("a.txt") end,
+///   function() return fetch("b.txt") end,
+/// })
+/// for i, r in ipairs(results) do
+///   if r.ok then print(r.value) else print("error: " .. r.err) end
+/// end
+#[lua_fn]
+async fn gather(lua: Lua, fns: Table) -> LuaResult<Table> {
+    let count = fns.raw_len();
+    let mut children = Vec::with_capacity(count);
+    for i in 1..=count {
+        let f: Function = fns
+            .raw_get(i)
+            .map_err(|_| mlua::Error::runtime(format!("gather: funs[{i}] must be a function")))?;
+        children.push(lua.create_thread(f)?);
+    }
+    let results = join_all(
+        children
+            .into_iter()
+            .map(|thread| async move { thread.into_async::<Value>(())?.await }),
+    )
+    .await;
+    let out = lua.create_table_with_capacity(count, 0)?;
+    for (i, res) in results.into_iter().enumerate() {
+        let entry = lua.create_table()?;
+        match res {
+            Ok(value) => {
+                entry.set("ok", true)?;
+                entry.set("value", value)?;
+            }
+            Err(e) => {
+                entry.set("ok", false)?;
+                entry.set("err", e.to_string())?;
+            }
+        }
+        out.raw_set(i + 1, entry)?;
+    }
+    Ok(out)
+}
+
+/// Create a counting semaphore that allows at most {n} concurrent permits.
+/// Use this to limit how many tasks hit a resource at the same time.
+///
+/// @param n integer Maximum number of concurrent permits. Values below 1 are clamped to 1.
+/// @return (maki.async.Semaphore) A new semaphore.
+/// @example
+/// local sem = maki.async.semaphore(5)
+/// -- each task acquires a permit before doing work
+/// local permit = sem:acquire()
+/// do_work()
+/// permit:release()
+#[lua_fn]
+fn semaphore(_lua: &Lua, n: usize) -> LuaResult<LuaSemaphore> {
+    Ok(LuaSemaphore {
+        sem: Arc::new(Semaphore::new(n.max(1))),
+    })
+}
+
+/// `await`, `wrap`, and `join` are registered by hand below: `await`
+/// consumes a raw `MultiValue` and the other two are Lua chunks closing over
+/// the table.
+#[allow(non_upper_case_globals)]
+const await__doc: FnDoc = FnDoc {
+    name: "await",
+    args: "{argc}, {fn}, {...}",
+    desc: "Turn a callback-based function into a normal call you can use in a coroutine. It calls `fn(..., callback)`, inserting the callback at position {argc}, then suspends your coroutine until the callback fires. You get back whatever the callback was called with.",
+    params: &[
+        ParamDoc {
+            name: "{argc}",
+            ty: "integer",
+            desc: "Total number of positional arguments {fn} expects (including the callback). Must be >= 1.",
+        },
+        ParamDoc {
+            name: "{fn}",
+            ty: "function",
+            desc: "Callback-based function to call.",
+        },
+        ParamDoc {
+            name: "{...}",
+            ty: "any",
+            desc: "Extra arguments forwarded to {fn} before the injected callback.",
+        },
+    ],
+    returns: "(...) Values passed by the caller to the injected callback.",
+    example: "local result = maki.async.await(2, http.get, url)",
+};
+
+#[allow(non_upper_case_globals)]
+const wrap__doc: FnDoc = FnDoc {
+    name: "wrap",
+    args: "{argc}, {fn}",
+    desc: "Create a coroutine-friendly wrapper around a callback-based function. The wrapper calls `maki.async.await` for you, so you can use the result like a normal function call.",
+    params: &[
+        ParamDoc {
+            name: "{argc}",
+            ty: "integer",
+            desc: "Callback position, forwarded to `maki.async.await`.",
+        },
+        ParamDoc {
+            name: "{fn}",
+            ty: "function",
+            desc: "Callback-based function to wrap.",
+        },
+    ],
+    returns: "(function) Wrapped function you can call like a normal function.",
+    example: "local get = maki.async.wrap(2, http.get)\nlocal body = get(url)",
+};
+
+#[allow(non_upper_case_globals)]
+const join__doc: FnDoc = FnDoc {
+    name: "join",
+    args: "{max_jobs}, {fns}",
+    desc: "Run all functions in {fns} with at most {max_jobs} going at once. Waits until every function has finished. Unlike `gather`, this does not return individual results.",
+    params: &[
+        ParamDoc {
+            name: "{max_jobs}",
+            ty: "integer",
+            desc: "Maximum number of functions running at the same time.",
+        },
+        ParamDoc {
+            name: "{fns}",
+            ty: "table",
+            desc: "Array of zero-argument functions to execute.",
+        },
+    ],
+    returns: "",
+    example: "maki.async.join(4, {\n  function() process(files[1]) end,\n  function() process(files[2]) end,\n  function() process(files[3]) end,\n})",
+};
+
+lua_table! {
+    /// Tools for running things concurrently in Lua plugins.
+    ///
+    /// Use `run` to fire off background tasks, `gather` or `join` to run
+    /// several functions at once, and `semaphore` to limit concurrency.
+    /// The `await` and `wrap` helpers bridge callback-based APIs into
+    /// coroutine-friendly calls.
+    ///
+    /// ```lua
+    /// local results = maki.async.gather({
+    ///   function() return fetch("a.txt") end,
+    ///   function() return fetch("b.txt") end,
+    /// })
+    /// ```
+    extend "maki.async" => pub(crate) fn add_async_fns(), DOCS [
+        run, manual r#await, manual wrap, manual join, gather, semaphore, on_cancel,
+    ]
 }
 
 pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
     let tbl = lua.create_table()?;
-
-    tbl.set(
-        "semaphore",
-        lua.create_function(|_, n: usize| {
-            Ok(LuaSemaphore {
-                sem: Arc::new(Semaphore::new(n.max(1))),
-            })
-        })?,
-    )?;
-
-    tbl.set(
-        "run",
-        lua.create_function(|lua, (work_fn, on_finish): (Function, Option<Function>)| {
-            let actual_work = if let Some(cb) = on_finish {
-                lua.load(
-                    r#"
-                        local work, finish = ...
-                        return function()
-                            local ok, result = pcall(work)
-                            if ok then
-                                finish(nil, result)
-                            else
-                                finish(result)
-                            end
-                        end
-                    "#,
-                )
-                .call::<Function>((work_fn, cb))?
-            } else {
-                work_fn
-            };
-            let work_key = lua.create_registry_value(actual_work)?;
-            enqueue_async_task(lua, work_key)?;
-            Ok(())
-        })?,
-    )?;
+    add_async_fns(&tbl, lua)?;
 
     tbl.set(
         "await",
@@ -172,42 +376,6 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
     )?;
 
     tbl.set(
-        "gather",
-        lua.create_async_function(|lua, funs: Table| async move {
-            let count = funs.raw_len();
-            let mut children = Vec::with_capacity(count);
-            for i in 1..=count {
-                let f: Function = funs.raw_get(i).map_err(|_| {
-                    mlua::Error::runtime(format!("gather: funs[{i}] must be a function"))
-                })?;
-                children.push(lua.create_thread(f)?);
-            }
-            let results = join_all(
-                children
-                    .into_iter()
-                    .map(|thread| async move { thread.into_async::<Value>(())?.await }),
-            )
-            .await;
-            let out = lua.create_table_with_capacity(count, 0)?;
-            for (i, res) in results.into_iter().enumerate() {
-                let entry = lua.create_table()?;
-                match res {
-                    Ok(value) => {
-                        entry.set("ok", true)?;
-                        entry.set("value", value)?;
-                    }
-                    Err(e) => {
-                        entry.set("ok", false)?;
-                        entry.set("err", e.to_string())?;
-                    }
-                }
-                out.raw_set(i + 1, entry)?;
-            }
-            Ok(out)
-        })?,
-    )?;
-
-    tbl.set(
         "wrap",
         lua.load(
             r#"
@@ -227,18 +395,16 @@ pub(crate) fn create_async_table(lua: &Lua) -> LuaResult<Table> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::pin::pin;
     use std::sync::Mutex;
 
-    use futures_lite::future::poll_once;
+    use futures_lite::future::{or, poll_once};
+    use maki_agent::cancel::CancelTrigger;
     use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
-    use crate::api::r#fn::JobStore;
-    use crate::api::ui::buf::BufferStore;
-    use crate::runtime::{CANCELLED_MSG, TaskCell};
+    use crate::runtime::{CANCELLED_MSG, TaskCell, TaskScope, block_on_or_fail};
 
     const ERR_TOO_FEW_ARGS: &str = "maki.async.await requires at least 2 arguments: argc, fun, ...";
     const ERR_ARGC_GE_1: &str = "argc must be >= 1";
@@ -459,17 +625,7 @@ mod tests {
     fn cancelled_task_handle() -> TaskHandle {
         let (trigger, token) = CancelToken::new();
         trigger.cancel();
-        Arc::new(Mutex::new(TaskCell {
-            cancel: token,
-            deadline: Cell::new(None),
-            deadline_secs: Cell::new(None),
-            jobs: JobStore::new(),
-            bufs: BufferStore::new(),
-            live: None,
-            root_buf: None,
-            live_sink: None,
-            inline_spawn: None,
-        }))
+        Arc::new(Mutex::new(TaskCell::new(token, None, None)))
     }
 
     #[test_case(0 ; "zero_clamps_to_capacity_one")]
@@ -548,5 +704,135 @@ mod tests {
                 "expected error containing {CANCELLED_MSG:?}, got: {msg}"
             );
         });
+    }
+
+    const HOOK_NEVER_FIRED: &str = "cancel hook never fired";
+    const PARKED_CHILD: &str = r#"
+        function()
+            return async_tbl.await(1, function(cb) parked_cb = cb end)
+        end
+    "#;
+    const RELEASE_PARKED_CHILD: &str = r#"parked_cb("done")"#;
+    const CHILD_VALUE: &str = "done";
+    const HOOK_RAW_YIELD: &str = "coroutine.yield()";
+    const HOOK_AWAIT: &str = "async_tbl.await(1, function() end)";
+    const HOOK_LATE_MSG: &str = "the hook must fire while the wait is still parked, not after it";
+    const HOOK_SURVIVED_MSG: &str = "a hook that waits from outside its coroutine must fail there";
+    const TASK_SURVIVED_MSG: &str = "the task must keep working after a hook blew up";
+
+    fn install_notify(lua: &Lua) -> flume::Receiver<()> {
+        let (fired_tx, fired_rx) = flume::bounded(1);
+        let notify = lua
+            .create_function(move |_, ()| {
+                fired_tx.send(()).ok();
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set("notify", notify).unwrap();
+        fired_rx
+    }
+
+    fn live_scope(lua: &Lua) -> (CancelTrigger, TaskScope) {
+        let (trigger, token) = CancelToken::new();
+        (
+            trigger,
+            TaskScope::new(lua, TaskCell::new(token, None, None)),
+        )
+    }
+
+    /// The composition `plugins/batch` leans on, and the one thing the
+    /// runtime's own hook tests cannot show: the handler is parked deep inside
+    /// a real `gather` whose child never finishes, so the hook runs on a VM
+    /// whose coroutine is suspended. Waiting from there is a plugin bug, raw
+    /// or through `maki.async`, and neither may cost the hooks behind it nor
+    /// the task's own result.
+    #[test_case(HOOK_RAW_YIELD ; "raw_yield")]
+    #[test_case(HOOK_AWAIT ; "awaiting")]
+    fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
+        let (lua, _tbl) = setup();
+        let (trigger, scope) = live_scope(&lua);
+        let fired_rx = install_notify(&lua);
+
+        let code = format!(
+            r#"
+            gather_returned = false
+            bad_hook_finished = false
+            async_tbl.on_cancel(function()
+                {bad_hook_body}
+                bad_hook_finished = true
+            end)
+            async_tbl.on_cancel(notify)
+            local r = async_tbl.gather({{ {PARKED_CHILD} }})
+            gather_returned = true
+            return r[1].ok, r[1].value
+            "#
+        );
+
+        let vals: Vec<Value> = block_on_or_fail(or(
+            scope.scope_future(lua.load(&code).eval_async::<MultiValue>()),
+            async {
+                trigger.cancel();
+                fired_rx.recv_async().await.expect(HOOK_NEVER_FIRED);
+                assert!(
+                    !lua.globals().get::<bool>("gather_returned").unwrap(),
+                    "{HOOK_LATE_MSG}"
+                );
+                assert!(
+                    !lua.globals().get::<bool>("bad_hook_finished").unwrap(),
+                    "{HOOK_SURVIVED_MSG}"
+                );
+                lua.load(RELEASE_PARKED_CHILD).exec().unwrap();
+                std::future::pending().await
+            },
+        ))
+        .unwrap()
+        .into_vec();
+
+        assert!(vals[0].as_boolean().unwrap(), "gather child must succeed");
+        assert_eq!(
+            vals[1].as_string().unwrap().to_string_lossy(),
+            CHILD_VALUE,
+            "{TASK_SURVIVED_MSG}"
+        );
+    }
+
+    /// A handler queued on a full semaphore waits on an `Event` that knows
+    /// nothing about the token, so the hook is the only cleanup that can run
+    /// before the acquire gives up. The Lua-side flag pins the order: the hook
+    /// ran while the acquire was still parked.
+    #[test]
+    fn on_cancel_hook_fires_while_a_semaphore_acquire_is_still_parked() {
+        let (lua, _tbl) = setup();
+        let (trigger, scope) = live_scope(&lua);
+
+        let code = r#"
+            hook_fired = false
+            local sem = async_tbl.semaphore(1)
+            held_permit = sem:acquire()
+            async_tbl.on_cancel(function() hook_fired = true end)
+            local ok, err = pcall(function() return sem:acquire() end)
+            return hook_fired, ok, tostring(err)
+        "#;
+
+        let vals: Vec<Value> = block_on_or_fail(or(
+            scope.scope_future(lua.load(code).eval_async::<MultiValue>()),
+            async {
+                trigger.cancel();
+                std::future::pending().await
+            },
+        ))
+        .unwrap()
+        .into_vec();
+
+        assert!(vals[0].as_boolean().unwrap(), "{HOOK_LATE_MSG}");
+        assert!(
+            !vals[1].as_boolean().unwrap(),
+            "a cancelled acquire must not hand out a permit"
+        );
+        let err = vals[2].as_string().unwrap().to_string_lossy();
+        assert!(
+            err.contains(CANCELLED_MSG),
+            "expected error containing {CANCELLED_MSG:?}, got: {err}"
+        );
     }
 }

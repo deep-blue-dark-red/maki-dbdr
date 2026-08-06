@@ -1,17 +1,20 @@
-mod agent;
-mod r#async;
+pub(crate) mod agent;
+pub(crate) mod r#async;
 pub(crate) mod autocmd;
 pub(crate) mod base64;
 pub(crate) mod env;
 pub(crate) mod r#fn;
 pub(crate) mod fs;
 pub(crate) mod image;
-mod interpreter;
+pub(crate) mod interpreter;
 pub(crate) mod json;
 pub(crate) mod keymap;
 pub(crate) mod log;
 pub(crate) mod net;
+pub(crate) mod options;
+pub(crate) mod session;
 pub(crate) mod slot;
+pub(crate) mod split;
 pub(crate) mod text;
 pub(crate) mod tool;
 pub(crate) mod treesitter;
@@ -24,6 +27,7 @@ use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table};
 
+use crate::api::options::PluginOpts;
 use crate::api::tool::PendingTools;
 use crate::api::util::command::UiAction;
 use crate::plugin_permissions::PluginPermissions;
@@ -34,10 +38,11 @@ pub(crate) fn create_maki_global(
     plugin: Arc<str>,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     permissions: &PluginPermissions,
+    opts: PluginOpts,
 ) -> LuaResult<Table> {
     let maki = lua.create_table()?;
 
-    let api = tool::create_api_table(lua, pending, Arc::clone(&plugin))?;
+    let api = tool::create_api_table(lua, pending, Arc::clone(&plugin), opts)?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     maki.set("api", api)?;
@@ -53,16 +58,24 @@ pub(crate) fn create_maki_global(
     maki.set("net", net::create_net_table(lua, permissions)?)?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
-        "ui",
-        ui::create_ui_table(lua, ui_action_tx, Arc::clone(&plugin))?,
+        "session",
+        session::create_session_table(lua, ui_action_tx.clone())?,
     )?;
-    maki.set("fn", r#fn::create_fn_table(lua, permissions)?)?;
+    maki.set(
+        "ui",
+        ui::create_ui_table(lua, ui_action_tx.clone(), Arc::clone(&plugin))?,
+    )?;
+    maki.set(
+        "fn",
+        r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx)?,
+    )?;
+    split::split__register(&maki, lua)?;
     maki.set("async", r#async::create_async_table(lua)?)?;
     maki.set(
         "interpreter",
         interpreter::create_interpreter_table(lua, permissions)?,
     )?;
-    agent::register(lua, &maki)?;
+    maki.set("agent", agent::create_agent_table(lua)?)?;
     maki.set(
         "keymap",
         keymap::create_keymap_table(lua, Arc::clone(&plugin))?,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
 use maki_storage::StateDir;
@@ -251,6 +251,8 @@ static THEME: LazyLock<ArcSwap<Theme>> =
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
+
 pub fn current() -> Guard<Arc<Theme>> {
     THEME.load()
 }
@@ -275,7 +277,12 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
 }
 
+pub fn set_current_name(name: &str) {
+    *CURRENT_NAME.lock().unwrap() = Some(name.to_owned());
+}
+
 pub fn persist_theme(name: &str) {
+    set_current_name(name);
     if let Ok(dir) = StateDir::resolve() {
         maki_storage::theme::persist_theme_name(&dir, name);
     }
@@ -287,6 +294,9 @@ fn read_theme_name() -> Option<String> {
 }
 
 pub fn current_theme_name() -> String {
+    if let Some(name) = CURRENT_NAME.lock().unwrap().clone() {
+        return name;
+    }
     read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
 }
 
@@ -328,6 +338,7 @@ pub fn style_by_name(name: &str) -> Style {
         "active" => t.active,
         "keybind_key" => t.keybind_key,
         "keybind_desc" => t.keybind_desc,
+        "keybind_section" => t.keybind_section,
         "success" | "todo_completed" => t.todo_completed,
         "warning" | "todo_in_progress" => t.todo_in_progress,
         "todo_pending" | "pending" => t.todo_pending,
@@ -406,6 +417,7 @@ pub struct Theme {
     pub index_line_nr: Style,
     pub index_keyword: Style,
     pub shell_prefix: Style,
+    pub progress_bar: Style,
 
     pub syntax: syntect::highlighting::Theme,
 }
@@ -788,6 +800,14 @@ impl Theme {
             index_line_nr: derived_style("index_line_nr", &["comment"], Modifier::empty()),
             index_keyword: derived_style("index_keyword", &["keyword"], Modifier::empty()),
             shell_prefix: derived_style("shell_prefix", &["string"], Modifier::BOLD),
+            progress_bar: {
+                let s = style("progress_bar");
+                if s == Style::default() {
+                    style("accent")
+                } else {
+                    s
+                }
+            },
             syntax,
         })
     }
@@ -988,6 +1008,12 @@ mod tests {
     }
 
     #[test]
+    fn current_theme_name_prefers_in_memory_name() {
+        set_current_name("zenburn");
+        assert_eq!(current_theme_name(), "zenburn");
+    }
+
+    #[test]
     fn helix_theme_loads_without_ui_section() {
         let toml = r##"
 "keyword" = { fg = "pink" }
@@ -1096,6 +1122,7 @@ mode_build = "#112233"
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
         assert_eq!(style_by_name("keybind_key"), t.keybind_key);
         assert_eq!(style_by_name("keybind_desc"), t.keybind_desc);
+        assert_eq!(style_by_name("keybind_section"), t.keybind_section);
         assert_eq!(style_by_name("selected"), t.item_selected);
         assert_eq!(style_by_name("success"), t.todo_completed);
         assert_eq!(style_by_name("warning"), t.todo_in_progress);

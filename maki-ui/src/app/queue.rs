@@ -1,11 +1,24 @@
 //! Queue for messages typed while the agent is busy.
 
-use super::{App, format_with_images};
+use std::time::Instant;
+
+use maki_agent::AgentInput;
+
+use super::{Action, App, Status, format_with_images};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
 use crate::components::queue_panel::QueueEntry;
 
 pub(crate) use crate::agent::shared_queue::QueuedMessage;
+
+pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
+pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
+
+pub(crate) enum SubmitOutcome {
+    Started(Vec<Action>),
+    Queued,
+    Rejected(&'static str),
+}
 
 #[derive(Default)]
 pub(crate) struct MessageQueue {
@@ -106,11 +119,43 @@ impl MessageQueue {
 }
 
 impl App {
+    /// The one queue-or-start decision, shared by the keyboard and Lua
+    /// paths so they cannot drift. Expects raw text: interpretation (slash
+    /// commands, `exit`, `!`) is the caller's job, or skipped on purpose.
+    pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
+        if msg.text.trim().is_empty() && msg.images.is_empty() {
+            return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
+        }
+        if self.status == Status::Streaming {
+            if self.queue_and_notify(msg) {
+                SubmitOutcome::Queued
+            } else {
+                SubmitOutcome::Rejected(NO_QUEUE_ERR)
+            }
+        } else {
+            SubmitOutcome::Started(self.start_from_queue(&msg))
+        }
+    }
+
+    /// Keyboard path: nobody is around to receive an `Err`, so
+    /// rejections flash on screen instead.
+    pub(super) fn submit_or_queue(&mut self, msg: QueuedMessage) -> Vec<Action> {
+        match self.submit_prompt(msg) {
+            SubmitOutcome::Started(actions) => actions,
+            SubmitOutcome::Queued => vec![],
+            SubmitOutcome::Rejected(e) => {
+                self.flash(e.into());
+                vec![]
+            }
+        }
+    }
+
     /// Deferred path: the agent is busy, so park the message and let
-    /// `QueueItemConsumed` draw it once the agent picks it up.
-    pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) {
+    /// `QueueItemConsumed` draw it once the agent picks it up. Returns
+    /// false when there is no shared queue, meaning the message was dropped.
+    pub(super) fn queue_and_notify(&mut self, msg: QueuedMessage) -> bool {
         let Some(ref shared) = self.queue.shared else {
-            return;
+            return false;
         };
         let input = self.build_agent_input(&msg);
         shared.push(QueueItem::Message {
@@ -120,6 +165,24 @@ impl App {
             run_id: self.run_id,
             displayed: false,
         });
+        true
+    }
+
+    /// Push restored queue items only here, never in `restore_display`: on
+    /// load/rewind the display is restored before `respawn` swaps the shared
+    /// queue, so pushing earlier would fill a queue that is about to die.
+    pub(crate) fn flush_restored_queue(&mut self) {
+        // The live queue owns the text from here on, so the recovery
+        // snapshot must stop overriding it on save.
+        self.recoverable_queue.clear();
+        // Read, not taken: the live queue is what the next checkpoint mirrors
+        // back into the session, so emptying it here changes nothing on disk.
+        for text in self.state.session.meta.queued_messages.clone() {
+            self.queue_and_notify(QueuedMessage {
+                text,
+                images: Vec::new(),
+            });
+        }
     }
 
     pub(super) fn queue_compact(&mut self) {
@@ -140,24 +203,49 @@ impl App {
         });
     }
 
-    /// Agent reached a deferred message: time to draw the bubble.
-    /// Immediate-dispatch items skip this event, so no dedup needed.
+    /// Agent reached a deferred message: time to draw the bubble. Restored
+    /// queue items start runs without `start_run`, so this is where the app
+    /// learns the agent is busy. Immediate-dispatch items skip this event,
+    /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
+        self.status = Status::Streaming;
         self.main_chat()
             .show_user_message(format_with_images(text, image_count));
     }
 
     /// Immediate path: kick off the agent and draw the bubble in the same
     /// frame, so the user sees their message land where it will stay.
-    pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<super::Action> {
-        self.status = super::Status::Streaming;
-        if let Some(ref handle) = self.lua_event_handle {
-            handle.fire_autocmd("TurnStart", serde_json::json!({}));
+    pub(super) fn start_from_queue(&mut self, msg: &QueuedMessage) -> Vec<Action> {
+        let display = format_with_images(&msg.text, msg.images.len());
+        let input = self.build_agent_input(msg);
+        self.start_run(input, display)
+    }
+
+    pub(crate) fn start_mailbox_run(
+        &mut self,
+        preamble: Vec<maki_providers::Message>,
+    ) -> Vec<Action> {
+        let mut input = self.build_agent_input(&QueuedMessage {
+            text: String::new(),
+            images: Vec::new(),
+        });
+        input.preamble = preamble;
+        self.start_run(input, String::new())
+    }
+
+    /// The one place a fresh run starts: every path that emits
+    /// `Action::SendMessage` must go through here so `run_id` bumps exactly
+    /// once per run.
+    pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        self.run_id += 1;
+        // New work supersedes text held for recovery after an agent error.
+        self.recoverable_queue.clear();
+        self.status = Status::Streaming;
+        self.turn_start = Some(Instant::now());
+        self.fire_session_autocmd("TurnStart", serde_json::json!({}));
+        if !display.is_empty() {
+            self.main_chat().show_user_message(display);
         }
-        self.main_chat()
-            .show_user_message(format_with_images(&msg.text, msg.images.len()));
-        vec![super::Action::SendMessage(Box::new(
-            self.build_agent_input(msg),
-        ))]
+        vec![Action::SendMessage(Box::new(input))]
     }
 }

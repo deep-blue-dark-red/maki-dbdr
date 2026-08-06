@@ -4,11 +4,7 @@ local function split_lines(s)
   if s:sub(-1) == "\n" then
     s = s:sub(1, -2)
   end
-  local lines = {}
-  for line in (s .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
-  return lines
+  return maki.split(s, "\n")
 end
 
 function M.replace_lines(content, start_line, end_line, new_string)
@@ -36,7 +32,7 @@ function M.replace_lines(content, start_line, end_line, new_string)
   for i = 1, skip_from - 1 do
     result[#result + 1] = lines[i]
   end
-  if new_string ~= "" then
+  if new_string ~= "" or inserting then
     for _, line in ipairs(split_lines(new_string)) do
       result[#result + 1] = line
     end

@@ -9,6 +9,7 @@ use maki_providers::TokenUsage;
 use maki_providers::model::Model;
 use maki_providers::provider::{self, Provider};
 use maki_storage::StateDir;
+use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::Session;
 use serde_json::Value;
 use tracing::{error, warn};
@@ -21,7 +22,8 @@ use crate::template;
 use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
+    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
+    ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -32,19 +34,19 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn open(session_id: &str, cwd: &str, model_spec: &str) -> Option<Self> {
+    fn open(session_id: MakiId, cwd: &str, model_spec: &str) -> Option<Self> {
         let dir = StateDir::resolve()
             .map_err(|e| warn!(error = %e, "state dir unavailable; session will not be persisted"))
             .ok()?;
         Some(Self::open_in(dir, session_id, cwd, model_spec))
     }
 
-    fn open_in(dir: StateDir, session_id: &str, cwd: &str, model_spec: &str) -> Self {
+    fn open_in(dir: StateDir, session_id: MakiId, cwd: &str, model_spec: &str) -> Self {
         match StoredSession::load(session_id, &dir) {
             Ok(session) => Self { dir, session },
             Err(_) => {
                 let mut session = StoredSession::new(model_spec, cwd);
-                session.id = session_id.to_owned();
+                session.id = session_id;
                 let mut store = Self { dir, session };
                 store.save();
                 store
@@ -59,8 +61,8 @@ impl SessionStore {
     }
 
     fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.messages = messages.to_vec();
-        self.session.model = model_spec;
+        self.session.replace_messages(messages.to_vec());
+        self.session.set_model(model_spec);
         self.session.update_title_if_default();
         self.save();
     }
@@ -84,7 +86,7 @@ pub struct HeadlessParams {
 pub struct HeadlessHandle {
     pub event_rx: Receiver<Envelope>,
     pub tool_names: Vec<String>,
-    pub session_id: String,
+    pub session_id: SessionRef,
     pub cwd: String,
     pub task: smol::Task<()>,
 }
@@ -99,7 +101,6 @@ fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
-    mcp_handle: Option<&McpHandle>,
     workflow: bool,
 ) -> AgentSetup {
     let vars = template::env_vars();
@@ -109,7 +110,6 @@ fn setup(
         model,
         config,
         excluded_tools,
-        mcp_handle,
         workflow,
         ToolRegistry::global(),
     );
@@ -121,12 +121,13 @@ fn setup(
     }
 }
 
+/// Base definitions only. MCP definitions are injected per request by
+/// `Agent::request_tools`; storing them here would freeze the catalog.
 fn tool_definitions(
     vars: &template::Vars,
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
-    mcp_handle: Option<&McpHandle>,
     workflow: bool,
     registry: &ToolRegistry,
 ) -> Value {
@@ -136,13 +137,17 @@ fn tool_definitions(
         audience: ToolAudience::MAIN,
         workflow,
     };
-    let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
+    registry.definitions(vars, &ctx, model.supports_tool_examples())
+}
 
-    if let Some(handle) = mcp_handle {
-        handle.extend_tools(&mut tools);
+/// Names advertised to SDK clients: base tools plus what the first request
+/// would carry from MCP (always-load definitions and `tool_search`).
+fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
+    let mut probe = tools.clone();
+    if let Some(mcp) = mcp {
+        mcp.extend_tools(&mut probe);
     }
-
-    tools
+    extract_tool_names(&probe)
 }
 
 pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
@@ -156,7 +161,6 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.mcp_handle.as_ref(),
         params.workflow,
     );
 
@@ -168,16 +172,18 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.model,
     );
 
-    let tool_names = extract_tool_names(&tools);
+    let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
+    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-
+    let session_id = MakiId::generate();
+    let session_ref = SessionRef::from(session_id);
+    let session_ref_clone = session_ref.clone();
+    let mailbox = SessionMailbox::register(session_id);
     let fast = params.fast;
     let workflow = params.workflow;
     let task = smol::spawn({
-        let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
         async move {
@@ -206,7 +212,8 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         params.permissions_config,
                         working_dir_path,
                     )),
-                    session_id: Some(session_id),
+                    session_id: Some(session_ref_clone.clone()),
+                    mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
@@ -222,7 +229,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 },
             )
             .with_loaded_instructions(instructions.loaded)
-            .with_mcp(params.mcp_handle);
+            .with_mcp(mcp);
 
             let result = agent
                 .run(AgentInput {
@@ -254,7 +261,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     HeadlessHandle {
         event_rx,
         tool_names,
-        session_id,
+        session_id: session_ref,
         cwd: working_dir,
         task,
     }
@@ -269,7 +276,7 @@ pub struct InteractiveParams {
     pub excluded_tools: Vec<&'static str>,
     pub mcp_handle: Option<McpHandle>,
     pub initial_wd: PathBuf,
-    pub session_id: Option<String>,
+    pub session_id: Option<SessionRef>,
     pub initial_history: Vec<Message>,
     pub yolo: bool,
     pub system_prompt_override: Option<String>,
@@ -284,7 +291,7 @@ pub struct InteractiveHandle {
     pub answer_tx: flume::Sender<String>,
     pub cancel_tx: flume::Sender<()>,
     pub model_tx: flume::Sender<Model>,
-    pub session_id: String,
+    pub session_id: SessionRef,
     pub permissions: Arc<PermissionManager>,
     pub task: smol::Task<()>,
 }
@@ -298,11 +305,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.mcp_handle.as_ref(),
         params.workflow,
     );
 
-    let tool_names = extract_tool_names(&tools);
+    let mcp = params
+        .mcp_handle
+        .clone()
+        .map(|h| McpSession::new(h, &params.initial_history));
+    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
@@ -310,9 +320,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
-    let session_id = params
-        .session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let (session_id, session_ref) = match params.session_id.clone() {
+        Some(w) => (w.id(), w),
+        None => {
+            let id = MakiId::generate();
+            (id, SessionRef::from(id))
+        }
+    };
+    let mailbox = SessionMailbox::register(session_id);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -326,8 +341,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
 
+    let session_ref_clone = session_ref.clone();
     let task = smol::spawn({
-        let session_id = session_id.clone();
         let permissions = Arc::clone(&permissions);
         async move {
             let mut model = params.model;
@@ -343,7 +358,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     }
                 };
 
-            let mut store = SessionStore::open(&session_id, &working_dir, &model.spec());
+            let mut store = SessionStore::open(session_id, &working_dir, &model.spec());
             let mut history = History::restored(params.initial_history);
             let mut run_id: u64 = 0;
 
@@ -362,7 +377,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &new_model,
                                 &params.config,
                                 &params.excluded_tools,
-                                params.mcp_handle.as_ref(),
                                 params.workflow,
                                 ToolRegistry::global(),
                             );
@@ -412,7 +426,8 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         config: params.config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
-                        session_id: Some(session_id.clone()),
+                        session_id: Some(session_ref_clone.clone()),
+                        mailbox: Some(mailbox.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
@@ -430,7 +445,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_loaded_instructions(instructions.loaded.clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
-                .with_mcp(params.mcp_handle.clone());
+                .with_mcp(mcp.clone());
 
                 let result = agent.run(input).await;
                 drop(agent);
@@ -462,7 +477,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         answer_tx,
         cancel_tx,
         model_tx,
-        session_id,
+        session_id: session_ref,
         permissions,
         task,
     }
@@ -486,21 +501,25 @@ mod tests {
 
     use super::*;
 
-    const SESSION_ID: &str = "acp-test-session";
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const CWD: &str = "/project";
     const MODEL_SPEC: &str = "anthropic/claude-test";
+
+    fn session_id() -> MakiId {
+        SESSION_ID.parse().unwrap()
+    }
 
     fn store_in(tmp: &TempDir) -> SessionStore {
         SessionStore::open_in(
             StateDir::from_path(tmp.path().to_path_buf()),
-            SESSION_ID,
+            session_id(),
             CWD,
             MODEL_SPEC,
         )
     }
 
     fn load(tmp: &TempDir) -> StoredSession {
-        StoredSession::load(SESSION_ID, &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
+        StoredSession::load(session_id(), &StateDir::from_path(tmp.path().to_path_buf())).unwrap()
     }
 
     #[test]
@@ -508,10 +527,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         store_in(&tmp);
         let loaded = load(&tmp);
-        assert_eq!(loaded.id, SESSION_ID);
+        assert_eq!(loaded.id, session_id());
         assert_eq!(loaded.cwd, CWD);
         assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages.is_empty());
+        assert!(loaded.messages().is_empty());
     }
 
     #[test]
@@ -522,8 +541,25 @@ mod tests {
         store.record_turn(&messages, MODEL_SPEC.into());
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.title, generate_title(&messages));
+    }
+
+    #[test]
+    fn record_turn_persists_observations() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.record_turn(
+            &[
+                Message::user("fix the login bug".into()),
+                Message::observation("build failed".into()),
+            ],
+            MODEL_SPEC.into(),
+        );
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages().len(), 2);
+        assert!(loaded.messages()[1].is_observation());
     }
 
     #[test]
@@ -534,7 +570,7 @@ mod tests {
         drop(store);
 
         let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages.len(), 1);
+        assert_eq!(store.session.messages().len(), 1);
 
         let messages = vec![
             Message::user("first prompt".into()),
@@ -543,7 +579,7 @@ mod tests {
         store.record_turn(&messages, "other/model".into());
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
     }
 
@@ -551,5 +587,23 @@ mod tests {
     fn extract_tool_names_filters_valid_entries() {
         let tools = serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}]);
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
+    }
+
+    #[test]
+    fn advertised_names_show_tool_search_not_deferred_tools() {
+        let base = serde_json::json!([{"name": "read"}]);
+        let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+        let names = advertised_tool_names(&base, Some(&mcp));
+        assert_eq!(
+            names,
+            vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
+            "clients must see the search tool, not deferred definitions"
+        );
+        assert_eq!(
+            base,
+            serde_json::json!([{"name": "read"}]),
+            "probing must not bake MCP entries into the base tools"
+        );
+        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
     }
 }

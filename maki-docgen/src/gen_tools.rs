@@ -1,13 +1,13 @@
 use maki_agent::template::Vars;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
-use maki_config::OPT_IN_TOOLS;
+use maki_config::{PluginFileConfig, PluginsConfig};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
-use maki_lua::PluginHost;
+use maki_lua::{OptionType, PluginHost};
 
 const DATE_PLACEHOLDER: &str = "YYYY-MM-DD";
 
@@ -21,6 +21,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "edit",
             "multiedit",
             "edit_lines",
+            "insert_lines",
             "glob",
             "grep",
             "index",
@@ -118,7 +119,7 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     };
     writeln!(out, "{header}").unwrap();
     for p in params {
-        let desc = p.description.replace('\n', "<br>");
+        let desc = p.description.replace('|', "\\|").replace('\n', "<br>");
         let required = if p.required { "yes" } else { "no" };
         if has_defaults {
             writeln!(
@@ -140,7 +141,7 @@ fn source_label(source: &ToolSource) -> &'static str {
     }
 }
 
-fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo) {
+fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {
     let description = info
         .def
         .get("description")
@@ -152,7 +153,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo) {
 
     writeln!(out).unwrap();
     let mut badge_text = source_label(&info.source).to_string();
-    if OPT_IN_TOOLS.contains(&name) {
+    if opt_in.contains(name) {
         badge_text.push_str(", opt-in");
     }
     writeln!(out, "### `{name}` *({badge_text})*").unwrap();
@@ -207,7 +208,7 @@ fn redact_def(def: &Value) -> Value {
 fn write_front_matter(out: &mut String) {
     writeln!(out, "+++").unwrap();
     writeln!(out, "title = \"Tools\"").unwrap();
-    writeln!(out, "weight = 3").unwrap();
+    writeln!(out, "weight = 6").unwrap();
     writeln!(out, "[extra]").unwrap();
     writeln!(out, "group = \"Reference\"").unwrap();
     writeln!(out, "+++").unwrap();
@@ -225,12 +226,33 @@ fn collect_tool_info(
     })
 }
 
-fn load_registry_with_builtins() -> Arc<ToolRegistry> {
+/// Loads every builtin with all sub-tools on, so the reference documents
+/// opt-in tools too. "Opt-in" means the plugin declares the tool as a boolean
+/// option defaulting to false, so the badge cannot drift from the defaults.
+fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     let registry = Arc::new(ToolRegistry::new());
-    let _host =
-        PluginHost::with_all_builtins(Arc::clone(&registry)).expect("loading builtin plugins");
-    registry
+    let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
+
+    let mut plugins = HashMap::new();
+    let mut edit = PluginFileConfig::default();
+    for &sub in maki_config::EDIT_SUB_TOOLS {
+        edit.opts.insert(sub.to_owned(), Value::Bool(true));
+    }
+    plugins.insert("edit".to_owned(), edit);
+    host.load_builtins(&PluginsConfig::from_plugins(plugins))
+        .expect("loading builtin plugins");
+
+    let opt_in = host
+        .plugin_options()
+        .expect("collecting plugin options")
+        .into_values()
+        .flatten()
+        .filter(|o| o.ty == OptionType::Boolean && o.default == Some(Value::Bool(false)))
+        .map(|o| o.name)
+        .collect();
+    (registry, opt_in)
 }
+
 
 pub fn generate() -> String {
     let vars = Vars::new()
@@ -238,7 +260,7 @@ pub fn generate() -> String {
         .set("{platform}", "linux")
         .set("{date}", "YYYY-MM-DD");
 
-    let registry = load_registry_with_builtins();
+    let (registry, opt_in) = load_registry_with_builtins();
     let defs = registry.definitions(
         &vars,
         &DescriptionContext {
@@ -273,9 +295,14 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(out, "# Tools").unwrap();
     writeln!(out).unwrap();
+    let opt_in_n = tools.keys().filter(|n| opt_in.contains(**n)).count();
+    let default_n = total - opt_in_n;
     writeln!(
         out,
-        "Maki ships with {total} built-in tools. This is the full reference."
+        "Maki ships with {total} built-in tools in this reference \
+         ({default_n} on by default, {opt_in_n} opt-in via plugin options). \
+         Tools marked **opt-in** are off until you enable them under `plugins` \
+         in [Configuration](/docs/configuration/)."
     )
     .unwrap();
 
@@ -294,7 +321,7 @@ pub fn generate() -> String {
         writeln!(out, "## {section_name}").unwrap();
         for name in present {
             let info = tools.get(name).expect("checked above");
-            write_tool_entry(&mut out, name, info);
+            write_tool_entry(&mut out, name, info, &opt_in);
             rendered.insert(name);
         }
     }
@@ -310,7 +337,7 @@ pub fn generate() -> String {
         writeln!(out, "## Additional tools").unwrap();
         for name in leftovers {
             let info = tools.get(name).expect("checked above");
-            write_tool_entry(&mut out, name, info);
+            write_tool_entry(&mut out, name, info, &opt_in);
         }
     }
 
@@ -364,7 +391,7 @@ mod tests {
 
     #[test]
     fn sections_partition_registered_tools() {
-        let registry = load_registry_with_builtins();
+        let (registry, _) = load_registry_with_builtins();
         let snapshot = registry.iter();
         let registered: HashSet<&str> = snapshot.iter().map(|e| e.name()).collect();
 

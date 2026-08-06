@@ -3,3 +3,6 @@ __pycache__/
 runs.csv
 /.direnv/
 bench/results/
+/site/_build/
+/site/.bin/
+/result

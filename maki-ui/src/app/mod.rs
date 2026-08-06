@@ -1,6 +1,8 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
 //! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
-//! `run_id` increments each run so stale events from previous agent runs are ignored.
+//! `run_id` invalidates in-flight agent events. It bumps in exactly three
+//! places, one per transition: `start_run`, `handle_cancel`, and
+//! `AgentHandles::respawn`. Everything else only reads it.
 
 mod btw;
 mod image_paste;
@@ -11,13 +13,13 @@ mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::AppSession;
@@ -44,27 +46,25 @@ use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
-use crate::components::session_picker::{SessionPicker, SessionPickerAction};
 use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::tool_display::format_turn_usage;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
-use crate::selection::{SelectionState, ZoneRegistry};
+use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SubagentInfo, ToolOutput,
+    SharedMessages, SubagentInfo,
 };
 use maki_config::UiConfig;
-use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader};
-use maki_providers::{Message, Model, ThinkingConfig};
+use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
+use maki_providers::{Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
@@ -76,7 +76,9 @@ pub(crate) use crate::agent::QueuedMessage;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
-pub(crate) use queue::MessageQueue;
+pub(crate) use queue::{MessageQueue, SubmitOutcome};
+use session::Sent;
+pub(crate) use session::session_has_content;
 use session_state::SessionState;
 
 const CANCEL_MSG: &str = "Cancelled.";
@@ -97,11 +99,13 @@ const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 
 const TASK_DONE_DETAIL: &str = "✓ ";
+const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 
 #[derive(Clone)]
 pub(super) struct TaskEntry {
     name: String,
     finished: Option<bool>,
+    chat_index: usize,
 }
 
 impl PickerItem for TaskEntry {
@@ -145,7 +149,6 @@ pub struct App {
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
     pub(super) mcp_picker: McpPicker,
-    pub(super) session_picker: SessionPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) goto_picker: GotoPicker,
     pub(super) help_modal: HelpModal,
@@ -166,6 +169,7 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) queue: MessageQueue,
+    recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
     pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
@@ -180,16 +184,16 @@ pub struct App {
 
     pub(crate) storage: StateDir,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
-    pub(crate) shared_history: Option<Arc<ArcSwap<Vec<Message>>>>,
+    pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
-    pub(crate) shared_tool_outputs: Option<Arc<Mutex<HashMap<String, ToolOutput>>>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
+    last_sent: Option<Sent>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(super) show_token_stats: bool,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) lua_event_handle: Option<EventHandle>,
+    pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
@@ -215,14 +219,25 @@ impl App {
         input_history_size: usize,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
+        lua_event_handle: EventHandle,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
+        let typewriter = ui_config.typewriter_ms_per_char;
+        let flash = ui_config.flash_duration();
+        let input_box = InputBox::new(
+            InputHistory::load(&storage, input_history_size),
+            ui_config.max_input_lines,
+        );
         let mut app = Self {
-            chats: vec![Chat::new("Main".into(), ui_config)],
+            chats: vec![Chat::new(
+                "Main".into(),
+                ui_config.clone(),
+                lua_event_handle.clone(),
+            )],
             active_chat: 0,
             chat_index: HashMap::new(),
-            input_box: InputBox::new(InputHistory::load(&storage, input_history_size)),
+            input_box,
             command_palette: CommandPalette::new(
                 custom_commands,
                 mcp_reader.clone(),
@@ -234,7 +249,6 @@ impl App {
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
-            session_picker: SessionPicker::new(),
             rewind_picker: RewindPicker::new(),
             goto_picker: GotoPicker::new(),
             help_modal: HelpModal::new(),
@@ -242,19 +256,20 @@ impl App {
             plugins_modal: PluginsModal::new(),
             skills_modal: SkillsModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(ui_config.typewriter_ms_per_char),
+            btw_modal: BtwModal::new(typewriter),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             settings_picker: SettingsPicker::new(),
-            status_bar: StatusBar::new(ui_config.flash_duration()),
+            status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
             queue: MessageQueue::default(),
+            recoverable_queue: Vec::new(),
             answer_tx: None,
             cmd_tx: None,
             pending_input: PendingInput::None,
@@ -270,14 +285,14 @@ impl App {
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
-            shared_tool_outputs: None,
             image_paste_rx: vec![],
             storage_writer,
+            last_sent: None,
             shell: shell::ShellState::default(),
             ui_config,
             show_token_stats: UserSettings::load().show_token_stats,
             permissions,
-            lua_event_handle: None,
+            lua_event_handle,
             keymap_reader,
             hint_reader,
             restore_event_tx: None,
@@ -287,7 +302,7 @@ impl App {
         };
         app.model_picker
             .set_recents(maki_storage::model::read_recents(&app.storage));
-        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.clone());
+        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.to_string());
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(app.state.session.title.clone());
         app
     }
@@ -318,6 +333,16 @@ impl App {
         self.status_bar.flash(msg);
     }
 
+    pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
+        if let Some(map) = data.as_object_mut() {
+            map.insert(
+                "session_id".into(),
+                serde_json::Value::String(self.state.session.id.to_string()),
+            );
+        }
+        self.lua_event_handle.fire_autocmd(event, data);
+    }
+
     pub fn tick_error_expiry(&mut self) {
         if self.status.is_error_expired() {
             self.status = Status::Idle;
@@ -326,6 +351,14 @@ impl App {
 
     fn active_chat(&mut self) -> &mut Chat {
         &mut self.chats[self.active_chat]
+    }
+
+    pub(crate) fn win_view(&self) -> WinView {
+        self.chats[self.active_chat].win_view()
+    }
+
+    pub(crate) fn set_scroll_top(&mut self, top: u16) {
+        self.active_chat().set_scroll_top(top);
     }
 
     fn clear_selection_unless_pending_copy(&mut self) {
@@ -368,7 +401,6 @@ impl App {
                 vec![]
             }
             Msg::Scroll { column, row, delta } => {
-                self.clear_selection_unless_pending_copy();
                 self.handle_scroll(column, row, delta);
                 vec![]
             }
@@ -391,23 +423,23 @@ impl App {
         }
     }
 
-    fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+    fn scroll_at(&mut self, column: u16, row: u16, delta: i32) -> Option<SelectionZone> {
         if self.btw_modal.is_open() {
             self.btw_modal.scroll(delta);
-            return;
+            return None;
         }
         if self.help_modal.is_open() {
             self.help_modal.scroll(delta);
-            return;
+            return None;
         }
         if self.usage_modal.is_open() {
             self.usage_modal.scroll(delta);
-            return;
+            return None;
         }
         let pos = Position::new(column, row);
         if self.float_mgr.is_open() && self.float_mgr.contains(pos) {
             self.float_mgr.scroll(delta);
-            return;
+            return None;
         }
         macro_rules! try_picker {
             ($picker:expr) => {
@@ -415,65 +447,56 @@ impl App {
                     if $picker.contains(pos) {
                         $picker.scroll(delta);
                     }
-                    return;
+                    return None;
                 }
             };
         }
-        try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
-        if let Some(zone) = self.zone_at(row, column) {
-            self.scroll_zone(zone.zone, delta);
-        }
+        let zone = self.zone_at(row, column)?.zone;
+        self.scroll_zone(zone, delta);
+        Some(zone)
+    }
+
+    fn task_entries(&self) -> Vec<TaskEntry> {
+        self.chats
+            .iter()
+            .enumerate()
+            .map(|(chat_index, chat)| TaskEntry {
+                name: chat.name.clone(),
+                finished: (chat_index > 0).then_some(chat.is_finished()),
+                chat_index,
+            })
+            .collect()
     }
 
     fn open_tasks(&mut self) {
-        let entries: Vec<TaskEntry> = self
-            .chats
-            .iter()
-            .enumerate()
-            .map(|(i, c)| TaskEntry {
-                name: c.name.clone(),
-                finished: (i > 0).then_some(c.is_finished()),
-            })
-            .collect();
         self.task_picker_original = Some(self.active_chat);
-        self.task_picker.open(entries, " Tasks ");
+        self.task_picker.open(self.task_entries(), " Tasks ");
         self.task_picker.select(self.active_chat);
     }
+
+    fn sync_task_picker(&mut self) {
+        if !self.task_picker.is_open() {
+            return;
+        }
+        let selected = self
+            .task_picker
+            .selected_item()
+            .map(|entry| entry.chat_index);
+        self.task_picker.replace_items(self.task_entries());
+        if let Some(chat_index) = selected {
+            self.task_picker
+                .select_item_by(|entry| entry.chat_index == chat_index);
+        }
+    }
+
 
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
-        }
-        if key::DELETE_CURRENT_SESSION.matches(key) {
-            let session_id = self.state.session.id.clone();
-
-            // 1. Delete the session from storage
-            if let Err(e) = AppSession::delete(&session_id, &self.storage) {
-                self.status_bar.flash(format!("Failed to delete session: {e}"));
-            } else {
-                self.status_bar.flash("Session deleted".into());
-                self.session_picker.remove_entry(&session_id);
-
-                // 2. Open the sessions list popup window directly
-                self.open_session_picker();
-            }
-            return Some(vec![]);
-        }
-        if key::TOGGLE_GLOBAL_SESSIONS.matches(key) {
-            let mut settings = UserSettings::load();
-            settings.global_sessions = !settings.global_sessions;
-            settings.save();
-            self.status_bar.flash(
-                if settings.global_sessions { "Global sessions enabled" } else { "Global sessions disabled" }.into(),
-            );
-            if self.session_picker.is_open() {
-                self.open_session_picker();
-            }
-            return Some(vec![]);
         }
         if key::QUIT.matches(key) {
             self.command_palette.close();
@@ -519,13 +542,6 @@ impl App {
         }
         if key::SCROLL_BOTTOM.matches(key) {
             self.active_chat().enable_auto_scroll();
-            return Some(vec![]);
-        }
-        if key::PLAN_TOGGLE.matches(key)
-            && self.state.mode == Mode::Plan
-            && self.state.plan.is_ready()
-        {
-            self.plan_form.toggle();
             return Some(vec![]);
         }
         if key::TOGGLE_VERBOSE.matches(key) {
@@ -740,31 +756,15 @@ impl App {
             }
             return Some(match self.task_picker.handle_key(key) {
                 PickerAction::Consumed | PickerAction::Toggle(..) => vec![],
-                PickerAction::Select(idx, _) => {
+                PickerAction::Select(entry) => {
                     self.task_picker_original = None;
-                    self.active_chat = idx;
+                    self.active_chat = entry.chat_index;
                     vec![]
                 }
                 PickerAction::Close => {
                     self.active_chat = self.task_picker_original.take().unwrap_or(0);
                     vec![]
                 }
-            });
-        }
-
-        if self.session_picker.is_open() {
-            return Some(match self.session_picker.handle_key(key) {
-                SessionPickerAction::Consumed => vec![],
-                SessionPickerAction::Select(id) => self.load_session(id),
-                SessionPickerAction::ConfirmDelete => {
-                    self.status_bar.flash(format!(
-                        "Press {} again to confirm delete",
-                        key::DELETE.label
-                    ));
-                    vec![]
-                }
-                SessionPickerAction::Delete(id) => self.delete_session(id),
-                SessionPickerAction::Close => vec![],
             });
         }
 
@@ -905,6 +905,14 @@ impl App {
             });
         }
 
+        if key::PLAN_TOGGLE.matches(key)
+            && self.state.mode == Mode::Plan
+            && self.state.plan.is_ready()
+        {
+            self.plan_form.toggle();
+            return Some(vec![]);
+        }
+
         None
     }
 
@@ -912,19 +920,21 @@ impl App {
         self.clear_selection_unless_pending_copy();
 
         if key::SUSPEND.matches(key) && cfg!(unix) {
-            return self.suspend();
+            return vec![Action::Suspend];
         }
 
         if let Some(actions) = self.dispatch_overlay(key) {
             return actions;
         }
 
-        if let Some(actions) = self.handle_ctrl(key) {
-            return actions;
+        if !(self.status == Status::Streaming && is_streaming_stop_key(key))
+            && self.dispatch_override(key)
+        {
+            return vec![];
         }
 
-        if self.dispatch_plugin_keymap(key) {
-            return vec![];
+        if let Some(actions) = self.handle_ctrl(key) {
+            return actions;
         }
 
         if !self.is_main_chat() {
@@ -948,13 +958,13 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
-    fn dispatch_plugin_keymap(&self, key: KeyEvent) -> bool {
+    fn dispatch_override(&self, key: KeyEvent) -> bool {
         let snap = self.keymap_reader.load();
         for entry in &snap.entries {
-            if entry.key == key.code && entry.modifiers == key.modifiers {
-                if let Some(ref handle) = self.lua_event_handle {
-                    handle.run_keybind_callback(entry.id);
-                }
+            if entry.key == key.code
+                && entry.modifiers == key.modifiers
+                && self.lua_event_handle.run_keybind_callback(entry.id)
+            {
                 return true;
             }
         }
@@ -966,7 +976,8 @@ impl App {
             return vec![Action::EditSystemPrompt];
         }
         if key::SESSIONS.matches(key) {
-            return self.open_session_picker();
+            self.run_lua_command("/sessions", String::new());
+            return vec![];
         }
         if key::SHIFT_SESSION_DOWN.matches(key) {
             return self.shift_session(-1);
@@ -1068,15 +1079,14 @@ impl App {
         }
     }
 
-    fn suspend(&mut self) -> Vec<Action> {
-        vec![Action::Suspend]
+    fn quit(&mut self) -> Vec<Action> {
+        self.quit_with(ExitRequest::Success)
     }
 
-    fn quit(&mut self) -> Vec<Action> {
-        self.save_session();
+    fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
-        self.exit_request = ExitRequest::Success;
-        vec![Action::Quit]
+        self.exit_request = req;
+        vec![]
     }
 
     pub fn reload_config(&mut self) {
@@ -1089,7 +1099,7 @@ impl App {
         let user_texts: Vec<String> = self
             .state
             .session
-            .messages
+            .messages()
             .iter()
             .filter_map(|m| m.user_text().map(str::to_string))
             .take(3)
@@ -1122,12 +1132,12 @@ impl App {
 
     pub(crate) fn apply_rename(&mut self, title: String) {
         let old_name = self.state.session.title.clone();
-        let session_id = self.state.session.id.clone();
-        self.state.session.title = title.clone();
+        let session_id = self.state.session.id;
+        self.state.session_mut().set_title(title.clone());
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(title.clone());
-        self.save_session();
+        self.checkpoint_now();
         maki_providers::update_api_log_symlink(
-            &session_id,
+            &session_id.to_string(),
             Some(&old_name),
             &title,
             self.state.session.created_at,
@@ -1155,7 +1165,7 @@ impl App {
             if cmd == "cd" || cmd.starts_with("cd ") {
                 self.flash("Only /cd can change the working directory".into());
             }
-            let id = self.shell.next_id();
+            let id = self.shell.reserve_id();
             let sigil = if prefix.visible { "!" } else { "!!" };
             let display = format!("{sigil} {}", prefix.command);
             self.main_chat().show_user_message(display);
@@ -1165,14 +1175,7 @@ impl App {
                 visible: prefix.visible,
             }];
         }
-        let msg: QueuedMessage = sub.into();
-        if self.status == Status::Streaming {
-            self.queue_and_notify(msg);
-            vec![]
-        } else {
-            self.run_id += 1;
-            self.start_from_queue(&msg)
-        }
+        self.submit_or_queue(sub.into())
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
@@ -1191,6 +1194,7 @@ impl App {
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
         self.queue.clear();
+        self.recoverable_queue.clear();
         self.status = Status::Idle;
         vec![Action::CancelAgent {
             run_id: cancelled_run,
@@ -1246,13 +1250,17 @@ impl App {
             return vec![];
         }
         if envelope.run_id != self.run_id {
-            // Stale run_id after cancel: agent updates shared_history before sending
-            // Done/Error, so this is the first moment the full conversation is available.
-            if matches!(
-                envelope.event,
-                AgentEvent::Done { .. } | AgentEvent::Error { .. }
-            ) {
-                self.save_session();
+            // A snapshot dropped here degrades the tool body to llm_output.
+            if let AgentEvent::ToolSnapshot { id, .. }
+            | AgentEvent::ToolHeaderSnapshot { id, .. }
+            | AgentEvent::LiveToolBuf { id, .. } = &envelope.event
+            {
+                tracing::debug!(
+                    tool_id = %id,
+                    event_run_id = envelope.run_id,
+                    current_run_id = self.run_id,
+                    "tool render event dropped: stale run_id"
+                );
             }
             return vec![];
         }
@@ -1267,11 +1275,29 @@ impl App {
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
             }
+            self.sync_task_picker();
             self.state
-                .session
-                .subagent_messages
-                .insert(tool_use_id, messages);
+                .session_mut()
+                .set_subagent_messages(tool_use_id, messages);
             return vec![];
+        }
+
+        match &envelope.event {
+            AgentEvent::ToolStart(event) => self.fire_session_autocmd(
+                "ToolStart",
+                serde_json::json!({
+                    "tool_id": event.id,
+                    "tool": event.tool,
+                }),
+            ),
+            AgentEvent::ToolDone(event) => self.fire_session_autocmd(
+                "ToolDone",
+                serde_json::json!({
+                    "tool_id": event.id,
+                    "tool": event.tool,
+                }),
+            ),
+            _ => {}
         }
 
         let subagent_id = envelope
@@ -1290,12 +1316,9 @@ impl App {
             {
                 self.transition_plan(PlanTrigger::WriteDone);
             }
-            if let Some(ref outputs) = self.shared_tool_outputs {
-                outputs
-                    .lock()
-                    .unwrap()
-                    .insert(e.id.clone(), e.output.clone());
-            }
+            self.state
+                .session_mut()
+                .insert_tool_output(e.id.clone(), e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
                 let (role, text) = if e.is_error {
                     (DisplayRole::Error, ERROR_TEXT)
@@ -1304,6 +1327,7 @@ impl App {
                 };
                 self.chats[sub_idx].mark_finished(role, text);
             }
+            self.sync_task_picker();
         }
 
         if let AgentEvent::Retry {
@@ -1325,22 +1349,12 @@ impl App {
 
         self.retry_info = None;
 
-        let plan_path = if self.state.mode == Mode::Plan {
-            self.state.plan.path()
-        } else {
-            None
-        };
-
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
-            self.chats[chat_idx].token_usage += tc.usage;
-            *self
-                .state
-                .session
-                .meta
-                .usage_by_model
-                .entry(tc.model.clone())
-                .or_default() += tc.usage.into();
+            add_cost(&mut self.chats[chat_idx].cost, tc.cost);
+            self.state
+                .session_mut()
+                .add_model_usage(&tc.model, tc.usage.into());
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -1368,11 +1382,18 @@ impl App {
                 }
             }
             *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
-            let formatted =
-                format_turn_usage(&tc.usage, &self.state.model.pricing, self.state.fast);
-            self.chats[chat_idx].set_pending_turn_usage(formatted);
+            self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
+            if let Some(tool_id) = &subagent_id {
+                let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
+                self.chats[0].set_tool_turn_usage(tool_id, formatted);
+            }
         }
 
+        let plan_path = if self.state.mode == Mode::Plan {
+            self.state.plan.path()
+        } else {
+            None
+        };
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
 
         if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
@@ -1407,13 +1428,11 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
-                    self.save_session();
+                    self.terminalize_turn(MISSING_TOOL_COMPLETION);
                     self.chat_index.clear();
                     self.subagent_answers.clear();
                     self.status = Status::Idle;
-                    if let Some(ref handle) = self.lua_event_handle {
-                        handle.fire_autocmd("TurnEnd", serde_json::json!({}));
-                    }
+                    self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
                     }
@@ -1424,16 +1443,15 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.save_session();
-                    self.queue.clear();
                     self.subagent_answers.clear();
-                    self.finish_subagents(DisplayRole::Error, ERROR_TEXT);
-                    for chat in &mut self.chats {
-                        chat.fail_in_progress_with_message(message.clone());
-                    }
-                    if let Some(ref handle) = self.lua_event_handle {
-                        handle.fire_autocmd("TurnError", serde_json::json!({ "message": message }));
-                    }
+                    self.terminalize_turn(&message);
+                    self.recoverable_queue = self.queue.text_messages();
+                    self.queue.clear();
+                    self.chat_index.clear();
+                    self.fire_session_autocmd(
+                        "TurnError",
+                        serde_json::json!({ "message": message }),
+                    );
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -1461,13 +1479,19 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::new(subagent.name.clone(), self.ui_config);
-        chat.set_restore_channel(self.lua_event_handle.clone(), self.restore_event_tx.clone());
+        let mut chat = Chat::new(
+            subagent.name.clone(),
+            self.ui_config.clone(),
+            self.lua_event_handle.clone(),
+        );
+        chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
         self.chats.push(chat);
+        self.sync_task_picker();
+        self.sync_subagents();
         idx
     }
 
@@ -1532,7 +1556,6 @@ impl App {
                 self.queue.set_focus();
                 vec![]
             }
-            "/sessions" => self.open_session_picker(),
             "/settings" => {
                 let settings = UserSettings::load();
                 self.settings_picker.open(&settings);
@@ -1634,11 +1657,12 @@ impl App {
                 vec![Action::RunLogsCommand]
             }
             "/exit" | "/q" => self.quit(),
-            "/reload" | "/reload_config" => {
+            "/reload" => self.quit_with(ExitRequest::Reload),
+            "/reload_config" => {
                 self.reload_config();
                 vec![]
             }
-            "/rename" => self.start_rename(),
+            "/rename" if cmd.args.trim().is_empty() => self.start_rename(),
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -1657,10 +1681,11 @@ impl App {
         let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
             return;
         };
-        let Some(handle) = &self.lua_event_handle else {
-            return;
-        };
-        handle.run_command(Arc::clone(&lua_cmd.plugin), Arc::clone(&lua_cmd.name), args);
+        self.lua_event_handle.run_command(
+            Arc::clone(&lua_cmd.plugin),
+            Arc::clone(&lua_cmd.name),
+            args,
+        );
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
@@ -1697,11 +1722,7 @@ impl App {
             self.flash("Agent is busy, try again later".into());
             vec![]
         } else {
-            self.run_id += 1;
-            self.status = Status::Streaming;
-            self.turn_start = Some(Instant::now());
-            self.main_chat().show_user_message(display_text);
-            vec![Action::SendMessage(Box::new(input))]
+            self.start_run(input, display_text)
         }
     }
 
@@ -1734,18 +1755,10 @@ impl App {
             self.flash(format!("Unknown command: {name}"));
             return vec![];
         };
-        let rendered = cmd.render(args);
-        let msg = QueuedMessage {
-            text: rendered,
+        self.submit_or_queue(QueuedMessage {
+            text: cmd.render(args),
             images: Vec::new(),
-        };
-        if self.status == Status::Streaming {
-            self.queue_and_notify(msg);
-            vec![]
-        } else {
-            self.run_id += 1;
-            self.start_from_queue(&msg)
-        }
+        })
     }
 
     fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
@@ -1767,7 +1780,9 @@ impl App {
         match std::env::set_current_dir(&path) {
             Ok(()) => {
                 if let Ok(canonical) = std::env::current_dir() {
-                    self.state.session.cwd = canonical.to_string_lossy().into_owned();
+                    self.state
+                        .session_mut()
+                        .set_cwd(canonical.to_string_lossy().into_owned());
                 }
                 self.status_bar.refresh_cwd();
                 self.flash(format!("cd {}", path.display()))
@@ -1777,7 +1792,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 19] {
+    fn overlays(&self) -> [&dyn Overlay; 18] {
         [
             &self.help_modal,
             &self.export_picker,
@@ -1789,7 +1804,6 @@ impl App {
             &self.search_modal,
             &self.file_picker,
             &self.task_picker,
-            &self.session_picker,
             &self.rewind_picker,
             &self.goto_picker,
             &self.theme_picker,
@@ -1801,7 +1815,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
         [
             &mut self.help_modal,
             &mut self.export_picker,
@@ -1813,7 +1827,6 @@ impl App {
             &mut self.search_modal,
             &mut self.file_picker,
             &mut self.task_picker,
-            &mut self.session_picker,
             &mut self.rewind_picker,
             &mut self.goto_picker,
             &mut self.theme_picker,
@@ -1829,6 +1842,12 @@ impl App {
         self.overlays().iter().any(|o| o.is_open())
     }
 
+    /// True when the agent is parked on user input: a permission prompt or an
+    /// auth retry. Drives the `needs_input` session status.
+    pub(crate) fn awaiting_input(&self) -> bool {
+        self.permission_prompt.is_open() || self.pending_input != PendingInput::None
+    }
+
     pub fn has_modal_overlay(&self) -> bool {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
     }
@@ -1840,7 +1859,6 @@ impl App {
     pub fn is_animating(&self) -> bool {
         !self.image_paste_rx.is_empty()
             || self.btw_modal.is_animating()
-            || self.session_picker.is_loading()
             || self.file_picker.is_loading()
             || self.float_mgr.is_open()
             || self
@@ -1852,10 +1870,34 @@ impl App {
     }
 
     fn finish_subagents(&mut self, role: DisplayRole, text: &str) {
-        for &sub_idx in self.chat_index.values() {
-            self.chats[sub_idx].mark_finished(role.clone(), text);
-        }
+        self.retain_resolved_subagents(role, text);
         self.chat_index.clear();
+    }
+
+    /// Terminalizes every tool left in progress when a turn ends, sparing
+    /// shell commands that outlive the agent.
+    fn terminalize_turn(&mut self, message: &str) {
+        self.retain_resolved_subagents(DisplayRole::Error, ERROR_TEXT);
+        self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
+        for chat in self.chats.iter_mut().skip(1) {
+            chat.fail_in_progress_with_message(message.into());
+        }
+        self.sync_task_picker();
+    }
+
+    /// Marks unfinished subagent chats as ended and drops them from
+    /// `chat_index`, so the session records only the children that really
+    /// completed.
+    fn retain_resolved_subagents(&mut self, role: DisplayRole, text: &str) {
+        self.chat_index.retain(|_, &mut sub_idx| {
+            if self.chats[sub_idx].is_finished() {
+                true
+            } else {
+                self.chats[sub_idx].mark_finished(role.clone(), text);
+                false
+            }
+        });
+        self.sync_subagents();
     }
 
     pub fn flush_all_chats(&mut self) {
@@ -1891,7 +1933,6 @@ impl App {
         }
         try_picker!(self.file_picker);
         try_picker!(self.task_picker);
-        try_picker!(self.session_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.goto_picker);
         try_picker!(self.theme_picker);
@@ -1956,7 +1997,6 @@ impl App {
         } else {
             format!("{}.", IMPLEMENT_MSG_PREFIX)
         };
-        self.run_id += 1;
         let msg = QueuedMessage {
             text,
             images: vec![],
@@ -1964,6 +2004,10 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
+}
+
+fn is_streaming_stop_key(key: KeyEvent) -> bool {
+    key::QUIT.matches(key) || key.code == KeyCode::Esc
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

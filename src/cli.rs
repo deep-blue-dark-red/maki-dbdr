@@ -69,9 +69,17 @@ pub struct Cli {
     #[arg(long)]
     pub no_rtk: bool,
 
-    /// Disable the Lua plugin system
+    /// Skip user `init.lua` files (global and project) but keep the Lua
+    /// host and every builtin plugin running, so tools and the default
+    /// keymap still load. Use this to recover from a broken `init.lua`
+    /// or keymap override. Only Lua `init.lua` files are affected;
+    /// `permissions.toml`, custom commands, and env files load as usual.
     #[arg(long)]
     pub no_plugins: bool,
+
+    /// Run plugin Lua on the interpreter with full debug info (no native codegen)
+    #[arg(long)]
+    pub no_jit: bool,
 
     /// Skip all permission prompts (allow everything)
     #[arg(long, alias = "dangerously-skip-permissions")]

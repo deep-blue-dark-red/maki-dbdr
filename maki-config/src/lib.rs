@@ -7,6 +7,7 @@ use maki_config_macro::ConfigSection;
 use maki_storage::paths;
 use maki_storage::sessions::{StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use thiserror::Error;
 use tracing::warn;
 
@@ -17,18 +18,15 @@ pub mod providers;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
-pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
-pub const DEFAULT_MAX_LINE_BYTES: usize = 500;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 
-pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
-pub const DEFAULT_CODE_EXECUTION_TIMEOUT_SECS: u64 = 30;
+pub const MIN_MAX_INPUT_LINES: u32 = 1;
+
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
-pub const DEFAULT_COMPACTION_BUFFER: u32 = 40_000;
-pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
-pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
+pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -39,25 +37,19 @@ pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
 
-pub const DEFAULT_MAX_FILE_SIZE_MB: u64 = 2;
-
 pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
-pub const MIN_RESPONSE_BYTES: usize = 1024;
-pub const MIN_LINE_BYTES: usize = 80;
-pub const MIN_BASH_TIMEOUT_SECS: u64 = 5;
-pub const MIN_CODE_EXECUTION_TIMEOUT_SECS: u64 = 5;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
-pub const MIN_SEARCH_RESULT_LIMIT: usize = 10;
-pub const MIN_INTERPRETER_MAX_MEMORY_MB: usize = 10;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
+const MAX_COMPACTION_PERCENT: u8 = 99;
+const COMPACTION_BUFFER_EXPECTED: &str =
+    r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
 pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
-pub const MIN_MAX_FILE_SIZE_MB: u64 = 1;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_LOW_SPEED_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
@@ -71,9 +63,9 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "grep",
     "index",
     "memory",
-    "multiedit",
     "question",
     "read",
+    "sessions",
     "skill",
     "task",
     "todo_write",
@@ -85,7 +77,12 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 
 pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
 
-pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines"];
+/// These used to be their own `tools.<name>` tables and are now edit plugin
+/// options; the config layer uses this list to reject the old form with a
+/// pointer to the new one.
+pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
+
+pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
 
 pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -94,20 +91,16 @@ pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::M
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
     Bool(bool),
-    U32(u32),
     U64(u64),
-    Usize(usize),
-    OptionalString,
+    Str(&'static str),
 }
 
 impl ConfigValue {
     pub fn format_default(&self) -> String {
         match self {
             Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-            Self::U32(v) => v.to_string(),
             Self::U64(v) => v.to_string(),
-            Self::Usize(v) => v.to_string(),
-            Self::OptionalString => "none".to_string(),
+            Self::Str(s) => (*s).to_string(),
         }
     }
 }
@@ -148,17 +141,9 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool | string",
         default: ConfigValue::Bool(false),
         min: None,
-        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", or a token budget)",
+        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
 ];
-
-pub const INDEX_FIELDS: &[ConfigField] = &[ConfigField {
-    name: "max_file_size_mb",
-    ty: "u64",
-    default: ConfigValue::U64(DEFAULT_MAX_FILE_SIZE_MB),
-    min: Some(MIN_MAX_FILE_SIZE_MB),
-    description: "Max file size for indexing (MB)",
-}];
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -171,6 +156,25 @@ pub enum ConfigError {
     },
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
+    #[error(
+        "invalid config: plugins.{tool} was removed; {tool} is provided by the edit plugin, \
+         set plugins.edit = {{ {tool} = true|false }} instead"
+    )]
+    RemovedEditSubTool { tool: &'static str },
+    #[error(
+        "invalid config: plugins.{plugin}: no bundled plugin is named \"{plugin}\" \
+         (bundled plugins: {valid})"
+    )]
+    UnknownPlugin { plugin: String, valid: String },
+    #[error(
+        "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
+         (plugins can provide more than tools).\n\n\
+         Fix your config with:\n\n    \
+         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/maki/init.lua\n\n\
+         Run it on .maki/init.lua too if you keep a project config. \
+         A .bak backup is left next to the file."
+    )]
+    RenamedToolsTable,
 }
 
 fn check(
@@ -227,8 +231,10 @@ pub struct RawConfig {
     pub agent: AgentFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
-    pub index: IndexFileConfig,
-    pub tools: HashMap<String, ToolFileConfig>,
+    pub plugins: HashMap<String, PluginFileConfig>,
+    /// Renamed to `plugins`; kept so old configs fail with a pointer to the
+    /// new name instead of a generic unknown-field error.
+    tools: HashMap<String, PluginFileConfig>,
 }
 
 impl RawConfig {
@@ -245,22 +251,24 @@ impl RawConfig {
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
-        self.index.merge(overlay.index);
+        for (name, plugin) in overlay.plugins {
+            let entry = self.plugins.entry(name).or_default();
+            if plugin.enabled.is_some() {
+                entry.enabled = plugin.enabled;
+            }
+            entry.opts.extend(plugin.opts);
+        }
         self.tools.extend(overlay.tools);
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
-        let mut disabled_tools: Vec<String> = self
-            .tools
+        self.validate_plugin_tables()?;
+        let disabled_tools: Vec<String> = self
+            .plugins
             .iter()
             .filter(|(_, cfg)| cfg.enabled == Some(false))
             .map(|(name, _)| name.clone())
             .collect();
-        for &name in OPT_IN_TOOLS {
-            if self.tools.get(name).and_then(|t| t.enabled) != Some(true) {
-                disabled_tools.push(name.to_string());
-            }
-        }
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
@@ -270,19 +278,49 @@ impl RawConfig {
                 .map(AlwaysThinking::resolve)
                 .transpose()?,
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent, no_rtk, &self.index, disabled_tools),
+            agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
             provider: ProviderConfig::from_file(self.provider),
             storage: StorageConfig::from_file(self.storage),
             permissions: PermissionsConfig::default(),
-            plugins: PluginsConfig::from_tools(self.tools),
+            plugins: PluginsConfig::from_plugins(self.plugins),
         })
+    }
+
+    /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
+    /// old config, so fail loudly instead of letting it silently drift.
+    fn validate_plugin_tables(&self) -> Result<(), ConfigError> {
+        if !self.tools.is_empty() {
+            return Err(ConfigError::RenamedToolsTable);
+        }
+        for &name in EDIT_SUB_TOOLS {
+            if self.plugins.contains_key(name) {
+                return Err(ConfigError::RemovedEditSubTool { tool: name });
+            }
+        }
+        let mut unknown: Vec<&String> = self
+            .plugins
+            .keys()
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
+            .collect();
+        unknown.sort();
+        if let Some(&plugin) = unknown.first() {
+            return Err(ConfigError::UnknownPlugin {
+                plugin: plugin.clone(),
+                valid: DEFAULT_BUILTINS.join(", "),
+            });
+        }
+        Ok(())
     }
 }
 
 #[derive(Deserialize, Default, Debug)]
-#[serde(default, deny_unknown_fields)]
-pub struct ToolFileConfig {
+#[serde(default)]
+pub struct PluginFileConfig {
     pub enabled: Option<bool>,
+    /// Plugin-specific options passed through opaquely; each plugin declares
+    /// and validates its own via `maki.api.register_options`.
+    #[serde(flatten)]
+    pub opts: JsonMap<String, JsonValue>,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -294,8 +332,10 @@ pub struct UiFileConfig {
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
+    pub theme: Option<String>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub show_token_stats: Option<bool>,
+    pub max_input_lines: Option<u32>,
 }
 
 impl UiFileConfig {
@@ -309,7 +349,9 @@ impl UiFileConfig {
             typewriter_ms_per_char,
             mouse_scroll_lines,
             show_thinking,
-            show_token_stats
+            show_token_stats,
+            theme,
+            max_input_lines
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -351,20 +393,83 @@ impl ToolOutputLinesFile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionBuffer {
+    Tokens(u32),
+    Percent(u8),
+}
+
+impl CompactionBuffer {
+    pub fn resolve(self, context_window: u32) -> u32 {
+        match self {
+            Self::Tokens(n) => n,
+            Self::Percent(p) => (u64::from(context_window) * u64::from(p) / 100) as u32,
+        }
+    }
+}
+
+impl Serialize for CompactionBuffer {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Tokens(n) => s.serialize_u32(*n),
+            Self::Percent(p) => s.collect_str(&format_args!("{p}%")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionBuffer {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct BufferVisitor;
+
+        impl serde::de::Visitor<'_> for BufferVisitor {
+            type Value = CompactionBuffer;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(COMPACTION_BUFFER_EXPECTED)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .ok()
+                    .filter(|n| *n >= MIN_COMPACTION_BUFFER)
+                    .map(CompactionBuffer::Tokens)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "compaction_buffer must be at least {MIN_COMPACTION_BUFFER} tokens"
+                        ))
+                    })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                self.visit_u64(u64::try_from(v).unwrap_or(0))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                s.strip_suffix('%')
+                    .and_then(|n| n.trim().parse::<u8>().ok())
+                    .filter(|p| (1..=MAX_COMPACTION_PERCENT).contains(p))
+                    .map(CompactionBuffer::Percent)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "invalid compaction_buffer {s:?}: expected {COMPACTION_BUFFER_EXPECTED}"
+                        ))
+                    })
+            }
+        }
+
+        d.deserialize_any(BufferVisitor)
+    }
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentFileConfig {
     pub max_output_bytes: Option<usize>,
     pub max_output_lines: Option<usize>,
-    pub max_response_bytes: Option<usize>,
-    pub max_line_bytes: Option<usize>,
-    pub bash_timeout_secs: Option<u64>,
-    pub code_execution_timeout_secs: Option<u64>,
     pub max_continuation_turns: Option<u32>,
-    pub compaction_buffer: Option<u32>,
-    pub search_result_limit: Option<usize>,
-    pub interpreter_max_memory_mb: Option<usize>,
+    pub compaction_buffer: Option<CompactionBuffer>,
     pub task_max_concurrent: Option<usize>,
+    pub stale_read_check: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -374,15 +479,10 @@ impl AgentFileConfig {
             overlay,
             max_output_bytes,
             max_output_lines,
-            max_response_bytes,
-            max_line_bytes,
-            bash_timeout_secs,
-            code_execution_timeout_secs,
             max_continuation_turns,
             compaction_buffer,
-            search_result_limit,
-            interpreter_max_memory_mb,
-            task_max_concurrent
+            task_max_concurrent,
+            stale_read_check
         );
     }
 }
@@ -426,18 +526,6 @@ impl StorageFileConfig {
             max_log_files,
             input_history_size
         );
-    }
-}
-
-#[derive(Deserialize, Default, Debug)]
-#[serde(default, deny_unknown_fields)]
-pub struct IndexFileConfig {
-    pub max_file_size_mb: Option<u64>,
-}
-
-impl IndexFileConfig {
-    fn merge(&mut self, overlay: IndexFileConfig) {
-        merge_option!(self, overlay, max_file_size_mb);
     }
 }
 
@@ -712,6 +800,7 @@ pub struct PermissionsConfig {
     pub yolo: bool,
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,
@@ -725,7 +814,7 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
-#[derive(Debug, Clone, Copy, ConfigSection)]
+#[derive(Debug, Clone, ConfigSection)]
 #[config(section = "ui")]
 pub struct UiConfig {
     #[config(default = true, desc = "Show splash animation on startup")]
@@ -743,11 +832,18 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
+    pub max_input_lines: u32,
+
     #[config(
         default = true,
         desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
     )]
     pub show_thinking: bool,
+
+    #[config(skip, default = "None")]
+    pub theme: Option<String>,
+
 
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
@@ -770,7 +866,9 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
+            theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             show_token_stats: f.show_token_stats.unwrap_or(false),
         }
@@ -895,38 +993,23 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_MAX_OUTPUT_LINES, min = MIN_OUTPUT_LINES, desc = "Max tool output lines")]
     pub max_output_lines: usize,
 
-    #[config(default = DEFAULT_MAX_RESPONSE_BYTES, min = MIN_RESPONSE_BYTES, desc = "Max LLM response size (bytes)")]
-    pub max_response_bytes: usize,
-
-    #[config(default = DEFAULT_MAX_LINE_BYTES, min = MIN_LINE_BYTES, desc = "Max bytes per line before truncation")]
-    pub max_line_bytes: usize,
-
-    #[config(default = DEFAULT_BASH_TIMEOUT_SECS, min = MIN_BASH_TIMEOUT_SECS, desc = "Bash command timeout (seconds)")]
-    pub bash_timeout_secs: u64,
-
-    #[config(default = DEFAULT_CODE_EXECUTION_TIMEOUT_SECS, min = MIN_CODE_EXECUTION_TIMEOUT_SECS, desc = "Code execution timeout (seconds)")]
-    pub code_execution_timeout_secs: u64,
-
     #[config(default = DEFAULT_MAX_CONTINUATION_TURNS, min = MIN_MAX_CONTINUATION_TURNS, desc = "Max automatic continuation turns")]
     pub max_continuation_turns: u32,
 
-    #[config(default = DEFAULT_COMPACTION_BUFFER, min = MIN_COMPACTION_BUFFER, desc = "Token buffer reserved during compaction")]
-    pub compaction_buffer: u32,
+    #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
+    pub compaction_buffer: CompactionBuffer,
 
-    #[config(default = DEFAULT_SEARCH_RESULT_LIMIT, min = MIN_SEARCH_RESULT_LIMIT, desc = "Max results from grep/glob searches")]
-    pub search_result_limit: usize,
-
-    #[config(default = DEFAULT_INTERPRETER_MAX_MEMORY_MB, min = MIN_INTERPRETER_MAX_MEMORY_MB, desc = "Memory limit for code interpreter (MB)")]
-    pub interpreter_max_memory_mb: usize,
+    #[config(
+        default = true,
+        desc = "Require re-reading a file that changed on disk before editing it"
+    )]
+    pub stale_read_check: bool,
 
     #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (task tool)")]
     pub task_max_concurrent: usize,
 
     #[config(skip, default = false)]
     pub no_rtk: bool,
-
-    #[config(skip, default = "DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024")]
-    pub index_max_file_size: u64,
 
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
@@ -939,57 +1022,23 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    fn from_file(
-        file: AgentFileConfig,
-        no_rtk: bool,
-        index_file_config: &IndexFileConfig,
-        disabled_tools: Vec<String>,
-    ) -> Self {
+    fn from_file(file: AgentFileConfig, no_rtk: bool, disabled_tools: Vec<String>) -> Self {
         Self {
             no_rtk,
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
-            max_response_bytes: file
-                .max_response_bytes
-                .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
-            max_line_bytes: file.max_line_bytes.unwrap_or(DEFAULT_MAX_LINE_BYTES),
-            bash_timeout_secs: file.bash_timeout_secs.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS),
-            code_execution_timeout_secs: file
-                .code_execution_timeout_secs
-                .unwrap_or(DEFAULT_CODE_EXECUTION_TIMEOUT_SECS),
             max_continuation_turns: file
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
-            search_result_limit: file
-                .search_result_limit
-                .unwrap_or(DEFAULT_SEARCH_RESULT_LIMIT),
-            interpreter_max_memory_mb: file
-                .interpreter_max_memory_mb
-                .unwrap_or(DEFAULT_INTERPRETER_MAX_MEMORY_MB),
             task_max_concurrent: file
                 .task_max_concurrent
                 .unwrap_or(DEFAULT_TASK_MAX_CONCURRENT),
-            index_max_file_size: index_file_config
-                .max_file_size_mb
-                .unwrap_or(DEFAULT_MAX_FILE_SIZE_MB)
-                * 1024
-                * 1024,
+            stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
         }
-    }
-
-    pub fn validate_all(&self) -> Result<(), ConfigError> {
-        self.validate()?;
-        check(
-            "agent",
-            "max_file_size_mb",
-            self.index_max_file_size / (1024 * 1024),
-            MIN_MAX_FILE_SIZE_MB,
-        )?;
-        Ok(())
     }
 }
 
@@ -1088,18 +1137,21 @@ impl StorageConfig {
 #[derive(Debug, Clone, Default)]
 pub struct PluginsConfig {
     pub enabled: bool,
-    pub tools: Vec<String>,
+    pub names: Vec<String>,
+    /// Per-plugin option tables, without `enabled`. Each plugin validates its
+    /// own via `maki.api.register_options` at load time.
+    pub opts: HashMap<String, JsonMap<String, JsonValue>>,
 }
 
 impl PluginsConfig {
-    pub fn from_tools(tools: HashMap<String, ToolFileConfig>) -> Self {
+    pub fn from_plugins(plugins: HashMap<String, PluginFileConfig>) -> Self {
         let mut all: Vec<String> = DEFAULT_BUILTINS
             .iter()
-            .filter(|name| tools.get(**name).and_then(|t| t.enabled).unwrap_or(true))
+            .filter(|name| plugins.get(**name).and_then(|t| t.enabled).unwrap_or(true))
             .map(|s| s.to_string())
             .collect();
 
-        let mut extra: Vec<&String> = tools
+        let mut extra: Vec<&String> = plugins
             .iter()
             .filter(|(name, cfg)| {
                 !DEFAULT_BUILTINS.contains(&name.as_str()) && cfg.enabled.unwrap_or(false)
@@ -1109,9 +1161,16 @@ impl PluginsConfig {
         extra.sort();
         all.extend(extra.into_iter().cloned());
 
+        let opts = plugins
+            .iter()
+            .filter(|(_, cfg)| !cfg.opts.is_empty())
+            .map(|(name, cfg)| (name.clone(), cfg.opts.clone()))
+            .collect();
+
         Self {
             enabled: true,
-            tools: all,
+            names: all,
+            opts,
         }
     }
 }
@@ -1119,7 +1178,7 @@ impl PluginsConfig {
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.ui.validate_all()?;
-        self.agent.validate_all()?;
+        self.agent.validate()?;
         self.provider.validate()?;
         self.storage.validate()?;
         Ok(())
@@ -1784,9 +1843,17 @@ fn insert_permission_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_storage::sessions::Effort;
     use std::fs;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    fn plugin_enabled(enabled: bool) -> PluginFileConfig {
+        PluginFileConfig {
+            enabled: Some(enabled),
+            opts: JsonMap::new(),
+        }
+    }
 
     fn write_global_permissions(dir: &Path, content: &str) {
         let perms_dir = dir.join(".config/maki");
@@ -1796,6 +1863,41 @@ mod tests {
 
     fn global_config_dir(dir: &Path) -> PathBuf {
         dir.join(".config/maki")
+    }
+
+    #[test_case("12000", CompactionBuffer::Tokens(12_000) ; "tokens_number")]
+    #[test_case("\"20%\"", CompactionBuffer::Percent(20) ; "percent_string")]
+    #[test_case("\" 5 %\"", CompactionBuffer::Percent(5) ; "percent_with_spaces")]
+    fn compaction_buffer_deserializes(json: &str, expected: CompactionBuffer) {
+        let parsed: CompactionBuffer = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed, expected);
+    }
+
+    #[test_case("500" ; "tokens_below_min")]
+    #[test_case("-1" ; "negative_tokens")]
+    #[test_case("\"0%\"" ; "zero_percent")]
+    #[test_case("\"100%\"" ; "percent_too_high")]
+    #[test_case("\"abc%\"" ; "non_numeric_percent")]
+    fn compaction_buffer_rejects(json: &str) {
+        assert!(serde_json::from_str::<CompactionBuffer>(json).is_err());
+    }
+
+    #[test_case(CompactionBuffer::Tokens(10_000), 64_000, 10_000 ; "tokens_ignore_window")]
+    #[test_case(CompactionBuffer::Percent(20), 64_000, 12_800 ; "percent_of_window")]
+    fn compaction_buffer_resolves(buffer: CompactionBuffer, window: u32, expected: u32) {
+        assert_eq!(buffer.resolve(window), expected);
+    }
+
+    #[test]
+    fn compaction_buffer_serializes_percent_as_string() {
+        assert_eq!(
+            serde_json::to_value(CompactionBuffer::Percent(20)).unwrap(),
+            serde_json::json!("20%")
+        );
+        assert_eq!(
+            serde_json::to_value(CompactionBuffer::Tokens(9_000)).unwrap(),
+            serde_json::json!(9_000)
+        );
     }
 
     #[test]
@@ -1818,14 +1920,12 @@ mod tests {
         let raw = RawConfig {
             agent: AgentFileConfig {
                 max_output_lines: Some(5000),
-                bash_timeout_secs: Some(60),
                 ..Default::default()
             },
             ..Default::default()
         };
         let config = raw.into_config(false).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
-        assert_eq!(config.agent.bash_timeout_secs, 60);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
 
@@ -1840,7 +1940,7 @@ mod tests {
             },
             agent: AgentFileConfig {
                 max_output_lines: Some(3000),
-                max_line_bytes: Some(800),
+                max_output_bytes: Some(80_000),
                 ..Default::default()
             },
             ..Default::default()
@@ -1857,7 +1957,7 @@ mod tests {
 
         assert_eq!(base.always_yolo, Some(true), "overlay wins");
         assert_eq!(base.agent.max_output_lines, Some(5000), "overlay wins");
-        assert_eq!(base.agent.max_line_bytes, Some(800), "base preserved");
+        assert_eq!(base.agent.max_output_bytes, Some(80_000), "base preserved");
         assert_eq!(base.ui.splash_animation, Some(false), "base preserved");
         assert_eq!(base.ui.flash_duration_ms, Some(2000), "base preserved");
     }
@@ -1917,9 +2017,12 @@ mod tests {
         assert_eq!(raw.into_config(false).unwrap().agent.task_max_concurrent, 3);
     }
 
+
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
     #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]
     #[test_case(AlwaysThinking::Budget(8192), StoredThinking::Budget { tokens: 8192 } ; "budget_number")]
+    #[test_case(AlwaysThinking::Mode("xhigh".into()), StoredThinking::Effort { level: Effort::XHigh } ; "effort_xhigh")]
+    #[test_case(AlwaysThinking::Mode("minimal".into()), StoredThinking::Effort { level: Effort::Minimal } ; "effort_minimal")]
     fn always_thinking_toggle_resolve(input: AlwaysThinking, expected: StoredThinking) {
         assert_eq!(input.resolve(), Ok(expected));
     }
@@ -1949,18 +2052,13 @@ mod tests {
 
     #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
     #[test_case("max_output_lines",  0 ; "zero_output_lines")]
-    #[test_case("max_response_bytes", 0 ; "zero_response_bytes")]
-    #[test_case("max_line_bytes",    0 ; "zero_line_bytes")]
     #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
-    #[test_case("max_line_bytes",    10 ; "below_min_line_bytes")]
     #[test_case("task_max_concurrent", 0 ; "zero_task_max_concurrent")]
     fn validate_rejects_invalid_agent(field: &str, value: usize) {
         let mut config = AgentConfig::default();
         match field {
             "max_output_bytes" => config.max_output_bytes = value,
             "max_output_lines" => config.max_output_lines = value,
-            "max_response_bytes" => config.max_response_bytes = value,
-            "max_line_bytes" => config.max_line_bytes = value,
             "task_max_concurrent" => config.task_max_concurrent = value,
             _ => unreachable!(),
         }
@@ -1992,9 +2090,9 @@ mod tests {
 
     #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]
     #[test_case("storage",  "max_log_files",        0 ; "storage_zero_log_files")]
-    #[test_case("agent",    "max_file_size_mb",     0 ; "agent_zero_file_size")]
     #[test_case("ui",       "mouse_scroll_lines",   0 ; "ui_zero_scroll_lines")]
-    #[test_case("agent",    "bash_timeout_secs",    1 ; "agent_bash_timeout_too_low")]
+    #[test_case("ui",       "max_input_lines",      0 ; "ui_zero_max_input_lines")]
+    #[test_case("agent",    "max_output_lines",     1 ; "agent_output_lines_too_low")]
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
             always_yolo: false,
@@ -2013,9 +2111,9 @@ mod tests {
                 config.provider.connect_timeout = Duration::from_secs(value)
             }
             ("storage", "max_log_files") => config.storage.max_log_files = value as u32,
-            ("agent", "max_file_size_mb") => config.agent.index_max_file_size = value * 1024 * 1024,
             ("ui", "mouse_scroll_lines") => config.ui.mouse_scroll_lines = value as u32,
-            ("agent", "bash_timeout_secs") => config.agent.bash_timeout_secs = value,
+            ("ui", "max_input_lines") => config.ui.max_input_lines = value as u32,
+            ("agent", "max_output_lines") => config.agent.max_output_lines = value as usize,
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();
@@ -2342,59 +2440,51 @@ mod tests {
     }
 
     #[test]
-    fn plugins_default_builtins_populated_when_enabled() {
-        let config = RawConfig::default().into_config(false).unwrap();
-        assert!(
-            !config.plugins.tools.is_empty(),
-            "enabled plugins should have default builtins"
-        );
-    }
-
-    #[test]
-    fn merge_tools_overlay_replaces_and_preserves() {
-        let mut base = RawConfig::default();
-        base.tools.insert(
-            "index".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
-        base.tools.insert(
-            "websearch".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
-
-        let mut overlay = RawConfig::default();
-        overlay.tools.insert(
-            "websearch".to_string(),
-            ToolFileConfig {
-                enabled: Some(false),
-            },
-        );
-        overlay.tools.insert(
-            "alpha_tool".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
+    fn merge_plugins_overlay_wins_per_key() {
+        let mut base: RawConfig = toml::from_str(
+            "[plugins.index]\nenabled = true\n\
+             [plugins.websearch]\nenabled = true\n\
+             [plugins.grep]\nenabled = true\nsearch_result_limit = 200\nmax_line_bytes = 900\n",
+        )
+        .unwrap();
+        let overlay: RawConfig = toml::from_str(
+            "[plugins.websearch]\nenabled = false\n\
+             [plugins.alpha_tool]\nenabled = true\n\
+             [plugins.grep]\nsearch_result_limit = 50\n",
+        )
+        .unwrap();
 
         base.merge(overlay);
         assert_eq!(
-            base.tools["index"].enabled,
+            base.plugins["index"].enabled,
             Some(true),
             "base-only key preserved"
         );
         assert_eq!(
-            base.tools["websearch"].enabled,
+            base.plugins["websearch"].enabled,
             Some(false),
             "overlay replaces"
         );
         assert_eq!(
-            base.tools["alpha_tool"].enabled,
+            base.plugins["alpha_tool"].enabled,
             Some(true),
             "overlay-only key added"
+        );
+        let grep = &base.plugins["grep"];
+        assert_eq!(
+            grep.enabled,
+            Some(true),
+            "enabled preserved when overlay omits it"
+        );
+        assert_eq!(
+            grep.opts["search_result_limit"],
+            serde_json::json!(50),
+            "overlay opt wins"
+        );
+        assert_eq!(
+            grep.opts["max_line_bytes"],
+            serde_json::json!(900),
+            "base opt preserved"
         );
     }
 
@@ -2417,9 +2507,20 @@ mod tests {
         assert!(config.ui.show_thinking);
     }
 
+    #[test]
+    fn max_input_lines_defaults_and_deserializes() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.ui.max_input_lines, DEFAULT_MAX_INPUT_LINES);
+
+        let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
+        assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
+    }
+
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]
-    #[test_case("agent = { bsh_timeout_secs = 60 }\n" ; "nested_section_typo")]
-    #[test_case("[tools.bash]\nenabled = true\ntypo_field = 42\n" ; "tool_config_typo")]
+    #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
+    #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
+    #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(
@@ -2429,67 +2530,85 @@ mod tests {
     }
 
     #[test]
-    fn deny_unknown_fields_accepts_valid_tools() {
-        const VALID: &str = "[tools.bash]\nenabled = true\n[tools.websearch]\nenabled = false\n";
+    fn deny_unknown_fields_accepts_valid_plugins() {
+        const VALID: &str =
+            "[plugins.bash]\nenabled = true\n[plugins.websearch]\nenabled = false\n";
         let result: Result<RawConfig, _> = toml::from_str(VALID);
         assert!(
             result.is_ok(),
-            "valid tools section should parse: {:?}",
+            "valid plugins section should parse: {:?}",
             result.err()
         );
     }
 
     #[test]
-    fn plugins_from_tools_default() {
-        let plugins = PluginsConfig::from_tools(HashMap::new());
+    fn plugin_extra_keys_parse_into_opts() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.bash]\nenabled = true\ntimeout_secs = 180\n").unwrap();
+        let bash = &raw.plugins["bash"];
+        assert_eq!(bash.enabled, Some(true));
+        assert_eq!(bash.opts["timeout_secs"], serde_json::json!(180));
+    }
+
+    #[test]
+    fn into_config_wires_plugin_names_and_opts() {
+        let raw: RawConfig = toml::from_str(
+            "[plugins.bash]\ntimeout_secs = 180\n[plugins.websearch]\nenabled = false\n",
+        )
+        .unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(config.plugins.names.contains(&"bash".to_string()));
+        assert!(!config.plugins.names.contains(&"websearch".to_string()));
+        assert!(
+            config.plugins.names.contains(&"index".to_string()),
+            "untouched builtin stays"
+        );
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(180)
+        );
+        assert!(
+            !config.plugins.opts.contains_key("websearch"),
+            "enabled-only tables produce no opts"
+        );
+    }
+
+    #[test]
+    fn from_plugins_default() {
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
         let expected: Vec<String> = DEFAULT_BUILTINS.iter().map(|s| s.to_string()).collect();
-        assert_eq!(plugins.tools, expected);
+        assert_eq!(plugins.names, expected);
         assert!(plugins.enabled);
     }
 
     #[test]
-    fn plugins_from_tools_enable_disable_and_sort() {
-        let mut tools = HashMap::new();
-        tools.insert(
-            "websearch".to_string(),
-            ToolFileConfig {
-                enabled: Some(false),
-            },
-        );
-        tools.insert(
-            "zeta".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
-        tools.insert(
-            "alpha".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
-        tools.insert("custom_tool".to_string(), ToolFileConfig { enabled: None });
+    fn from_plugins_enable_disable_and_sort() {
+        let mut entries = HashMap::new();
+        entries.insert("websearch".to_string(), plugin_enabled(false));
+        entries.insert("zeta".to_string(), plugin_enabled(true));
+        entries.insert("alpha".to_string(), plugin_enabled(true));
+        entries.insert("custom_tool".to_string(), PluginFileConfig::default());
 
-        let plugins = PluginsConfig::from_tools(tools);
+        let plugins = PluginsConfig::from_plugins(entries);
         assert!(
-            !plugins.tools.contains(&"websearch".to_string()),
+            !plugins.names.contains(&"websearch".to_string()),
             "disabled builtin removed"
         );
         assert!(
-            plugins.tools.contains(&"index".to_string()),
+            plugins.names.contains(&"index".to_string()),
             "untouched builtin stays"
         );
         assert!(
-            plugins.tools.contains(&"bash".to_string()),
+            plugins.names.contains(&"bash".to_string()),
             "bash is a default builtin"
         );
         assert!(
-            !plugins.tools.contains(&"custom_tool".to_string()),
+            !plugins.names.contains(&"custom_tool".to_string()),
             "enabled=None non-default ignored"
         );
 
         let extras: Vec<_> = plugins
-            .tools
+            .names
             .iter()
             .filter(|t| !DEFAULT_BUILTINS.contains(&t.as_str()))
             .cloned()
@@ -2499,22 +2618,6 @@ mod tests {
             vec!["alpha", "zeta"],
             "extras sorted alphabetically"
         );
-    }
-
-    #[test]
-    fn plugins_from_tools_all_builtins_disabled() {
-        let mut tools = HashMap::new();
-        for name in DEFAULT_BUILTINS {
-            tools.insert(
-                name.to_string(),
-                ToolFileConfig {
-                    enabled: Some(false),
-                },
-            );
-        }
-        let plugins = PluginsConfig::from_tools(tools);
-        assert!(plugins.tools.is_empty());
-        assert!(plugins.enabled);
     }
 
     #[test]
@@ -2549,32 +2652,6 @@ mod tests {
     }
 
     #[test]
-    fn into_config_tools_flow_to_plugins() {
-        let mut tools = HashMap::new();
-        tools.insert(
-            "bash".to_string(),
-            ToolFileConfig {
-                enabled: Some(true),
-            },
-        );
-        tools.insert(
-            "websearch".to_string(),
-            ToolFileConfig {
-                enabled: Some(false),
-            },
-        );
-        let raw = RawConfig {
-            tools,
-            ..Default::default()
-        };
-        let config = raw.into_config(false).unwrap();
-
-        assert!(config.plugins.tools.contains(&"bash".to_string()));
-        assert!(!config.plugins.tools.contains(&"websearch".to_string()));
-        assert!(config.plugins.tools.contains(&"index".to_string()));
-    }
-
-    #[test]
     fn default_builtins_sorted() {
         for pair in DEFAULT_BUILTINS.windows(2) {
             assert!(
@@ -2587,42 +2664,74 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_tools_require_explicit_enable() {
-        let default_config = RawConfig::default().into_config(false).unwrap();
-        for &name in OPT_IN_TOOLS {
+    fn removed_sub_tool_tables_error() {
+        for &tool in EDIT_SUB_TOOLS {
+            let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
+            let Err(err) = raw.into_config(false) else {
+                panic!("plugins.{tool} should be rejected");
+            };
+            let msg = err.to_string();
             assert!(
-                default_config
-                    .agent
-                    .disabled_tools
-                    .contains(&name.to_string()),
-                "{name} should be disabled by default"
+                msg.contains(&format!("plugins.{tool} was removed"))
+                    && msg.contains("plugins.edit = {"),
+                "error should point at plugins.edit, got: {msg}"
             );
         }
+    }
 
-        let mut tools = HashMap::new();
-        for &name in OPT_IN_TOOLS {
-            tools.insert(
-                name.to_string(),
-                ToolFileConfig {
-                    enabled: Some(true),
-                },
-            );
-        }
-        let enabled_config = RawConfig {
-            tools,
-            ..Default::default()
-        }
-        .into_config(false)
-        .unwrap();
-        for &name in OPT_IN_TOOLS {
-            assert!(
-                !enabled_config
-                    .agent
-                    .disabled_tools
-                    .contains(&name.to_string()),
-                "{name} should be enabled when configured"
-            );
-        }
+    #[test_case("enabled = false" ; "enabled_false")]
+    #[test_case("search_result_limit = 50" ; "opts_only")]
+    fn unknown_plugin_name_errors(body: &str) {
+        let raw: RawConfig = toml::from_str(&format!("[plugins.gerp]\n{body}\n")).unwrap();
+        let Err(err) = raw.into_config(false) else {
+            panic!("plugins.gerp should be rejected");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no bundled plugin is named \"gerp\"") && msg.contains("grep"),
+            "error should name the typo and list bundled plugins, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn disabled_plugin_keeps_opts_but_not_load_entry() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.bash]\nenabled = false\ntimeout_secs = 180\n").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert!(!config.plugins.names.contains(&"bash".to_string()));
+        assert_eq!(
+            config.plugins.opts["bash"]["timeout_secs"],
+            serde_json::json!(180),
+            "opts survive for when the plugin is re-enabled"
+        );
+    }
+
+    #[test]
+    fn renamed_tools_table_errors() {
+        let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
+        let Err(err) = raw.into_config(false) else {
+            panic!("old tools table should be rejected");
+        };
+        assert!(
+            err.to_string().contains("renamed to `plugins`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn edit_sub_tool_toggles_flow_as_edit_opts() {
+        let raw: RawConfig =
+            toml::from_str("[plugins.edit]\nmultiedit = false\nedit_lines = true\n").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(
+            config.plugins.opts["edit"]["multiedit"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            config.plugins.opts["edit"]["edit_lines"],
+            serde_json::json!(true)
+        );
+        assert!(config.agent.disabled_tools.is_empty());
     }
 
     #[test]

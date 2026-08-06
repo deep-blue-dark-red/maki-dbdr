@@ -5,6 +5,9 @@
 -- primitives only (`maki.agent.session`, `maki.json.schema_validator`,
 -- `maki.async.semaphore`).
 
+local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
+
 local STRUCTURED_OUTPUT_NAME = "structured_output"
 local STRUCTURED_OUTPUT_DESCRIPTION = "Report your final result. Call it exactly once when your task is complete."
 local STRUCTURED_OUTPUT_ACK = "Output recorded."
@@ -12,12 +15,16 @@ local STRUCTURED_OUTPUT_PROMPT_SUFFIX = "\n\nWhen finished, call the structured_
 local MAX_STRUCTURED_RETRIES = 2
 local MAX_SCHEMA_ERRORS = 3
 local SCHEMA_COMPILE_ERROR = "invalid output_schema"
+local SCHEMA_ROOT_ERROR = "output_schema must have type object"
 local STRUCTURED_MISSING_ERROR = "subagent finished without calling structured_output"
 local STRUCTURED_INVALID_ERROR = "subagent result does not match output_schema"
 local NUDGE_MISSING =
   "You did not call the structured_output tool. Call it now with your final result matching its input schema."
 local INVALID_INPUT_PREFIX =
   "Input does not match the required schema. Fix the errors and call structured_output again:\n"
+local BODY_INDENT_COLS = 4
+local MIN_MD_WIDTH = 20
+local DEFAULT_OUTPUT_LINES = 5
 
 local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
 
@@ -31,6 +38,14 @@ Notes:
 3. Each invocation starts fresh - inline any needed context into the prompt.
 4. Tell it to return concise summaries with file:line refs, not full file contents.
 ]]
+
+local opts = maki.api.register_options({
+  max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
+  allow_model = {
+    default = false,
+    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
+  },
+})
 
 local schema = {
   type = "object",
@@ -59,6 +74,15 @@ local schema = {
   },
 }
 
+-- Only advertise `model` when the plugin opts in: it costs tokens in every
+-- task schema, and an off-by-default flag keeps the common path lean.
+if opts.allow_model then
+  schema.properties.model = {
+    type = "string",
+    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier.',
+  }
+end
+
 local examples = {
   {
     description = "Find auth middleware",
@@ -67,7 +91,8 @@ local examples = {
   },
 }
 
-local semaphore
+-- Process-wide cap on concurrent subagents.
+local semaphore = maki.async.semaphore(opts.max_concurrent)
 
 local function bounded_errors(errors)
   local out = {}
@@ -86,6 +111,9 @@ local function handler(input, ctx)
   -- Compile early: a bad schema costs zero tokens.
   local validator
   if input.output_schema then
+    if type(input.output_schema) ~= "table" or input.output_schema.type ~= "object" then
+      return { llm_output = SCHEMA_ROOT_ERROR, is_error = true }
+    end
     local compile_err
     validator, compile_err = maki.json.schema_validator(input.output_schema)
     if compile_err then
@@ -95,6 +123,7 @@ local function handler(input, ctx)
 
   local model, model_err = maki.agent.resolve_model(ctx, {
     tier = input.model_tier,
+    spec = opts.allow_model and input.model or nil,
   })
   if model_err then
     return { llm_output = model_err, is_error = true }
@@ -113,7 +142,6 @@ local function handler(input, ctx)
   local tool_defs, tools_err = maki.agent.tools(ctx, {
     audience = audience,
     spec = model.spec,
-    include_mcp = true,
   })
   if tools_err then
     return { llm_output = tools_err, is_error = true }
@@ -139,10 +167,6 @@ local function handler(input, ctx)
     }
   end
 
-  -- Process-wide cap on concurrent subagents, sized from config on first use.
-  if not semaphore then
-    semaphore = maki.async.semaphore(math.max(ctx:config("task_max_concurrent", 1), 1))
-  end
   local permit = semaphore:acquire()
 
   -- pcall so a raised error cannot leak the permit.
@@ -194,6 +218,18 @@ local function header(input)
   return input.description
 end
 
+-- Standalone runs render markdown on the Rust side (format = "markdown");
+-- this mirrors that for restore and batch children, which build the body here.
+local function restore(_input, output, is_error, ctx)
+  local tol = ctx:tool_output_lines()
+  return ToolView.restore_markdown(output, is_error, {
+    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    keep = "head",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
+    width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
+  })
+end
+
 maki.api.register_tool({
   name = "task",
   description = description,
@@ -203,4 +239,5 @@ maki.api.register_tool({
   schema = schema,
   handler = handler,
   header = header,
+  restore = restore,
 })

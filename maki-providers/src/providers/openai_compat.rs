@@ -15,6 +15,7 @@ use crate::{
 const STREAM_DONE: &str = "[DONE]";
 
 pub(crate) struct OpenAiCompatConfig {
+    pub slug: &'static str,
     pub api_key_env: &'static str,
     pub base_url: &'static str,
     pub max_tokens_field: &'static str,
@@ -26,14 +27,27 @@ pub(crate) struct OpenAiCompatProvider {
     client: HttpClient,
     config: &'static OpenAiCompatConfig,
     stream_timeout: Duration,
+    /// Env / `providers.toml` override, resolved once at construction. The
+    /// static compat default stays the last resort because it can be more
+    /// specific than the inventory one (`http://localhost:11434/v1` vs the
+    /// bare ollama host). Request-time `auth.base_url` still wins (custom,
+    /// local, dynamic).
+    resolved_base_url: Option<String>,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
+        let resolved_base_url = if config.slug.is_empty() {
+            None
+        } else {
+            let providers = maki_config::providers::ProvidersConfig::load();
+            maki_config::providers::configured_base_url(config.slug, providers.get(config.slug))
+        };
         Self {
             client: super::http_client(timeouts),
             config,
             stream_timeout: timeouts.stream,
+            resolved_base_url,
         }
     }
 
@@ -108,8 +122,8 @@ impl OpenAiCompatProvider {
             "messages": wire_messages,
             "stream": true,
         });
-        if model.max_output_tokens != 0 {
-            body[self.config.max_tokens_field] = json!(model.max_output_tokens);
+        if let Some(max_output) = model.max_output_tokens {
+            body[self.config.max_tokens_field] = json!(max_output);
         }
         if self.config.include_stream_usage {
             body["stream_options"] = json!({"include_usage": true});
@@ -120,13 +134,25 @@ impl OpenAiCompatProvider {
         body
     }
 
+    /// Effective base URL: an auth-supplied value (dynamic/custom providers)
+    /// wins, then the construction-time env / `providers.toml` override, then
+    /// the static compat default.
+    fn base_url(&self, auth: &ResolvedAuth) -> String {
+        if let Some(explicit) = auth.base_url.as_deref() {
+            return explicit.to_string();
+        }
+        self.resolved_base_url
+            .clone()
+            .unwrap_or_else(|| self.config.base_url.to_string())
+    }
+
     fn build_request(
         &self,
         method: &str,
         path: &str,
         auth: &ResolvedAuth,
     ) -> isahc::http::request::Builder {
-        let base = auth.base_url.as_deref().unwrap_or(self.config.base_url);
+        let base = self.base_url(auth);
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -179,7 +205,7 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
         parse_fn: impl Fn(&Value) -> Option<crate::model::ModelInfo>,
     ) -> Result<Vec<crate::model::ModelInfo>, AgentError> {
-        let base = auth.base_url.as_deref().unwrap_or(self.config.base_url);
+        let base = self.base_url(auth);
         let url = format!("{base}/models");
         let body_text = self.get_text(auth, &url).await?;
         let body: Value = serde_json::from_str(&body_text)?;
@@ -228,6 +254,8 @@ impl OpenAiCompatProvider {
             max_output_tokens,
             pricing: Some(pricing),
             supports_thinking: None,
+            supports_vision: None,
+            tier: None,
             provider_info: None,
         })
     }
@@ -301,7 +329,9 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         ContentBlock::Thinking { thinking, .. } => {
                             reasoning_text.push_str(thinking);
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             tool_calls.push(json!({
                                 "id": id,
                                 "type": "function",
@@ -318,12 +348,10 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                 }
 
                 if !text.is_empty() || !tool_calls.is_empty() || !reasoning_text.is_empty() {
-                    let mut msg_obj = json!({"role": "assistant"});
-                    if !text.is_empty() {
-                        msg_obj["content"] = Value::String(text);
-                    } else if !reasoning_text.is_empty() {
-                        msg_obj["content"] = Value::String(String::new());
-                    }
+                    // Always emit string `content` (""): some OpenAI-compatible
+                    // backends (e.g. Cloudflare Workers AI gpt-oss) reject
+                    // omitted/null content on assistant tool-call messages.
+                    let mut msg_obj = json!({"role": "assistant", "content": text});
                     if !reasoning_text.is_empty() {
                         msg_obj["reasoning_content"] = Value::String(reasoning_text);
                     }
@@ -377,6 +405,7 @@ struct FunctionDelta {
 #[derive(Deserialize)]
 struct ChunkDelta {
     content: Option<ContentDelta>,
+    #[serde(alias = "reasoning")]
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -410,8 +439,9 @@ enum ThinkingDeltaBlock {
 
 #[derive(Deserialize)]
 struct ChunkChoice {
-    #[serde(alias = "message")]
     delta: Option<ChunkDelta>,
+    #[serde(default)]
+    message: Option<ChunkDelta>,
     finish_reason: Option<String>,
 }
 
@@ -428,6 +458,9 @@ struct ChunkUsage {
     #[serde(default)]
     completion_tokens: u32,
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek reports cache hits here instead of `prompt_tokens_details`.
+    #[serde(default)]
+    prompt_cache_hit_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -486,8 +519,8 @@ pub async fn parse_sse(
         if let Some(u) = chunk.usage {
             let cached = u
                 .prompt_tokens_details
-                .map(|d| d.cached_tokens)
-                .unwrap_or(0);
+                .map_or(0, |d| d.cached_tokens)
+                .max(u.prompt_cache_hit_tokens);
             usage = TokenUsage {
                 input: u.prompt_tokens.saturating_sub(cached),
                 output: u.completion_tokens,
@@ -504,7 +537,7 @@ pub async fn parse_sse(
             stop_reason = Some(StopReason::from_openai(&reason));
         }
 
-        let Some(delta) = choice.delta else {
+        let Some(delta) = choice.delta.or(choice.message) else {
             continue;
         };
 
@@ -646,7 +679,7 @@ pub async fn parse_sse(
         } else {
             acc.name
         };
-        content_blocks.push(ContentBlock::ToolUse { id, name, input });
+        content_blocks.push(ContentBlock::tool_use(id, name, input));
     }
 
     Ok(StreamResponse {
@@ -704,6 +737,25 @@ data: [DONE]\n";
     }
 
     #[test]
+    fn parse_sse_deepseek_cache_hit_tokens() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.input, 20);
+            assert_eq!(resp.usage.cache_read, 80);
+            assert_eq!(resp.usage.output, 10);
+        })
+    }
+
+    #[test]
     fn parse_sse_reasoning_and_content() {
         smol::block_on(async {
             let sse = "\
@@ -736,6 +788,7 @@ data: [DONE]\n";
                     ProviderEvent::ThinkingDelta { text } => thinking.push(text),
                     ProviderEvent::TextDelta { text } => text_deltas.push(text),
                     ProviderEvent::ToolUseStart { .. } => {}
+                    ProviderEvent::PromptProgress { .. } => {}
                 }
             }
             assert_eq!(thinking, vec!["Let me think", "..."]);
@@ -753,11 +806,7 @@ data: [DONE]\n";
                     ContentBlock::Text {
                         text: "thinking...".to_string(),
                     },
-                    ContentBlock::ToolUse {
-                        id: "tc_1".to_string(),
-                        name: "bash".to_string(),
-                        input: json!({"command": "ls"}),
-                    },
+                    ContentBlock::tool_use("tc_1", "bash", json!({"command": "ls"})),
                 ],
                 ..Default::default()
             },
@@ -786,6 +835,30 @@ data: [DONE]\n";
         assert_eq!(wire[3]["role"], "tool");
         assert_eq!(wire[3]["tool_call_id"], "tc_1");
         assert_eq!(wire[3]["content"], "file.txt");
+    }
+
+    #[test]
+    fn convert_messages_assistant_tool_calls_only_has_content() {
+        let messages = vec![
+            Message::user("list files".to_string()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    "tc_1",
+                    "bash",
+                    json!({"command": "ls"}),
+                )],
+                ..Default::default()
+            },
+        ];
+
+        let wire = convert_messages(&messages, "be helpful");
+
+        assert_eq!(wire[2]["role"], "assistant");
+        // `content` must be a present string ("") even with only tool_calls;
+        // strict OpenAI-compatible backends reject null/omitted content.
+        assert_eq!(wire[2]["content"], "");
+        assert_eq!(wire[2]["tool_calls"][0]["function"]["name"], "bash");
     }
 
     #[test]

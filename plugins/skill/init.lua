@@ -1,5 +1,7 @@
 local SKILL_FILE = "SKILL.md"
 local NOT_FOUND = "skill not found: "
+local REFERENCE_FILE = "lua-api.md"
+local REFERENCE_UNAVAILABLE = "(unavailable; full reference inlined below)"
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 local helpers = require("skill_helpers")
@@ -54,14 +56,48 @@ local function find_project_ancestors()
     return {}
   end
   local dirs = { cwd }
+  if maki.fs.metadata(maki.fs.joinpath(cwd, ".git")) then
+    return dirs
+  end
   for _, parent in ipairs(maki.fs.parents(cwd)) do
     dirs[#dirs + 1] = parent
-    local git = maki.fs.joinpath(parent, ".git")
-    if maki.fs.metadata(git) then
+    if maki.fs.metadata(maki.fs.joinpath(parent, ".git")) then
       break
     end
   end
   return dirs
+end
+
+local opts = maki.api.register_options({
+  plugin_dev = { default = true, desc = "Offer the builtin maki-plugin-dev skill for writing maki plugins." },
+})
+
+local ok, builtin, reference = pcall(function()
+  return require("plugin_dev"), require("plugin_dev_reference")
+end)
+if not ok then
+  maki.log.warn("builtin plugin_dev skill unavailable: " .. tostring(builtin))
+  builtin = nil
+end
+
+local function resolve_builtin_content()
+  local state = maki.env.state_dir()
+  if state then
+    local dir = maki.fs.joinpath(state, "docs")
+    local path = maki.fs.joinpath(dir, REFERENCE_FILE)
+    local _, err = maki.fs.mkdir(dir, { parents = true })
+    if not err then
+      _, err = maki.fs.write(path, reference.content)
+    end
+    if not err then
+      return (builtin.content:gsub(builtin.reference_placeholder, function()
+        return path
+      end))
+    end
+    maki.log.warn("failed to write lua api reference to " .. path .. ": " .. tostring(err))
+  end
+  local content = builtin.content:gsub(builtin.reference_placeholder, REFERENCE_UNAVAILABLE)
+  return content .. "\n---\n\n" .. reference.content
 end
 
 local function discover_skills()
@@ -80,6 +116,16 @@ local function discover_skills()
   end
 
   local skills = {}
+
+  if builtin and opts.plugin_dev then
+    skills[builtin.name] = {
+      name = builtin.name,
+      description = builtin.description,
+      content = builtin.content,
+      location = "builtin:" .. builtin.name,
+      resolve = resolve_builtin_content,
+    }
+  end
 
   local config = maki.env.config_dir()
   if config then
@@ -118,6 +164,14 @@ maki.api.register_tool({
     return input.name or "list"
   end,
 
+  restore = function(_input, output, _is_error, ctx)
+    local tol = ctx:tool_output_lines()
+    return ToolView.restore(output, {
+      max_lines = (tol and tol.other) or 20,
+      keep = "head",
+    })
+  end,
+
   handler = function(input, ctx)
     local skills = discover_skills()
     if not input.name or input.name == "" then
@@ -127,14 +181,15 @@ maki.api.register_tool({
     local skill = skills[input.name]
     if not skill then
       local available = build_skill_list(skills)
-      return NOT_FOUND .. input.name .. available
+      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+    end
+    if skill.resolve then
+      skill.content = skill.resolve()
     end
 
     local lines = {}
-    local i = 1
-    for line in (skill.content .. "\n"):gmatch("([^\n]*)\n") do
+    for i, line in ipairs(maki.split(skill.content, "\n")) do
       lines[#lines + 1] = string.format("%4d | %s", i, line)
-      i = i + 1
     end
     local formatted = skill.location .. "\n" .. table.concat(lines, "\n")
 

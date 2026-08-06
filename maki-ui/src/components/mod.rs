@@ -17,12 +17,11 @@ pub(crate) mod modal;
 pub(crate) mod model_picker;
 pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
+pub(crate) mod progress_bar;
 pub mod queue_panel;
-pub(crate) mod render_hints;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
-pub(crate) mod session_picker;
 pub(crate) mod plugins_modal;
 pub(crate) mod settings_picker;
 pub(crate) mod skills_modal;
@@ -33,7 +32,6 @@ pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -179,7 +177,6 @@ impl ModalScroll {
 
 pub struct LoadedSession {
     pub messages: Vec<Message>,
-    pub tool_outputs: HashMap<String, ToolOutput>,
     pub model_spec: String,
 }
 
@@ -229,12 +226,13 @@ pub enum ExitRequest {
     None,
     Success,
     Error,
+    Reload,
 }
 
 impl ExitRequest {
     pub fn code(&self) -> i32 {
         match self {
-            Self::None | Self::Success => 0,
+            Self::None | Self::Success | Self::Reload => 0,
             Self::Error => 1,
         }
     }
@@ -402,15 +400,14 @@ pub(crate) fn test_pricing() -> ModelPricing {
 pub(crate) fn test_model() -> maki_providers::Model {
     maki_providers::Model {
         id: "test-model".into(),
-        provider: maki_providers::provider::ProviderKind::Anthropic,
-        dynamic_slug: None,
+        provider: std::sync::Arc::<str>::from("anthropic"),
         tier: maki_providers::ModelTier::Medium,
         family: maki_providers::ModelFamily::Claude,
         supports_tool_examples_override: None,
         supports_thinking_override: None,
-        vision: true,
+        supports_vision_override: Some(true),
         pricing: test_pricing(),
-        max_output_tokens: 8192,
+        max_output_tokens: Some(8192),
         context_window: TEST_CONTEXT_WINDOW,
     }
 }

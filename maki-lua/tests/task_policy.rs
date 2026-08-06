@@ -17,6 +17,7 @@ const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 const MAX_STRUCTURED_RETRIES: usize = 2;
 const MAX_SCHEMA_ERRORS: usize = 3;
 const SCHEMA_COMPILE_ERROR: &str = "invalid output_schema";
+const SCHEMA_ROOT_ERROR: &str = "output_schema must have type object";
 const STRUCTURED_MISSING_ERROR: &str = "subagent finished without calling structured_output";
 const STRUCTURED_INVALID_ERROR: &str = "subagent result does not match output_schema";
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
@@ -28,6 +29,8 @@ const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
 const PROMPT_ERR_MSG: &str = "model exploded";
 const RAISE_MSG: &str = "stub prompt kaboom";
+/// Mirrors the task plugin's `max_concurrent` default.
+const TASK_DEFAULT_MAX_CONCURRENT: u64 = 8;
 
 const SCENARIO_PLAIN: &str = "plain";
 const SCENARIO_HAPPY: &str = "happy";
@@ -63,6 +66,7 @@ maki.async.semaphore = function(n)
 end
 
 maki.agent.resolve_model = function(ctx, opts)
+  recorder.resolve_opts = opts
   return { spec = "test/model" }
 end
 
@@ -140,11 +144,13 @@ maki.api.register_tool({
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
       second_err = recorder.second_err,
-      task_cap = ctx:config().task_max_concurrent,
       acquired = recorder.acquired,
       released = recorder.released,
       sem_size = recorder.sem_size,
     }
+    if recorder.resolve_opts then
+      snap.resolve_opts = recorder.resolve_opts
+    end
     if #recorder.prompts > 0 then
       snap.prompts = recorder.prompts
     end
@@ -154,14 +160,24 @@ maki.api.register_tool({
 "#;
 
 fn load_task_host() -> (Arc<ToolRegistry>, PluginHost) {
+    load_task_host_with_opts(serde_json::Map::new())
+}
+
+fn load_task_host_with_opts(
+    opts: serde_json::Map<String, serde_json::Value>,
+) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@PROMPT_ERR@", PROMPT_ERR_MSG)
         .replace("@RAISE_MSG@", RAISE_MSG);
-    host.load_source("task_policy", &format!("{prelude}\n{TASK_PLUGIN_SRC}"))
-        .unwrap();
+    host.load_source_with_opts(
+        "task_policy",
+        &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
+        opts,
+    )
+    .unwrap();
     (reg, host)
 }
 
@@ -192,6 +208,47 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
     input
 }
 
+const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+
+#[test]
+fn model_spec_forwards_full_spec_to_resolve_model() {
+    let mut opts = serde_json::Map::new();
+    opts.insert("allow_model".into(), json!(true));
+    let (reg, _host) = load_task_host_with_opts(opts);
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["model"] = json!(FULL_MODEL_SPEC);
+    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
+    assert_eq!(out, PLAIN_TEXT);
+
+    let snap = probe(&reg);
+    let opts = snap["resolve_opts"]
+        .as_object()
+        .expect("resolve_opts missing");
+    assert_eq!(opts["spec"], json!(FULL_MODEL_SPEC));
+    assert!(
+        opts.get("tier").is_none_or(Value::is_null),
+        "tier should be unset when only model spec is given"
+    );
+}
+
+#[test]
+fn model_spec_ignored_when_allow_model_off() {
+    let (reg, _host) = load_task_host();
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    input["model"] = json!(FULL_MODEL_SPEC);
+    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
+    assert_eq!(out, PLAIN_TEXT);
+
+    let snap = probe(&reg);
+    let opts = snap["resolve_opts"]
+        .as_object()
+        .expect("resolve_opts missing");
+    assert!(
+        opts.get("spec").is_none_or(Value::is_null),
+        "spec should not be forwarded when allow_model is off"
+    );
+}
+
 fn answer_schema() -> Value {
     json!({
         "type": "object",
@@ -217,7 +274,10 @@ fn multi_error_schema() -> Value {
 }
 
 #[test_case::test_case(json!({"subagent_type": "bogus"}), UNKNOWN_SUBAGENT_ERR ; "unknown_subagent_type")]
-#[test_case::test_case(json!({"output_schema": {"type": 42}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
+#[test_case::test_case(json!({"output_schema": {"type": "object", "properties": {"x": {"type": 42}}}}), SCHEMA_COMPILE_ERROR ; "invalid_output_schema")]
+#[test_case::test_case(json!({"output_schema": {"type": "array"}}), SCHEMA_ROOT_ERROR ; "non_object_output_schema")]
+#[test_case::test_case(json!({"output_schema": "not an object"}), SCHEMA_ROOT_ERROR ; "non_table_output_schema")]
+#[test_case::test_case(json!({"output_schema": {"description": "missing type"}}), SCHEMA_ROOT_ERROR ; "output_schema_missing_type")]
 fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
@@ -355,11 +415,10 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     assert!(err.contains(RAISE_MSG), "got: {err}");
 
     let snap = probe(&reg);
-    let cap = snap["task_cap"].as_u64().expect("task_cap missing");
     assert_eq!(
         snap["sem_size"],
-        json!(cap),
-        "semaphore not sized from config"
+        json!(TASK_DEFAULT_MAX_CONCURRENT),
+        "semaphore not sized from the default max_concurrent option"
     );
     assert_eq!(snap["acquired"], json!(1));
     assert_eq!(snap["released"], json!(1), "permit not explicitly released");

@@ -6,19 +6,116 @@ ListPicker.__index = ListPicker
 local DETAIL_RIGHT_PAD = 2
 local NO_MATCHES_LABEL = "  (no matches)"
 
+local function split_words(query)
+  local words = {}
+  for w in (query or ""):lower():gmatch("%S+") do
+    words[#words + 1] = w
+  end
+  return words
+end
+
+-- Words may come in any order: "441 review" still hits "review gh pr 441".
+local function matches(label, words)
+  local hay = label:lower()
+  for _, w in ipairs(words) do
+    if not hay:find(w, 1, true) then
+      return false
+    end
+  end
+  return true
+end
+
+-- Word hits can overlap ("alpha" and "phab" in "alphabet"), which would nest
+-- highlights, so the ranges are merged before styling.
+local function match_ranges(label, words)
+  local hay = label:lower()
+  local ranges = {}
+  for _, w in ipairs(words) do
+    local s, e = hay:find(w, 1, true)
+    if s then
+      ranges[#ranges + 1] = { s, e }
+    end
+  end
+  table.sort(ranges, function(a, b)
+    return a[1] < b[1]
+  end)
+  local merged = {}
+  for _, r in ipairs(ranges) do
+    local last = merged[#merged]
+    if last and r[1] <= last[2] + 1 then
+      last[2] = math.max(last[2], r[2])
+    else
+      merged[#merged + 1] = r
+    end
+  end
+  return merged
+end
+
+local function highlight_spans(label, words, base, match_style)
+  local ranges = match_ranges(label, words)
+  if #ranges == 0 then
+    return { { label, base } }
+  end
+  local spans, pos = {}, 1
+  for _, r in ipairs(ranges) do
+    if r[1] > pos then
+      spans[#spans + 1] = { label:sub(pos, r[1] - 1), base }
+    end
+    spans[#spans + 1] = { label:sub(r[1], r[2]), match_style }
+    pos = r[2] + 1
+  end
+  if pos <= #label then
+    spans[#spans + 1] = { label:sub(pos), base }
+  end
+  return spans
+end
+
+local function item_label(item)
+  return type(item) == "string" and item or item.label
+end
+
+local function item_section(item)
+  return type(item) == "table" and item.section or nil
+end
+
+local function next_section(item, prev)
+  local s = item_section(item)
+  if s and s ~= prev then
+    return s
+  end
+  return nil
+end
+
+local function section_rows(items)
+  local n = 0
+  local prev = nil
+  for _, item in ipairs(items) do
+    local s = next_section(item, prev)
+    if s then
+      n = n + 1
+      prev = s
+    end
+  end
+  if n == 0 then
+    return 0
+  end
+  return item_section(items[1]) and 2 * n - 1 or 2 * n
+end
+
 local function filter_items(items, query)
-  if query == "" then
+  local words = split_words(query)
+  if #words == 0 then
     local indices = {}
     for i = 1, #items do
       indices[i] = i
     end
     return items, indices
   end
-  local q = query:lower()
   local filtered, indices = {}, {}
   for i, item in ipairs(items) do
-    local label = type(item) == "string" and item or item.label
-    if label:lower():find(q, 1, true) then
+    local section = item_section(item)
+    local hay = section and (item_label(item) .. " " .. section) or item_label(item)
+    if matches(hay, words) then
       filtered[#filtered + 1] = item
       indices[#indices + 1] = i
     end
@@ -26,42 +123,41 @@ local function filter_items(items, query)
   return filtered, indices
 end
 
-local function find_match_pos(label, query)
-  if query == "" then
-    return nil
-  end
-  local ll = label:lower()
-  local ql = query:lower()
-  local start = ll:find(ql, 1, true)
-  if not start then
-    return nil
-  end
-  return start, start + #ql - 1
-end
-
 local function render_lines(items, selected, width, query)
   width = width or 80
-  query = query or ""
+  local words = split_words(query)
   local lines = {}
+  local item_lines = {}
+  local prev_section = nil
   for i, item in ipairs(items) do
-    local label = type(item) == "string" and item or item.label
+    local label = item_label(item)
     local detail = type(item) == "table" and item.detail or nil
+    local section = next_section(item, prev_section)
     local is_sel = (i == selected)
     local style = is_sel and "selected" or "item"
     local detail_style = is_sel and "selected" or "dim"
     local match_style = is_sel and "match_selected" or "match"
 
-    local spans = {}
-    local ms, me = find_match_pos(label, query)
-    if ms then
-      local before = label:sub(1, ms - 1)
-      local match = label:sub(ms, me)
-      local after = label:sub(me + 1)
-      spans[#spans + 1] = { "  " .. before, style }
-      spans[#spans + 1] = { match, match_style }
-      spans[#spans + 1] = { after, style }
+    if section then
+      if #lines > 0 then
+        lines[#lines + 1] = {}
+      end
+      local header = { { "  " .. section, "keybind_section" } }
+      local section_detail = type(item) == "table" and item.section_detail or nil
+      if section_detail then
+        header[#header + 1] = { " " .. section_detail, "dim" }
+      end
+      lines[#lines + 1] = header
+      prev_section = section
+    end
+
+    item_lines[i] = #lines + 1
+
+    local spans = highlight_spans(label, words, style, match_style)
+    if spans[1][2] == style then
+      spans[1][1] = "  " .. spans[1][1]
     else
-      spans[#spans + 1] = { "  " .. label, style }
+      table.insert(spans, 1, { "  ", style })
     end
 
     if detail then
@@ -81,9 +177,14 @@ local function render_lines(items, selected, width, query)
 
     lines[#lines + 1] = spans
   end
-  return lines
+  return lines, item_lines
 end
 
+-- Open a fuzzy-filter picker in a floating window and block until the user
+-- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
+-- title, footer, cursor (initial index), submit_keys (extra submit keys
+-- besides enter). Returns { type = "choice"|"delete", index } or
+-- { type = "close" }.
 function ListPicker.open(items, opts)
   opts = opts or {}
   local submit_keys = { enter = true }
@@ -96,20 +197,16 @@ function ListPicker.open(items, opts)
   local input = TextInput.new()
   local filtered, original_indices = filter_items(items, "")
 
-  local cursor = opts.cursor or 1
-  if cursor > #filtered then
-    cursor = #filtered
-  end
-  if cursor < 1 then
-    cursor = 1
-  end
+  local cursor = math.max(math.min(opts.cursor or 1, #filtered), 1)
+  local item_lines = {}
 
   local function build_lines()
     local content
     if #filtered == 0 then
       content = { { { NO_MATCHES_LABEL, "dim" } } }
+      item_lines = {}
     else
-      content = render_lines(filtered, cursor, width, input:value())
+      content, item_lines = render_lines(filtered, cursor, width, input:value())
     end
     local r = input:render("\xe2\x9d\xaf ")
     for _, ln in ipairs(r.lines) do
@@ -121,7 +218,7 @@ function ListPicker.open(items, opts)
   local buf = maki.ui.buf()
 
   local border_chrome = 2
-  local content_h = #items + 1
+  local content_h = #items + section_rows(items) + 1
   local total_h = content_h + border_chrome
 
   local win = maki.ui.open_win(buf, {
@@ -132,12 +229,28 @@ function ListPicker.open(items, opts)
   })
 
   width = win.width
-  buf:set_lines(build_lines())
-
-  if cursor > 1 then
-    win:set_cursor(cursor)
-  end
+  local height = win.height
   local confirming = nil
+
+  local function move_cursor(to)
+    if #filtered > 0 then
+      cursor = math.max(math.min(to, #filtered), 1)
+    end
+    buf:set_lines(build_lines())
+    if item_lines[cursor] then
+      win:set_cursor(item_lines[cursor])
+    end
+    confirming = nil
+  end
+
+  local function page_size()
+    return math.max(height - 2, 1)
+  end
+
+  buf:set_lines(build_lines())
+  if #filtered > 0 then
+    move_cursor(cursor)
+  end
 
   while true do
     local ev = win:recv()
@@ -147,22 +260,17 @@ function ListPicker.open(items, opts)
 
     if ev.type == "resize" then
       width = ev.width
-      buf:set_lines(build_lines())
+      height = ev.height
+      move_cursor(cursor)
     elseif ev.type == "key" then
       if ev.key == "up" then
-        if cursor > 1 then
-          cursor = cursor - 1
-          win:set_cursor(cursor)
-          buf:set_lines(build_lines())
-        end
-        confirming = nil
+        move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)
       elseif ev.key == "down" then
-        if cursor < #filtered then
-          cursor = cursor + 1
-          win:set_cursor(cursor)
-          buf:set_lines(build_lines())
-        end
-        confirming = nil
+        move_cursor(cursor % math.max(#filtered, 1) + 1)
+      elseif ev.key == "pageup" then
+        move_cursor(cursor - page_size())
+      elseif ev.key == "pagedown" then
+        move_cursor(cursor + page_size())
       elseif ev.key == "esc" or ev.key == "ctrl+c" then
         win:close()
         return { type = "close" }
@@ -185,26 +293,21 @@ function ListPicker.open(items, opts)
         local result = input:handle_key(ev.key)
         if result == TextInput.Result.CHANGED then
           filtered, original_indices = filter_items(items, input:value())
-          if cursor > #filtered then
-            cursor = #filtered
-            if cursor < 1 then
-              cursor = 1
-            end
-            win:set_cursor(cursor)
-          end
-          buf:set_lines(build_lines())
-          confirming = nil
+          move_cursor(1)
         elseif result == TextInput.Result.MOVED then
-          buf:set_lines(build_lines())
-          confirming = nil
+          move_cursor(cursor)
         end
       end
     end
   end
 end
 
+ListPicker.split_words = split_words
+ListPicker.matches = matches
+ListPicker.highlight_spans = highlight_spans
+
 ListPicker._render_lines = render_lines
 ListPicker._filter_items = filter_items
-ListPicker._find_match_pos = find_match_pos
+ListPicker._section_rows = section_rows
 
 return ListPicker

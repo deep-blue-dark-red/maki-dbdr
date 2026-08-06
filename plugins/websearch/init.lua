@@ -5,6 +5,15 @@ local DEFAULT_NUM_RESULTS = 8
 local parse_sse_response = require("parse_sse")
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
+
+local opts = maki.api.register_options(output_limits.extend({
+  max_response_bytes = {
+    default = 5 * 1024 * 1024,
+    min = 1024,
+    desc = "Stop reading a response after this many bytes.",
+  },
+}))
 
 local function web_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -45,7 +54,7 @@ maki.api.register_tool({
   handler = function(input, ctx)
     local query = input.query
     if not query then
-      return "error: query is required"
+      return { llm_output = "error: query is required", is_error = true }
     end
 
     local num_results = input.num_results or DEFAULT_NUM_RESULTS
@@ -65,13 +74,10 @@ maki.api.register_tool({
       },
     })
     if not payload then
-      return "error: failed to encode request: " .. tostring(encode_err)
+      return { llm_output = "error: failed to encode request: " .. tostring(encode_err), is_error = true }
     end
 
-    local config = ctx:config()
-    local max_response = (config and config.max_response_bytes) or (5 * 1024 * 1024)
-    local max_lines = (config and config.max_output_lines) or 2000
-    local max_bytes = (config and config.max_output_bytes) or (50 * 1024)
+    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     local headers = {
       ["Content-Type"] = "application/json",
@@ -87,20 +93,20 @@ maki.api.register_tool({
       body = payload,
       headers = headers,
       timeout = REQUEST_TIMEOUT_SECS,
-      max_bytes = max_response,
+      max_bytes = opts.max_response_bytes,
     })
     if not resp then
-      return "error: " .. tostring(err)
+      return { llm_output = "error: " .. tostring(err), is_error = true }
     end
 
     if resp.status < 200 or resp.status >= 300 then
       local preview = resp.body:sub(1, 200)
-      return "error: HTTP " .. tostring(resp.status) .. ": " .. preview
+      return { llm_output = "error: HTTP " .. tostring(resp.status) .. ": " .. preview, is_error = true }
     end
 
     local text, parse_err = parse_sse_response(resp.body)
     if not text then
-      return "error: " .. tostring(parse_err)
+      return { llm_output = "error: " .. tostring(parse_err), is_error = true }
     end
 
     local llm_output = truncate(text, max_lines, max_bytes)

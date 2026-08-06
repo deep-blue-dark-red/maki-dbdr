@@ -1,15 +1,22 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
-use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
+use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
-use crate::model::{Model, ModelFamily, ModelInfo, models_for_provider};
+use maki_storage::id::SessionRef;
+
+use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
+use crate::providers::catalog::{
+    OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
+};
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
@@ -62,7 +69,7 @@ impl ProviderKind {
             Self::OpenRouter => "OpenRouter",
             Self::Synthetic => "Synthetic",
             Self::TensorX => "TensorX",
-            Self::Opencode => "Opencode",
+            Self::Opencode => "Opencode Zen",
         }
     }
 
@@ -102,22 +109,6 @@ impl ProviderKind {
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
         }
-    }
-
-    pub const fn supports_thinking(self) -> bool {
-        matches!(
-            self,
-            Self::Anthropic
-                | Self::Google
-                | Self::Mistral
-                | Self::DeepSeek
-                | Self::Synthetic
-                | Self::OpenAi
-                | Self::OpenRouter
-                | Self::LlamaCpp
-                | Self::TensorX
-                | Self::Opencode
-        )
     }
 
     pub const fn features(self) -> Option<&'static str> {
@@ -166,36 +157,26 @@ impl ProviderKind {
         }
     }
 
-    pub const fn accepts_arbitrary_models(self) -> bool {
-        matches!(
-            self,
-            Self::Ollama
-                | Self::LlamaCpp
-                | Self::Google
-                | Self::Copilot
-                | Self::OpenRouter
-                | Self::TensorX
-                | Self::Mistral
-                | Self::Opencode
-        )
-    }
-
-    pub const fn fallback_max_output(self) -> u32 {
+    /// `None` when we honestly don't know the output window: llama.cpp
+    /// serves whatever model the user loaded, and TensorX rejects explicit
+    /// max_tokens (see tensorx.rs). Unknown means "don't limit", never
+    /// "assume small"; a `0` sentinel here once silently capped llama.cpp
+    /// thinking budgets at the floor.
+    pub const fn fallback_max_output(self) -> Option<u32> {
         match self {
-            Self::Anthropic => 128_000,
-            Self::OpenAi => 100_000,
-            Self::Google => 65_536,
-            Self::Copilot => 100_000,
-            Self::Ollama => 16_384,
-            Self::LlamaCpp => 0,
-            Self::Mistral => 32_000,
-            Self::Zai => 16_000,
-            Self::DeepSeek => 384_000,
-            Self::OpenRouter => 128_000,
-            Self::Synthetic => 32_000,
-            // FIXME: See comment in tensorx.rs
-            Self::TensorX => 0,
-            Self::Opencode => 128_000,
+            Self::Anthropic => Some(128_000),
+            Self::OpenAi => Some(100_000),
+            Self::Google => Some(65_536),
+            Self::Copilot => Some(100_000),
+            Self::Ollama => Some(16_384),
+            Self::LlamaCpp => None,
+            Self::Mistral => None,
+            Self::Zai => Some(16_000),
+            Self::DeepSeek => Some(384_000),
+            Self::OpenRouter => Some(128_000),
+            Self::Synthetic => Some(32_000),
+            Self::TensorX => None,
+            Self::Opencode => Some(128_000),
         }
     }
 
@@ -240,10 +221,6 @@ impl ProviderKind {
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
         }
     }
-
-    pub fn is_available(self) -> bool {
-        self.create(Timeouts::default()).is_ok()
-    }
 }
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -258,7 +235,7 @@ pub trait Provider: Send + Sync {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a str>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
@@ -284,20 +261,43 @@ pub trait Provider: Send + Sync {
     fn adjust_model(&self, _model: &mut Model) {}
 }
 
-fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    if dynamic::display_name(slug).is_some() {
-        dynamic::create(slug, timeouts)
-    } else {
-        crate::providers::custom::create(slug, timeouts)
+pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    if let Ok(kind) = ProviderKind::from_str(slug) {
+        return kind.create(timeouts);
     }
+    if dynamic::display_name(slug).is_some() {
+        return dynamic::create(slug, timeouts);
+    }
+    if crate::providers::custom::base_kind(slug).is_some() {
+        return crate::providers::custom::create(slug, timeouts);
+    }
+    if let Some(catalog) = crate::providers::catalog::try_create(slug, timeouts) {
+        return catalog;
+    }
+    Err(AgentError::Config {
+        message: format!("unknown provider '{slug}'"),
+    })
+}
+
+pub fn provider_available(slug: &str) -> bool {
+    provider_for_slug(slug, Timeouts::default()).is_ok()
+}
+
+/// Non-blocking variant of [`provider_available`] for offline model discovery:
+/// catalog-backed slugs consult only the already-warm catalog, so a cold cache
+/// reports them unavailable instead of blocking on a network fetch.
+fn provider_available_offline(slug: &str) -> bool {
+    if ProviderKind::from_str(slug).is_ok()
+        || dynamic::display_name(slug).is_some()
+        || crate::providers::custom::base_kind(slug).is_some()
+    {
+        return provider_available(slug);
+    }
+    available_if_warm(slug)
 }
 
 pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    if let Some(slug) = &model.dynamic_slug {
-        debug!(slug, model = %model.id, "slug provider created");
-        return provider_for_slug(slug, timeouts);
-    }
-    let provider = model.provider.create(timeouts)?;
+    let provider = provider_for_slug(&model.provider, timeouts)?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(provider)
@@ -326,7 +326,7 @@ impl Provider for UnconfiguredProvider {
         _tools: &'a Value,
         _event_tx: &'a Sender<ProviderEvent>,
         _opts: RequestOptions,
-        _session_id: Option<&'a str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async {
             Err(AgentError::Config {
@@ -348,21 +348,11 @@ pub async fn from_model_async(
     model: &mut Model,
     timeouts: Timeouts,
 ) -> Result<Box<dyn Provider>, AgentError> {
-    let slug = model.dynamic_slug.clone();
-    let kind = model.provider;
+    let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = smol::unblock(move || {
-        if let Some(slug) = &slug {
-            provider_for_slug(slug, timeouts)
-        } else {
-            kind.create(timeouts)
-        }
-    })
-    .await?;
-    if model.dynamic_slug.is_none() {
-        provider.adjust_model(model);
-    }
-    debug!(provider = %kind, model = %id, "provider created");
+    let provider = smol::unblock(move || provider_for_slug(&slug, timeouts)).await?;
+    provider.adjust_model(model);
+    debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
 }
 
@@ -373,14 +363,17 @@ pub struct ModelBatch {
 
 /// Offline version of model discovery: returns specs from static tables
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
+/// Never blocks on catalog download; catalog-backed providers appear only once
+/// the catalog has warmed in the background.
 pub fn available_model_specs() -> Vec<String> {
-    let mut specs: Vec<String> = ProviderKind::iter()
-        .filter(|kind| kind.is_available())
-        .flat_map(|kind| {
-            models_for_provider(kind)
+    let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
+        .iter()
+        .filter(|m| provider_available_offline(m.slug))
+        .flat_map(|m| {
+            m.models
                 .iter()
                 .flat_map(|entry| entry.prefixes.iter())
-                .map(move |p| format!("{kind}/{p}"))
+                .map(move |p| format!("{}/{}", m.slug, p))
         })
         .collect();
     for slug in dynamic::discovered_slugs() {
@@ -389,6 +382,26 @@ pub fn available_model_specs() -> Vec<String> {
     for spec in crate::providers::custom::declared_model_specs() {
         if !specs.contains(&spec) {
             specs.push(spec);
+        }
+    }
+    if let Some(catalog) = catalog_providers_if_available() {
+        for cat in catalog {
+            if ProviderKind::from_str(&cat.slug).is_ok()
+                || dynamic::base_for_slug(&cat.slug).is_some()
+                || crate::providers::custom::base_kind(&cat.slug).is_some()
+                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+            {
+                continue;
+            }
+            if !provider_available(&cat.slug) {
+                continue;
+            }
+            for model_id in cat.models.keys() {
+                let spec = format!("{}/{}", cat.slug, model_id);
+                if !specs.contains(&spec) {
+                    specs.push(spec);
+                }
+            }
         }
     }
     specs
@@ -401,26 +414,29 @@ pub async fn fetch_all_models(
     let (tx, rx) = flume::unbounded();
     let timeouts = Timeouts::default();
 
-    for kind in ProviderKind::iter() {
-        let Ok(provider) = smol::unblock(move || kind.create(timeouts)).await else {
-            warn!(provider = %kind, "failed to create provider, skipping");
+    for manifest in crate::manifest::ManifestRegistry::builtins() {
+        let slug = manifest.slug;
+        let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
+            warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
+        let display_name = manifest.display_name;
         let tx = tx.clone();
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
-                    if kind.accepts_arbitrary_models() {
+                    if manifest.accepts_arbitrary_models {
+                        let slug: Arc<str> = Arc::from(slug);
                         crate::model_registry::model_registry()
                             .write()
                             .unwrap()
-                            .set_known_models(kind, models.clone());
+                            .set_known_models(&slug, models.clone());
                     }
                     let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{kind}/{}", m.id)).collect();
-                    for entry in models_for_provider(kind) {
+                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+                    for entry in manifest.models {
                         for prefix in entry.prefixes {
-                            let spec = format!("{kind}/{prefix}");
+                            let spec = format!("{slug}/{prefix}");
                             if !specs.contains(&spec) {
                                 specs.push(spec);
                             }
@@ -432,17 +448,17 @@ pub async fn fetch_all_models(
                     }
                 }
                 Err(e) => {
-                    warn!(provider = %kind, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = models_for_provider(kind)
+                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
+                    let fallback: Vec<String> = manifest
+                        .models
                         .iter()
                         .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{kind}/{p}"))
+                        .map(|p| format!("{slug}/{p}"))
                         .collect();
                     ModelBatch {
                         models: fallback,
                         warnings: vec![format!(
-                            "{}: {e} (using static fallback)",
-                            kind.display_name()
+                            "{display_name}: {e} (using static fallback)"
                         )],
                     }
                 }
@@ -482,6 +498,31 @@ pub async fn fetch_all_models(
         .detach();
     }
 
+    let tx_catalog = tx.clone();
+    smol::spawn(async move {
+        let catalog = smol::unblock(catalog_providers).await;
+        for cat in catalog {
+            if ProviderKind::from_str(&cat.slug).is_ok()
+                || dynamic::base_for_slug(&cat.slug).is_some()
+                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+            {
+                continue;
+            }
+            if !provider_available(&cat.slug) {
+                continue;
+            }
+            let slug = cat.slug;
+            let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
+            let _ = tx_catalog
+                .send_async(ModelBatch {
+                    models,
+                    warnings: Vec::new(),
+                })
+                .await;
+        }
+    })
+    .detach();
+
     let custom_timeouts = timeouts;
     let tx_custom = tx.clone();
     smol::spawn(async move {
@@ -514,5 +555,29 @@ pub async fn fetch_all_models(
     }
     if let Some(done) = on_done {
         done();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_for_slug_unknown_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
+            tmp.path().to_path_buf(),
+        ));
+        let result = provider_for_slug("nonexistent-provider-xyz", Timeouts::default());
+        match result {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("unknown provider"),
+                    "expected 'unknown provider' message, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for unknown provider"),
+        }
     }
 }

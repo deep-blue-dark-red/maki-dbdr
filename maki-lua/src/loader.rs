@@ -10,10 +10,11 @@ use maki_agent::tools::ToolRegistry;
 use maki_config::{PluginsConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
+use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -26,6 +27,10 @@ pub(crate) struct BundledPlugin {
 /// `lib` is not a default builtin; it exists so plugins can
 /// `require()` shared modules across boundaries.
 pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
+    BundledPlugin {
+        name: "sessions",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
     BundledPlugin {
         name: "index",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
@@ -100,6 +105,14 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     },
 ];
 
+pub(crate) fn lib_dir() -> &'static Dir<'static> {
+    &BUNDLED_PLUGINS
+        .iter()
+        .find(|p| p.name == "lib")
+        .expect("lib plugin bundled")
+        .dir
+}
+
 static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
     let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
     Vec::leak(dirs)
@@ -116,19 +129,16 @@ pub fn bundled_plugins() -> impl Iterator<Item = (&'static str, String)> {
 }
 
 pub struct PluginHost {
-    inner: Option<LuaThread>,
+    inner: LuaThread,
 }
 
 impl Drop for PluginHost {
     fn drop(&mut self) {
-        let Some(ref mut inner) = self.inner else {
+        let Some(handle) = self.inner.join.take() else {
             return;
         };
-        let Some(handle) = inner.join.take() else {
-            return;
-        };
-        inner.shutdown.store(true, Ordering::Release);
-        let _ = inner.tx.send(Request::Shutdown);
+        self.inner.shutdown.store(true, Ordering::Release);
+        let _ = self.inner.tx.send(Request::Shutdown);
         let (done_tx, done_rx) = flume::bounded(1);
         std::thread::spawn(move || {
             let _ = done_tx.send(handle.join().is_err());
@@ -143,21 +153,37 @@ impl Drop for PluginHost {
 
 impl PluginHost {
     pub fn new(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
-        let lua = runtime::spawn(registry, *BUNDLED_DIRS)?;
-        Ok(Self { inner: Some(lua) })
+        Self::with_jit(registry, true)
     }
 
-    pub fn disabled() -> Self {
-        Self { inner: None }
+    /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
+    /// interpreter with full debug info. Applied at VM creation, so
+    /// every chunk gets it, init.lua files included.
+    pub fn with_jit(registry: Arc<ToolRegistry>, jit: bool) -> Result<Self, PluginError> {
+        let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit)?;
+        Ok(Self { inner: lua })
+    }
+
+    /// Stop the Lua thread from taking new work without joining it, so the
+    /// caller can rebuild shared state (like the tool registry) while the
+    /// old VM winds down on its own. The flag makes the watchdog abort
+    /// in-flight callbacks, `Shutdown` on the priority lane skips ahead of
+    /// queued bulk work, and swapping the senders for disconnected ones
+    /// makes every later host call fail right at the send; `&mut self`
+    /// rules out a call racing the swap. `Drop` still joins the thread.
+    pub fn begin_shutdown(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        let _ = self.inner.prio_tx.send(Request::Shutdown);
+        self.inner.tx = flume::unbounded().0;
+        self.inner.prio_tx = flume::unbounded().0;
     }
 
     /// Boots the runtime and loads every default bundled plugin into `registry`.
-    /// A convenience over `new` + `load_builtins(PluginsConfig::from_tools(defaults))`
-    /// for callers (tests, docgen, headless runs) that want the full builtin set
-    /// without permuting a config.
+    /// For callers like tests and docgen that want the full builtin set
+    /// without building a config.
     pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
         let mut host = Self::new(registry)?;
-        host.load_builtins(&PluginsConfig::from_tools(HashMap::new()))?;
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
         Ok(host)
     }
 
@@ -173,6 +199,20 @@ impl PluginHost {
         self.run_init_file(&cwd.join(".maki/init.lua"), "project/init.lua", &mut merged)?;
 
         Ok(merged)
+    }
+
+    /// `--no-plugins` recovery path: skip every user `init.lua` while the
+    /// host and builtin plugins stay live. Centralized so every entry point
+    /// (TUI, index, acp, prompt) honors the flag identically.
+    pub fn load_init_files_or_skip(
+        &self,
+        no_plugins: bool,
+        cwd: &Path,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if no_plugins {
+            return Ok(None);
+        }
+        self.load_init_files(cwd)
     }
 
     fn run_init_file(
@@ -199,15 +239,38 @@ impl PluginHost {
     }
 
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
-        for builtin in &config.tools {
+        let result = self.send_builtin_loads(config);
+        // Armed even when a load failed, so a caller that only warns about the
+        // error is not left interpreting for the rest of the session.
+        let _ = self.inner.tx.send(Request::WarmJit);
+        result
+    }
+
+    fn send_builtin_loads(&self, config: &PluginsConfig) -> Result<(), PluginError> {
+        for (plugin, opts) in &config.opts {
+            let keys: Vec<&str> = opts.keys().map(String::as_str).collect();
+            if !BUNDLED_PLUGINS.iter().any(|p| p.name == plugin.as_str()) {
+                return Err(PluginError::UnknownPluginOptions {
+                    plugin: plugin.clone(),
+                    keys: keys.join(", "),
+                });
+            }
+            if !config.names.contains(plugin) {
+                tracing::warn!(
+                    plugin = plugin.as_str(),
+                    keys = keys.join(", "),
+                    "plugin is disabled; its plugins.{} options are ignored until re-enabled",
+                    plugin
+                );
+            }
+        }
+        for builtin in &config.names {
             let dir = match BUNDLED_PLUGINS.iter().find(|p| p.name == builtin.as_str()) {
                 Some(p) => &p.dir,
                 None => {
-                    tracing::warn!(
-                        builtin = builtin.as_str(),
-                        "unknown builtin plugin, skipping"
-                    );
-                    continue;
+                    return Err(PluginError::UnknownPlugin {
+                        plugin: builtin.clone(),
+                    });
                 }
             };
             let init = dir
@@ -218,16 +281,21 @@ impl PluginHost {
                     source: mlua::Error::runtime("bundled plugin missing init.lua"),
                 })?;
             let name: Arc<str> = Arc::from(builtin.as_str());
-            self.send_load(name, init.to_owned(), None, PluginPermissions::trusted())?;
+            let opts = config
+                .opts
+                .get(builtin.as_str())
+                .cloned()
+                .map(Arc::new)
+                .unwrap_or_default();
+            self.send_load(
+                name,
+                init.to_owned(),
+                None,
+                PluginPermissions::trusted(),
+                opts,
+            )?;
         }
         Ok(())
-    }
-
-    fn tx(&self) -> Result<&flume::Sender<Request>, PluginError> {
-        self.inner
-            .as_ref()
-            .map(|r| &r.tx)
-            .ok_or(PluginError::HostDead)
     }
 
     fn send_load(
@@ -236,18 +304,32 @@ impl PluginHost {
         source: String,
         plugin_dir: Option<PathBuf>,
         permissions: PluginPermissions,
+        opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        let tx = self.tx()?;
         let (reply_tx, reply_rx) = flume::bounded(1);
-        tx.send(Request::LoadSource {
-            name,
-            source,
-            plugin_dir,
-            permissions,
-            reply: reply_tx,
-        })
-        .map_err(|_| PluginError::HostDead)?;
+        self.inner
+            .tx
+            .send(Request::LoadSource {
+                name,
+                source,
+                plugin_dir,
+                permissions,
+                opts,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?
+    }
+
+    /// Option specs declared by loaded plugins via `maki.api.register_options`,
+    /// keyed by plugin name. Used by docgen.
+    pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.inner
+            .tx
+            .send(Request::CollectPluginOptions { reply: reply_tx })
+            .map_err(|_| PluginError::HostDead)?;
+        reply_rx.recv().map_err(|_| PluginError::HostDead)
     }
 
     pub fn send_run_init_lua(
@@ -256,36 +338,48 @@ impl PluginHost {
         source_name: String,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
-        let tx = self.tx()?;
         let (reply_tx, reply_rx) = flume::bounded(1);
-        tx.send(Request::RunInitLua {
-            source,
-            source_name,
-            plugin_dir,
-            reply: reply_tx,
-        })
-        .map_err(|_| PluginError::HostDead)?;
+        self.inner
+            .tx
+            .send(Request::RunInitLua {
+                source,
+                source_name,
+                plugin_dir,
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?
     }
 
     pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
-        let tx = self.tx()?;
         let (reply_tx, reply_rx) = flume::bounded(1);
-        tx.send(Request::ClearPlugin {
-            plugin: Arc::from(plugin),
-            reply: reply_tx,
-        })
-        .map_err(|_| PluginError::HostDead)?;
+        self.inner
+            .tx
+            .send(Request::ClearPlugin {
+                plugin: Arc::from(plugin),
+                reply: reply_tx,
+            })
+            .map_err(|_| PluginError::HostDead)?;
         reply_rx.recv().map_err(|_| PluginError::HostDead)?;
         Ok(())
     }
 
     pub fn load_source(&self, name: &str, source: &str) -> Result<(), PluginError> {
+        self.load_source_with_opts(name, source, serde_json::Map::new())
+    }
+
+    pub fn load_source_with_opts(
+        &self,
+        name: &str,
+        source: &str,
+        opts: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), PluginError> {
         self.send_load(
             Arc::from(name),
             source.to_owned(),
             None,
             PluginPermissions::trusted(),
+            Arc::new(opts),
         )
     }
 
@@ -295,7 +389,13 @@ impl PluginHost {
         source: &str,
         permissions: PluginPermissions,
     ) -> Result<(), PluginError> {
-        self.send_load(Arc::from(name), source.to_owned(), None, permissions)
+        self.send_load(
+            Arc::from(name),
+            source.to_owned(),
+            None,
+            permissions,
+            PluginOpts::default(),
+        )
     }
 
     pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
@@ -305,55 +405,85 @@ impl PluginHost {
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
         let permissions = load_plugin_permissions(plugin_dir.as_deref());
-        self.send_load(Arc::from("user"), source, plugin_dir, permissions)
+        // Test-only path today. Once user plugin dirs exist: derive a real
+        // plugin name, since the hardcoded "user" would collide across files,
+        // pass the `plugins.<name>` opts through, and teach the
+        // unknown-plugin guards about user plugin names.
+        self.send_load(
+            Arc::from("user"),
+            source,
+            plugin_dir,
+            permissions,
+            PluginOpts::default(),
+        )
     }
 
-    pub fn event_handle(&self) -> Option<EventHandle> {
-        self.inner
-            .as_ref()
-            .map(|t| EventHandle { tx: t.tx.clone() })
+    pub fn event_handle(&self) -> EventHandle {
+        EventHandle {
+            tx: self.inner.tx.clone(),
+            prio_tx: self.inner.prio_tx.clone(),
+        }
     }
 
     pub fn command_reader(&self) -> LuaCommandReader {
-        self.inner
-            .as_ref()
-            .map(|t| t.command_reader.clone())
-            .unwrap_or_else(LuaCommandReader::empty)
+        self.inner.command_reader.clone()
     }
 
     pub fn keymap_reader(&self) -> KeymapReader {
-        self.inner
-            .as_ref()
-            .map(|t| t.keymap_reader.clone())
-            .unwrap_or_else(KeymapReader::empty)
+        self.inner.keymap_reader.clone()
     }
 
     pub fn hint_reader(&self) -> HintReader {
-        self.inner
-            .as_ref()
-            .map(|t| t.hint_reader.clone())
-            .unwrap_or_else(HintReader::empty)
+        self.inner.hint_reader.clone()
     }
 
-    pub fn ui_action_rx(&self) -> Option<flume::Receiver<UiAction>> {
-        self.inner.as_ref().map(|t| t.ui_action_rx.clone())
+    pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
+        self.inner.ui_action_rx.clone()
     }
 }
 
 #[derive(Clone)]
 pub struct EventHandle {
     tx: flume::Sender<Request>,
+    /// User-initiated requests bypass queued bulk work (session restores).
+    prio_tx: flume::Sender<Request>,
 }
 
 impl EventHandle {
+    pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
+        Self {
+            tx,
+            prio_tx: flume::unbounded().0,
+        }
+    }
+
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
-        let (tx, _rx) = flume::unbounded();
-        Self { tx }
+        Self::from_tx(flume::unbounded().0)
+    }
+
+    /// True when no runtime is draining requests. Production handles stay
+    /// connected for the host's lifetime; the disconnected-for-test handle
+    /// and a host whose thread has shut down both report true. Callers use
+    /// this to skip async side effects (e.g. a restore-complete flip) that
+    /// no live consumer would ever observe.
+    pub fn is_disconnected(&self) -> bool {
+        self.tx.is_disconnected() && self.prio_tx.is_disconnected()
+    }
+
+    /// Test probe sibling of `from_tx`: collapses both senders onto one
+    /// channel so a `RequestProbe` sees every request, including the
+    /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
+    /// would route to a disconnected channel.
+    pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
+        Self {
+            tx: shared.clone(),
+            prio_tx: shared,
+        }
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String) {
-        let _ = self.tx.try_send(Request::RunCommand {
+        let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
             args,
@@ -379,11 +509,48 @@ impl EventHandle {
     /// `row` is the 1-based line in the tool's live buffer, 0 for clicks
     /// outside it (header line etc.).
     pub fn request_click(&self, tool_use_id: String, row: usize) {
-        let _ = self.tx.send(Request::ClickTool { tool_use_id, row });
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: None,
+        });
+    }
+
+    /// Like [`Self::request_click`], but when the runtime no longer holds
+    /// a live or warm handle for the tool it restores from `item` (whose
+    /// `clicks` must already include `row`) and emits fresh snapshots on
+    /// `event_tx`. Callers need no knowledge of the runtime's warm cache.
+    pub fn request_click_with_fallback(
+        &self,
+        tool_use_id: String,
+        row: usize,
+        item: RestoreItem,
+        event_tx: maki_agent::EventSender,
+    ) {
+        let _ = self.tx.send(Request::ClickTool {
+            tool_use_id,
+            row,
+            fallback: Some(Box::new(ClickFallback { item, event_tx })),
+        });
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
         let _ = self.tx.send(Request::RestoreComplete { flag });
+    }
+
+    /// Blocks until every restore item queued so far has finished; restores
+    /// run as spawned tasks, and the `RestoreComplete` flag flips only once
+    /// the whole batch has landed, making it the batch barrier.
+    #[doc(hidden)]
+    pub fn wait_restore_complete_for_test(&self) {
+        const DEADLINE: Duration = Duration::from_secs(30);
+        let flag = Arc::new(AtomicBool::new(true));
+        self.send_restore_complete(Arc::clone(&flag));
+        let start = std::time::Instant::now();
+        while flag.load(Ordering::Relaxed) {
+            assert!(start.elapsed() < DEADLINE, "restore batch never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
@@ -393,8 +560,10 @@ impl EventHandle {
         });
     }
 
-    pub fn run_keybind_callback(&self, id: u64) {
-        let _ = self.tx.try_send(Request::RunKeybindCallback { id });
+    pub fn run_keybind_callback(&self, id: u64) -> bool {
+        self.prio_tx
+            .try_send(Request::RunKeybindCallback { id })
+            .is_ok()
     }
 
     /// Unload a loaded plugin by name. This is a synchronous request.
@@ -422,14 +591,66 @@ mod tests {
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
+    use std::time::Instant;
     use test_case::test_case;
+
+    /// jit=true is exercised by the whole integration suite
+    /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
+    /// interpreter path needs its own coverage.
+    #[test]
+    fn with_jit_off_loads_builtins_and_registers_tools() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::with_jit(Arc::clone(&reg), false).unwrap();
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+        assert!(reg.has("glob"));
+    }
+
+    /// The second call sends `Shutdown` on a sender that is already
+    /// disconnected; it must swallow that error and keep rejecting work.
+    #[test]
+    fn begin_shutdown_rejects_later_loads_and_is_idempotent() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.begin_shutdown();
+        assert!(host.load_source("late", "return {}").is_err());
+        host.begin_shutdown();
+        assert!(host.load_source("later", "return {}").is_err());
+    }
+
+    /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
+    /// clone keeps queued requests alive after the Lua thread exits, and
+    /// dispatch prefers the priority lane, so a bulk request queued behind
+    /// `Shutdown` is never served. Without the drain its reply sender lives
+    /// forever and `collect_prompt_slots` blocks; with it, the call falls
+    /// back to defaults right away.
+    #[test]
+    fn live_event_handle_does_not_hang_after_begin_shutdown() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hinted",
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
+        )
+        .unwrap();
+        let handle = host.event_handle();
+        host.begin_shutdown();
+
+        let slots = handle.collect_prompt_slots();
+        assert!(
+            contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
+            "dead host must yield defaults, not real slots"
+        );
+
+        drop(host);
+        let slots = handle.collect_prompt_slots();
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+    }
 
     /// Load `src` as one plugin, collect resolved slots.
     /// Panics on failure; use `load_err` to inspect errors.
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
-        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots();
         (host, slots)
     }
 
@@ -451,6 +672,7 @@ mod tests {
             name: Arc::from("/test"),
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
+            max_args: 0,
         }]);
         let snap = reader.load();
         assert_eq!(snap.commands.len(), 1);
@@ -476,10 +698,11 @@ mod tests {
 
     #[test]
     fn run_command_sends_correct_request() {
-        let (tx, rx) = flume::bounded(8);
-        let handle = EventHandle { tx };
+        let (prio_tx, prio_rx) = flume::bounded(8);
+        let (tx, _rx) = flume::bounded(8);
+        let handle = EventHandle { tx, prio_tx };
         handle.run_command(Arc::from("myplugin"), Arc::from("/greet"), "world".into());
-        let req = rx.try_recv().unwrap();
+        let req = prio_rx.try_recv().unwrap();
         match req {
             Request::RunCommand {
                 plugin,
@@ -529,6 +752,26 @@ mod tests {
     }
 
     #[test]
+    fn register_command_adds_missing_leading_slash() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "noslash",
+            r#"
+            maki.api.register_command({
+                name = "hello",
+                description = "no slash",
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert_eq!(snap.commands.len(), 1);
+        assert_eq!(snap.commands[0].name.as_ref(), "/hello");
+    }
+
+    #[test]
     fn command_reader_generation_increments_on_publish() {
         let (writer, reader) = LuaCommandWriter::new();
         assert_eq!(reader.load().generation, 0);
@@ -536,13 +779,85 @@ mod tests {
         assert!(reader.load().generation > 0);
     }
 
+    /// End-to-end: a plugin registers a keymap override, the override is published
+    /// to the snapshot, EventHandle::run_keybind_callback dispatches the request,
+    /// the runtime resolves the Function by id from the registry, and the callback
+    /// executes with an observable side effect. This is the load-bearing path the
+    /// dispatch reorder and the dead-host fallback rest on; unit tests only cover
+    /// the layers in isolation.
     #[test]
-    fn disabled_host_returns_defaults() {
-        let host = PluginHost::disabled();
-        let snap = host.command_reader().load();
-        assert_eq!(snap.commands.len(), 0);
-        assert_eq!(snap.generation, 0);
-        assert!(host.ui_action_rx().is_none());
+    fn keybind_callback_runs_end_to_end() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "kb",
+            r#"
+            maki.keymap.set("n", "<C-g>", function()
+                maki.api.register_command({
+                    name = "/fired",
+                    description = "callback ran",
+                    handler = function() end,
+                })
+            end, { desc = "test override" })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.keymap_reader().load();
+        assert_eq!(snap.entries.len(), 1, "override published to snapshot");
+        let entry = &snap.entries[0];
+        assert_eq!(entry.desc, "test override");
+        assert!(
+            host.command_reader().load().commands.is_empty(),
+            "callback has not fired yet"
+        );
+
+        let handle = host.event_handle();
+        handle.run_keybind_callback(entry.id);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let cmds = &host.command_reader().load().commands;
+            if cmds.iter().any(|c| c.name.as_ref() == "/fired") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "keybind callback did not register /fired within 2s"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// `load_init_files_or_skip` is the single seam every entry point
+    /// (TUI, index, acp, prompt) uses to honor `--no-plugins`. Verify both
+    /// halves: the flag skips a broken init.lua, and absence runs it (so
+    /// the skip path is not a tautology that hides a regression in the
+    /// unconditional loader).
+    #[test]
+    fn load_init_files_or_skip_respects_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "error('broken init lua must not run')",
+        )
+        .unwrap();
+
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+
+        let skipped = host
+            .load_init_files_or_skip(true, dir.path())
+            .expect("no-plugins skips broken init.lua");
+        assert!(
+            skipped.is_none(),
+            "--no-plugins must skip user init.lua entirely"
+        );
+
+        let ran = host.load_init_files_or_skip(false, dir.path());
+        assert!(
+            ran.is_err(),
+            "without --no-plugins the broken init.lua must surface as an error"
+        );
     }
 
     #[test]
@@ -673,7 +988,7 @@ mod tests {
             )
             .unwrap();
         }
-        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots();
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["from_aaa", "from_zzz"],
@@ -693,7 +1008,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let handle = host.event_handle().unwrap();
+        let handle = host.event_handle();
 
         let slots = handle.collect_prompt_slots();
         assert_eq!(
@@ -775,7 +1090,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots();
         let entries = slots.get(PromptId::System, Slot::Identity);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.last().unwrap().content, "ZZZ");
@@ -866,7 +1181,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().unwrap().collect_prompt_slots();
+        let slots = host.event_handle().collect_prompt_slots();
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["HINT"]

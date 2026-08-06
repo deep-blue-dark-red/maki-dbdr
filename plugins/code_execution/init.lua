@@ -5,9 +5,8 @@
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
 
-local DEFAULT_TIMEOUT = 30
-local DEFAULT_MAX_MEMORY_MB = 50
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
@@ -16,17 +15,20 @@ local SEPARATOR = "──────"
 local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
 local WORKFLOW_TOOLS_NOTE =
-  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`). Raise this tool's `timeout` param: subagents outlive the default code_execution timeout.\n"
+  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
+
+local opts = maki.api.register_options(output_limits.extend({
+  timeout_secs = {
+    default = 30,
+    min = 5,
+    desc = "Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it.",
+  },
+  max_memory_mb = { default = 50, min = 10, desc = "Memory limit for the Python sandbox (MB)." },
+}))
 
 local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
-end
-
-local function append_lines(view, text)
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-    view:append(line)
-  end
 end
 
 local function line_nr_fmt(count)
@@ -38,10 +40,7 @@ end
 -- script renders the same no matter which lifecycle callbacks ran. The
 -- header is always rebuilt from scratch; nothing mutates existing lines.
 local function build_body(ctx, code)
-  local lines = {}
-  for line in (code:gsub("\n+$", "") .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
+  local lines = maki.split(code:gsub("\n+$", ""), "\n")
   local hl
   local buf = maki.ui.buf()
   local view = new_view(ctx, buf)
@@ -81,18 +80,10 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = [[Execute Python code in a sandboxed interpreter with tools as callable functions.
-
-Use for chained/dependent tool calls and filtering/processing results, e.g. filtering web tool output. **DRAMATICALLY** faster than sequential tool calls!
-
-- All tools are async and return strings: `result = await read(path='file.txt')`. Parse output yourself.
-- Use `asyncio.gather()` for concurrency within one execution.
-- Available libs: re, asyncio, sys, os, json. No other imports, no classes, no filesystem/network access.
-- Fresh sandbox each run: no state persists between executions.
-- 30 second timeout (configurable via `timeout` parameter).
-- Skip it when a single tool call needs no transformation.
-- NOT a thinking scratchpad. Reason in your response text.
-]]
+local description = "Run Python to chain dependent tool calls or filter their output. The same "
+  .. "tools are async functions here: `r = await read(path='x')`. Tools return strings — parse "
+  .. "them yourself. Concurrency via asyncio.gather. Libs: re, asyncio, sys, os, json. No imports, "
+  .. "no network. 30s default timeout."
 
 local schema = {
   type = "object",
@@ -101,11 +92,11 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency.",
+      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await asyncio.gather(...)` for concurrency.",
     },
     timeout = {
       type = "integer",
-      description = "Timeout in seconds (default 30, max 300)",
+      description = "Script execution timeout in seconds (default 30)",
     },
   },
 }
@@ -113,7 +104,7 @@ local schema = {
 local examples = {
   {
     code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
-results = await asyncio.gather(*[read(path=f) for f in files if f.strip()])
+results = await asyncio.gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
 for f, c in zip(files, results):
     if 'fn main' in c: print(f)]],
   },
@@ -218,13 +209,11 @@ end
 
 local function handler(input, ctx)
   local config = ctx:config()
-  local timeout = input.timeout or config.code_execution_timeout_secs or DEFAULT_TIMEOUT
+  local timeout = input.timeout or opts.timeout_secs
 
   local buf, view, highlight = build_body(ctx, input.code)
   ctx:live_buf(buf)
   maki.async.run(highlight)
-
-  ctx:set_deadline(timeout)
 
   view:append({ { "Waiting for output...", "dim" } })
 
@@ -240,14 +229,15 @@ local function handler(input, ctx)
   local tools = {}
   for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
     local name = t.name
+    local call_opts = t.workflow_only and {} or { timeout = timeout }
     tools[name] = function(tool_input)
-      return maki.agent.call_tool(ctx, name, tool_input, { timeout = timeout })
+      return maki.agent.call_tool(ctx, name, tool_input, call_opts)
     end
   end
 
   local result, err = maki.interpreter.run(PREAMBLE .. input.code, {
     timeout = timeout,
-    max_memory_mb = config.interpreter_max_memory_mb or DEFAULT_MAX_MEMORY_MB,
+    max_memory_mb = opts.max_memory_mb,
     on_output = show,
     tools = tools,
   })
@@ -256,7 +246,7 @@ local function handler(input, ctx)
     if waiting then
       view:clear()
     end
-    append_lines(view, err)
+    view:append_text(err)
     view:finish()
     return { llm_output = err, is_error = true, body = buf }
   end
@@ -272,11 +262,8 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local llm_output = truncate(
-    output,
-    config.max_output_lines or DEFAULT_MAX_OUTPUT_LINES,
-    config.max_output_bytes or DEFAULT_MAX_OUTPUT_BYTES
-  )
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+  local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 
   return { llm_output = llm_output, body = buf }
@@ -294,7 +281,7 @@ local function restore(input, output, is_error, ctx)
   elseif output == NO_OUTPUT then
     view:append({ { "No output", "dim" } })
   else
-    append_lines(view, output)
+    view:append_text(output)
   end
   view:finish()
   highlight()

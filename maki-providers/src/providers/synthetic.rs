@@ -1,16 +1,18 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "synthetic",
     api_key_env: "SYNTHETIC_API_KEY",
     base_url: "https://api.synthetic.new/openai/v1",
     max_tokens_field: "max_completion_tokens",
@@ -30,7 +32,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
             prefixes: &["hf:moonshotai/Kimi-K2.5"],
@@ -45,7 +47,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -61,7 +63,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -77,7 +79,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
     ]
@@ -125,7 +127,7 @@ impl Provider for Synthetic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -133,7 +135,7 @@ impl Provider for Synthetic {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, EffortScale::Standard);
+                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await

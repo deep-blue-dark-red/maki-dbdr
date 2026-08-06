@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
+use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
@@ -10,13 +11,14 @@ use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
-    AgentError, EffortScale, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    UsageLimit,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
+    dialect,
 };
 
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "zai",
     api_key_env: "ZHIPU_API_KEY",
     base_url: "https://api.z.ai/api/paas/v4",
     max_tokens_field: "max_tokens",
@@ -68,7 +70,7 @@ impl From<QuotaResponse> for ProviderUsage {
                 .into_iter()
                 .map(|l| UsageLimit {
                     label: quota_label(&l.kind, l.unit),
-                    percentage: l.percentage,
+                    percentage: Some(l.percentage),
                     reset_at: l.next_reset_time,
                     detail: None,
                 })
@@ -108,7 +110,7 @@ inventory::submit!(BuiltInProvider {
     needs_url: false,
 });
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
             prefixes: &["glm-5-code"],
@@ -123,7 +125,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -139,7 +141,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.20,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 1_000_000,
         },
         ModelEntry {
@@ -155,7 +157,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.20,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -171,7 +173,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -187,7 +189,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.11,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -203,7 +205,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 98304,
+            max_output_tokens: Some(98304),
             context_window: 131_072,
         },
         ModelEntry {
@@ -219,7 +221,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.03,
                 fast: None,
             },
-            max_output_tokens: 98304,
+            max_output_tokens: Some(98304),
             context_window: 131_072,
         },
         ModelEntry {
@@ -235,7 +237,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.11,
                 fast: None,
             },
-            max_output_tokens: 98304,
+            max_output_tokens: Some(98304),
             context_window: 131_072,
         },
     ]
@@ -290,7 +292,7 @@ impl Provider for Zai {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -299,7 +301,7 @@ impl Provider for Zai {
             let mut body = self.compat.build_body(model, messages, system, tools);
             if model.supports_thinking() {
                 opts.thinking
-                    .apply_reasoning_effort(&mut body, EffortScale::Glm);
+                    .apply_reasoning_effort(&mut body, &dialect::GLM, model);
             }
             match self
                 .compat
@@ -384,7 +386,7 @@ mod tests {
         assert_eq!(usage.plan.as_deref(), Some("lite"));
         assert_eq!(usage.limits.len(), 3);
         assert_eq!(usage.limits[0].label, "5-hour tokens");
-        assert_eq!(usage.limits[0].percentage, 16);
+        assert_eq!(usage.limits[0].percentage, Some(16));
         assert_eq!(usage.limits[0].reset_at, Some(1777819631597));
         assert_eq!(usage.limits[1].label, "Weekly tokens");
         assert_eq!(usage.limits[2].label, "Subscription time");
@@ -400,7 +402,7 @@ mod tests {
         let usage: ProviderUsage = parsed.into();
         assert!(usage.plan.is_none());
         assert_eq!(usage.limits[0].label, "TOKENS_LIMIT #9");
-        assert_eq!(usage.limits[0].percentage, 50);
+        assert_eq!(usage.limits[0].percentage, Some(50));
         assert_eq!(usage.limits[0].reset_at, None);
     }
 }

@@ -1,11 +1,11 @@
 //! Rebuilds display messages from stored sessions. Tool outputs get syntax
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::components::messages::MessagesPanel;
+use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
@@ -14,7 +14,8 @@ use crate::selection::Selection;
 use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
-use maki_providers::{ContentBlock, Message, Role, TokenUsage};
+use maki_lua::WinView;
+use maki_providers::{ContentBlock, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -41,7 +42,7 @@ pub enum ChatEventResult {
 
 pub struct Chat {
     pub name: String,
-    pub token_usage: TokenUsage,
+    pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
     pending_turn_usage: Option<String>,
@@ -50,14 +51,14 @@ pub struct Chat {
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig) -> Self {
+    pub fn new(name: String, ui_config: UiConfig, lua_event_handle: maki_lua::EventHandle) -> Self {
         Self {
             name,
-            token_usage: TokenUsage::default(),
+            cost: None,
             context_size: 0,
             model_id: None,
             pending_turn_usage: None,
-            messages_panel: MessagesPanel::new(ui_config),
+            messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             finished: false,
         }
     }
@@ -66,19 +67,20 @@ impl Chat {
         self.pending_turn_usage = Some(usage);
     }
 
-    pub(crate) fn set_restore_channel(
-        &mut self,
-        event_handle: Option<maki_lua::EventHandle>,
-        event_tx: Option<maki_agent::EventSender>,
-    ) {
-        self.messages_panel
-            .set_restore_channel(event_handle, event_tx);
+    pub(crate) fn set_restore_channel(&mut self, event_tx: Option<maki_agent::EventSender>) {
+        self.messages_panel.set_restore_channel(event_tx);
     }
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
         match event {
-            AgentEvent::ThinkingDelta { text } => self.messages_panel.thinking_delta(&text),
-            AgentEvent::TextDelta { text } => self.messages_panel.text_delta(&text),
+            AgentEvent::ThinkingDelta { text } => {
+                self.messages_panel.clear_prompt_progress();
+                self.messages_panel.thinking_delta(&text);
+            }
+            AgentEvent::TextDelta { text } => {
+                self.messages_panel.clear_prompt_progress();
+                self.messages_panel.text_delta(&text);
+            }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => {
@@ -114,6 +116,9 @@ impl Chat {
             AgentEvent::CompactionStart { checkpoint } => {
                 self.messages_panel.begin_compaction(checkpoint);
             }
+            AgentEvent::CompactionDone => {
+                self.messages_panel.flush();
+            }
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }
@@ -145,7 +150,18 @@ impl Chat {
                 self.messages_panel.register_live_buf(id, body);
             }
             AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. } => {}
-            AgentEvent::BatchProgress(_) => {}
+            AgentEvent::PromptProgress {
+                processed,
+                total,
+                cache,
+            } => {
+                self.messages_panel
+                    .set_prompt_progress((processed < total).then_some(PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    }));
+            }
         }
         ChatEventResult::Continue
     }
@@ -154,8 +170,16 @@ impl Chat {
         self.messages_panel.scroll(delta);
     }
 
+    pub fn set_scroll_top(&mut self, top: u16) {
+        self.messages_panel.set_scroll_top(top);
+    }
+
     pub fn half_page(&self) -> i32 {
         self.messages_panel.half_page()
+    }
+
+    pub fn win_view(&self) -> WinView {
+        self.messages_panel.win_view()
     }
 
     pub fn auto_scroll(&self) -> bool {
@@ -250,6 +274,11 @@ impl Chat {
         self.messages_panel.fail_in_progress_with_message(message);
     }
 
+    pub fn fail_in_progress_except(&mut self, message: String, excluded: &HashSet<String>) {
+        self.messages_panel
+            .fail_in_progress_except(message, excluded);
+    }
+
     pub fn push(&mut self, msg: DisplayMessage) {
         self.messages_panel.push(msg);
     }
@@ -274,6 +303,10 @@ impl Chat {
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.update_tool_model(tool_id, model);
+    }
+
+    pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
+        self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
@@ -329,17 +362,35 @@ impl Chat {
     pub fn last_message_role(&self) -> Option<&DisplayRole> {
         self.messages_panel.last_message_role()
     }
+
+    #[cfg(test)]
+    pub fn streaming_text_is_empty(&self) -> bool {
+        self.messages_panel.streaming_text_is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn streaming_thinking_is_empty(&self) -> bool {
+        self.messages_panel.streaming_thinking_is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn tool_turn_usage(&self, tool_id: &str) -> Option<&str> {
+        self.messages_panel.tool_turn_usage(tool_id)
+    }
 }
 
 pub fn history_to_display(
     messages: &[Message],
-    tool_outputs: &HashMap<String, ToolOutput>,
+    tool_outputs: &HashMap<String, Arc<ToolOutput>>,
     tool_output_lines: &ToolOutputLines,
 ) -> (Vec<DisplayMessage>, Vec<maki_lua::RestoreItem>) {
     let results = build_tool_results_map(messages);
     let mut display = Vec::new();
     let mut restore_items: Vec<maki_lua::RestoreItem> = Vec::new();
     for msg in messages {
+        if msg.is_observation() {
+            continue;
+        }
         match msg.role {
             Role::User => {
                 if let Some(text) = msg.user_text() {
@@ -356,7 +407,9 @@ pub fn history_to_display(
                             display
                                 .push(DisplayMessage::new(DisplayRole::Thinking, thinking.clone()));
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             let static_name = name.as_str();
                             let reg = ToolRegistry::global();
                             let tool_call: Option<Box<dyn ToolInvocation>> =
@@ -373,7 +426,7 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str());
+                            let stored = tool_outputs.get(id.as_str()).map(Arc::as_ref);
                             let (text, truncated_lines, tool_output, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
@@ -511,7 +564,7 @@ fn build_loaded_tool(
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
     let mut map = HashMap::new();
     for msg in messages {
-        if !matches!(msg.role, Role::User) {
+        if !matches!(msg.role, Role::User) || msg.is_observation() {
             continue;
         }
         for block in &msg.content {
@@ -584,13 +637,17 @@ mod tests {
         }
     }
 
-    fn empty_outputs() -> HashMap<String, ToolOutput> {
+    fn empty_outputs() -> HashMap<String, Arc<ToolOutput>> {
         HashMap::new()
     }
 
     #[test]
     fn tool_lifecycle() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         chat.handle_event(tool_start("t1", "bash"), None);
         assert_eq!(chat.in_progress_count(), 1);
 
@@ -603,7 +660,11 @@ mod tests {
 
     #[test]
     fn plan_write_renders_file_content() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -623,7 +684,11 @@ mod tests {
 
     #[test]
     fn plan_write_ignores_different_path() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         let plan_path = Path::new("/plans/123.md");
         chat.handle_event(tool_start("w1", "write"), Some(plan_path));
         let (output, wp) = write_output("src/main.rs");
@@ -636,7 +701,11 @@ mod tests {
 
     #[test]
     fn plan_edit_shows_path_only() {
-        let mut chat = Chat::new("Main".into(), UiConfig::default());
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
         let dir = tempfile::tempdir().unwrap();
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# My Plan\n\n- Step 1").unwrap();
@@ -668,6 +737,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn history_hides_observations_but_keeps_the_reply() {
+        let msgs = vec![
+            Message::observation("build failed".into()),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "I will fix it".into(),
+                }],
+                ..Default::default()
+            },
+        ];
+        let display = history_to_display(&msgs, &empty_outputs(), &ToolOutputLines::default()).0;
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, DisplayRole::Assistant);
+        assert_eq!(display[0].text, "I will fix it");
+    }
+
     fn tool_use_pair(
         tool: &str,
         input: serde_json::Value,
@@ -677,11 +764,7 @@ mod tests {
         vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: tool.into(),
-                    input,
-                }],
+                content: vec![ContentBlock::tool_use("t1", tool, input)],
                 ..Default::default()
             },
             Message {
@@ -720,11 +803,7 @@ mod tests {
                     ContentBlock::Text {
                         text: "Sure, let me help.".into(),
                     },
-                    ContentBlock::ToolUse {
-                        id: "t1".into(),
-                        name: "bash".into(),
-                        input: serde_json::json!({"command": "echo hi"}),
-                    },
+                    ContentBlock::tool_use("t1", "bash", serde_json::json!({"command": "echo hi"})),
                 ],
                 ..Default::default()
             },
@@ -792,7 +871,7 @@ mod tests {
         for (tool_name, input_json, output) in variants {
             let discriminant = std::mem::discriminant(&output);
             let msgs = tool_use_pair(tool_name, input_json, "ok", false);
-            let outputs = HashMap::from([("t1".into(), output)]);
+            let outputs = HashMap::from([("t1".into(), Arc::new(output))]);
             let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
             assert_eq!(
                 std::mem::discriminant(display[0].tool_output.as_deref().unwrap()),
@@ -815,7 +894,7 @@ mod tests {
             "wrote 12 bytes",
             false,
         );
-        let outputs = HashMap::from([("t1".into(), write_output)]);
+        let outputs = HashMap::from([("t1".into(), Arc::new(write_output))]);
         let display = history_to_display(&msgs, &outputs, &ToolOutputLines::default()).0;
         assert!(display[0].annotation.is_some());
     }
@@ -918,7 +997,7 @@ mod tests {
             "edited a",
             false,
         );
-        let outputs = HashMap::from([("t1".to_owned(), edit_output("a"))]);
+        let outputs = HashMap::from([("t1".to_owned(), Arc::new(edit_output("a")))]);
         let (_, items) = history_to_display(&msgs, &outputs, &ToolOutputLines::default());
         assert!(items.is_empty(), "Rust owns Diff rendering on restore");
 
@@ -940,5 +1019,42 @@ mod tests {
         let mut no_output = tool_msg_with_input("bash");
         no_output.tool_output = None;
         assert!(restore_item_for(&no_output, tol, RESTORE_THEME_GEN).is_none());
+    }
+
+    #[test]
+    fn compaction_done_flushes_streaming_buffers() {
+        let mut chat = Chat::new(
+            "Main".into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        );
+
+        chat.handle_event(AgentEvent::AutoCompacting, None);
+        assert_eq!(chat.message_count(), 1);
+
+        chat.handle_event(
+            AgentEvent::TextDelta {
+                text: "summary".into(),
+            },
+            None,
+        );
+        chat.handle_event(
+            AgentEvent::ThinkingDelta {
+                text: "thinking".into(),
+            },
+            None,
+        );
+        assert!(!chat.streaming_text_is_empty());
+        assert!(!chat.streaming_thinking_is_empty());
+
+        chat.handle_event(AgentEvent::CompactionDone, None);
+        assert!(chat.streaming_text_is_empty());
+        assert!(chat.streaming_thinking_is_empty());
+        assert_eq!(chat.message_count(), 3);
+
+        chat.handle_event(AgentEvent::TextDelta { text: "new".into() }, None);
+        chat.flush();
+        assert_eq!(chat.message_count(), 4);
+        assert_eq!(chat.last_message_text(), "new");
     }
 }

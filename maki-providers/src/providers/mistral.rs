@@ -1,16 +1,18 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "mistral",
     api_key_env: "MISTRAL_API_KEY",
     base_url: "https://api.mistral.ai/v1",
     max_tokens_field: "max_tokens",
@@ -49,7 +51,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[
         ModelEntry {
             prefixes: &[
@@ -68,7 +70,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 262_144,
+            max_output_tokens: None,
             context_window: 262_144,
         },
         ModelEntry {
@@ -84,7 +86,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 262_144,
+            max_output_tokens: None,
             context_window: 262_144,
         },
         ModelEntry {
@@ -100,7 +102,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 262_144,
+            max_output_tokens: None,
             context_window: 262_144,
         },
     ]
@@ -190,7 +192,7 @@ impl Provider for Mistral {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a str>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -198,13 +200,13 @@ impl Provider for Mistral {
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, EffortScale::HighOnly);
+                .apply_reasoning_effort(&mut body, &dialect::HIGH_ONLY, model);
             // Convert assistant messages to Mistral's expected format with thinking content
             convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
 
             let mut extra_headers = vec![];
             if let Some(session_id) = session_id {
-                extra_headers.push(("x-affinity", session_id));
+                extra_headers.push(("x-affinity", session_id.as_str()));
             }
             self.compat
                 .do_stream(model, &extra_headers, &body, event_tx, &auth)
@@ -238,12 +240,20 @@ impl Provider for Mistral {
                         .and_then(Value::as_object)
                         .and_then(|c| c.get("reasoning"))
                         .and_then(Value::as_bool);
+                    let supports_vision = m
+                        .get("capabilities")
+                        .and_then(Value::as_object)
+                        .and_then(|c| c.get("vision"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     Some(crate::model::ModelInfo {
                         id: id.to_string(),
                         context_window,
                         max_output_tokens: None,
                         pricing: None,
                         supports_thinking,
+                        supports_vision: Some(supports_vision),
+                        tier: None,
                         provider_info: None,
                     })
                 })

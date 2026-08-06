@@ -6,6 +6,16 @@
   <title>maki</title>
   <meta name="description" content="An efficient AI coding agent. Native Rust TUI. Immediate startup, 60 FPS, low memory. Indexes files instead of reading them, chains tools in a sandbox interpreter. Anthropic, OpenAI, Google, Z.AI, OpenRouter, Synthetic, or any OpenAI / Anthropic compatible API.">
   <meta name="theme-color" content="#f0ede2">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://maki.sh/">
+  <meta property="og:title" content="maki - the efficient coder">
+  <meta property="og:description" content="An efficient AI coding agent. Native Rust TUI with novel context token reduction techniques: 2x cheaper and 2x faster in benchmarks.">
+  <meta property="og:image" content="https://maki.sh/android-chrome-512x512.png">
+  <meta property="og:site_name" content="maki">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="maki - the efficient coder">
+  <meta name="twitter:description" content="An efficient AI coding agent. Native Rust TUI with novel context token reduction techniques: 2x cheaper and 2x faster in benchmarks.">
+  <meta name="twitter:image" content="https://maki.sh/android-chrome-512x512.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
@@ -694,6 +704,49 @@
       left: 0.55rem;
       color: oklch(75% 0.1 280);
     }
+    .player-hint {
+      margin-top: 0.6rem;
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+    .player-hint button {
+      background: none;
+      border: none;
+      padding: 0;
+      font: inherit;
+      font-weight: 700;
+      color: var(--navy-light);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+      cursor: pointer;
+    }
+    .player-hint button:hover {
+      color: var(--deep-navy);
+    }
+
+    /* ── DOOM DEMO ── */
+    .doom-demo {
+      max-width: 820px;
+      margin: 3rem auto 0;
+    }
+    .doom-line {
+      text-align: center;
+      font-size: 1.15rem;
+      font-weight: 800;
+      color: var(--deep-navy);
+      margin-bottom: 1rem;
+    }
+    .doom-demo .tui { display: block; }
+    .doom-demo .tui-body { min-width: 0; min-height: 0; }
+    .doom-video {
+      display: block;
+      width: 100%;
+      height: auto;
+      aspect-ratio: 1920 / 970;
+      background: #000;
+      cursor: pointer;
+    }
 
 
     /* ── PROVIDERS ── */
@@ -902,6 +955,21 @@
       width: 1px;
       background: oklch(32% 0.04 270);
     }
+    .exec-duo {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+    .exec-duo .exec-demo {
+      display: flex;
+      flex-direction: column;
+    }
+    .exec-duo .exec-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    .exec-duo .exec-pane pre { flex: 1; }
     .exec-pane .kw  { color: #cba6f7; }
     .exec-pane .fn  { color: #89b4fa; }
     .exec-pane .st  { color: #a6e3a1; }
@@ -919,6 +987,7 @@
       .index-divider { width: auto; height: 1px; }
       .exec-body { grid-template-columns: 1fr; }
       .exec-divider { width: auto; height: 1px; }
+      .exec-duo { grid-template-columns: 1fr; }
     }
 
     /* ── BOTTOM SKY ── */
@@ -1238,6 +1307,7 @@
   </div>
 
   <div class="hero-preview">
+    <div class="tui-scale-wrap">
     <div class="tui">
       <div class="tui-titlebar">
         <div class="tui-dot tui-dot-r"></div>
@@ -1270,6 +1340,8 @@
         </div>
       </div>
     </div>
+    </div>
+    <p class="player-hint"><button type="button" id="skip-hint-btn">Skip to 1:07</button> to see the snake game Opus 4.6 created</p>
   </div>
   </div>
 </section>
@@ -1308,6 +1380,13 @@
           <p>The system prompt, tool descriptions, and examples are short. When context gets too long, maki compacts history automatically: strips images, thinking blocks, and summarizes older turns.</p>
         </div>
       </div>
+      <div class="pitch-item">
+        <div class="pip pip-salmon"></div>
+        <div>
+          <strong><a href="/docs/mcp/#tool-search" target="_blank" rel="noopener">MCP tool_search</a></strong>
+          <p>Datadog's MCP server exposes over 100 tools with all toolsets on, and each definition sits in your context on every request, used or not. Maki hides them behind a single <code>tool_search</code> tool, so the model looks up what it needs and the rest never loads.</p>
+        </div>
+      </div>
     </div>
 
     <div class="pitch-col">
@@ -1337,8 +1416,15 @@
       <div class="pitch-item">
         <div class="pip pip-pink"></div>
         <div>
-          <strong>Sessions, memory, MCP</strong>
-          <p>Long-term memory that persists across sessions. Tell maki to remember something, somtimes it picks things up on its own. Double-Escape to rewind. Plan mode restricts the agent to read-only. MCP servers over stdio or HTTP. Skills. 26 themes. Paste images. <code>--print</code> for headless (output is Claude Code-compatible). <code>maki acp</code> runs an <a href="/docs/acp/">ACP</a> server for editors like <a href="https://zed.dev" target="_blank" rel="noopener">Zed</a>.</p>
+          <strong>Sessions, memory, MCP, ACP</strong>
+          <p>Sessions run in parallel: switch away and the agent keeps working, <code>/sessions</code> to jump back when it flashes done. Long-term memory that persists across sessions. Tell maki to remember something, sometimes it picks things up on its own. Double-Escape to rewind. Plan mode restricts the agent to read-only. MCP servers over stdio or HTTP. Skills. 26 themes. Paste images. <code>--print</code> for headless (output is Claude Code-compatible). <code>maki acp</code> runs an <a href="/docs/acp/">ACP</a> server for editors like <a href="https://zed.dev" target="_blank" rel="noopener">Zed</a>.</p>
+        </div>
+      </div>
+      <div class="pitch-item">
+        <div class="pip pip-salmon"></div>
+        <div>
+          <strong><a href="#lua">Lua plugins</a></strong>
+          <p>Extend maki in Lua with a Neovim-style plugin API. Every built-in tool is a Lua plugin, so anything maki does out of the box, your plugins can do too: add tools, slash commands, keymaps, and UI.</p>
         </div>
       </div>
     </div>
@@ -1460,6 +1546,88 @@ imports = <span class="fn">set</span>()
     <div class="showcase-stat">
       <span><span class="stat-num">~40k</span> tokens</span> <span class="stat-arrow">&rarr;</span> <span><span class="stat-num">~30</span> tokens</span>
       <span class="stat-result">1300x reduction</span>
+    </div>
+  </div>
+
+  <div class="divider reveal"></div>
+
+  <!-- LUA PLUGINS SHOWCASE -->
+  <div class="showcase reveal" id="lua">
+    <div class="showcase-header">
+      <span>See it in action</span>
+      <h2>Lua plugins: hackable all the way down</h2>
+      <p>Every built-in tool, <code>read</code>, <code>bash</code>, <code>edit</code>, even <code>batch</code>, is itself a Lua plugin. Read them in <a href="https://github.com/tontinton/maki/tree/main/plugins" target="_blank" rel="noopener"><code>./plugins</code></a>. The <a href="/docs/lua-api/">API</a> mirrors Neovim (<code>maki.fs</code>, <code>maki.uv</code>, <code>maki.keymap</code>, <code>maki.treesitter</code>), so it feels familiar. Drop a file in <code>~/.config/maki/plugins/</code> to add tools, slash commands, keymaps, or UI.</p>
+    </div>
+
+    <div class="exec-duo">
+      <div class="exec-demo">
+        <div class="exec-pane">
+          <div class="exec-pane-label">add a ci_status tool: the model checks CI itself</div>
+          <pre><span class="fn">maki.api.register_tool</span>({
+  name = <span class="st">"ci_status"</span>,
+  description = <span class="st">"Latest CI run for this branch"</span>,
+  schema = { type = <span class="st">"object"</span>, properties = {} },
+  handler = <span class="kw">function</span>()
+    <span class="kw">local</span> res, err = <span class="fn">maki.net.request</span>(
+      <span class="st">"https://ci.internal/runs/json?branch=main"</span>)
+    <span class="kw">if</span> err <span class="kw">then</span>
+      <span class="kw">return</span> { llm_output = err, is_error = <span class="kw">true</span> }
+    <span class="kw">end</span>
+    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
+    <span class="fn">buf:lines</span>(<span class="fn">maki.ui.highlight</span>(res.body, <span class="st">"json"</span>))
+    <span class="kw">return</span> { llm_output = res.body, body = buf }
+  <span class="kw">end</span>,
+})</pre>
+        </div>
+      </div>
+      <div class="exec-demo">
+        <div class="exec-pane">
+          <div class="exec-pane-label">add /standup: show yesterday's commits</div>
+          <pre><span class="fn">maki.api.register_command</span>({
+  name = <span class="st">"/standup"</span>,
+  description = <span class="st">"Yesterday's commits"</span>,
+  handler = <span class="kw">function</span>()
+    <span class="kw">local</span> buf = <span class="fn">maki.ui.buf</span>()
+    <span class="kw">local</span> win = <span class="fn">maki.ui.open_win</span>(buf, { title = <span class="st">"standup"</span> })
+    <span class="fn">maki.fn.jobstart</span>(
+      <span class="st">"git log --since=yesterday --oneline"</span>, {
+        on_stdout = <span class="kw">function</span>(_, line) <span class="fn">buf:line</span>(line) <span class="kw">end</span>,
+      })
+    <span class="kw">repeat</span>
+      <span class="kw">local</span> ev = <span class="fn">win:recv</span>()
+    <span class="kw">until</span> <span class="kw">not</span> ev <span class="kw">or</span> ev.key == <span class="st">"esc"</span>
+    <span class="fn">win:close</span>()
+  <span class="kw">end</span>,
+})</pre>
+        </div>
+      </div>
+    </div>
+
+    <div class="doom-demo reveal">
+      <p class="doom-line">And yes... it can even run DOOM!</p>
+      <div class="tui">
+        <div class="tui-titlebar">
+          <div class="tui-dot tui-dot-r"></div>
+          <div class="tui-dot tui-dot-y"></div>
+          <div class="tui-dot tui-dot-g"></div>
+        </div>
+        <div class="tui-body">
+          <video class="doom-video" width="1920" height="970" muted loop playsinline preload="none" aria-label="maki running DOOM through a Lua plugin">
+            <source src="doom-av1.mp4" type="video/mp4; codecs=av01.0.04M.08">
+            <source src="doom.mp4" type="video/mp4">
+          </video>
+          <div class="player-controls">
+            <button class="player-btn doom-play-btn" aria-label="Play/Pause">
+              <svg viewBox="0 0 24 24" class="doom-play-icon"><path d="M8 5v14l11-7z"/></svg>
+              <svg viewBox="0 0 24 24" class="doom-pause-icon" style="display:none"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+            </button>
+            <div class="player-progress doom-progress">
+              <div class="player-progress-bar doom-progress-fill"></div>
+            </div>
+            <span class="player-time doom-time">0:00 / 0:00</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1794,8 +1962,76 @@ imports = <span class="fn">set</span>()
     });
   });
 
+  document.getElementById('skip-hint-btn').addEventListener('click', () => {
+    player.seek(67);
+    player.play();
+  });
+
   // Start progress updates
   progressRaf = requestAnimationFrame(updateProgress);
+
+  // DOOM demo player
+  (() => {
+    const demo = document.querySelector('.doom-demo');
+    if (!demo) return;
+    const video = demo.querySelector('.doom-video');
+    const dPlayIcon = demo.querySelector('.doom-play-icon');
+    const dPauseIcon = demo.querySelector('.doom-pause-icon');
+    const dProgress = demo.querySelector('.doom-progress');
+    const dFill = demo.querySelector('.doom-progress-fill');
+    const dTime = demo.querySelector('.doom-time');
+    let userPaused = false;
+
+    function render() {
+      const d = video.duration || 0;
+      dFill.style.width = d ? (video.currentTime / d * 100) + '%' : '0%';
+      dTime.textContent = `${formatTime(video.currentTime)} / ${formatTime(d)}`;
+    }
+    video.addEventListener('timeupdate', render);
+    video.addEventListener('loadedmetadata', render);
+    video.addEventListener('play', () => {
+      dPlayIcon.style.display = 'none';
+      dPauseIcon.style.display = 'block';
+    });
+    video.addEventListener('pause', () => {
+      dPlayIcon.style.display = 'block';
+      dPauseIcon.style.display = 'none';
+    });
+
+    function toggle() {
+      if (video.paused) {
+        userPaused = false;
+        video.play();
+      } else {
+        userPaused = true;
+        video.pause();
+      }
+    }
+    demo.querySelector('.doom-play-btn').addEventListener('click', toggle);
+    video.addEventListener('click', toggle);
+
+    dProgress.addEventListener('click', (e) => {
+      const rect = dProgress.getBoundingClientRect();
+      const pct = (e.clientX - rect.left) / rect.width;
+      video.currentTime = pct * (video.duration || 0);
+      render();
+    });
+
+    new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        if (!userPaused) video.play().catch(() => {});
+      } else if (!video.paused) {
+        video.pause();
+      }
+    }, { threshold: 0.35 }).observe(video);
+
+    window.addEventListener('load', () => {
+      if (video.readyState === 0 && video.paused) {
+        video.preload = 'auto';
+        video.load();
+      }
+    }, { once: true });
+  })();
 </script>
 
 </body>

@@ -45,6 +45,22 @@ pub struct McpAuthData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderCredentials {
     pub api_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl ProviderCredentials {
+    pub fn masked_api_key(&self) -> String {
+        if self.api_key.len() > 8 {
+            format!(
+                "{}...{}",
+                &self.api_key[..4],
+                &self.api_key[self.api_key.len() - 4..]
+            )
+        } else {
+            "****".to_string()
+        }
+    }
 }
 
 pub fn now_millis() -> u64 {

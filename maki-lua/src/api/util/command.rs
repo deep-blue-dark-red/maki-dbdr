@@ -7,11 +7,15 @@ use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
 use mlua::RegistryKey;
 
+pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
+const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+
 #[derive(Clone)]
 pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
+    pub max_args: usize,
 }
 
 #[derive(Clone, Default)]
@@ -118,6 +122,7 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub max_args: usize,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
@@ -130,6 +135,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 name: Arc::clone(name),
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
+                max_args: entry.max_args,
             })
         })
         .collect();
@@ -387,6 +393,29 @@ pub enum WinCommand {
     Close,
 }
 
+pub enum SessionRequest {
+    List { global: bool },
+    Live,
+    Current,
+    New { prompt: Option<String>, focus: bool },
+    Prompt { id: Option<String>, text: String },
+    Focus { id: String },
+    Delete { id: String },
+    SetTitle { id: String, title: String },
+}
+
+pub type SessionReply = Result<serde_json::Value, String>;
+
+/// Viewport of the focused chat transcript, zero-based like the rest of the
+/// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
+/// `auto_scroll` is true while the transcript follows streaming output.
+pub struct WinView {
+    pub scroll_top: u16,
+    pub line_count: u16,
+    pub height: u16,
+    pub auto_scroll: bool,
+}
+
 pub enum UiAction {
     OpenWin {
         buf: Arc<SharedBuf>,
@@ -400,6 +429,37 @@ pub enum UiAction {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
     },
+    Session {
+        req: SessionRequest,
+        reply_tx: flume::Sender<SessionReply>,
+    },
+    WinSaveView {
+        reply_tx: flume::Sender<WinView>,
+    },
+    WinRestView {
+        scroll_top: u16,
+    },
+}
+
+/// Hand an action to the UI event loop. A full or closed channel means the
+/// same thing as a missing sender: nobody is there to run it.
+pub(crate) fn ui_send(
+    tx: Option<&flume::Sender<UiAction>>,
+    action: UiAction,
+) -> Result<(), &'static str> {
+    tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
+}
+
+/// Send an action carrying a reply channel and await the answer. Only
+/// works from a callback: the loop drains `UiAction` between frames, so a
+/// call at config load time would wait forever.
+pub(crate) async fn ui_roundtrip<T>(
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<T>) -> UiAction,
+) -> Result<T, &'static str> {
+    let (reply_tx, reply_rx) = flume::bounded(1);
+    ui_send(tx, action(reply_tx))?;
+    reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
 }
 
 #[cfg(test)]
@@ -414,6 +474,7 @@ mod tests {
         CommandEntry {
             handler: key,
             description: Arc::from(desc),
+            max_args: 0,
         }
     }
 

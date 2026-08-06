@@ -80,7 +80,7 @@ impl App {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
                 + panel_h
-                + self.input_box.height(inner.width)
+                + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             if panel_h > 0 { panel_h + 1 } else { 1 }
@@ -97,13 +97,10 @@ impl App {
             self.float_mgr.panel_reqs()
         };
 
-        let (queue_height, _input_height) = if bottom_takeover {
-            (0, 0)
+        let queue_height = if bottom_takeover {
+            0
         } else {
-            let queue_height = queue_panel::height(self.queue.panel_len());
-            let panel_h: u16 = panel_reqs.iter().map(|(_, h)| *h).sum();
-            let input_height = bottom_area.height.saturating_sub(queue_height + panel_h);
-            (queue_height, input_height)
+            queue_panel::height(self.queue.panel_len())
         };
 
         let mut constraints = vec![Constraint::Length(queue_height)];
@@ -239,14 +236,6 @@ impl App {
             overlay_rect = self.file_picker.view(frame, full);
         }
 
-        if self.session_picker.is_open() {
-            self.session_picker.tick();
-            overlay_rect = self.session_picker.view(frame, full);
-            if let Some(flash) = self.session_picker.take_flash() {
-                self.status_bar.flash(flash);
-            }
-        }
-
         macro_rules! render_if_open {
             ($overlay:expr) => {
                 if $overlay.is_open() {
@@ -289,7 +278,7 @@ impl App {
             let quota = self.usage_slot.load();
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
-                by_model: &self.state.session.meta.usage_by_model,
+                by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
                 quota: quota.as_deref(),
@@ -319,9 +308,9 @@ impl App {
                 .as_deref()
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
-                usage: &chat.token_usage,
                 global_usage: &self.state.token_usage,
                 context_size: chat.context_size,
+                cost: chat.cost,
                 pricing: &self.state.model.pricing,
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
@@ -456,8 +445,6 @@ impl App {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
-        } else if self.session_picker.is_open() {
-            contexts.push(KeybindContext::SessionPicker);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
         } else if self.task_picker.is_open() {

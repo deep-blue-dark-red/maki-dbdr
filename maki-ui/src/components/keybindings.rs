@@ -486,7 +486,6 @@ pub enum KeybindContext {
     Picker,
     FormInput,
     TaskPicker,
-    SessionPicker,
     RewindPicker,
     GotoPicker,
     ThemePicker,
@@ -507,7 +506,6 @@ impl KeybindContext {
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
             Self::TaskPicker => "Task Picker",
-            Self::SessionPicker => "Session Picker",
             Self::RewindPicker => "Rewind Picker",
             Self::GotoPicker => "Goto Picker",
             Self::ThemePicker => "Theme Picker",
@@ -523,7 +521,6 @@ impl KeybindContext {
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
             Self::TaskPicker
-            | Self::SessionPicker
             | Self::RewindPicker
             | Self::GotoPicker
             | Self::ThemePicker
@@ -734,7 +731,10 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::MacMulti(&["\\+Enter", "Ctrl+J", "Alt+Enter"], &["⇧↵", "⌃J", "⌥↵"]),
+        label: KeyLabel::MacMulti(
+            &["Shift+Enter", "Ctrl+Enter", "Ctrl+J", "Alt+Enter"],
+            &["⇧↵", "⌃↵", "⌃J", "⌥↵"],
+        ),
         description: "Newline",
         context: KeybindContext::Editing,
         platform: Platform::All,
@@ -884,9 +884,15 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Action("delete"),
-        description: "Delete session",
-        context: KeybindContext::SessionPicker,
+        label: KeyLabel::Alt("PageUp", "PageDown"),
+        description: "Scroll page up / down",
+        context: KeybindContext::Picker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
+        description: "Scroll page up / down",
+        context: KeybindContext::Picker,
         platform: Platform::All,
     },
     Keybind {
@@ -902,7 +908,7 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single("1/2/3/4"),
+        label: KeyLabel::Single("!/@/#/$"),
         description: "Set tier (strong/medium/weak/compaction)",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,

@@ -368,6 +368,7 @@ local KEYMAP = {
   ["alt+f"] = "move_word_right",
   ["ctrl+a"] = "move_home",
   ["backspace"] = "remove_char",
+  ["shift+backspace"] = "remove_char",
   ["delete"] = "delete_char",
   ["ctrl+w"] = "remove_word_before",
   ["ctrl+backspace"] = "remove_word_before",
@@ -394,6 +395,8 @@ function TextInput:handle_key(key)
   return result
 end
 
+-- Wrap lines to {width} with {prefix} before the first row. Returns
+-- { lines = styled lines, cursor_row = 1-based row holding the cursor }.
 function TextInput:render(prefix, prefix_width, width)
   local result = {}
   local pw = prefix_width or #prefix

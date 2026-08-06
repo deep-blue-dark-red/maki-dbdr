@@ -3,8 +3,14 @@ local ToolView = require("maki.tool_view")
 local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 
+local SNIPPET_MAX_CHARS = 32
+local FALLBACK_VIEW_LINES = 10
+
 local EDIT_LINES_DESCRIPTION =
-  [[Edit lines by number. Omit `end` to insert before `start` without removing lines. Set `end` to replace or delete (empty `new_string`) a range.]]
+  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
+
+local INSERT_LINES_DESCRIPTION =
+  [[Insert lines before a given line number. Lines at `line` and below shift down. Existing lines are preserved. Do not use with the batch tool.]]
 
 local EDIT_DESCRIPTION = [[Replace an exact string match in a file.
 
@@ -33,10 +39,7 @@ local function edit_header(input)
 end
 
 local function split_lines(text)
-  local lines = {}
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
+  local lines = maki.split(text, "\n")
   if lines[#lines] == "" then
     lines[#lines] = nil
   end
@@ -48,27 +51,133 @@ local function edit_view_opts(ctx)
   return { max_lines = (tol and tol.write) or FALLBACK_VIEW_LINES, keep = "head" }
 end
 
--- Old lines red, new lines green, one block per edit. Rebuilt purely from
--- the input, so a batch child can render the change without the file
--- snapshots (those live in ToolOutput::Diff, which Rust renders standalone).
-local function diff_view(blocks, ctx)
+-- Line number of `needle` in `content` (plain find, first match).
+local function line_of(content, needle)
+  local pos = content:find(needle, 1, true)
+  if not pos then
+    return nil
+  end
+  local _, newlines = content:sub(1, pos - 1):gsub("\n", "")
+  return newlines + 1
+end
+
+-- The edit already happened, so each block's `new` text sits in the file
+-- right now: read it once and recover real line numbers. Best effort,
+-- blocks stay unnumbered when the text moved or the file is gone.
+local function resolve_block_nrs(blocks, path)
+  if not path then
+    return
+  end
+  local content
+  for _, b in ipairs(blocks) do
+    if not b.nr and (b.new or "") ~= "" then
+      content = content or maki.fs.read(maki.fs.abspath(path))
+      if not content then
+        return
+      end
+      b.nr = line_of(content, b.new)
+    end
+  end
+end
+
+local function gutter_width(blocks)
+  local max_nr = 0
+  for _, b in ipairs(blocks) do
+    if b.nr then
+      local n = #split_lines(b.old or "")
+      if n == 0 then
+        n = #split_lines(b.new or "")
+      end
+      max_nr = math.max(max_nr, b.nr + n - 1)
+    end
+  end
+  return max_nr > 0 and #tostring(max_nr) or 0
+end
+
+-- The one gutter builder both render passes share: the plain render and
+-- the async highlight rewrite must produce byte-identical gutters or the
+-- columns shift when highlights land.
+local function nr_span(fmt, start_nr, i)
+  return { string.format(fmt, start_nr and (start_nr + i - 1) or ""), "line_nr" }
+end
+
+local function append_diff_lines(view, text, style, prefix, nr_fmt, start_nr, jobs)
+  local lines = split_lines(text or "")
+  if #lines == 0 then
+    return
+  end
+  jobs[#jobs + 1] = {
+    first = #view.all_lines + 1,
+    text = table.concat(lines, "\n"),
+    style = style,
+    prefix = prefix,
+    start_nr = start_nr,
+  }
+  for i, line in ipairs(lines) do
+    local spans = {}
+    if nr_fmt then
+      spans[#spans + 1] = nr_span(nr_fmt, start_nr, i)
+    end
+    spans[#spans + 1] = { prefix .. line, style }
+    view:append(spans)
+  end
+end
+
+-- Re-renders the block's lines with syntax colors on the diff backgrounds,
+-- keeping the gutter and prefix the plain render put there.
+local function apply_highlights(view, fmt, jobs, ext)
+  maki.async.run(function()
+    for _, job in ipairs(jobs) do
+      local bg = maki.ui.theme_color(job.style)
+      local highlighted = bg and maki.ui.highlight(job.text, ext)
+      for i, hl_line in ipairs(highlighted or {}) do
+        local idx = job.first + i - 1
+        if not view.all_lines[idx] then
+          break
+        end
+        local spans = {}
+        if fmt then
+          spans[#spans + 1] = nr_span(fmt, job.start_nr, i)
+        end
+        spans[#spans + 1] = { job.prefix, { bg = bg } }
+        for _, seg in ipairs(hl_line) do
+          local s = type(seg[2]) == "table" and seg[2] or {}
+          s.bg = bg
+          spans[#spans + 1] = { seg[1], s }
+        end
+        view:update_line(idx, spans)
+      end
+    end
+    view:flush()
+  end)
+end
+
+-- Mirrors the standalone Rust diff render (code_view.rs): numbered gutter
+-- on removed lines, blank gutter + `+` on added lines, and no truncation
+-- ever, a diff is exactly the change and hiding part of it lies.
+local function diff_view(blocks, path)
   local buf = maki.ui.buf()
-  local view = ToolView.new(buf, edit_view_opts(ctx))
+  local view = ToolView.new(buf, { max_lines = math.huge, keep = "head" })
+  resolve_block_nrs(blocks, path)
+  local w = gutter_width(blocks)
+  local fmt = w > 0 and ("%" .. w .. "s ") or nil
+  local jobs = {}
+  local function append(text, style, prefix, start_nr)
+    append_diff_lines(view, text, style, prefix, fmt, start_nr, jobs)
+  end
   for i, block in ipairs(blocks) do
     if i > 1 then
       view:append({})
     end
-    for _, line in ipairs(split_lines(block.old or "")) do
-      view:append({ { line, "diff_old" } })
-    end
-    for _, line in ipairs(split_lines(block.new or "")) do
-      view:append({ { line, "diff_new" } })
-    end
+    local has_old = (block.old or "") ~= ""
+    append(block.old, "diff_old", "- ", block.nr)
+    append(block.new, "diff_new", "+ ", not has_old and block.nr or nil)
   end
   view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
+  local ext = (path or ""):match("%.([^%.]+)$")
+  if #jobs > 0 and ext then
+    apply_highlights(view, fmt, jobs, ext)
+  end
   return buf
 end
 
@@ -77,7 +186,7 @@ local function diff_restore(blocks_from)
     if is_error then
       return ToolView.restore(output, edit_view_opts(ctx))
     end
-    return diff_view(blocks_from(input), ctx)
+    return diff_view(blocks_from(input), input.path)
   end
 end
 
@@ -121,6 +230,18 @@ local function diff_result(edit_result, summary)
     diff_after = edit_result.after,
     written_path = edit_result.path,
   }
+end
+
+local opts = maki.api.register_options({
+  multiedit = { default = true, desc = "Provide the `multiedit` tool." },
+  edit_lines = { default = false, desc = "Provide the opt-in `edit_lines` tool." },
+  insert_lines = { default = false, desc = "Provide the opt-in `insert_lines` tool." },
+})
+
+local function register_tool_if(enabled, tool)
+  if enabled then
+    maki.api.register_tool(tool)
+  end
 end
 
 maki.api.register_tool({
@@ -174,7 +295,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_tool_if(opts.multiedit, {
   name = "multiedit",
   kind = "edit",
   mutable_path = "path",
@@ -239,7 +360,12 @@ maki.api.register_tool({
         local replaced, replace_err =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
         if replace_err then
-          return nil, string.format("edit %d: %s", i - 1, replace_err)
+          local snippet = edit.old_string:match("[^\n]*")
+          local cut = utf8.offset(snippet, SNIPPET_MAX_CHARS + 1)
+          if cut then
+            snippet = snippet:sub(1, cut - 1) .. "…"
+          end
+          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet, replace_err)
         end
         content = replaced
       end
@@ -255,7 +381,7 @@ maki.api.register_tool({
   end,
 })
 
-maki.api.register_tool({
+register_tool_if(opts.edit_lines, {
   name = "edit_lines",
   kind = "edit",
   mutable_path = "path",
@@ -279,7 +405,8 @@ maki.api.register_tool({
       },
       ["end"] = {
         type = "integer",
-        description = "Last line, inclusive. Omit to insert before start without removing lines.",
+        description = "Last line, inclusive",
+        required = true,
       },
       new_string = {
         type = "string",
@@ -291,20 +418,65 @@ maki.api.register_tool({
 
   header = edit_header,
   restore = diff_restore(function(input)
-    return { { new = input.new_string } }
+    return { { new = input.new_string, nr = input.start } }
   end),
 
   handler = function(input, ctx)
-    local end_line = input["end"]
     local result, err = apply_edit(input.path, ctx, function(content)
-      return replace_lines(content, input.start, end_line, input.new_string)
+      return replace_lines(content, input.start, input["end"], input.new_string)
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
-    local summary = end_line
-        and string.format("replaced lines %d-%d in %s", input.start, end_line, shorten_path(result.path))
-      or string.format("inserted at line %d in %s", input.start, shorten_path(result.path))
-    return diff_result(result, summary)
+    return diff_result(
+      result,
+      string.format("replaced lines %d-%d in %s", input.start, input["end"], shorten_path(result.path))
+    )
+  end,
+})
+
+register_tool_if(opts.insert_lines, {
+  name = "insert_lines",
+  kind = "edit",
+  mutable_path = "path",
+  permission_scopes = "path",
+  audiences = { "main", "general_sub", "interpreter" },
+  description = INSERT_LINES_DESCRIPTION,
+
+  schema = {
+    type = "object",
+    properties = {
+      path = {
+        type = "string",
+        description = "Absolute path to the file",
+        required = true,
+        alias = "file_path",
+      },
+      line = {
+        type = "integer",
+        description = "Line number to insert before (1-indexed). Use 1 to insert at the top.",
+        required = true,
+      },
+      new_string = {
+        type = "string",
+        description = "Text to insert",
+        required = true,
+      },
+    },
+  },
+
+  header = edit_header,
+  restore = diff_restore(function(input)
+    return { { new = input.new_string, nr = input.line } }
+  end),
+
+  handler = function(input, ctx)
+    local result, err = apply_edit(input.path, ctx, function(content)
+      return replace_lines(content, input.line, nil, input.new_string)
+    end)
+    if not result then
+      return { llm_output = err, is_error = true }
+    end
+    return diff_result(result, string.format("inserted at line %d in %s", input.line, shorten_path(result.path)))
   end,
 })

@@ -1,16 +1,18 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "tensorx",
     api_key_env: "TENSORX_API_KEY",
     base_url: "https://api.tensorx.ai/v1",
     max_tokens_field: "max_tokens",
@@ -30,7 +32,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     needs_url: false,
 });
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     &[]
 }
 
@@ -82,7 +84,7 @@ impl Provider for TensorX {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -92,8 +94,10 @@ impl Provider for TensorX {
 
             let (has_thinking, has_reasoning_effort) = {
                 let guard = crate::model_registry::model_registry().read().unwrap();
+                // Discovery keys by the builtin slug; a dynamic wrap's model
+                // carries its own slug, so don't key by model.provider.
                 let info = guard
-                    .discovered(model.provider, &model.id)
+                    .discovered("tensorx", &model.id)
                     .and_then(|d| d.provider_info.clone())
                     .map(|arc| {
                         Arc::downcast::<TensorXModelInfo>(arc).expect("wrong provider info type")
@@ -106,19 +110,15 @@ impl Provider for TensorX {
             };
 
             if has_thinking {
-                body["thinking"] = json!(!matches!(opts.thinking, ThinkingConfig::Off));
+                body["thinking"] = json!(opts.thinking.is_enabled());
             }
             if has_reasoning_effort {
-                let effort = match opts.thinking {
-                    ThinkingConfig::Adaptive => "high",
-                    ThinkingConfig::Budget(n) => ThinkingConfig::budget_to_effort(n),
-                    ThinkingConfig::Off => "none",
-                };
-                body["reasoning_effort"] = json!(effort);
+                opts.thinking
+                    .apply_reasoning_effort(&mut body, &dialect::TENSORX, model);
             }
             // Fallback for deepseek models that use chat_template_kwargs
             else if !has_thinking
-                && !matches!(opts.thinking, ThinkingConfig::Off)
+                && opts.thinking.is_enabled()
                 && model.id.starts_with("deepseek/deepseek-v4")
             {
                 body["chat_template_kwargs"] = json!({"thinking": true});
@@ -189,6 +189,11 @@ impl Provider for TensorX {
                                 None
                             };
 
+                            let supports_vision = info
+                                .get("supports_vision")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+
                             let supports_thinking =
                                 info.get("supports_reasoning").and_then(Value::as_bool);
 
@@ -210,6 +215,8 @@ impl Provider for TensorX {
                                 max_output_tokens,
                                 pricing,
                                 supports_thinking,
+                                supports_vision: Some(supports_vision),
+                                tier: None,
                                 provider_info: supported_params
                                     .map(|p| Arc::new(p) as Arc<dyn std::any::Any + Send + Sync>),
                             })

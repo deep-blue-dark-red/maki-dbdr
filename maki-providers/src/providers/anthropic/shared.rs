@@ -13,6 +13,11 @@ use crate::{
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 
+/// The messages API refuses requests without max_tokens. Anthropic-kind
+/// models always get a window from the fallback table, so this only fires if
+/// an unknown-window model is ever routed here; 32k is safe for every Claude.
+pub(crate) const FALLBACK_MAX_TOKENS: u32 = 32_000;
+
 /// A `-1m` suffix is our own convention for asking Anthropic for the 1M context
 /// window. We strip it from the id before sending and add [`LONG_CONTEXT_BETA`]
 /// to the request instead.
@@ -199,13 +204,13 @@ pub(crate) fn build_request_body_with_system(
     let wire_tools = build_wire_tools(tools);
 
     let mut body = json!({
-        "max_tokens": model.max_output_tokens,
+        "max_tokens": model.max_output_tokens.unwrap_or(FALLBACK_MAX_TOKENS),
         "system": system_blocks,
         "messages": wire_messages,
         "tools": wire_tools,
     });
 
-    thinking.apply_to_body(&mut body, &model.id);
+    thinking.apply_to_body(&mut body, model);
     body
 }
 
@@ -269,11 +274,8 @@ impl EventParser {
                                     name: name.clone(),
                                 })
                                 .await?;
-                            self.content_blocks.push(ContentBlock::ToolUse {
-                                id,
-                                name,
-                                input: Value::Null,
-                            });
+                            self.content_blocks
+                                .push(ContentBlock::tool_use(id, name, Value::Null));
                         }
                     }
                 }
@@ -377,7 +379,7 @@ impl EventParser {
     }
 }
 
-pub(crate) fn models() -> &'static [ModelEntry] {
+pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
             prefixes: &["claude-haiku-4-5"],
@@ -392,7 +394,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.10,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -408,7 +410,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -416,7 +418,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
             tier: ModelTier::Medium,
             family: ModelFamily::Claude,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 3.00,
                 output: 15.00,
@@ -424,7 +426,24 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
+            context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-sonnet-5"],
+            tier: ModelTier::Medium,
+            family: ModelFamily::Claude,
+            vision: true,
+            default: true,
+            // Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.20,
+                fast: None,
+            },
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -440,7 +459,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.30,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -456,7 +475,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 0.50,
                 fast: None,
             },
-            max_output_tokens: 64000,
+            max_output_tokens: Some(64000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -470,12 +489,10 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 30.00,
-                    output: 150.00,
-                }),
+                // Fast mode withdrawn on 2026-06-29.
+                fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -489,16 +506,33 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 output: 25.00,
                 cache_write: 6.25,
                 cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 30.00,
-                    output: 150.00,
-                }),
+                // Fast mode withdrawn on 2026-07-24.
+                fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
             prefixes: &["claude-opus-4-8"],
+            tier: ModelTier::Strong,
+            family: ModelFamily::Claude,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 5.00,
+                output: 25.00,
+                cache_write: 6.25,
+                cache_read: 0.50,
+                fast: Some(FastPricing {
+                    input: 10.00,
+                    output: 50.00,
+                }),
+            },
+            max_output_tokens: Some(128000),
+            context_window: 200_000,
+        },
+        ModelEntry {
+            prefixes: &["claude-opus-5"],
             tier: ModelTier::Strong,
             family: ModelFamily::Claude,
             vision: true,
@@ -513,7 +547,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                     output: 50.00,
                 }),
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -529,7 +563,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 1.00,
                 fast: None,
             },
-            max_output_tokens: 128000,
+            max_output_tokens: Some(128000),
             context_window: 200_000,
         },
         ModelEntry {
@@ -545,7 +579,7 @@ pub(crate) fn models() -> &'static [ModelEntry] {
                 cache_read: 1.50,
                 fast: None,
             },
-            max_output_tokens: 32000,
+            max_output_tokens: Some(32000),
             context_window: 200_000,
         },
     ];

@@ -15,6 +15,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 ### User experience
 
 * SUPER fast startup, 60 FPS, and light on memory. Not running any JavaScript, using [ratatui](https://ratatui.rs) for TUI. Even the splash screen animation uses SIMD.
+* Extend with neovim like Lua plugins - [Builtin plugins](https://github.com/tontinton/maki/tree/main/plugins), [User made plugins showcase](https://github.com/tontinton/maki/discussions/452), [Lua API reference](https://maki.sh/docs/lua-api/).
 * Philosophy of not hiding anything - while other coding agents hide information as models improve (e.g. not showing number of lines read), maki leaves you in control.
 * UI fits everything well on my small screen laptop.
 * Full visibility of subagents - each subagent gets their own "chat window" you can easily navigate between using `/tasks` (Ctrl-X), or Ctrl-N/P.
@@ -46,12 +47,14 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
 * Synthetic - `SYNTHETIC_API_KEY`.
+* OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
+* OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 
 **Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
 
 ## Installation
 
-### Recommended
+### Linux / macOS
 
 ```sh
 # Download and read the script first (don't blindly trust shell scripts).
@@ -62,11 +65,36 @@ cat install.sh
 chmod +x install.sh && sh install.sh
 ```
 
-### One-liner
+One-liner:
 
 ```sh
 curl -fsSL https://maki.sh/install.sh | sh
 ```
+
+### Windows (PowerShell)
+
+```powershell
+# Download and read the script first (don't blindly trust remote scripts).
+irm https://maki.sh/install.ps1 -OutFile install.ps1
+Get-Content install.ps1
+
+# Then run.
+.\install.ps1
+```
+
+One-liner:
+
+```powershell
+irm https://maki.sh/install.ps1 | iex
+```
+
+### Windows (Git Bash)
+
+```sh
+curl -fsSL https://maki.sh/install.sh | sh
+```
+
+Both install to `%LOCALAPPDATA%\maki` and add it to your user PATH. Override with `MAKI_INSTALL_DIR` / `$env:MAKI_INSTALL_DIR`.
 
 ### Living on the edge (main branch)
 
@@ -102,16 +130,9 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 
 ## Documentation
 
-More info at the [official docs](http://maki.sh/docs).
+More info at the [official docs](https://maki.sh/docs).
 
 > DISCLAIMER: >90% of code in maki was written by maki, guided by humans. The code is not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded. I just think people should be honest about their use of AI in projects in this era.
-
-## Extending with Lua
-
-Currently working on a refactor so maki is a core agent UI loop with features like tools, UI elements, and storage all controlled by Lua plugins.
-This will allow you to customize the hell out of maki.
-
-Status: all tools are Lua plugins (in the `./plugins` dir). Little by little we should migrate more functionalities into Lua.
 
 ## Example config
 

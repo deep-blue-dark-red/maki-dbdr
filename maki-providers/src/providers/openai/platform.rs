@@ -2,18 +2,20 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::StateDir;
+use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, EffortScale, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::auth;
 use crate::providers::ResolvedAuth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "openai",
     api_key_env: "OPENAI_API_KEY",
     base_url: "https://api.openai.com/v1",
     max_tokens_field: "max_completion_tokens",
@@ -63,6 +65,10 @@ pub struct OpenAi {
     auth: Arc<Mutex<ResolvedAuth>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
+    /// Env / `providers.toml` override for the platform API, resolved once at
+    /// construction. Used by the Responses (codex) path only; ChatGPT Coding
+    /// Plan OAuth keeps its fixed backend URL.
+    resolved_base_url: Option<String>,
 }
 
 impl OpenAi {
@@ -71,6 +77,7 @@ impl OpenAi {
         let resolved = auth::resolve(&storage)?;
         let compat = OpenAiCompatProvider::new(&CONFIG, timeouts);
         Ok(Self {
+            resolved_base_url: resolve_openai_base_url(),
             compat,
             auth: Arc::new(Mutex::new(resolved)),
             storage: Some(storage),
@@ -83,6 +90,7 @@ impl OpenAi {
         timeouts: crate::providers::Timeouts,
     ) -> Self {
         Self {
+            resolved_base_url: resolve_openai_base_url(),
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
             storage: None,
@@ -155,13 +163,23 @@ impl OpenAi {
         {
             return Ok(auth::build_coding_plan_resolved(&tokens));
         }
-        // Fall back to standard API key via the Responses API.
+        // Fall back to standard API key via the Responses API. Env /
+        // providers.toml base_url overrides the platform API only, never the
+        // ChatGPT backend above.
         let mut auth = self.current_auth();
         if auth.base_url.is_none() {
-            auth.base_url = Some(CONFIG.base_url.into());
+            auth.base_url = self
+                .resolved_base_url
+                .clone()
+                .or_else(|| Some(CONFIG.base_url.into()));
         }
         Ok(auth)
     }
+}
+
+fn resolve_openai_base_url() -> Option<String> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::configured_base_url("openai", config.get("openai"))
 }
 
 impl Provider for OpenAi {
@@ -173,7 +191,7 @@ impl Provider for OpenAi {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -200,7 +218,7 @@ impl Provider for OpenAi {
 
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking
-                .apply_reasoning_effort(&mut body, EffortScale::Standard);
+                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat

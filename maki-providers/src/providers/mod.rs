@@ -12,6 +12,7 @@ use tracing::debug;
 use crate::AgentError;
 
 pub(crate) mod anthropic;
+pub(crate) mod catalog;
 pub(crate) mod copilot;
 pub mod custom;
 pub(crate) mod deepseek;
@@ -23,7 +24,7 @@ pub(crate) mod mistral;
 pub(crate) mod ollama;
 pub(crate) mod openai;
 pub(crate) mod openai_compat;
-pub(crate) mod opencode;
+pub mod opencode;
 pub(crate) mod openrouter;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;

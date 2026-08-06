@@ -1,5 +1,6 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
+local output_limits = require("maki.output_limits")
 
 local RTK_REWRITE_TIMEOUT_MS = 2000
 local RTK_UNSUPPORTED_FLAGS = {
@@ -160,6 +161,7 @@ local function create_bash_view(command, ctx)
   local view = ToolView.new(buf, {
     max_lines = (tol and tol.bash) or 5,
     keep = "tail",
+    max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
   })
   view:set_header(build_header_lines(command))
   buf:on("click", function()
@@ -247,6 +249,14 @@ maki.api.register_prompt_hint({
   content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
 })
 
+local opts = maki.api.register_options(output_limits.extend({
+  timeout_secs = {
+    default = 120,
+    min = 5,
+    desc = "Kill the command after this many seconds. A call's `timeout` param overrides it.",
+  },
+}))
+
 maki.api.register_tool({
   name = "bash",
   kind = "execute",
@@ -306,23 +316,17 @@ maki.api.register_tool({
     elseif is_error then
       local body, code = output:match("^(.-)\nExit code: (%d+)$")
       if body then
-        for line in (body .. "\n"):gmatch("([^\n]*)\n") do
-          view:append(line)
-        end
+        view:append_text(body)
         view:append({ { "Exit code: " .. code, "dim" } })
       else
-        for line in (output .. "\n"):gmatch("([^\n]*)\n") do
-          view:append(line)
-        end
+        view:append_text(output)
       end
     else
       if output == "Exit code: 0" or output == "" then
         view:clear()
         view:append({ { "No output", "dim" } })
       else
-        for line in (output .. "\n"):gmatch("([^\n]*)\n") do
-          view:append(line)
-        end
+        view:append_text(output)
       end
     end
     view:finish()
@@ -335,9 +339,8 @@ maki.api.register_tool({
     end
 
     local command, workdir = parse_cd_hint(input)
-    local timeout_secs = input.timeout or ctx:config("bash_timeout_secs", 120)
-    local max_lines = ctx:config("max_output_lines", 2000)
-    local max_bytes = ctx:config("max_output_bytes", (50 * 1024))
+    local timeout_secs = input.timeout or opts.timeout_secs
+    local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
     ctx:set_deadline(timeout_secs)
 

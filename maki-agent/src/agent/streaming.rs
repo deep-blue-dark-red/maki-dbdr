@@ -1,6 +1,7 @@
 use maki_providers::provider::Provider;
 use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions, StreamResponse};
+use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
@@ -13,6 +14,15 @@ async fn forward_provider_events(prx: flume::Receiver<ProviderEvent>, event_tx: 
             ProviderEvent::TextDelta { text } => AgentEvent::TextDelta { text },
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
             ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending { id, name },
+            ProviderEvent::PromptProgress {
+                processed,
+                total,
+                cache,
+            } => AgentEvent::PromptProgress {
+                processed,
+                total,
+                cache,
+            },
         };
         if event_tx.send(ae).is_err() {
             break;
@@ -30,7 +40,7 @@ pub(crate) async fn stream_with_retry(
     event_tx: &EventSender,
     cancel: &CancelToken,
     opts: RequestOptions,
-    session_id: Option<&str>,
+    session_id: Option<&SessionRef>,
 ) -> Result<StreamResponse, AgentError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);

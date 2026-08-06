@@ -8,6 +8,7 @@ use maki_storage::{StateDir, StorageError};
 
 const INSTALL_SCRIPT_URL: &str = "https://maki.sh/install.sh";
 const BACKUP_FILENAME: &str = "maki_backup";
+const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateError {
@@ -56,14 +57,17 @@ pub enum UpdateError {
 
 fn fetch_script() -> Result<String, UpdateError> {
     use isahc::ReadResponseExt;
-    let mut response = isahc::get(INSTALL_SCRIPT_URL).map_err(|e| UpdateError::Fetch {
-        url: INSTALL_SCRIPT_URL,
-        source: e,
-    })?;
-    response.text().map_err(|e| UpdateError::Fetch {
-        url: INSTALL_SCRIPT_URL,
-        source: e.into(),
-    })
+    isahc::get(INSTALL_SCRIPT_URL)
+        .and_then(|mut r| r.text().map_err(Into::into))
+        .map_err(|source| UpdateError::Fetch {
+            url: INSTALL_SCRIPT_URL,
+            source,
+        })
+        .or_else(|e| {
+            version::curl_fetch(INSTALL_SCRIPT_URL)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .map_err(|_| e)
+        })
 }
 
 fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateError> {
@@ -75,7 +79,7 @@ fn backup_binary(exe_path: &Path, storage: &StateDir) -> Result<PathBuf, UpdateE
     Ok(backup_path)
 }
 
-fn execute_script(script: &str) -> Result<(), UpdateError> {
+fn execute_script(script: &str, install_dir: &Path) -> Result<(), UpdateError> {
     let mut tmp = tempfile::NamedTempFile::new().map_err(UpdateError::WriteScript)?;
     tmp.write_all(script.as_bytes())
         .map_err(UpdateError::WriteScript)?;
@@ -83,6 +87,7 @@ fn execute_script(script: &str) -> Result<(), UpdateError> {
 
     let status = std::process::Command::new("sh")
         .arg(tmp.path())
+        .env(INSTALL_DIR_ENV, install_dir)
         .status()
         .map_err(UpdateError::ExecScript)?;
 
@@ -90,6 +95,12 @@ fn execute_script(script: &str) -> Result<(), UpdateError> {
         return Err(UpdateError::InstallFailed(status.code()));
     }
     Ok(())
+}
+
+fn current_exe_resolved() -> Result<PathBuf, UpdateError> {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(UpdateError::CurrentExe)
 }
 
 #[cfg(unix)]
@@ -118,22 +129,19 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     if needs_sudo(exe_path) {
         println!("Restoring to {} (requires sudo)...", exe_path.display());
         let status = std::process::Command::new("sudo")
-            .args(["cp", "--"])
+            .args([
+                "sh",
+                "-c",
+                r#"cp -- "$1" "$2" && mv -- "$2" "$3""#,
+                "maki-restore",
+            ])
             .arg(backup_path)
-            .arg(&tmp)
-            .status()
-            .map_err(err)?;
-        if !status.success() {
-            return Err(err(std::io::Error::other("sudo cp failed")));
-        }
-        let status = std::process::Command::new("sudo")
-            .args(["mv", "--"])
             .arg(&tmp)
             .arg(exe_path)
             .status()
             .map_err(err)?;
         if !status.success() {
-            return Err(err(std::io::Error::other("sudo mv failed")));
+            return Err(err(std::io::Error::other("sudo restore failed")));
         }
     } else {
         std::fs::copy(backup_path, &tmp).map_err(err)?;
@@ -142,8 +150,11 @@ fn restore_backup(backup_path: &Path, exe_path: &Path) -> Result<(), UpdateError
     Ok(())
 }
 
-fn prompt_yes() -> bool {
-    eprint!("Run this script? [y/N] ");
+fn prompt_yes(install_dir: &Path) -> bool {
+    eprint!(
+        "Install to {} and run this script? [y/N] ",
+        install_dir.display()
+    );
     let _ = std::io::stderr().flush();
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y")
@@ -160,7 +171,18 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
     println!("Latest version:  v{latest}");
     println!();
 
-    let exe_path = std::env::current_exe().map_err(UpdateError::CurrentExe)?;
+    let exe_path = current_exe_resolved()?;
+    let install_dir = match std::env::var_os(INSTALL_DIR_ENV).filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => exe_path
+            .parent()
+            .ok_or_else(|| {
+                UpdateError::CurrentExe(std::io::Error::other(
+                    "binary path has no parent directory",
+                ))
+            })?
+            .to_path_buf(),
+    };
     let storage = StateDir::resolve()?;
 
     let script = fetch_script()?;
@@ -171,14 +193,14 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
         println!("{}", maki_ui::highlight_ansi("bash", &script));
     }
 
-    if !skip_confirm && !prompt_yes() {
+    if !skip_confirm && !prompt_yes(&install_dir) {
         println!("Aborted.");
         return Ok(());
     }
 
     let backup_path = backup_binary(&exe_path, &storage)?;
 
-    execute_script(&script)?;
+    execute_script(&script, &install_dir)?;
 
     println!();
     println!("Updated successfully.");
@@ -189,7 +211,7 @@ pub fn update(skip_confirm: bool, no_color: bool) -> Result<(), UpdateError> {
 }
 
 pub fn rollback() -> Result<(), UpdateError> {
-    let exe_path = std::env::current_exe().map_err(UpdateError::CurrentExe)?;
+    let exe_path = current_exe_resolved()?;
     let storage = StateDir::resolve()?;
     let backup_path = storage.path().join(BACKUP_FILENAME);
 

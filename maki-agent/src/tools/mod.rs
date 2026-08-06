@@ -31,13 +31,14 @@ use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpHandle;
+use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
 use maki_config::ToolOutputLines;
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
+use maki_storage::id::SessionRef;
 
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
@@ -108,7 +109,7 @@ impl ToolFilter {
 /// One gate for every definitions builder (main loop, headless, Lua): a model
 /// without vision never learns `view_image` exists.
 pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
-    if model.vision {
+    if model.supports_vision() {
         &[]
     } else {
         &[VIEW_IMAGE_TOOL_NAME]
@@ -193,11 +194,15 @@ pub struct ToolContext {
     pub model: Arc<Model>,
     pub event_tx: EventSender,
     pub mode: AgentMode,
+    /// The session this run belongs to. A subagent inherits its parent's,
+    /// so a tool can always tell which conversation it is serving. `None`
+    /// when there is no session at all, like the `maki index` one-shot.
+    pub session_id: Option<SessionRef>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
-    pub mcp: Option<McpHandle>,
+    pub mcp: Option<McpSession>,
     pub deadline: Deadline,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
@@ -222,6 +227,7 @@ pub struct ToolContext {
 pub enum ToolLive {
     Buf(Arc<SharedBuf>),
     Annotation(String),
+    Usage(String),
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -360,13 +366,13 @@ pub fn truncate_output(text: String, max_lines: usize, max_bytes: usize) -> Stri
 }
 
 pub fn is_builtin_tool(name: &str) -> bool {
-    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::OPT_IN_TOOLS.contains(&name)
+    maki_config::DEFAULT_BUILTINS.contains(&name) || maki_config::EDIT_SUB_TOOLS.contains(&name)
 }
 
 pub fn all_builtin_tool_names() -> Vec<&'static str> {
     maki_config::DEFAULT_BUILTINS
         .iter()
-        .chain(maki_config::OPT_IN_TOOLS.iter())
+        .chain(maki_config::EDIT_SUB_TOOLS.iter())
         .copied()
         .collect()
 }
@@ -384,7 +390,7 @@ impl Provider for NullProvider {
         _: &'a Value,
         _: &'a flume::Sender<ProviderEvent>,
         _: RequestOptions,
-        _: Option<&str>,
+        _: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, crate::AgentError>> {
         Box::pin(async { unimplemented!() })
     }
@@ -413,6 +419,7 @@ pub fn interpreter_ctx(
         model: Arc::clone(&MODEL),
         event_tx: event_tx.clone(),
         mode: mode.clone(),
+        session_id: None,
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
@@ -569,7 +576,7 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
 
     use tempfile::TempDir;
     use test_case::test_case;
@@ -582,7 +589,7 @@ mod tests {
     #[test_case(false ; "text_only_model_loses_view_image")]
     fn from_config_gates_view_image_on_vision(vision: bool) {
         let mut model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-        model.vision = vision;
+        model.supports_vision_override = Some(vision);
         let filter = ToolFilter::from_config(&AgentConfig::default(), &model, &[]);
         assert_eq!(filter.matches(VIEW_IMAGE_TOOL_NAME), vision);
         assert!(
@@ -693,6 +700,98 @@ mod tests {
         params.path = Some(dir.path().to_string_lossy().into());
         let err = grep::grep_search(params).unwrap_err();
         assert!(err.contains(grep::INVALID_REGEX), "got: {err}");
+    }
+
+    #[test]
+    fn grep_search_multiline_groups_spanning_lines() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("span.rs"), "fn foo() {\n    bar\n}\n").unwrap();
+
+        let mut params = grep::GrepParams::new("(?s)foo.*\\n}".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries.len(), 1);
+        let lines = &entries[0].groups[0].lines;
+        assert!(lines.iter().any(|l| l.text.contains("foo") && l.is_match));
+    }
+
+    #[test]
+    fn grep_search_context_lines_surround_matches() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("ctx.rs"),
+            "l1\nl2\nA\nl4\nl5\nl6\nl7\nl8\nB\nl10\n",
+        )
+        .unwrap();
+
+        let mut params = grep::GrepParams::new("A|B".into());
+        params.path = Some(dir.path().to_string_lossy().into());
+        params.context_before = 1;
+        params.context_after = 1;
+        let (_, entries) = grep::grep_search(params).unwrap();
+        assert_eq!(entries[0].groups.len(), 2);
+
+        let g0 = &entries[0].groups[0].lines;
+        assert!(g0.iter().any(|l| l.text == "l2" && !l.is_match));
+        assert!(g0.iter().any(|l| l.text == "A" && l.is_match));
+
+        let g1 = &entries[0].groups[1].lines;
+        assert!(g1.iter().any(|l| l.text == "B" && l.is_match));
+        assert!(g1.iter().any(|l| l.text == "l10" && !l.is_match));
+    }
+
+    #[test]
+    fn grep_search_parallel_stable_under_repeated_calls() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let tied_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        for i in 0..20u32 {
+            let path = root.join(format!("f{i:03}.rs"));
+            fs::write(&path, format!("needle {i}\n")).unwrap();
+            let f = File::options().write(true).open(&path).unwrap();
+            f.set_modified(tied_mtime).unwrap();
+        }
+        let path_str = root.to_string_lossy().to_string();
+
+        let mut reference: Option<Vec<(String, usize, bool)>> = None;
+        for _ in 0..20 {
+            let mut params = grep::GrepParams::new("needle".into());
+            params.path = Some(path_str.clone());
+            params.limit = 1000;
+            let (_, entries) = grep::grep_search(params).unwrap();
+
+            let flat: Vec<(String, usize, bool)> = entries
+                .iter()
+                .flat_map(|e| {
+                    e.groups.iter().flat_map(|g| {
+                        g.lines
+                            .iter()
+                            .map(|l| (e.path.clone(), l.line_nr, l.is_match))
+                    })
+                })
+                .collect();
+            match &reference {
+                None => reference = Some(flat),
+                Some(prev) => assert_eq!(flat, *prev),
+            }
+        }
+    }
+
+    #[test]
+    fn grep_search_limit_truncates_groups_after_sort() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        for i in 0..10u32 {
+            fs::write(root.join(format!("m_{i}.rs")), "hit\n").unwrap();
+        }
+
+        let mut params = grep::GrepParams::new("hit".into());
+        params.path = Some(root.to_string_lossy().into());
+        params.limit = 3;
+        let (_, entries) = grep::grep_search(params).unwrap();
+
+        let total_groups: usize = entries.iter().map(|e| e.groups.len()).sum();
+        assert_eq!(total_groups, 3);
     }
 
     #[test]

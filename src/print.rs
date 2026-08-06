@@ -20,6 +20,7 @@ use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConf
 use maki_lua::EventHandle;
 use maki_providers::model::Model;
 use maki_providers::{StopReason, TokenUsage};
+use maki_storage::id::SessionRef;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -56,7 +57,7 @@ struct PrintResult {
     num_turns: u32,
     result: String,
     stop_reason: Option<StopReason>,
-    session_id: String,
+    session_id: SessionRef,
     total_cost_usd: f64,
     usage: TokenUsage,
 }
@@ -67,7 +68,7 @@ struct InitEvent<'a> {
     event_type: &'static str,
     subtype: &'static str,
     cwd: &'a str,
-    session_id: &'a str,
+    session_id: &'a SessionRef,
     tools: &'a [String],
     model: &'a str,
 }
@@ -77,7 +78,7 @@ struct AssistantEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: AssistantMessage<'a>,
-    session_id: &'a str,
+    session_id: &'a SessionRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -95,7 +96,7 @@ struct UserEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
     message: UserMessage<'a>,
-    session_id: &'a str,
+    session_id: &'a SessionRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<&'a str>,
 }
@@ -114,7 +115,7 @@ struct RetryEvent<'a> {
     attempt: u32,
     retry_delay_ms: u64,
     error: &'a str,
-    session_id: &'a str,
+    session_id: &'a SessionRef,
 }
 
 enum VerboseOutput {
@@ -142,7 +143,7 @@ pub fn run(
     config: AgentConfig,
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
-    lua_handle: Option<EventHandle>,
+    lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
 ) -> Result<()> {
@@ -157,13 +158,10 @@ pub fn run(
 
     let images = load_images(&image_paths)?;
 
-    let prompt_slots = lua_handle
-        .as_ref()
-        .map(|h| h.collect_prompt_slots())
-        .unwrap_or_default();
+    let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -236,6 +234,7 @@ pub fn run(
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
+            | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
@@ -244,8 +243,8 @@ pub fn run(
             | AgentEvent::LiveToolBuf { .. }
             | AgentEvent::CompactionStart { .. }
             | AgentEvent::RenameResult { .. }
-            | AgentEvent::BatchProgress(_)
-            | AgentEvent::Nudge => {}
+            | AgentEvent::Nudge
+            | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -386,7 +385,7 @@ mod tests {
             num_turns: 2,
             result: "done".into(),
             stop_reason: Some(StopReason::EndTurn),
-            session_id: "sess-123".into(),
+            session_id: SessionRef::generate(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),
         };
@@ -395,11 +394,12 @@ mod tests {
             assert!(json.get(field).is_some(), "PrintResult missing: {field}");
         }
 
+        let sid = SessionRef::generate();
         let init = InitEvent {
             event_type: "system",
             subtype: "init",
             cwd: "/tmp",
-            session_id: "abc",
+            session_id: &sid,
             tools: &["bash".into(), "read".into()],
             model: "test-model",
         };
@@ -414,7 +414,7 @@ mod tests {
             attempt: 2,
             retry_delay_ms: 3000,
             error: "rate_limit",
-            session_id: "abc",
+            session_id: &sid,
         };
         let json: Value = serde_json::to_value(&retry).unwrap();
         for field in RETRY_EVENT_FIELDS {

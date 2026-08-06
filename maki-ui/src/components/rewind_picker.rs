@@ -69,7 +69,7 @@ impl RewindPicker {
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
         for (msg_idx, msg) in messages.iter().enumerate() {
-            if !matches!(msg.role, Role::User) {
+            if !matches!(msg.role, Role::User) || msg.is_observation() {
                 continue;
             }
             let Some(full_text) = msg.user_text() else {
@@ -123,7 +123,7 @@ impl RewindPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> RewindPickerAction {
         match self.picker.handle_key(key) {
             PickerAction::Consumed => RewindPickerAction::Consumed,
-            PickerAction::Select(_, entry) => RewindPickerAction::Select(entry),
+            PickerAction::Select(entry) => RewindPickerAction::Select(entry),
             PickerAction::Close => RewindPickerAction::Close,
             PickerAction::Toggle(..) => RewindPickerAction::Consumed,
         }
@@ -220,9 +220,10 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_messages_are_excluded() {
+    fn synthetic_messages_and_observations_are_excluded() {
         let mut picker = RewindPicker::new();
         let msgs = vec![
+            Message::observation("build failed".into()),
             user_msg("real prompt"),
             assistant_msg(),
             Message::synthetic("[Cancelled by user]".into()),
@@ -230,7 +231,7 @@ mod tests {
         picker.open(&msgs).unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("real prompt"));
-        assert_eq!(item.turn_index, 0);
+        assert_eq!(item.turn_index, 1);
     }
 
     #[test]

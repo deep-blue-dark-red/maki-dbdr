@@ -20,12 +20,91 @@ local function line_nr_fmt(count)
   return "%" .. w .. "d "
 end
 
+-- Truncate a UTF-8 string at a byte boundary that is also a codepoint
+-- boundary, appending an ellipsis if truncation happened.
+local function utf8_truncate_bytes(s, max_bytes)
+  if #s <= max_bytes then
+    return s
+  end
+  if max_bytes <= 0 then
+    return ""
+  end
+  local i = max_bytes
+  while i > 0 do
+    local next_b = s:byte(i + 1)
+    if not next_b or next_b < 0x80 or next_b >= 0xC0 then
+      break
+    end
+    i = i - 1
+  end
+  if i <= 0 then
+    return "…"
+  end
+  return s:sub(1, i) .. "…"
+end
+
+local function line_text_bytes(line)
+  if type(line) == "string" then
+    return #line
+  end
+  local n = 0
+  for _, span in ipairs(line) do
+    if type(span) == "string" then
+      n = n + #span
+    else
+      n = n + #(span[1] or "")
+    end
+  end
+  return n
+end
+
+local function truncate_line(line, max_bytes)
+  if not max_bytes or max_bytes <= 0 then
+    return line
+  end
+  if type(line) == "string" then
+    return utf8_truncate_bytes(line, max_bytes)
+  end
+  if line_text_bytes(line) <= max_bytes then
+    return line
+  end
+  local out = {}
+  local used = 0
+  for _, span in ipairs(line) do
+    if used >= max_bytes then
+      break
+    end
+    local text, style
+    if type(span) == "string" then
+      text = span
+    else
+      text = span[1] or ""
+      style = span[2]
+    end
+    local remaining = max_bytes - used
+    if #text > remaining then
+      text = utf8_truncate_bytes(text, remaining)
+    end
+    if style then
+      out[#out + 1] = { text, style }
+    else
+      out[#out + 1] = text
+    end
+    used = used + #text
+  end
+  return out
+end
+
+-- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
+-- (default "tail"), max_expand_lines (default 2000) kept for expansion,
+-- max_line_bytes (optional) per-line byte cap applied at render time.
 function ToolView.new(buf, opts)
   local self = setmetatable({}, ToolView)
   self.buf = buf
   self.max = (opts and opts.max_lines) or 80
   self.keep = (opts and opts.keep) or "tail"
   self.max_expand_lines = (opts and opts.max_expand_lines) or 2000
+  self.max_line_bytes = (opts and opts.max_line_bytes) or nil
   self.header = {}
   self.ring = {}
   self.ring_start = 1
@@ -93,6 +172,14 @@ function ToolView:append(line)
   end
 end
 
+function ToolView:append_text(text)
+  for _, line in ipairs(maki.split(text, "\n")) do
+    self:append(line)
+  end
+end
+
+-- Append {content} with line numbers, then syntax-highlight it for {ext}
+-- asynchronously. Returns false when {content} is empty.
 function ToolView:set_highlight(content, ext)
   ext = ext or "md"
   if content:sub(-1) == "\n" then
@@ -101,10 +188,7 @@ function ToolView:set_highlight(content, ext)
   if content == "" then
     return false
   end
-  local lines = {}
-  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
-    lines[#lines + 1] = line
-  end
+  local lines = maki.split(content, "\n")
 
   local fmt = line_nr_fmt(#lines)
   for idx, line in ipairs(lines) do
@@ -132,6 +216,17 @@ function ToolView:set_highlight(content, ext)
   return true
 end
 
+-- Content rows on screen, for callers with their own per-row click targets. A
+-- single hidden line is drawn as itself instead of a notice, so it counts as
+-- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
+-- prints its notice first and shifts them.
+function ToolView:visible_count()
+  if self.expanded then
+    return #self.all_lines
+  end
+  return self.ring_count + (self.skipped == 1 and 1 or 0)
+end
+
 function ToolView:toggle()
   self.expanded = not self.expanded
   self:flush()
@@ -141,12 +236,12 @@ function ToolView:flush()
   local lines = {}
 
   for _, h in ipairs(self.header) do
-    lines[#lines + 1] = h
+    lines[#lines + 1] = truncate_line(h, self.max_line_bytes)
   end
 
   if self.expanded then
     for _, line in ipairs(self.all_lines) do
-      lines[#lines + 1] = line
+      lines[#lines + 1] = truncate_line(line, self.max_line_bytes)
     end
     if self.all_skipped > 0 then
       lines[#lines + 1] = { { self.all_skipped .. " lines omitted", "dim" } }
@@ -158,16 +253,18 @@ function ToolView:flush()
       or nil
 
     if self.keep == "tail" and notice then
-      lines[#lines + 1] = notice
+      lines[#lines + 1] = truncate_line(notice, self.max_line_bytes)
     end
 
     for i = 0, self.ring_count - 1 do
-      local idx = ((self.ring_start - 1 + i) % self.max) + 1
-      lines[#lines + 1] = self.ring[idx]
+      -- Modulo only after the ring wrapped: `x % math.huge` is NaN in Luau,
+      -- and uncapped views (max_lines = math.huge) never wrap.
+      local idx = self.ring_start == 1 and (i + 1) or (((self.ring_start - 1 + i) % self.max) + 1)
+      lines[#lines + 1] = truncate_line(self.ring[idx], self.max_line_bytes)
     end
 
     if self.keep == "head" and notice then
-      lines[#lines + 1] = notice
+      lines[#lines + 1] = truncate_line(notice, self.max_line_bytes)
     end
   end
 
@@ -184,16 +281,17 @@ function ToolView:update_line(all_idx, line)
   end
 end
 
+-- Call once after the last append so the collapsed notice renders.
 function ToolView:finish()
   if self.keep == "head" and self.skipped > 0 then
     self:flush()
   end
 end
 
-function ToolView.restore(output, opts)
+function ToolView.restore_lines(lines, opts)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, opts)
-  for line in (output .. "\n"):gmatch("([^\n]*)\n") do
+  for _, line in ipairs(lines) do
     view:append(line)
   end
   view:finish()
@@ -201,6 +299,25 @@ function ToolView.restore(output, opts)
     view:toggle()
   end)
   return buf
+end
+
+-- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
+-- wired. For `restore` hooks.
+function ToolView.restore(output, opts)
+  return ToolView.restore_lines(maki.split(output, "\n"), opts)
+end
+
+-- Same, for tools whose live output goes through markdown (`format =
+-- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
+-- live.
+function ToolView.restore_markdown(output, is_error, opts)
+  if not is_error then
+    local ok, md_lines = pcall(maki.ui.markdown, output, opts.width)
+    if ok then
+      return ToolView.restore_lines(md_lines, opts)
+    end
+  end
+  return ToolView.restore(output, opts)
 end
 
 return ToolView

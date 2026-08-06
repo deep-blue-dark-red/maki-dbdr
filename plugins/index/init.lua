@@ -1,9 +1,14 @@
+local dir_listing = require("maki.dir_listing")
 local indexer = require("indexer")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 
 local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
 local TRUNCATED_INFIX = " more truncated]"
+
+local opts = maki.api.register_options({
+  max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
+})
 
 local function split_trailing_range(line)
   local pos = line:find(" %[%d[%d%-,]*%]$")
@@ -50,11 +55,8 @@ local function infer_line_meta(line)
 end
 
 local function render_skeleton(view, text, meta)
-  text = text:gsub("\n+$", "") .. "\n"
   local hl_entries = {}
-  local line_nr = 0
-  for line in text:gmatch("([^\n]*)\n") do
-    line_nr = line_nr + 1
+  for line_nr, line in ipairs(maki.split(text:gsub("\n+$", ""), "\n")) do
     local m = (meta and meta[line_nr]) or infer_line_meta(line)
     if line == "" then
       view:append("")
@@ -169,6 +171,10 @@ Return a compact overview of a source file: imports, type definitions, function 
     return render_header(input.path)
   end,
   restore = function(input, output, _is_error, ctx)
+    local meta = input.path and maki.fs.metadata(input.path)
+    if meta and meta.is_dir then
+      return { body = dir_listing.view(output, ctx) }
+    end
     local ext = input.path:match("%.([^%.]+)$") or ""
     local buf, header = render_index(output, input.path, ctx, ext)
     return { body = buf, header = header }
@@ -176,15 +182,27 @@ Return a compact overview of a source file: imports, type definitions, function 
   handler = function(input, ctx)
     local path = input.path
     if not path then
-      return "error: path is required"
+      return { llm_output = "error: path is required", is_error = true }
     end
 
     local meta = maki.fs.metadata(path)
-    if meta and meta.is_dir then
-      return {
-        llm_output = "Path is a directory. Use index on files or use the read or glob tool to list directories.",
-        is_error = true,
+    if not meta then
+      return { llm_output = "error: path not found: " .. path, is_error = true }
+    end
+    if meta.is_dir then
+      local listing, err = dir_listing.list(path, ctx)
+      if not listing then
+        return { llm_output = "error: " .. tostring(err), is_error = true }
+      end
+      local output = {
+        llm_output = listing.text,
+        body = dir_listing.view(listing.text, ctx),
+        annotation = listing.count .. " entries",
       }
+      if listing.instructions then
+        output.instructions = listing.instructions
+      end
+      return output
     end
 
     local filename = path:match("([^/]+)$")
@@ -202,23 +220,26 @@ Return a compact overview of a source file: imports, type definitions, function 
       end
     end
 
-    local max_file_size = ctx:config("index_max_file_size", (2 * 1024 * 1024))
+    local max_file_size = opts.max_file_size_mb * 1024 * 1024
     if meta and meta.size > max_file_size then
-      return "error: File too large ("
-        .. meta.size
-        .. " bytes, max "
-        .. max_file_size
-        .. "). Use read with offset/limit instead."
+      return {
+        llm_output = "error: File too large ("
+          .. meta.size
+          .. " bytes, max "
+          .. max_file_size
+          .. "). Use read with offset/limit instead.",
+        is_error = true,
+      }
     end
 
     local source, err = maki.fs.read(path)
     if not source then
-      return "error: " .. err
+      return { llm_output = "error: " .. err, is_error = true }
     end
 
     local skeleton, line_meta = indexer.index_source(source, lang)
     if not skeleton then
-      return "error: " .. tostring(line_meta)
+      return { llm_output = "error: " .. tostring(line_meta), is_error = true }
     end
 
     local ext = indexer.LANG_TO_EXT[lang] or path:match("%.([^%.]+)$") or ""

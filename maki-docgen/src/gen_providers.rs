@@ -1,11 +1,12 @@
-use maki_providers::model::{ModelEntry, ModelTier, models_for_provider};
+use maki_providers::manifest::ManifestRegistry;
+use maki_providers::model::{ModelEntry, ModelTier};
 use maki_providers::provider::ProviderKind;
 use std::fmt::Write;
 use strum::IntoEnumIterator;
 
 const FRONT_MATTER: &str = r#"+++
 title = "Providers"
-weight = 5
+weight = 7
 [extra]
 group = "Reference"
 +++"#;
@@ -17,6 +18,25 @@ const AUTH_RELOADING: &str = r#"## Auth Reloading
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
 You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors."#;
+
+const BASE_URL_OVERRIDES: &str = r#"## Base URL Overrides
+
+Every provider honors a `<SLUG>_BASE_URL` env var (`anthropic` -> `ANTHROPIC_BASE_URL`, `llama-cpp` -> `LLAMA_CPP_BASE_URL`). Set it to the origin of a proxy or a compatible endpoint and Maki appends the API paths itself:
+
+```sh
+ANTHROPIC_BASE_URL=https://my-proxy.internal maki
+```
+
+It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. One exception: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend.
+
+You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
+
+```toml
+[openai]
+base_url = "http://xxxx:1234/v1"
+```
+
+The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those."#;
 
 const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
 
@@ -44,6 +64,15 @@ enable_free_models = true
 
 The default is `false`."#;
 
+const OPENCODE_GO_SECTION: &str = r#"### Opencode Go
+
+- **Env var**: `OPENCODE_API_KEY`
+- **API**: `https://opencode.ai/zen/go/v1`
+- **Features**: Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API
+
+No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
+"#;
+
 const MODEL_IDENTIFIERS: &str = r#"## Model Identifiers
 
 Models are referenced as `provider/model_id`:
@@ -56,13 +85,149 @@ zai/glm-4.7
 
 If the model name is unique across providers, the prefix can be omitted."#;
 
+fn providers_toml_section() -> String {
+    let mut plan_rows = String::new();
+    let mut plan_examples = String::new();
+    let mut builtins: Vec<_> = maki_config::providers::all_builtins();
+    builtins.sort_by_key(|b| b.slug);
+    let mut wrote_example = false;
+    for b in builtins {
+        let Some(plans) = b.plans.filter(|p| p.len() > 1) else {
+            continue;
+        };
+        if !wrote_example {
+            let _ = writeln!(plan_examples, "```toml");
+            wrote_example = true;
+        } else {
+            let _ = writeln!(plan_examples);
+        }
+        // Prefer a non-default plan key in the example when one exists.
+        let example_key = plans
+            .iter()
+            .find(|(_, p)| {
+                p.base_url != b.default_base_url || p.default_model != Some(b.default_model)
+            })
+            .unwrap_or(&plans[0])
+            .0;
+        let _ = writeln!(plan_examples, "[{}]", b.slug);
+        let _ = writeln!(plan_examples, "plan = \"{example_key}\"");
+        for (key, plan) in plans {
+            let mut detail = plan.display_name.to_string();
+            if !plan.base_url.is_empty() {
+                detail = format!("{detail} at `{}`", plan.base_url);
+            }
+            if let Some(model) = plan.default_model {
+                detail = format!("{detail}, default `{model}`");
+            }
+            let _ = writeln!(plan_rows, "| {} | `{key}` | {detail} |", b.display_name);
+        }
+    }
+    if wrote_example {
+        let _ = writeln!(plan_examples, "```");
+    }
+
+    let plans_body = if plan_rows.is_empty() {
+        "No built-in currently ships more than one plan.".to_string()
+    } else {
+        format!(
+            "Some built-ins ship multiple plans (different base URLs or default models). \
+`maki auth login <provider>` asks which plan to use when more than one exists. \
+You can also set it in TOML:\n\n\
+{plan_examples}\n\
+Current plans:\n\n\
+| Provider | Plan | What it does |\n\
+|----------|------|--------------|\n\
+{plan_rows}\n\
+Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file."
+        )
+    };
+
+    format!(
+        r#"## providers.toml
+
+`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+
+1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
+2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
+
+```toml
+# Point a built-in at a proxy. Env vars still win over this file.
+[anthropic]
+base_url = "https://my-proxy.internal"
+
+# Full custom provider. Slug becomes the `provider/` prefix in model specs.
+[my-proxy]
+display_name = "My Proxy"
+protocol = "openai"            # openai | openai-responses | anthropic | google
+base_url = "https://llm.example.com/v1"
+api_key_env = "MY_PROXY_API_KEY"
+default_model = "my-proxy/fast-v1"
+discover_models = true         # also list models via the provider's /models endpoint
+
+[[my-proxy.models]]
+id = "fast-v1"
+tier = "weak"
+context_window = 128000
+max_output_tokens = 16384
+pricing_input = 0.5
+pricing_output = 1.5
+
+[[my-proxy.models]]
+id = "smart-v1"
+tier = "strong"
+context_window = 200000
+max_output_tokens = 32000
+supports_thinking = true
+supports_vision = false
+```
+
+### Provider fields
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `display_name` | string | Shown in pickers and auth status |
+| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
+| `base_url` | string | Origin of the API. Maki appends the protocol paths |
+| `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
+| `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
+| `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
+| `default_model` | string | Used after login when no model is saved yet |
+| `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
+| `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
+| `models` | array | Declared models for custom providers (see below) |
+
+### Model fields
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `context_window` | u32 | protocol default | Tokens of context |
+| `max_output_tokens` | u32 | protocol default | Max completion tokens |
+| `supports_tool_examples` | bool | protocol default | |
+| `supports_thinking` | bool | protocol default | |
+| `supports_vision` | bool | protocol default | When false, image input and `view_image` are off |
+| `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
+| `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
+| `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+
+Custom slugs must not reuse a built-in provider name. A bad TOML parse exits with code 2 at startup so a typo cannot silently empty the registry.
+
+You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
+
+### Plans
+
+{plans_body}"#
+    )
+}
+
 fn dynamic_providers_section() -> String {
     let valid_values: Vec<String> = ProviderKind::iter().map(|k| format!("`{k}`")).collect();
 
     format!(
         r#"## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into `~/.config/maki/providers/`. The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|
@@ -112,8 +277,10 @@ fn format_pricing(entry: &ModelEntry) -> String {
 
 fn format_context(entry: &ModelEntry) -> String {
     let ctx_k = entry.context_window / 1_000;
-    let out_k = entry.max_output_tokens / 1_000;
-    format!("{ctx_k}K ctx / {out_k}K out")
+    match entry.max_output_tokens {
+        Some(out) => format!("{ctx_k}K ctx / {}K out", out / 1_000),
+        None => format!("{ctx_k}K ctx"),
+    }
 }
 
 struct ProviderSection {
@@ -152,7 +319,7 @@ fn build_sections() -> Vec<ProviderSection> {
                         "https://api.z.ai/api/coding/paas/v4",
                     ],
                     features: ProviderKind::Zai.features(),
-                    entries: models_for_provider(ProviderKind::Zai),
+                    entries: ManifestRegistry::get("zai").unwrap().models,
                 });
             }
             ProviderKind::OpenAi => {
@@ -162,7 +329,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: models_for_provider(kind),
+                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
                 });
             }
             ProviderKind::Copilot => {
@@ -175,7 +342,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     ),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: models_for_provider(kind),
+                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
                 });
             }
             _ => {
@@ -185,7 +352,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     auth_line: format_auth(kind),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: models_for_provider(kind),
+                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
                 });
             }
         }
@@ -204,41 +371,24 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         "|------|--------|-------------------------------|---------|"
     );
 
+    // A row per model, not per tier: prices and context sizes differ inside a
+    // tier, so one merged row would quote a single model's numbers for all.
     for tier in [ModelTier::Weak, ModelTier::Medium, ModelTier::Strong] {
-        let tier_entries: Vec<_> = entries.iter().filter(|e| e.tier == tier).collect();
-        if tier_entries.is_empty() {
-            continue;
-        }
-
-        let models: Vec<String> = tier_entries
-            .iter()
-            .map(|e| {
-                let names = e.prefixes.join(", ");
-                if e.default {
+        for entry in entries.iter().filter(|e| e.tier == tier) {
+            let names = entry.prefixes.join(", ");
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} |",
+                tier_label(tier),
+                if entry.default {
                     format!("**{names}** (default)")
                 } else {
                     names
-                }
-            })
-            .collect();
-
-        let pricing = tier_entries
-            .first()
-            .map(|e| format_pricing(e))
-            .unwrap_or_default();
-        let context = tier_entries
-            .first()
-            .map(|e| format_context(e))
-            .unwrap_or_default();
-
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} |",
-            tier_label(tier),
-            models.join(", "),
-            pricing,
-            context,
-        );
+                },
+                format_pricing(entry),
+                format_context(entry),
+            );
+        }
     }
 
     let defaults: Vec<String> = entries
@@ -329,6 +479,7 @@ pub fn generate() -> String {
     );
     let _ = writeln!(out, "{TIER_PICKER_NOTE}\n");
     let _ = writeln!(out, "{AUTH_RELOADING}\n");
+    let _ = writeln!(out, "{BASE_URL_OVERRIDES}\n");
     let _ = writeln!(out, "## Built-in Providers\n");
 
     for section in &build_sections() {
@@ -336,7 +487,12 @@ pub fn generate() -> String {
         let _ = writeln!(out);
     }
 
+    // Opencode Go is catalog-backed (no ProviderKind), so it gets a static
+    // section right after Opencode Zen, which is the last built-in section.
+    let _ = writeln!(out, "{OPENCODE_GO_SECTION}\n");
+
     let _ = writeln!(out, "{MODEL_IDENTIFIERS}\n");
+    let _ = writeln!(out, "{}\n", providers_toml_section());
     let _ = writeln!(out, "{}", dynamic_providers_section());
 
     out

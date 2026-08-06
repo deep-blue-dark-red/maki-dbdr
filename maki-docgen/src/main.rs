@@ -1,31 +1,31 @@
 mod gen_commands;
 mod gen_config;
 mod gen_keybindings;
+mod gen_lua_api;
 mod gen_providers;
 mod gen_tools;
 mod lua_util;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const CONTENT_DIR: &str = "site/docs/content";
 
-fn page_path(section: &str) -> std::path::PathBuf {
+fn page_path(section: &str) -> PathBuf {
     Path::new(CONTENT_DIR).join(section).join("_index.md")
 }
 
-fn write_page(section: &str, content: &str) {
-    let dir = Path::new(CONTENT_DIR).join(section);
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("_index.md");
-    fs::write(&path, content).unwrap();
+fn write_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, content).unwrap();
     println!("wrote {}", path.display());
 }
 
-fn check_page(section: &str, expected: &str) -> bool {
-    let path = page_path(section);
-    match fs::read_to_string(&path) {
+fn check_file(path: &Path, expected: &str) -> bool {
+    match fs::read_to_string(path) {
         Ok(existing) if existing == expected => {
             println!("ok {}", path.display());
             true
@@ -44,44 +44,49 @@ fn check_page(section: &str, expected: &str) -> bool {
 fn main() -> ExitCode {
     let check = std::env::args().any(|a| a == "--check");
 
-    let ((tools, providers), (config, (keybindings, commands))) = smol::block_on(async {
-        smol::future::zip(
+    let ((tools, providers), ((config, lua_api), (keybindings, commands))) =
+        smol::block_on(async {
             smol::future::zip(
-                smol::unblock(gen_tools::generate),
-                smol::unblock(gen_providers::generate),
-            ),
-            smol::future::zip(
-                smol::unblock(gen_config::generate),
                 smol::future::zip(
-                    smol::unblock(gen_keybindings::generate),
-                    smol::unblock(gen_commands::generate),
+                    smol::unblock(gen_tools::generate),
+                    smol::unblock(gen_providers::generate),
                 ),
-            ),
-        )
-        .await
-    });
-
-    let pages = [
-        ("tools", tools),
-        ("providers", providers),
-        ("configuration", config),
-        ("keybindings", keybindings),
-        ("commands", commands),
+                smol::future::zip(
+                    smol::future::zip(
+                        smol::unblock(gen_config::generate),
+                        smol::unblock(gen_lua_api::generate),
+                    ),
+                    smol::future::zip(
+                        smol::unblock(gen_keybindings::generate),
+                        smol::unblock(gen_commands::generate),
+                    ),
+                ),
+            )
+            .await
+        });
+    let outputs = [
+        (page_path("tools"), tools),
+        (page_path("providers"), providers),
+        (page_path("configuration"), config),
+        (page_path("lua-api"), lua_api),
+        (page_path("keybindings"), keybindings),
+        (page_path("commands"), commands),
     ];
 
     if check {
-        let all_ok = pages
+        let mismatches = outputs
             .iter()
-            .all(|(section, content)| check_page(section, content));
-        if all_ok {
+            .filter(|(path, content)| !check_file(path, content))
+            .count();
+        if mismatches == 0 {
             ExitCode::SUCCESS
         } else {
             eprintln!("docs out of date, run `just gen-docs` to update");
             ExitCode::FAILURE
         }
     } else {
-        for (section, content) in pages {
-            write_page(section, &content);
+        for (path, content) in &outputs {
+            write_file(path, content);
         }
         ExitCode::SUCCESS
     }

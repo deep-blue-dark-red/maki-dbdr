@@ -1,5 +1,5 @@
 [package]
-name = "maki-tool-macro"
+name = "maki-lua-macro"
 version.workspace = true
 edition.workspace = true
 

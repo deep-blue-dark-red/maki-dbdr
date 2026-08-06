@@ -25,6 +25,15 @@ pub enum Language {
     Starlark,
     Zig,
     Nix,
+    Dart,
+    Sql,
+    Toml,
+    Yaml,
+    Containerfile,
+    Css,
+    Hcl,
+    Json,
+    Make,
 }
 
 impl Language {
@@ -53,6 +62,15 @@ impl Language {
             "starlark" => Some(Self::Starlark),
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
+            "dart" => Some(Self::Dart),
+            "sql" => Some(Self::Sql),
+            "toml" => Some(Self::Toml),
+            "yaml" => Some(Self::Yaml),
+            "containerfile" | "dockerfile" => Some(Self::Containerfile),
+            "css" => Some(Self::Css),
+            "hcl" => Some(Self::Hcl),
+            "json" => Some(Self::Json),
+            "make" => Some(Self::Make),
             _ => None,
         }
     }
@@ -82,6 +100,15 @@ impl Language {
             "bzl" => Some(Self::Starlark),
             "zig" => Some(Self::Zig),
             "nix" => Some(Self::Nix),
+            "dart" => Some(Self::Dart),
+            "sql" => Some(Self::Sql),
+            "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "dockerfile" => Some(Self::Containerfile),
+            "css" => Some(Self::Css),
+            "hcl" | "tf" | "tfvars" => Some(Self::Hcl),
+            "json" => Some(Self::Json),
+            "mk" => Some(Self::Make),
             _ => None,
         }
     }
@@ -111,6 +138,15 @@ impl Language {
             Self::Starlark => tree_sitter_starlark::LANGUAGE.into(),
             Self::Zig => tree_sitter_zig::LANGUAGE.into(),
             Self::Nix => tree_sitter_nix::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Self::Sql => tree_sitter_sequel::LANGUAGE.into(),
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Containerfile => tree_sitter_containerfile::LANGUAGE.into(),
+            Self::Css => tree_sitter_css::LANGUAGE.into(),
+            Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Make => tree_sitter_make::LANGUAGE.into(),
         }
     }
 }

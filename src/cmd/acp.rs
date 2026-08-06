@@ -11,18 +11,18 @@ use maki_storage::StateDir;
 
 use crate::setup;
 
-pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
+pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
 
-    let mut plugin_host = PluginHost::new(Arc::clone(ToolRegistry::global_arc()))
+    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
     let raw_config = plugin_host
-        .load_init_files(&cwd)
+        .load_init_files_or_skip(no_plugins, &cwd)
         .context("load init.lua files")?;
 
     let mut config = raw_config
@@ -48,15 +48,13 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
 
     let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
 
-    setup::init_logging(&storage, &config.storage);
+    setup::init_logging(&config.storage);
     setup::install_panic_log_hook();
+    setup::warn_ignored_provider_fields();
 
-    let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));
+    let (mcp_handle, _mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));
 
-    let prompt_slots = plugin_host
-        .event_handle()
-        .map(|h| h.collect_prompt_slots())
-        .unwrap_or_default();
+    let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
     maki_acp::run(maki_acp::AcpParams {
         model,

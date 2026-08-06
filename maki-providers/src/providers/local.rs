@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use futures::future::join_all;
+use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -134,7 +135,7 @@ impl Provider for LocalEndpoint {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a str>,
+        _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
@@ -142,7 +143,8 @@ impl Provider for LocalEndpoint {
             if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
                 let mut buf = String::new();
                 let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-                let body = responses::build_body(model, messages, system, tools);
+                let mut body = responses::build_body(model, messages, system, tools);
+                body["return_progress"] = serde_json::Value::Bool(true);
                 // TODO: wire thinking budget into responses API when llama.cpp supports it
                 return responses::do_stream(
                     self.compat.client(),
@@ -160,7 +162,7 @@ impl Provider for LocalEndpoint {
             let mut body = self.compat.build_body(model, messages, system, tools);
 
             if self.thinking_budget_field {
-                opts.thinking.apply_local_thinking(&mut body);
+                opts.thinking.apply_local_thinking(&mut body, model);
             }
 
             self.compat
@@ -222,6 +224,16 @@ struct LlamaCppModelData {
     status: Option<LlamaCppStatus>,
     #[serde(default)]
     max_model_len: Option<u32>,
+    #[serde(default)]
+    architecture: Option<LlamaCppArchitecture>,
+}
+
+#[derive(Deserialize)]
+struct LlamaCppArchitecture {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    output_modalities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,16 +288,29 @@ impl LocalEndpoint {
         let mut models: Vec<crate::model::ModelInfo> = body
             .data
             .into_iter()
-            .map(|m| {
+            .filter_map(|m| {
+                let arch = m.architecture.as_ref();
+                let has_text_input = arch
+                    .map(|a| a.input_modalities.iter().any(|m| m == "text"))
+                    .unwrap_or(true);
+                let has_text_output = arch
+                    .map(|a| a.output_modalities.iter().any(|m| m == "text"))
+                    .unwrap_or(true);
+                if !has_text_input || !has_text_output {
+                    return None;
+                }
                 let context_window = llamacpp_extract_ctx_from_model(&m, &mode, props_n_ctx);
-                crate::model::ModelInfo {
+                let supports_vision = arch.map(|a| a.input_modalities.iter().any(|m| m == "image"));
+                Some(crate::model::ModelInfo {
                     id: m.id,
                     context_window: Some(context_window),
                     max_output_tokens: None,
                     pricing: Some(crate::model::ModelPricing::ZERO),
                     supports_thinking: None,
+                    supports_vision,
+                    tier: None,
                     provider_info: None,
-                }
+                })
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -391,6 +416,8 @@ impl LocalEndpoint {
                 max_output_tokens: None,
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,
+                supports_vision: None,
+                tier: None,
                 provider_info: None,
             })
             .collect();
@@ -478,6 +505,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: Some("https://ollama.com/v1"),
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
+        slug: "ollama",
         api_key_env: "",
         base_url: "http://localhost:11434/v1",
         max_tokens_field: "max_tokens",
@@ -497,6 +525,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: None,
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
+        slug: "llama-cpp",
         api_key_env: "",
         base_url: "http://localhost:8080/v1",
         max_tokens_field: "max_tokens",
@@ -639,6 +668,7 @@ mod tests {
                 meta: Some(LlamaCppMeta { n_ctx }),
                 status: None,
                 max_model_len: None,
+                architecture: None,
             }
         }
 
@@ -648,6 +678,7 @@ mod tests {
                 meta: None,
                 status: Some(LlamaCppStatus { args }),
                 max_model_len: None,
+                architecture: None,
             }
         }
 
@@ -657,6 +688,7 @@ mod tests {
                 meta: None,
                 status: None,
                 max_model_len: Some(v),
+                architecture: None,
             }
         }
 
@@ -666,6 +698,7 @@ mod tests {
                 meta: None,
                 status: None,
                 max_model_len: None,
+                architecture: None,
             }
         }
 

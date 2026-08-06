@@ -1,11 +1,13 @@
 use std::fmt::Write;
+use std::sync::Arc;
 
+use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, ConfigField, DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_FILE_SIZE_MB,
-    DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MOUSE_SCROLL_LINES, INDEX_FIELDS,
-    MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, ToolOutputLines,
-    UiConfig,
+    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, StorageConfig,
+    TOP_LEVEL_FIELDS, ToolOutputLines, UiConfig,
 };
+use maki_lua::{PluginHost, PluginOptionSpecs};
 
 fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
     writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
@@ -66,6 +68,69 @@ fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
     writeln!(out).unwrap();
 }
 
+fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
+    for (plugin, options) in specs {
+        writeln!(out, "### `plugins.{plugin}`\n").unwrap();
+        writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
+        writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
+        for o in options {
+            let default = o
+                .default
+                .as_ref()
+                .map_or("-".to_string(), |d| format!("`{d}`"));
+            let min = o.min.map_or("-".to_string(), |m| m.to_string());
+            writeln!(
+                out,
+                "| `{name}` | {ty} | {default} | {min} | {desc} |",
+                name = o.name,
+                ty = o.ty,
+                desc = o.desc,
+            )
+            .unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+}
+
+fn collect_plugin_options() -> PluginOptionSpecs {
+    let host =
+        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins");
+    let specs = host.plugin_options().expect("collecting plugin options");
+    assert!(
+        !specs.is_empty(),
+        "no plugin declared options; the plugins reference would be empty"
+    );
+    specs
+}
+
+fn write_theme_section(out: &mut String) {
+    writeln!(out, "### `ui.theme`\n").unwrap();
+    writeln!(
+        out,
+        "Name of the color theme to load at startup, overriding the theme you \
+         last picked interactively. If unset, Maki keeps your last selection \
+         (the built-in default on first run). An unknown name is ignored with \
+         a warning.\n"
+    )
+    .unwrap();
+    let names = maki_ui::BUNDLED_THEMES
+        .iter()
+        .map(|t| format!("`{}`", t.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(out, "Available themes: {names}.\n").unwrap();
+    writeln!(
+        out,
+        "Themes use 24-bit colors, but not every terminal can show them. Maki \
+         checks the environment, terminfo, and the terminal itself, and when \
+         truecolor is missing it quietly falls back to the closest of the 256 \
+         classic terminal colors. If detection gets it wrong, set \
+         `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force \
+         the fallback.\n"
+    )
+    .unwrap();
+}
+
 fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
@@ -113,13 +178,13 @@ maki.setup({{
     ui = {{
         splash_animation = true,
         mouse_scroll_lines = {mouse_scroll},
+        theme = \"tokyonight\",
         tool_output_lines = {{
             bash = {tol_bash},
             read = {tol_read},
         }},
     }},
     agent = {{
-        bash_timeout_secs = {bash_timeout},
         max_output_lines = {max_output_lines},
     }},
     provider = {{
@@ -128,8 +193,9 @@ maki.setup({{
     storage = {{
         max_log_files = {max_log_files},
     }},
-    index = {{
-        max_file_size_mb = {max_file_size},
+    plugins = {{
+        bash = {{ timeout_secs = 180 }},
+        index = {{ max_file_size_mb = 4 }},
     }},
 }})
 ```
@@ -143,10 +209,8 @@ All fields are optional. Typos in field names cause an error right away.
         mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
-        bash_timeout = DEFAULT_BASH_TIMEOUT_SECS + 60,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
-        max_file_size = DEFAULT_MAX_FILE_SIZE_MB + 2,
     )
     .unwrap();
 
@@ -155,18 +219,25 @@ All fields are optional. Typos in field names cause an error right away.
     writeln!(out).unwrap();
 
     write_section(&mut out, "[ui]", UiConfig::FIELDS);
+    write_theme_section(&mut out);
     write_tool_output_section(&mut out);
     write_section(&mut out, "[agent]", AgentConfig::FIELDS);
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
-    write_section(&mut out, "[index]", INDEX_FIELDS);
 
-    writeln!(out, "## Tools\n").unwrap();
+    writeln!(out, "## Plugins\n").unwrap();
     writeln!(
         out,
-        "The `tools` table lets you turn tools on or off. \
-         By default `index`, `webfetch`, and `websearch` are on. \
-         `bash` is off by default.\n"
+        "The `plugins` table turns plugins on or off and passes options to \
+         them. All bundled plugins are on by default. Set \
+         `enabled = false` to turn one off.\n\n\
+         Each plugin checks its own options at startup. A typo, a wrong \
+         type, or an unknown plugin name gives you a clear error right \
+         away.\n\n\
+         The edit plugin's extra tools are options too: \
+         `plugins.edit = {{ multiedit = false, edit_lines = true }}`. \
+         The old `tools` table is gone. If your config still uses it, \
+         Maki stops at startup and shows you the new form.\n"
     )
     .unwrap();
     writeln!(
@@ -174,14 +245,16 @@ All fields are optional. Typos in field names cause an error right away.
         "\
 ```lua
 maki.setup({{
-    tools = {{
-        bash = {{ enabled = true }},
+    plugins = {{
+        bash = {{ timeout_secs = 180 }},
         websearch = {{ enabled = false }},
     }},
 }})
 ```\n"
     )
     .unwrap();
+
+    write_plugin_options(&mut out, &collect_plugin_options());
 
     writeln!(out, "## Validation\n").unwrap();
     writeln!(
@@ -196,80 +269,48 @@ maki.setup({{
         "
 ## Directory layout
 
-Maki uses XDG directories on Linux and macOS:
+Maki follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).
 
-| Purpose | Path |
-|---------|------|
-| Config | `~/.config/maki/` (init.lua, permissions.toml, mcp.toml) |
-| Data | `~/.local/share/maki/` |
-| Logs | `~/.local/logs/maki/` |
-| State | `~/.local/state/maki/` |
+| Purpose | Linux / macOS | Windows |
+|---------|---------------|---------|
+| Config | `~/.config/maki/` | `%APPDATA%\\maki\\` |
+| Data | `~/.local/share/maki/` | `%APPDATA%\\maki\\` |
+| State | `~/.local/state/maki/` | `%APPDATA%\\maki\\` |
+| Logs | `~/.local/logs/maki/` | `%APPDATA%\\maki\\` |
+| Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\\maki\\` |
 
-`~/.maki/` is checked as a legacy fallback.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
+
+`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 
 ### Migrating from ~/.maki/
-
-Older versions stored everything in `~/.maki/`. If that directory still exists, maki uses it
-as a fallback. To move to XDG directories, run:
 
 ```
 maki migrate xdg
 ```
 
-This safely moves sessions, auth, plans, memories, logs, and preferences to XDG locations.
-Where both old and new files exist, they are merged (input history, model tiers, etc.).
-Nothing is deleted until it has been copied. At the end you get a summary of where everything
-lives now.
+This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
 
 Safe to run more than once.
 
 ## Personal Instructions
 
-On top of `AGENTS.md`, you can add your own instructions in two places:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
 
-- `AGENTS.local.md` at project root for per-project preferences (gitignored)
+- `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
 
-Both are added to the system prompt at the start of every session.
+All of these are added to the system prompt at the start of every session.
 
-## Migrating from config.toml
+## Memory
 
-Still have a `config.toml`? Here is how to switch over.
+The `memory` tool and `/memory` command store small Markdown notes under the state directory, scoped per project:
 
-**Rename your config files:**
+`…/state/maki/projects/<project-id>/memories/`
 
-```
-~/.config/maki/config.toml  ->  ~/.config/maki/init.lua
-.maki/config.toml           ->  .maki/init.lua
-```
+(Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\\maki\\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
-**Wrap the content in `maki.setup()`:**
-
-Before:
-
-```toml
-[agent]
-bash_timeout_secs = 180
-```
-
-After:
-
-```lua
-maki.setup({{
-    agent = {{ bash_timeout_secs = 180 }},
-}})
-```
-
-Same field names, just Lua syntax instead of TOML.
-
-**Move MCP sections to `mcp.toml`.**
-
-- `~/.config/maki/mcp.toml` (global)
-- `.maki/mcp.toml` (per-project)
-
-Same format, just a different file. See [MCP](/docs/mcp/).
-
-**Permissions stay in `permissions.toml`.**"
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml)."
     )
     .unwrap();
 
