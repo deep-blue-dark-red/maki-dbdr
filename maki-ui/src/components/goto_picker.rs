@@ -85,7 +85,7 @@ impl GotoPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> GotoPickerAction {
         match self.picker.handle_key(key) {
             PickerAction::Consumed => GotoPickerAction::Consumed,
-            PickerAction::Select(_, entry) => GotoPickerAction::Select(entry),
+            PickerAction::Select(entry) => GotoPickerAction::Select(entry),
             PickerAction::Close => GotoPickerAction::Close,
             PickerAction::Toggle(..) => GotoPickerAction::Consumed,
         }

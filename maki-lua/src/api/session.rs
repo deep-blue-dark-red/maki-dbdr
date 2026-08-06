@@ -28,12 +28,22 @@ async fn roundtrip(
 /// Lists sessions stored for the current project. Answered from a
 /// background scan, so a slow disk never blocks the UI.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at}`, or nil and an error.
+/// @param opts table? Optional fields: global (boolean) list sessions from
+///   every project directory instead of just the current one.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, context_size}`, or nil and an error.
 /// @example
-/// local stored, err = maki.session.list()
+/// local stored, err = maki.session.list({ global = true })
 #[lua_fn]
-async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
-    roundtrip(lua, tx, SessionRequest::List).await
+async fn list(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let global = match opts {
+        Some(opts) => opts.get("global").unwrap_or(false),
+        None => false,
+    };
+    roundtrip(lua, tx, SessionRequest::List { global }).await
 }
 
 /// Lists the sessions currently running in this UI. Status is "working",

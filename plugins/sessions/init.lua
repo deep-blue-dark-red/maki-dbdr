@@ -17,6 +17,8 @@ local LOADING_HINT = "  Loading sessions…"
 local CURRENT_LABEL = "current"
 local TICK_MS = 100
 local AGE_TICKS = 10
+local GLOBAL_ON_HINT = "Showing sessions from all projects"
+local GLOBAL_OFF_HINT = "Showing sessions from this project"
 -- Placeholder only: the host swaps "spinner:*"-styled spans for the live
 -- animated frame, so working rows spin without this plugin redrawing.
 local WORKING_ICON = "· "
@@ -33,6 +35,7 @@ local FILTER_KEYS = {
   { "Ctrl+N", "new" },
   { "Ctrl+R", "rename" },
   { "Ctrl+D", "delete" },
+  { "Ctrl+Shift+M", "all projects" },
 }
 local RENAME_KEYS = {
   { "Enter", "save" },
@@ -148,6 +151,16 @@ local function age(updated_at)
   return "just now"
 end
 
+local function format_context_size(tokens)
+  tokens = tokens or 0
+  if tokens >= 1000000 then
+    return string.format("%.1fM", tokens / 1000000)
+  elseif tokens >= 1000 then
+    return string.format("%.1fK", tokens / 1000)
+  end
+  return tostring(tokens)
+end
+
 local function dispw(s)
   return utf8.len(s) or #s
 end
@@ -172,7 +185,8 @@ local function render()
     local selected = s.id == board.sel_id
     local icon, icon_style, spinning = icon_of(s)
     local base = selected and "selected" or "item"
-    local right = s.focused and CURRENT_LABEL or age(s.updated_at)
+    local ctx = "ctx: " .. format_context_size(s.context_size) .. " · "
+    local right = ctx .. (s.focused and CURRENT_LABEL or age(s.updated_at))
     local right_style = selected and "selected" or (s.focused and "accent" or "dim")
     if selected then
       icon_style = "selected"
@@ -438,6 +452,8 @@ local function handle_key(key)
     start_rename()
   elseif key == "ctrl+d" then
     delete_selected()
+  elseif key == "ctrl+shift+m" then
+    toggle_global()
   else
     local r = board.input:handle_key(key)
     if r ~= "ignored" then
@@ -449,6 +465,42 @@ local function handle_key(key)
       render()
     end
   end
+end
+
+-- Reloads the stored-session scan for the board's current `global` scope.
+-- Called on open and again whenever the scope is toggled.
+local function load_stored()
+  local this_board = board
+  board.loading = true
+  board.stored = nil
+  refresh()
+  maki.async.run(function()
+    local stored, err = maki.session.list({ global = board.global })
+    if board ~= this_board then
+      return
+    end
+    if err then
+      maki.ui.flash(err)
+      stored = {}
+    end
+    -- A delete may have landed while the scan was in flight; never let the
+    -- stale snapshot resurrect that session as a ghost row.
+    local kept = {}
+    for _, st in ipairs(stored) do
+      if not board.deleted[st.id] then
+        kept[#kept + 1] = st
+      end
+    end
+    board.stored = kept
+    board.loading = false
+    refresh()
+  end)
+end
+
+local function toggle_global()
+  board.global = not board.global
+  maki.ui.flash(board.global and GLOBAL_ON_HINT or GLOBAL_OFF_HINT)
+  load_stored()
 end
 
 local function open()
@@ -481,33 +533,13 @@ local function open()
     sel_id = nil,
     frame = 0,
     loading = true,
+    global = false,
   }
   -- Two-phase load: live sessions are cheap, so they show up and take keys
   -- right away; the stored scan can be slow, so a background task merges it
   -- in once it lands.
   refresh()
-  local this_board = board
-  maki.async.run(function()
-    local stored, err = maki.session.list()
-    if board ~= this_board then
-      return
-    end
-    if err then
-      maki.ui.flash(err)
-      stored = {}
-    end
-    -- A delete may have landed while the scan was in flight; never let the
-    -- stale snapshot resurrect that session as a ghost row.
-    local kept = {}
-    for _, st in ipairs(stored) do
-      if not board.deleted[st.id] then
-        kept[#kept + 1] = st
-      end
-    end
-    board.stored = kept
-    board.loading = false
-    refresh()
-  end)
+  load_stored()
   while board do
     local ev = board.win:recv(TICK_MS)
     if not ev or ev.type == "close" then

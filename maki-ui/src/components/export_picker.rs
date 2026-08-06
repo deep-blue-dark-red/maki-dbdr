@@ -77,7 +77,7 @@ impl ExportPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> ExportPickerAction {
         match self.picker.handle_key(key) {
             PickerAction::Consumed | PickerAction::Toggle(_, _) => ExportPickerAction::Consumed,
-            PickerAction::Select(_, entry) => {
+            PickerAction::Select(entry) => {
                 self.picker.close();
                 ExportPickerAction::Select(entry)
             }

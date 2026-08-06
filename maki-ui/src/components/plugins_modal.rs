@@ -40,9 +40,9 @@ impl PluginsModal {
         }
     }
 
-    pub fn open(&mut self, event_handle: &Option<EventHandle>) {
+    pub fn open(&mut self, event_handle: &EventHandle) {
         self.open = true;
-        self.event_handle = event_handle.clone();
+        self.event_handle = Some(event_handle.clone());
         self.selected = 0;
         self.refresh();
     }
