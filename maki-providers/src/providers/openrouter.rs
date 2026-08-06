@@ -19,6 +19,7 @@ const APP_TITLE: &str = "maki";
 const PER_MILLION: f64 = 1_000_000.0;
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "openrouter",
     api_key_env: "OPENROUTER_API_KEY",
     base_url: "https://openrouter.ai/api/v1",
     max_tokens_field: "max_tokens",
@@ -160,6 +161,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
         pricing: Some(pricing),
         supports_thinking: Some(supports_thinking),
         supports_vision: Some(supports_vision),
+        tier: None,
         provider_info: reasoning.map(|r| Arc::new(r) as Arc<dyn std::any::Any + Send + Sync>),
     })
 }

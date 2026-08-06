@@ -21,9 +21,13 @@ pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
+pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+
+pub const MIN_MAX_INPUT_LINES: u32 = 1;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -37,6 +41,7 @@ pub const MIN_OUTPUT_BYTES: usize = 1024;
 pub const MIN_OUTPUT_LINES: usize = 10;
 pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
+pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
 const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
     r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
@@ -70,12 +75,18 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "write",
 ];
 
+pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
+
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
 /// pointer to the new one.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+
+pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {
@@ -321,7 +332,10 @@ pub struct UiFileConfig {
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
+    pub theme: Option<String>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
+    pub show_token_stats: Option<bool>,
+    pub max_input_lines: Option<u32>,
 }
 
 impl UiFileConfig {
@@ -334,7 +348,10 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
-            show_thinking
+            show_thinking,
+            show_token_stats,
+            theme,
+            max_input_lines
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -451,6 +468,8 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+    pub task_max_concurrent: Option<usize>,
+    pub stale_read_check: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -461,7 +480,9 @@ impl AgentFileConfig {
             max_output_bytes,
             max_output_lines,
             max_continuation_turns,
-            compaction_buffer
+            compaction_buffer,
+            task_max_concurrent,
+            stale_read_check
         );
     }
 }
@@ -793,7 +814,7 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
-#[derive(Debug, Clone, Copy, ConfigSection)]
+#[derive(Debug, Clone, ConfigSection)]
 #[config(section = "ui")]
 pub struct UiConfig {
     #[config(default = true, desc = "Show splash animation on startup")]
@@ -811,14 +832,24 @@ pub struct UiConfig {
     #[config(default = DEFAULT_MOUSE_SCROLL_LINES, min = MIN_MOUSE_SCROLL_LINES, desc = "Lines per mouse wheel scroll")]
     pub mouse_scroll_lines: u32,
 
+    #[config(default = DEFAULT_MAX_INPUT_LINES, min = MIN_MAX_INPUT_LINES, desc = "Maximum visible input lines")]
+    pub max_input_lines: u32,
+
     #[config(
         default = true,
         desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
     )]
     pub show_thinking: bool,
 
+    #[config(skip, default = "None")]
+    pub theme: Option<String>,
+
+
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
+
+    #[config(default = false, desc = "Show token statistics (tokens/sec, cache rate) in status bar")]
+    pub show_token_stats: bool,
 }
 
 impl UiConfig {
@@ -835,8 +866,11 @@ impl UiConfig {
                 .typewriter_ms_per_char
                 .unwrap_or(DEFAULT_TYPEWRITER_MS_PER_CHAR),
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
+            max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
+            theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
+            show_token_stats: f.show_token_stats.unwrap_or(false),
         }
     }
 
@@ -965,6 +999,15 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_COMPACTION_BUFFER, ty = "u32 | string", default_doc = "20%", desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")")]
     pub compaction_buffer: CompactionBuffer,
 
+    #[config(
+        default = true,
+        desc = "Require re-reading a file that changed on disk before editing it"
+    )]
+    pub stale_read_check: bool,
+
+    #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (task tool)")]
+    pub task_max_concurrent: usize,
+
     #[config(skip, default = false)]
     pub no_rtk: bool,
 
@@ -988,6 +1031,10 @@ impl AgentConfig {
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            task_max_concurrent: file
+                .task_max_concurrent
+                .unwrap_or(DEFAULT_TASK_MAX_CONCURRENT),
+            stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
@@ -1952,6 +1999,25 @@ mod tests {
         assert!(raw.into_config(false).unwrap().always_workflow);
     }
 
+    #[test]
+    fn task_max_concurrent_resolves_default_and_set() {
+        let defaults = RawConfig::default().into_config(false).unwrap();
+        assert_eq!(
+            defaults.agent.task_max_concurrent,
+            DEFAULT_TASK_MAX_CONCURRENT
+        );
+
+        let raw = RawConfig {
+            agent: AgentFileConfig {
+                task_max_concurrent: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(raw.into_config(false).unwrap().agent.task_max_concurrent, 3);
+    }
+
+
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
     #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]
     #[test_case(AlwaysThinking::Budget(8192), StoredThinking::Budget { tokens: 8192 } ; "budget_number")]
@@ -1987,11 +2053,13 @@ mod tests {
     #[test_case("max_output_bytes",  0 ; "zero_output_bytes")]
     #[test_case("max_output_lines",  0 ; "zero_output_lines")]
     #[test_case("max_output_bytes",  500 ; "below_min_output_bytes")]
+    #[test_case("task_max_concurrent", 0 ; "zero_task_max_concurrent")]
     fn validate_rejects_invalid_agent(field: &str, value: usize) {
         let mut config = AgentConfig::default();
         match field {
             "max_output_bytes" => config.max_output_bytes = value,
             "max_output_lines" => config.max_output_lines = value,
+            "task_max_concurrent" => config.task_max_concurrent = value,
             _ => unreachable!(),
         }
         let err = config.validate().unwrap_err();
@@ -2023,6 +2091,7 @@ mod tests {
     #[test_case("provider", "connect_timeout_secs", 0 ; "provider_zero_connect_timeout")]
     #[test_case("storage",  "max_log_files",        0 ; "storage_zero_log_files")]
     #[test_case("ui",       "mouse_scroll_lines",   0 ; "ui_zero_scroll_lines")]
+    #[test_case("ui",       "max_input_lines",      0 ; "ui_zero_max_input_lines")]
     #[test_case("agent",    "max_output_lines",     1 ; "agent_output_lines_too_low")]
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
@@ -2043,6 +2112,7 @@ mod tests {
             }
             ("storage", "max_log_files") => config.storage.max_log_files = value as u32,
             ("ui", "mouse_scroll_lines") => config.ui.mouse_scroll_lines = value as u32,
+            ("ui", "max_input_lines") => config.ui.max_input_lines = value as u32,
             ("agent", "max_output_lines") => config.agent.max_output_lines = value as usize,
             _ => unreachable!(),
         }
@@ -2435,6 +2505,16 @@ mod tests {
         let raw: RawConfig = toml::from_str("").unwrap();
         let config = raw.into_config(false).unwrap();
         assert!(config.ui.show_thinking);
+    }
+
+    #[test]
+    fn max_input_lines_defaults_and_deserializes() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.ui.max_input_lines, DEFAULT_MAX_INPUT_LINES);
+
+        let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
+        assert_eq!(raw.ui.max_input_lines.unwrap(), 5);
     }
 
     #[test_case("[ui]\nsplash_animaton = true\n" ; "top_level_typo")]

@@ -1,11 +1,62 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use maki_agent::tools::{ToolRegistry, ToolSource, timeout_annotation};
+use maki_agent::ToolOutput;
+use maki_agent::tools::{
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
+    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+};
 use maki_config::{AlwaysThinking, PluginsConfig, ToolOutputLines};
 use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
-use std::path::Path;
+use maki_storage::id::SessionRef;
+#[cfg(unix)]
+use rustix::process::{Pid, test_kill_process_group};
+use serde_json::{Value, json};
+
+const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const USAGE_TOOL_NAME: &str = "usage_child";
+const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
+const USAGE_OUTPUT: &str = "usage_done";
+
+/// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
+/// a native stub stands in for one.
+struct UsageTool;
+
+impl ToolInvocation for UsageTool {
+    fn start_header(&self) -> HeaderFuture {
+        HeaderFuture::Ready(HeaderResult::plain(USAGE_TOOL_NAME.into()))
+    }
+
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+        Box::pin(async move {
+            if let Some(sink) = &ctx.live_sink {
+                let _ = sink.send(ToolLive::Usage(USAGE_VALUE.into()));
+            }
+            ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(USAGE_OUTPUT.into())))
+        })
+    }
+}
+
+impl Tool for UsageTool {
+    fn name(&self) -> &str {
+        USAGE_TOOL_NAME
+    }
+
+    fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+        "emits usage".into()
+    }
+
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}, "additionalProperties": false})
+    }
+
+    fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+        Ok(Box::new(UsageTool))
+    }
+}
 
 fn fresh_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::new())
@@ -184,6 +235,79 @@ fn register_echo_tool() {
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
     assert_eq!(out, "hello");
+}
+
+const SESSION_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "whoami",
+    description = "reports the calling session",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        local id, err = ctx:session_id()
+        if err then
+            return "err:" .. err
+        end
+        return "id:" .. tostring(id)
+    end,
+})
+"#;
+
+fn exec_with_ctx(
+    reg: &ToolRegistry,
+    name: &str,
+    input: serde_json::Value,
+    ctx: &ToolContext,
+) -> Result<String, String> {
+    let entry = reg
+        .get(name)
+        .unwrap_or_else(|| panic!("tool {name} not registered"));
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    smol::block_on(async { inv.execute(ctx).await })
+        .output
+        .map(|out| match out {
+            maki_agent::ToolOutput::Plain(s) => s.text,
+            other => panic!("unexpected output: {other:?}"),
+        })
+}
+
+/// The point of the whole thing: a handler learns who called it without
+/// asking `maki.session.current()`, which answers with whoever is focused.
+#[test]
+fn handler_reads_the_calling_session() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
+
+    let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+        .parse()
+        .expect("valid session id");
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session.clone());
+
+    let out = exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap();
+    assert_eq!(
+        out,
+        format!("id:{}", session.id()),
+        "lua sees the canonical form, so it compares equal to maki.session.current()"
+    );
+    assert_ne!(
+        out,
+        format!("id:{}", session.as_str()),
+        "the verbatim form would not match ids from maki.session.live()"
+    );
+}
+
+#[test]
+fn handler_without_a_session_gets_nil_and_no_error() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("session_plugin", SESSION_PLUGIN).unwrap();
+
+    let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    assert_eq!(
+        exec_with_ctx(&reg, "whoami", json!({}), &ctx).unwrap(),
+        "id:nil"
+    );
 }
 
 #[test]
@@ -366,7 +490,7 @@ fn restore_snapshot_text(
 ) -> String {
     let host = PluginHost::new(fresh_registry()).unwrap();
     host.load_source("restore_plugin", src).unwrap();
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
 
     handle.request_restore(
@@ -536,6 +660,36 @@ fn agent_api_value_failures_return_err_pairs() {
     host.load_source("agent_pairs_plugin", &src).unwrap();
     let out = exec_tool(&reg, "agent_pairs_probe", serde_json::json!({})).unwrap();
     assert_eq!(out, "prompt_err tools_err model_err");
+}
+
+/// `spec` must win over `tier` when both are given, proving the task plugin's
+/// `model` field (forwarded as `spec`) takes precedence over `model_tier`.
+#[test]
+fn resolve_model_spec_takes_precedence_over_tier() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "spec_precedence_probe",
+            description = "t",
+            schema = {MINIMAL_SCHEMA},
+            audiences = {{ "main" }},
+            handler = function(input, ctx)
+                local m, err = maki.agent.resolve_model(ctx, {{
+                    tier = "weak",
+                    spec = "anthropic/claude-opus-4-8",
+                }})
+                if err then return "err:" .. err end
+                return m.spec
+            end
+        }})"#
+    );
+    host.load_source("spec_precedence_probe", &src).unwrap();
+    let out = exec_tool(&reg, "spec_precedence_probe", serde_json::json!({})).unwrap();
+    assert_eq!(
+        out, "anthropic/claude-opus-4-8",
+        "spec must override tier when both are set"
+    );
 }
 
 /// Restore used to lose anything drawn via `maki.async.run`: those tasks
@@ -1185,7 +1339,7 @@ fn click_until_finished(
     tool: &str,
     click_id: &'static str,
 ) -> String {
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     let entry = reg.get(tool).expect("tool registered");
     let inv = entry.tool.parse(&serde_json::json!({})).expect("parse");
     let worker = std::thread::spawn(move || {
@@ -1405,7 +1559,7 @@ fn warm_click_reaches_finished_tool(is_error: bool) {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (fb_tx, fb_rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
         0,
@@ -1430,7 +1584,7 @@ fn click_fallback_restores_when_warm_missing() {
     let (_reg, host) = warm_host(false, true);
     let (tx, rx) = flume::unbounded();
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         GONE_ID.to_owned(),
         0,
@@ -1457,7 +1611,7 @@ fn click_fallback_restores_when_warm_buf_has_no_handler() {
     recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (fb_tx, fb_rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click_with_fallback(
         WARM_ID.to_owned(),
         0,
@@ -1485,7 +1639,7 @@ fn restore_evicts_warm_handle() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     let (tx, _rx) = flume::unbounded();
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_restore(
         warm_restore_item(WARM_ID, Vec::new()),
         maki_agent::EventSender::new(tx, 0),
@@ -1514,7 +1668,7 @@ fn warm_fifo_evicts_oldest_runtime_side() {
         bufs.push(recv_live_buf(&rx, &id).expect("live buf published"));
     }
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click("t1".to_owned(), 0);
     eh.request_click("t0".to_owned(), 0);
     barrier(&host);
@@ -1542,7 +1696,7 @@ fn warm_map_cleared_by_load_source() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
     barrier(&host);
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -1582,7 +1736,7 @@ fn warm_click_runs_async_jobs() {
     exec_warm_tool(&reg, "warm_async", &ctx).expect("tool output");
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
@@ -1603,18 +1757,25 @@ fn warm_click_survives_post_completion_cancel() {
     let body = recv_live_buf(&rx, WARM_ID).expect("live buf published");
     trigger.cancel();
 
-    let eh = host.event_handle().expect("event handle available");
+    let eh = host.event_handle();
     eh.request_click(WARM_ID.to_owned(), 0);
     barrier(&host);
 
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs and
-/// annotations (live and completion alike) through the callbacks.
+/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
+    reg.register(
+        Arc::new(UsageTool),
+        ToolSource::Lua {
+            plugin: Arc::from("usage_fixture"),
+        },
+    )
+    .unwrap();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let src = format!(
         r#"
@@ -1667,12 +1828,17 @@ maki.api.register_tool({{
             end,
             on_annotation = function(a) ann2 = a end,
         }})
+        local usage = "nil"
+        local text3 = maki.agent.call_tool(ctx, "{USAGE_TOOL_NAME}", {{}}, {{
+            on_usage = function(value) usage = value end,
+        }})
         local ann3 = "nil"
         local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
         return tostring(text) .. "/" .. ann
             .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+            .. " " .. tostring(text3) .. "/" .. usage
             .. " " .. tostring(err3) .. "/" .. ann3
     end
 }})
@@ -1688,7 +1854,10 @@ maki.api.register_tool({{
     .expect("driver ok");
     assert_eq!(
         out,
-        "child_done/5 items stream_done/streamed line/1 lines boom/nil"
+        format!(
+            "child_done/5 items stream_done/streamed line/1 lines \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+        )
     );
 }
 
@@ -1715,6 +1884,100 @@ fn jobstop_kills_running_job() {
     host.load_source("job_stop", &src).unwrap();
     let out = exec_tool(&reg, "job_stop", serde_json::json!({})).unwrap();
     assert_eq!(out, "killed=true");
+}
+
+#[test]
+fn plugin_owned_job_outlives_its_starting_tool() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+local output = "pending"
+local exit_code = "pending"
+maki.api.register_tool({{
+    name = "start_plugin_job",
+    description = "starts a plugin-owned job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
+            owner = "plugin",
+            on_stdout = function(_, line) output = line end,
+            on_exit = function(_, code) exit_code = tostring(code) end,
+        }})
+        return maki.fn.jobwait(id, 1) == nil and "started" or "did not time out"
+    end,
+}})
+maki.api.register_tool({{
+    name = "plugin_job_state",
+    description = "reports plugin-owned job callbacks",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return output .. "/" .. exit_code
+    end,
+}})
+"#
+    );
+    host.load_source("plugin_job", &src).unwrap();
+    assert_eq!(
+        exec_tool(&reg, "start_plugin_job", json!({})).unwrap(),
+        "started"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = exec_tool(&reg, "plugin_job_state", json!({})).unwrap();
+        if state == "plugin-output/7" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plugin-owned callbacks did not run: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unloading_plugin_kills_its_jobs() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("job.pid");
+    let src = format!(
+        r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{
+            owner = "plugin",
+        }})"#,
+        pid_path.display()
+    );
+    host.load_source("plugin_job", &src).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !pid_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plugin job did not publish its process id"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = std::fs::read_to_string(&pid_path)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let pid = Pid::from_raw(pid).unwrap();
+    assert!(test_kill_process_group(pid).is_ok());
+
+    host.unload("plugin_job").unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plugin process group survived unload"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -2188,7 +2451,7 @@ fn register_command_happy_path() {
         maki.api.register_command({
             name = "/hello",
             description = "says hello",
-            handler = function(args) end,
+            handler = function(opts) end,
         })
         "#,
     )
@@ -2202,6 +2465,53 @@ fn register_command_happy_path() {
     assert_eq!(snap.commands[0].plugin.as_ref(), "cmd_plugin");
 }
 
+#[test_case::test_case("" => 0 ; "default_zero")]
+#[test_case::test_case("nargs = 0," => 0 ; "zero")]
+#[test_case::test_case("nargs = 1," => 1 ; "one")]
+#[test_case::test_case(r#"nargs = "?","# => 1 ; "zero_or_one")]
+#[test_case::test_case(r#"nargs = "*","# => usize::MAX ; "any")]
+#[test_case::test_case(r#"nargs = "+","# => usize::MAX ; "one_or_more")]
+fn register_command_nargs_values(nargs_field: &str) -> usize {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "cmd_nargs",
+        &format!(
+            r#"maki.api.register_command({{ name = "/test", {nargs_field} handler = function() end }})"#
+        ),
+    )
+    .unwrap();
+
+    host.command_reader().load().commands[0].max_args
+}
+
+#[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
+#[test_case::test_case("", "|" ; "empty_args")]
+fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/echo",
+            nargs = "*",
+            handler = function(opts)
+                maki.ui.flash(opts.args .. "|" .. table.concat(opts.fargs, ","))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into());
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command handler did not run");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
+
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"
@@ -2209,6 +2519,18 @@ fn register_command_happy_path() {
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "/test", description = "no handler" })"#,
     "handler" ; "missing_handler"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", nargs = -1, handler = function() end })"#,
+    NARGS_ERR ; "negative_nargs"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", nargs = 2, handler = function() end })"#,
+    NARGS_ERR ; "nargs_two"
+)]
+#[test_case::test_case(
+    r#"maki.api.register_command({ name = "/test", nargs = "!", handler = function() end })"#,
+    NARGS_ERR ; "unknown_string_nargs"
 )]
 fn register_command_validation_rejects(src: &str, expected_err: &str) {
     let reg = fresh_registry();
@@ -2343,7 +2665,7 @@ fn restore_tool_async_ordering_and_delivery() {
 
     let input = serde_json::json!({"command": "echo ok", "timeout": 1});
 
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
     let event_tx = maki_agent::EventSender::new(tx, 0);
 
@@ -2421,7 +2743,7 @@ fn restore_rebuilds_body_from_input_content(
     expected: &[&str],
 ) {
     let (_reg, host) = builtins_host();
-    let handle = host.event_handle().expect("event handle available");
+    let handle = host.event_handle();
     let (tx, rx) = flume::unbounded();
 
     handle.request_restore(
@@ -3340,8 +3662,8 @@ fn async_run_from_parked_command_handler_runs_promptly() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
-    let handle = host.event_handle().unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/park"), String::new());
 
     let action = rx
@@ -3371,12 +3693,188 @@ fn job_callbacks_fire_while_command_handler_parked() {
         "#,
     )
     .unwrap();
-    let rx = host.ui_action_rx().unwrap();
-    let handle = host.event_handle().unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
     handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new());
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("job callbacks starved while command handler was parked");
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
+}
+
+/// read tool requires offset and limit; missing fields should fail schema validation.
+mod read_tool_required_params {
+    use super::*;
+
+    const MISSING_OFFSET_ERR: &str = "invalid parameter 'offset': required";
+    const MISSING_LIMIT_ERR: &str = "invalid parameter 'limit': required";
+    const MAX_OUTPUT_LINES: i32 = 2000;
+
+    #[test]
+    fn missing_offset_fails_parse() {
+        let (reg, _host) = builtins_host();
+        let entry = reg.get("read").expect("read registered");
+        let err = entry
+            .tool
+            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "limit": 10 }))
+            .err()
+            .expect("missing offset should fail");
+        assert!(err.to_string().contains(MISSING_OFFSET_ERR), "got: {err}");
+    }
+
+    #[test]
+    fn missing_limit_fails_parse() {
+        let (reg, _host) = builtins_host();
+        let entry = reg.get("read").expect("read registered");
+        let err = entry
+            .tool
+            .parse(&serde_json::json!({ "path": "/tmp/foo.txt", "offset": 1 }))
+            .err()
+            .expect("missing limit should fail");
+        assert!(err.to_string().contains(MISSING_LIMIT_ERR), "got: {err}");
+    }
+
+    #[test]
+    fn both_offset_and_limit_present_parses() {
+        let (reg, _host) = builtins_host();
+        let entry = reg.get("read").expect("read registered");
+        let result = entry.tool.parse(&serde_json::json!({
+            "path": "/tmp/foo.txt",
+            "offset": 1,
+            "limit": 10
+        }));
+        assert!(result.is_ok(), "valid input should parse");
+    }
+
+    #[test]
+    fn limit_zero_parses_and_reads_to_cap() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // Write 100 lines
+        let content = (1..=100i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        );
+        let out = out.expect("read should succeed");
+        // limit=0 means read to end (capped at 2000). 100 lines < 2000, so all should be read.
+        assert!(
+            out.contains("1: line 1"),
+            "should start at line 1, got: {out}"
+        );
+        assert!(
+            out.contains("100: line 100"),
+            "should include last line, got: {out}"
+        );
+    }
+
+    #[test]
+    fn limit_zero_respects_2000_cap() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        // Write 2500 lines
+        let content = (1..=2500i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        );
+        let out = out.expect("read should succeed");
+        // limit=0 capped at 2000, so should have lines 1-2000
+        assert!(out.contains("1: line 1"), "should start at line 1");
+        assert!(
+            out.contains("2000: line 2000"),
+            "should include line 2000, got last lines: {}",
+            out.split('\n').rev().take(5).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            !out.contains("2001: line 2001"),
+            "should not include line 2001"
+        );
+        // Should have truncation hint
+        assert!(
+            out.contains("Truncated"),
+            "should mention truncation, got: {out}"
+        );
+    }
+
+    #[test]
+    fn explicit_limit_above_cap_is_clamped() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        let content = (1..=MAX_OUTPUT_LINES + 500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": MAX_OUTPUT_LINES + 500
+            }),
+        );
+        let out = out.expect("read should succeed");
+        assert!(
+            out.contains(&format!("{MAX_OUTPUT_LINES}: line {MAX_OUTPUT_LINES}")),
+            "should include the last line within the cap, got: {out}"
+        );
+        assert!(
+            !out.contains(&format!(
+                "{}: line {}",
+                MAX_OUTPUT_LINES + 1,
+                MAX_OUTPUT_LINES + 1
+            )),
+            "explicit limit must be clamped to the cap, got: {out}"
+        );
+    }
+
+    #[test]
+    fn offset_beyond_file_returns_empty() {
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "just one line\n").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 100,
+                "limit": 10
+            }),
+        );
+        let out = out.expect("read should succeed");
+        assert!(
+            out.is_empty(),
+            "offset beyond file should return empty, got: {out}"
+        );
+    }
 }

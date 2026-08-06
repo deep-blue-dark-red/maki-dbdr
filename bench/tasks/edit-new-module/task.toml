@@ -1,0 +1,6 @@
+[task]
+id = "edit-new-module"
+category = "edit"
+prompt = "tests/test_slug.py imports util.slug which does not exist yet. Implement util/slug.py per the spec in README.md so that `python3 -m unittest discover -q` passes. Do not modify the tests."
+max_turns = 15
+timeout_s = 240

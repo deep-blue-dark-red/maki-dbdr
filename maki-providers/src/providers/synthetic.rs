@@ -12,6 +12,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "synthetic",
     api_key_env: "SYNTHETIC_API_KEY",
     base_url: "https://api.synthetic.new/openai/v1",
     max_tokens_field: "max_completion_tokens",
@@ -46,7 +47,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -62,7 +63,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
         ModelEntry {
@@ -78,7 +79,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 131072,
+            max_output_tokens: Some(131072),
             context_window: 200_000,
         },
     ]

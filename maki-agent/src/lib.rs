@@ -5,16 +5,21 @@ pub mod cancel;
 pub mod child_guard;
 pub use child_guard::ChildGuard;
 pub mod headless;
+pub mod mailbox;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
 pub use mcp::protocol::PromptRole;
-pub use mcp::{McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSnapshot, McpSnapshotReader};
+pub use mcp::{
+    McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
+};
 pub(crate) mod task_set;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, History, Instructions, LoadedInstructions, SharedMessages,
-    find_subdirectory_instructions, is_instruction_file,
+    Agent, AgentParams, AgentRunParams, History, HistorySnapshot, Instructions, LoadedInstructions,
+    SharedMessages, UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
+    is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
+pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
 pub mod command;
 pub mod diff;
@@ -58,7 +63,6 @@ pub enum ExtractedCommand {
     Interrupt(AgentInput, u64),
     Compact(u64),
     Checkpoint(u64),
-    Rename(Vec<maki_providers::Message>, u64),
 }
 
 pub trait InterruptSource: Send + Sync {

@@ -1,4 +1,4 @@
-pub use crate::components::settings_picker::UserSettings;
+use crate::components::settings_picker::UserSettings;
 use crate::components::keybindings::{update_bind, get_configured_bind, key_event_to_string};
 use std::fs;
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ pub fn config_path() -> Result<PathBuf, std::io::Error> {
     let parent = config_dir.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "No parent config dir")
     })?;
-    Ok(parent.join("maki.config"))
+    Ok(parent.join("user.config"))
 }
 
 pub fn default_skills_dirs() -> Vec<String> {
@@ -50,8 +50,19 @@ pub fn load_config() -> UserSettings {
     };
 
     if !path.exists() {
-        // Migration logic: if settings.json exists, load it, delete it, and save it in maki.config
         let mut settings = UserSettings::default();
+        if let Some(parent) = path.parent() {
+            // Migrate old maki.config → user.config
+            let old_maki_config = parent.join("maki.config");
+            if old_maki_config.exists() {
+                let _ = fs::rename(&old_maki_config, &path);
+                // Re-check after migration
+                if path.exists() {
+                    return load_config();
+                }
+            }
+        }
+        // Migrate legacy settings.json
         if let Ok(config_dir) = maki_storage::paths::config_dir() {
             let old_path = config_dir.join("settings.json");
             if old_path.exists() {

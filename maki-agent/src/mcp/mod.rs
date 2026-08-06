@@ -8,6 +8,10 @@
 //! two lock-free `ArcSwap`s: a `ToolIndex` for tool calls and an `McpSnapshot` for the UI.
 //! This way a slow tool call never blocks a toggle and vice versa.
 //!
+//! Servers connect inside `run`, not in `start`, so a slow `initialize` never delays the
+//! caller's first frame. Whoever needs the tools waits on `McpHandle::ready`. Connects
+//! land alongside commands, so one slow server holds up neither a fast one nor a shutdown.
+//!
 //! `McpSnapshotReader` is a read-only handle. Outside code physically cannot publish a
 //! snapshot, so the "only `run` publishes" invariant is enforced by the type system.
 
@@ -19,12 +23,14 @@ pub mod protocol;
 pub mod stdio;
 pub mod transport;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use maki_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
@@ -36,10 +42,25 @@ use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
+use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
 const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
+pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
+/// Below this many deferrable tools, a search round-trip plus its
+/// prompt-cache miss cost more than a handful of upfront definitions.
+/// Overridden by `defer_tools` in mcp.toml.
+const DEFAULT_DEFER_TOOLS: usize = 10;
+/// Loads per search are capped so one broad query can't flood the context.
+const MAX_SEARCH_LOADS: usize = 5;
+const NAME_HIT_SCORE: usize = 2;
+const DESCRIPTION_HIT_SCORE: usize = 1;
+/// Overflow names shown to the model so it can re-search by exact name.
+const MAX_OVERFLOW_NAMES: usize = 20;
+const SEARCH_NO_MATCH: &str = "No deferred MCP tools matched";
+const SEARCH_OVERFLOW_PREFIX: &str = "Also matched but not loaded: ";
+pub(crate) const SEARCH_EMPTY_QUERY: &str = "query must not be empty";
 
 /// Convert internal qualified name (`server.tool`) to wire format (`server__tool`)
 /// for LLM provider APIs that reject dots in tool names.
@@ -174,7 +195,22 @@ struct McpManagerInner {
 struct ToolIndex {
     tools: HashMap<Arc<str>, ToolRef>,
     prompts: HashMap<String, PromptRef>,
-    descriptors: Arc<[Value]>,
+    descriptors: Arc<[ToolDescriptor]>,
+}
+
+/// One published MCP tool. Wire name and search text are derived from
+/// `definition` on demand: searches are model-paced and rare, so nothing
+/// to cache.
+struct ToolDescriptor {
+    qualified_name: Arc<str>,
+    always_load: bool,
+    definition: Value,
+}
+
+impl ToolDescriptor {
+    fn wire_name(&self) -> &str {
+        self.definition["name"].as_str().unwrap_or_default()
+    }
 }
 
 struct ToolRef {
@@ -249,6 +285,196 @@ pub struct McpHandle {
     cmd_tx: flume::Sender<McpCommand>,
     index: Arc<ArcSwap<ToolIndex>>,
     snapshot: Arc<ArcSwap<McpSnapshot>>,
+    /// Never changes after startup, so it lives here instead of being
+    /// copied into every republished `ToolIndex`.
+    defer_tools: usize,
+    /// Nothing is ever sent on it. `run` drops the sender once the first
+    /// connect pass has published, and that disconnect is the signal.
+    ready_rx: flume::Receiver<Infallible>,
+}
+
+/// One session's view of MCP: the shared handle plus the deferred tools
+/// this session loaded. Loads are per session, so a subagent's searches
+/// never bloat the parent's context.
+///
+/// `extend_tools` output must never be stored: recompute it every request
+/// or the `tool_search` catalog goes stale.
+#[derive(Clone)]
+pub struct McpSession {
+    handle: McpHandle,
+    loaded: Arc<Mutex<HashSet<Arc<str>>>>,
+}
+
+impl std::ops::Deref for McpSession {
+    type Target = McpHandle;
+    fn deref(&self) -> &McpHandle {
+        &self.handle
+    }
+}
+
+impl McpSession {
+    /// `history` seeds the loaded set when resuming: tools the model was
+    /// already calling stay declared across restarts. A pure string scan,
+    /// so it is safe before servers connect, and unknown names are inert.
+    pub fn new(handle: McpHandle, history: &[Message]) -> Self {
+        let loaded = history
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { name, .. } if name.contains(WIRE_SEPARATOR) => {
+                    Some(internal_tool_name(name).into())
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            handle,
+            loaded: Arc::new(Mutex::new(loaded)),
+        }
+    }
+
+    /// A view over the same handle with no loads, for a new (sub)session.
+    pub fn fresh(&self) -> Self {
+        Self::new(self.handle.clone(), &[])
+    }
+
+    /// Append this request's MCP definitions: loaded and `always_load`
+    /// tools in full, the rest as names inside one `tool_search` catalog.
+    /// Names already in the array are skipped.
+    ///
+    /// The `defer_tools` threshold is measured against the full index, not
+    /// what's left deferred, so loading tools mid-session can never flip
+    /// the remainder into the context.
+    pub fn extend_tools(&self, tools: &mut Value) {
+        let Some(arr) = tools.as_array_mut() else {
+            debug_assert!(false, "tools must be a JSON array");
+            return;
+        };
+        let existing: HashSet<String> = arr
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        let idx = self.handle.index.load();
+        let defer =
+            idx.descriptors.iter().filter(|d| !d.always_load).count() > self.handle.defer_tools;
+        let loaded = self.lock_loaded();
+        let mut deferred: Vec<&ToolDescriptor> = Vec::new();
+        for d in idx.descriptors.iter() {
+            if existing.contains(d.wire_name()) {
+                continue;
+            }
+            if !defer || d.always_load || loaded.contains(&*d.qualified_name) {
+                arr.push(d.definition.clone());
+            } else {
+                deferred.push(d);
+            }
+        }
+        drop(loaded);
+        if !deferred.is_empty() {
+            if existing.contains(TOOL_SEARCH_TOOL_NAME) {
+                warn!(
+                    deferred = deferred.len(),
+                    "a tool named {TOOL_SEARCH_TOOL_NAME} already exists; deferred MCP tools stay hidden"
+                );
+            } else {
+                arr.push(tool_search_definition(&deferred));
+            }
+        }
+    }
+
+    /// Rank deferred tools against `query` keywords (exact name first,
+    /// then name hits over description hits) and mark the top
+    /// `MAX_SEARCH_LOADS` loaded; their definitions join the next request.
+    pub fn search_tools(&self, query: &str) -> Result<String, String> {
+        let q = query.trim().to_lowercase();
+        let tokens: Vec<&str> = q
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return Err(SEARCH_EMPTY_QUERY.into());
+        }
+        let idx = self.handle.index.load();
+        let mut matches: Vec<(bool, usize, &ToolDescriptor)> = idx
+            .descriptors
+            .iter()
+            .filter(|d| !d.always_load)
+            .filter_map(|d| {
+                let name = d.wire_name().to_lowercase();
+                let haystack = build_haystack(&d.definition);
+                // The catalog shows bare tool names, so exact match must
+                // accept both `server__tool` and `tool`.
+                let exact = name == q
+                    || d.qualified_name
+                        .split_once(SEPARATOR)
+                        .is_some_and(|(_, raw)| raw.eq_ignore_ascii_case(&q));
+                let score: usize = tokens
+                    .iter()
+                    .map(|t| {
+                        if name.contains(t) {
+                            NAME_HIT_SCORE
+                        } else if haystack.contains(t) {
+                            DESCRIPTION_HIT_SCORE
+                        } else {
+                            0
+                        }
+                    })
+                    .sum();
+                (exact || score > 0).then_some((exact, score, d))
+            })
+            .collect();
+        matches.sort_by(|a, b| {
+            (b.0, b.1)
+                .cmp(&(a.0, a.1))
+                .then_with(|| a.2.wire_name().cmp(b.2.wire_name()))
+        });
+        let mut loaded = self.lock_loaded();
+        let mut hits: Vec<&str> = Vec::new();
+        let mut overflow: Vec<&str> = Vec::new();
+        for (_, _, d) in &matches {
+            if hits.len() < MAX_SEARCH_LOADS {
+                loaded.insert(Arc::clone(&d.qualified_name));
+                hits.push(d.wire_name());
+            } else {
+                overflow.push(d.wire_name());
+            }
+        }
+        drop(loaded);
+        info!(query = %q, loaded = hits.len(), overflow = overflow.len(), "MCP tool search");
+        if hits.is_empty() {
+            return Ok(format!(
+                "{SEARCH_NO_MATCH} '{query}'. Try other keywords or an exact name from the catalog."
+            ));
+        }
+        let plural = if hits.len() == 1 { "tool" } else { "tools" };
+        let mut out = format!(
+            "Loaded {} {plural}, callable from your next message:",
+            hits.len()
+        );
+        for hit in &hits {
+            out.push_str(&format!("\n- `{hit}`"));
+        }
+        if !overflow.is_empty() {
+            let shown = overflow.len().min(MAX_OVERFLOW_NAMES);
+            let names: Vec<String> = overflow[..shown].iter().map(|n| format!("`{n}`")).collect();
+            out.push_str(&format!("\n{SEARCH_OVERFLOW_PREFIX}{}", names.join(", ")));
+            if overflow.len() > shown {
+                out.push_str(&format!(" and {} more", overflow.len() - shown));
+            }
+            out.push_str(". Search an exact tool name to load it.");
+        }
+        Ok(out)
+    }
+
+    /// Invoked on every MCP dispatch: a deferred tool the model calls by
+    /// catalog name gets its full definition on the next request.
+    pub fn mark_loaded(&self, qualified_name: &str) {
+        self.lock_loaded().insert(Arc::from(qualified_name));
+    }
+
+    fn lock_loaded(&self) -> std::sync::MutexGuard<'_, HashSet<Arc<str>>> {
+        self.loaded.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl McpHandle {
@@ -256,6 +482,13 @@ impl McpHandle {
         if let Err(e) = self.cmd_tx.try_send(cmd) {
             warn!(error = %e, "MCP command loop is gone");
         }
+    }
+
+    /// Resolves once every enabled server has connected or failed. Await it
+    /// before building a request's tool list, or an early prompt ships without
+    /// the MCP tools.
+    pub async fn ready(&self) {
+        let _ = self.ready_rx.recv_async().await;
     }
 
     pub fn reader(&self) -> McpSnapshotReader {
@@ -305,12 +538,6 @@ impl McpHandle {
         transport::get_prompt(transport.as_ref(), &raw_name, arguments).await
     }
 
-    pub fn extend_tools(&self, tools: &mut Value) {
-        if let Some(arr) = tools.as_array_mut() {
-            arr.extend(self.index.load().descriptors.iter().cloned());
-        }
-    }
-
     pub async fn shutdown(&self) {
         let (ack_tx, ack_rx) = flume::bounded(1);
         self.send(McpCommand::Shutdown { ack: ack_tx });
@@ -331,35 +558,140 @@ impl McpHandle {
     }
 }
 
+/// Returns as soon as the config is read, so nothing with a screen waits on a
+/// slow `initialize`. Await `McpHandle::ready` before touching the tool index.
 pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
     let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
-    let handle = start_with_config(config).await;
+    (start_with_config(config), config_errors)
+}
+
+/// `start` for callers with no frame to protect, who want the tools up front.
+pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+    let (handle, config_errors) = start(cwd).await;
+    if let Some(handle) = &handle {
+        handle.ready().await;
+    }
     (handle, config_errors)
 }
 
-pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
+pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
         return None;
     }
 
-    let mut inner = parse_entries(config);
-    start_enabled(&mut inner).await;
-    inner.generation += 1;
+    let defer_tools = config.defer_tools.unwrap_or(DEFAULT_DEFER_TOOLS);
+    let inner = parse_entries(config);
 
     let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
     let index: Arc<ArcSwap<ToolIndex>> = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
     publish(&inner, &index, &snapshot);
 
     let (cmd_tx, cmd_rx) = flume::unbounded();
+    let (ready_tx, ready_rx) = flume::bounded(0);
     let handle = McpHandle {
         cmd_tx,
         index: Arc::clone(&index),
         snapshot: Arc::clone(&snapshot),
+        defer_tools,
+        ready_rx,
     };
 
+    info!(total = inner.entries.len(), "MCP servers connecting");
+
+    smol::spawn(run(inner, index, snapshot, cmd_rx, ready_tx)).detach();
+    Some(handle)
+}
+
+/// Connect results ride the same loop as commands, so a `Shutdown` arriving
+/// mid-connect never waits for a slow `initialize`.
+enum Step {
+    Connected(usize, Result<StartResult, McpError>),
+    Command(McpCommand),
+    /// Every handle is gone.
+    Closed,
+}
+
+async fn run(
+    mut inner: McpManagerInner,
+    index: Arc<ArcSwap<ToolIndex>>,
+    snapshot: Arc<ArcSwap<McpSnapshot>>,
+    cmd_rx: flume::Receiver<McpCommand>,
+    ready_tx: flume::Sender<Infallible>,
+) {
+    let (connected_tx, connected_rx) = flume::unbounded();
+    // Held, not detached: dropping a pending connect drops the transport it
+    // owns, which kills the child process group it just spawned.
+    let connects = spawn_connects(&inner, connected_tx);
+    let mut ready = Some(ready_tx);
+
+    let mut ack: Option<flume::Sender<()>> = None;
+    loop {
+        release_ready(&inner, &mut ready);
+        let step = futures_lite::future::or(
+            async {
+                match connected_rx.recv_async().await {
+                    Ok((i, result)) => Step::Connected(i, result),
+                    // Every connect landed, so only commands wake us now.
+                    Err(_) => futures_lite::future::pending().await,
+                }
+            },
+            async {
+                match cmd_rx.recv_async().await {
+                    Ok(cmd) => Step::Command(cmd),
+                    Err(_) => Step::Closed,
+                }
+            },
+        )
+        .await;
+
+        match step {
+            Step::Connected(i, result) => {
+                // A toggle or reconnect that ran mid-connect owns the entry
+                // now, so a late result must not resurrect it. Dropping it
+                // kills the transport it carries.
+                if inner.entries[i].status == McpServerStatus::Connecting {
+                    let _ = apply_start_result(&mut inner.entries[i], result, "start");
+                }
+            }
+            Step::Command(McpCommand::Toggle { server, enabled }) => {
+                handle_toggle(&mut inner, &server, enabled).await;
+            }
+            Step::Command(McpCommand::Reconnect { server }) => {
+                handle_reconnect(&mut inner, &server).await;
+            }
+            Step::Command(McpCommand::Shutdown { ack: tx }) => {
+                ack = Some(tx);
+                break;
+            }
+            Step::Closed => break,
+        }
+        inner.generation += 1;
+        publish(&inner, &index, &snapshot);
+    }
+    drop(connects);
+    shutdown_all(&mut inner).await;
+    inner.generation += 1;
+    publish(&inner, &index, &snapshot);
+    if let Some(tx) = ack {
+        let _ = tx.try_send(());
+    }
+}
+
+/// Nothing left in `Connecting` means every server landed and the last publish
+/// already carried its tools, so waiters can go.
+fn release_ready(inner: &McpManagerInner, ready: &mut Option<flume::Sender<Infallible>>) {
+    if ready.is_none()
+        || inner
+            .entries
+            .iter()
+            .any(|e| e.status == McpServerStatus::Connecting)
+    {
+        return;
+    }
+    drop(ready.take());
     info!(
         running = inner
             .entries
@@ -369,40 +701,6 @@ pub async fn start_with_config(config: McpConfig) -> Option<McpHandle> {
         total = inner.entries.len(),
         "MCP servers initialized"
     );
-
-    smol::spawn(run(inner, index, snapshot, cmd_rx)).detach();
-    Some(handle)
-}
-
-async fn run(
-    mut inner: McpManagerInner,
-    index: Arc<ArcSwap<ToolIndex>>,
-    snapshot: Arc<ArcSwap<McpSnapshot>>,
-    cmd_rx: flume::Receiver<McpCommand>,
-) {
-    let mut ack: Option<flume::Sender<()>> = None;
-    while let Ok(cmd) = cmd_rx.recv_async().await {
-        match cmd {
-            McpCommand::Toggle { server, enabled } => {
-                handle_toggle(&mut inner, &server, enabled).await;
-            }
-            McpCommand::Reconnect { server } => {
-                handle_reconnect(&mut inner, &server).await;
-            }
-            McpCommand::Shutdown { ack: tx } => {
-                ack = Some(tx);
-                break;
-            }
-        }
-        inner.generation += 1;
-        publish(&inner, &index, &snapshot);
-    }
-    shutdown_all(&mut inner).await;
-    inner.generation += 1;
-    publish(&inner, &index, &snapshot);
-    if let Some(tx) = ack {
-        let _ = tx.try_send(());
-    }
 }
 
 async fn handle_toggle(inner: &mut McpManagerInner, server_name: &str, enabled: bool) {
@@ -528,9 +826,24 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             maki_storage::StateDir::resolve().ok(),
         )?),
     };
-    transport::initialize(transport.as_ref()).await?;
-    let tool_infos = transport::list_tools(transport.as_ref()).await?;
-    let prompt_infos = transport::list_prompts(transport.as_ref()).await?;
+    let capabilities = transport::initialize(transport.as_ref()).await?;
+    // Asymmetric on purpose: sloppy servers omit `capabilities` yet serve
+    // tools/list fine, so always ask (fatal only when tools were declared).
+    // Prompts only when declared: undeclared endpoints may answer junk,
+    // and junk must not take down the server's tools.
+    let tool_infos = match transport::list_tools(transport.as_ref()).await {
+        Ok(tools) => tools,
+        Err(e) if !capabilities.tools => {
+            warn!(server = config.name, error = %e, "tools/list failed; server declared no tools");
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    let prompt_infos = if capabilities.prompts {
+        transport::list_prompts(transport.as_ref()).await?
+    } else {
+        Vec::new()
+    };
     info!(
         server = config.name,
         tool_count = tool_infos.len(),
@@ -572,26 +885,35 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
         });
     }
 
+    // Config maps are unordered; a stable order keeps the tool_search
+    // catalog and tools array byte-identical across runs (prompt cache).
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
     McpManagerInner {
         entries,
         generation: 0,
     }
 }
 
-async fn start_enabled(inner: &mut McpManagerInner) {
-    let tasks: Vec<_> = inner
+/// One task per enabled server, each reporting back as it lands, so `run`
+/// publishes a fast server's tools without waiting for the slowest.
+fn spawn_connects(
+    inner: &McpManagerInner,
+    tx: flume::Sender<(usize, Result<StartResult, McpError>)>,
+) -> Vec<smol::Task<()>> {
+    inner
         .entries
         .iter()
         .enumerate()
         .filter(|(_, e)| e.status == McpServerStatus::Connecting)
         .filter_map(|(i, e)| e.config.clone().map(|c| (i, c)))
-        .map(|(i, cfg)| smol::spawn(async move { (i, start_server(&cfg).await) }))
-        .collect();
-
-    for task in tasks {
-        let (i, result) = task.await;
-        let _ = apply_start_result(&mut inner.entries[i], result, "start");
-    }
+        .map(|(i, config)| {
+            let tx = tx.clone();
+            smol::spawn(async move {
+                let _ = tx.send_async((i, start_server(&config).await)).await;
+            })
+        })
+        .collect()
 }
 
 fn apply_start_result(
@@ -618,7 +940,7 @@ fn apply_start_result(
 fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSwap<McpSnapshot>) {
     let mut tools = HashMap::new();
     let mut prompts = HashMap::new();
-    let mut descriptors: Vec<Value> = Vec::new();
+    let mut descriptors: Vec<ToolDescriptor> = Vec::new();
     let mut server_infos = Vec::with_capacity(inner.entries.len());
     let mut prompt_infos = Vec::new();
     let mut pids = Vec::new();
@@ -632,6 +954,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
         {
+            let always_load = entry.config.as_ref().is_some_and(|c| c.always_load);
             for t in &entry.tools {
                 tools.insert(
                     Arc::clone(&t.qualified_name),
@@ -640,11 +963,16 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                         transport: Arc::clone(transport),
                     },
                 );
-                descriptors.push(json!({
-                    "name": wire_tool_name(&t.qualified_name),
-                    "description": t.description,
-                    "input_schema": t.input_schema,
-                }));
+                let sanitized_schema = sanitize_tool_input_schema(t.input_schema.clone());
+                descriptors.push(ToolDescriptor {
+                    qualified_name: Arc::clone(&t.qualified_name),
+                    always_load,
+                    definition: json!({
+                        "name": wire_tool_name(&t.qualified_name),
+                        "description": t.description,
+                        "input_schema": sanitized_schema,
+                    }),
+                });
             }
             for p in &entry.prompts {
                 prompts.insert(
@@ -681,6 +1009,152 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         pids,
         generation: inner.generation,
     }));
+}
+
+/// Session for dispatch-level tests outside this module, built through the
+/// real `publish` path so it can't drift from production index construction.
+#[cfg(test)]
+pub(crate) fn stub_session(tools: &[(&str, &str)]) -> McpSession {
+    let entry = ServerEntry {
+        name: "stub".into(),
+        config: None,
+        transport_kind: "stub",
+        origin: PathBuf::new(),
+        status: McpServerStatus::Running,
+        transport: Some(Arc::new(StubTransport(Arc::from("stub")))),
+        tools: tools
+            .iter()
+            .map(|(qualified, description)| McpToolDef {
+                qualified_name: Arc::from(*qualified),
+                raw_name: qualified
+                    .split_once(SEPARATOR)
+                    .map_or(*qualified, |(_, r)| r)
+                    .into(),
+                description: (*description).into(),
+                input_schema: json!({}),
+            })
+            .collect(),
+        prompts: Vec::new(),
+    };
+    let inner = McpManagerInner {
+        entries: vec![entry],
+        generation: 0,
+    };
+    let index = Arc::new(ArcSwap::from_pointee(ToolIndex::default()));
+    let snapshot = Arc::new(ArcSwap::from_pointee(McpSnapshot::default()));
+    publish(&inner, &index, &snapshot);
+    McpSession::new(
+        McpHandle {
+            cmd_tx: flume::unbounded().0,
+            index,
+            snapshot,
+            defer_tools: 0,
+            ready_rx: flume::bounded(0).1,
+        },
+        &[],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn tool_names(tools: &Value) -> Vec<&str> {
+    tools
+        .as_array()
+        .expect("tools must be a JSON array")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect()
+}
+
+#[cfg(test)]
+struct StubTransport(Arc<str>);
+
+#[cfg(test)]
+impl McpTransport for StubTransport {
+    fn send_request<'a>(
+        &'a self,
+        method: &'a str,
+        _params: Option<Value>,
+    ) -> transport::BoxFuture<'a, Result<Value, McpError>> {
+        Box::pin(async move {
+            Err(McpError::UnknownTool {
+                name: method.into(),
+            })
+        })
+    }
+    fn send_notification<'a>(
+        &'a self,
+        _method: &'a str,
+        _params: Option<Value>,
+    ) -> transport::BoxFuture<'a, Result<(), McpError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn shutdown<'a>(&'a self) -> transport::BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+    fn server_name(&self) -> &Arc<str> {
+        &self.0
+    }
+    fn transport_kind(&self) -> &'static str {
+        "stub"
+    }
+}
+
+fn build_haystack(definition: &Value) -> String {
+    let mut hay = definition["description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    if let Some(props) = definition["input_schema"]["properties"].as_object() {
+        for key in props.keys() {
+            hay.push(' ');
+            hay.push_str(&key.to_lowercase());
+        }
+    }
+    hay
+}
+
+fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
+    // Grouping by server drops the repeated `server__` prefix, a few
+    // tokens per tool. Descriptors arrive grouped because entries are
+    // sorted and published per server.
+    let mut catalog = String::new();
+    let mut current_server = "";
+    for d in deferred {
+        let (server, raw) = d
+            .qualified_name
+            .split_once(SEPARATOR)
+            .unwrap_or((UNKNOWN_MCP, &d.qualified_name));
+        if server == current_server {
+            catalog.push_str(", ");
+        } else {
+            if !catalog.is_empty() {
+                catalog.push('\n');
+            }
+            catalog.push_str(server);
+            catalog.push_str(": ");
+            current_server = server;
+        }
+        catalog.push_str(raw);
+    }
+    json!({
+        "name": TOOL_SEARCH_TOOL_NAME,
+        "description": format!(
+            "Search and load deferred MCP tools; they are not callable until \
+             loaded, from your next message on. Keywords match tool names, \
+             descriptions, and parameter names; an exact tool name always wins.\n\
+             Deferred tools:\n{catalog}"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords or an exact tool name from the catalog"
+                }
+            },
+            "required": ["query"]
+        }
+    })
 }
 
 fn transport_url(transport: &Transport) -> Option<String> {
@@ -732,14 +1206,20 @@ mod tests {
     use super::*;
     use async_lock::Mutex as AsyncMutex;
     use config::{RawServerConfig, RawStdioFields, RawTransport};
+    use maki_providers::Role;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::time::Instant;
+    use test_case::test_case;
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+    const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
+            always_load: false,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -754,7 +1234,11 @@ mod tests {
             origins.insert(name.to_string(), PathBuf::from("/test/config.toml"));
             mcp.insert(name.to_string(), cfg);
         }
-        McpConfig { mcp, origins }
+        McpConfig {
+            mcp,
+            origins,
+            ..Default::default()
+        }
     }
 
     const TOOL_NAME: &str = "srv.tool";
@@ -845,18 +1329,26 @@ mod tests {
     fn bad_stdio_config(name: &str) -> ServerConfig {
         ServerConfig {
             name: name.into(),
-            timeout: std::time::Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            always_load: false,
             transport: Transport::Stdio {
-                program: "/nonexistent/definitely-not-here".into(),
+                program: MISSING_PROGRAM.into(),
                 args: vec![],
                 environment: HashMap::new(),
             },
         }
     }
 
-    /// Build `inner`, publish it into fresh `ArcSwap`s, and return a live `McpHandle` pointing
+    /// Build `inner`, publish it into fresh `ArcSwap`s, and return a live `McpSession` pointing
     /// at the same state so tests can hit both the mutation and the read path.
-    fn setup(entries: Vec<ServerEntry>) -> (McpManagerInner, McpHandle) {
+    fn setup(entries: Vec<ServerEntry>) -> (McpManagerInner, McpSession) {
+        setup_with_defer(entries, 0)
+    }
+
+    fn setup_with_defer(
+        entries: Vec<ServerEntry>,
+        defer_tools: usize,
+    ) -> (McpManagerInner, McpSession) {
         let inner = McpManagerInner {
             entries,
             generation: 0,
@@ -868,32 +1360,390 @@ mod tests {
             cmd_tx: flume::unbounded().0,
             index,
             snapshot,
+            defer_tools,
+            ready_rx: flume::bounded(0).1,
         };
-        (inner, handle)
+        (inner, McpSession::new(handle, &[]))
     }
 
     #[test]
-    fn start_with_config_produces_terminal_statuses() {
+    fn parse_entries_sorts_servers_by_name() {
+        let config = make_config(vec![
+            ("zeta", stdio_raw(&["z"])),
+            ("alpha", stdio_raw(&["a"])),
+            ("mid", stdio_raw(&["m"])),
+        ]);
+        let inner = parse_entries(config);
+        let names: Vec<&str> = inner.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    fn always_load_entry(name: &str, transport: Arc<dyn McpTransport>) -> ServerEntry {
+        let mut raw = stdio_raw(&["echo"]);
+        raw.always_load = true;
+        let mut entry = fake_entry(name, transport);
+        entry.config = Some(parse_server(name.into(), raw).unwrap());
+        entry
+    }
+
+    #[test]
+    fn extend_tools_skips_deferral_at_or_below_threshold() {
+        let (_inner, handle) = setup_with_defer(vec![fake_entry("srv", FakeTransport::new())], 1);
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
+    }
+
+    #[test]
+    fn defer_threshold_ignores_always_load_tools() {
+        let (_inner, handle) = setup_with_defer(
+            vec![
+                always_load_entry("eager", FakeTransport::new()),
+                fake_entry("lazy", FakeTransport::new()),
+            ],
+            1,
+        );
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec!["eager__tool", "lazy__tool"]);
+    }
+
+    #[test]
+    fn extend_tools_defers_behind_tool_search_by_default() {
+        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+        let catalog = tools[0]["description"].as_str().unwrap();
+        assert!(catalog.contains("srv: tool"), "catalog groups by server");
+        assert!(handle.has_tool(TOOL_NAME), "deferred tools stay callable");
+    }
+
+    #[test]
+    fn extend_tools_includes_always_load_server_upfront() {
+        let (_inner, handle) = setup(vec![
+            always_load_entry("eager", FakeTransport::new()),
+            fake_entry("lazy", FakeTransport::new()),
+        ]);
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        let names = tool_names(&tools);
+        assert!(names.contains(&"eager__tool"));
+        assert!(names.contains(&TOOL_SEARCH_TOOL_NAME));
+        assert!(!names.contains(&"lazy__tool"));
+    }
+
+    #[test]
+    fn search_loads_tools_into_next_extend() {
+        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let result = handle.search_tools("TOOL").unwrap();
+        assert!(result.contains(WIRE_TOOL_NAME), "got: {result}");
+
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec![WIRE_TOOL_NAME]);
+    }
+
+    #[test]
+    fn search_reports_no_match_without_loading() {
+        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let result = handle.search_tools("nonexistent-capability").unwrap();
+        assert!(result.contains(SEARCH_NO_MATCH), "got: {result}");
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    #[test]
+    fn search_caps_loads_and_reports_overflow() {
+        let transport: Arc<dyn McpTransport> = FakeTransport::new();
+        let mut entry = fake_entry("srv", Arc::clone(&transport));
+        entry.tools = (0..MAX_SEARCH_LOADS + 2)
+            .map(|i| McpToolDef {
+                qualified_name: intern(format!("srv{SEPARATOR}tool-{i}")),
+                raw_name: format!("tool-{i}"),
+                description: String::new(),
+                input_schema: json!({}),
+            })
+            .collect();
+        let (_inner, handle) = setup(vec![entry]);
+
+        let result = handle.search_tools("tool").unwrap();
+        let expected = format!(
+            "{SEARCH_OVERFLOW_PREFIX}`srv__tool-{}`, `srv__tool-{}`",
+            MAX_SEARCH_LOADS,
+            MAX_SEARCH_LOADS + 1
+        );
+        assert!(
+            result.contains(&expected),
+            "overflow must list names: {result}"
+        );
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        // Loaded cap plus the search tool for the remaining deferred ones.
+        assert_eq!(tools.as_array().unwrap().len(), MAX_SEARCH_LOADS + 1);
+    }
+
+    fn entry_with_tools(name: &str, tools: Vec<McpToolDef>) -> ServerEntry {
+        let mut entry = fake_entry(name, FakeTransport::new());
+        entry.tools = tools;
+        entry
+    }
+
+    fn tool_def(server: &str, raw: &str, description: &str, schema: Value) -> McpToolDef {
+        McpToolDef {
+            qualified_name: intern(format!("{server}{SEPARATOR}{raw}")),
+            raw_name: raw.into(),
+            description: description.into(),
+            input_schema: schema,
+        }
+    }
+
+    #[test_case("srv__tool-" ; "wire_name")]
+    #[test_case("tool-" ; "bare_name_as_shown_in_catalog")]
+    fn search_exact_name_outranks_keyword_matches(prefix: &str) {
+        let tools = (0..MAX_SEARCH_LOADS + 1)
+            .map(|i| tool_def("srv", &format!("tool-{i}"), "", json!({})))
+            .collect();
+        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
+        // Alphabetical tie-break alone would leave the last tool in overflow.
+        let last = format!("{prefix}{MAX_SEARCH_LOADS}");
+        let result = handle.search_tools(&last).unwrap();
+        let overflow = result
+            .lines()
+            .find(|l| l.starts_with(SEARCH_OVERFLOW_PREFIX))
+            .expect("one match past the cap must overflow");
+        assert!(
+            result.contains(&format!("srv__tool-{MAX_SEARCH_LOADS}"))
+                && !overflow.contains(&format!("tool-{MAX_SEARCH_LOADS}")),
+            "exact name must be loaded, not overflowed: {result}"
+        );
+    }
+
+    #[test]
+    fn search_ranks_name_hits_above_description_hits() {
+        let tools = vec![
+            tool_def("srv", "add_comment", "Comment on an issue", json!({})),
+            tool_def("srv", "create_issue", "Open a ticket", json!({})),
+        ];
+        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
+        let result = handle.search_tools("issue").unwrap();
+        let pos = |name: &str| {
+            result
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must match: {result}"))
+        };
+        assert!(
+            pos("srv__create_issue") < pos("srv__add_comment"),
+            "name hit must rank above description hit: {result}"
+        );
+    }
+
+    #[test]
+    fn search_multi_word_query_matches_any_keyword() {
+        let tools = vec![tool_def(
+            "srv",
+            "create_pr",
+            "Open a pull request",
+            json!({}),
+        )];
+        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
+        let result = handle.search_tools("pull request").unwrap();
+        assert!(result.contains("srv__create_pr"), "got: {result}");
+    }
+
+    #[test]
+    fn search_matches_schema_parameter_names() {
+        let schema = json!({"type": "object", "properties": {"labels": {"type": "array"}}});
+        let tools = vec![tool_def("srv", "update", "Update a thing", schema)];
+        let (_inner, handle) = setup(vec![entry_with_tools("srv", tools)]);
+        let result = handle.search_tools("labels").unwrap();
+        assert!(result.contains("srv__update"), "got: {result}");
+    }
+
+    #[test]
+    fn extend_tools_never_duplicates_existing_names() {
+        let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        handle.extend_tools(&mut tools);
+        assert_eq!(tool_names(&tools), vec!["eager__tool"]);
+    }
+
+    #[test]
+    fn new_seeds_loads_only_from_wire_names_in_history() {
+        let (_inner, session) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let tool_use = |name: &str| ContentBlock::tool_use("t", name, json!({}));
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                tool_use(WIRE_TOOL_NAME),
+                tool_use("read"),
+                tool_use("gone__tool"),
+            ],
+            display_text: None,
+            ..Default::default()
+        }];
+        let restored = McpSession::new(session.handle.clone(), &history);
+        let mut tools = json!([]);
+        restored.extend_tools(&mut tools);
+        assert_eq!(
+            tool_names(&tools),
+            vec![WIRE_TOOL_NAME],
+            "only wire names still in the index may load"
+        );
+    }
+
+    #[test]
+    fn mid_session_loads_never_flip_remainder_into_context() {
+        let defs = vec![
+            tool_def("srv", "alpha", "", json!({})),
+            tool_def("srv", "beta", "", json!({})),
+            tool_def("srv", "gamma", "", json!({})),
+        ];
+        let (_inner, handle) = setup_with_defer(vec![entry_with_tools("srv", defs)], 2);
+        handle.mark_loaded("srv.alpha");
+        handle.mark_loaded("srv.beta");
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        let names = tool_names(&tools);
+        assert!(names.contains(&"srv__alpha") && names.contains(&"srv__beta"));
+        assert!(
+            !names.contains(&"srv__gamma"),
+            "threshold must compare the full index, not the remaining deferred count: {names:?}"
+        );
+        let catalog = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == TOOL_SEARCH_TOOL_NAME)
+            .expect("tool_search must stay while any tool is deferred");
+        let description = catalog["description"].as_str().unwrap();
+        assert!(description.contains("srv: gamma"), "got: {description}");
+    }
+
+    #[test]
+    fn mark_loaded_declares_tool_and_drops_empty_catalog() {
+        let (_inner, handle) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        handle.mark_loaded(TOOL_NAME);
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(
+            tool_names(&tools),
+            vec![WIRE_TOOL_NAME],
+            "loaded tool must be declared; an empty catalog must not be advertised"
+        );
+    }
+
+    #[test]
+    fn existing_wire_name_stays_out_of_catalog() {
+        let defs = vec![
+            tool_def("srv", "alpha", "", json!({})),
+            tool_def("srv", "beta", "", json!({})),
+        ];
+        let (_inner, handle) = setup(vec![entry_with_tools("srv", defs)]);
+        let mut tools = json!([{ "name": "srv__alpha" }]);
+        handle.extend_tools(&mut tools);
+        assert_eq!(
+            tool_names(&tools),
+            vec!["srv__alpha", TOOL_SEARCH_TOOL_NAME],
+            "colliding name must be skipped, not deferred or re-added"
+        );
+        let catalog = tools[1]["description"].as_str().unwrap();
+        assert!(catalog.contains("srv: beta"), "got: {catalog}");
+        assert!(!catalog.contains("alpha"), "got: {catalog}");
+    }
+
+    #[test]
+    fn history_seeding_handles_tool_names_with_double_underscores() {
+        let defs = vec![tool_def("srv", "do__thing", "", json!({}))];
+        let (_inner, session) = setup(vec![entry_with_tools("srv", defs)]);
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use("t", "srv__do__thing", json!({}))],
+            display_text: None,
+            ..Default::default()
+        }];
+        let restored = McpSession::new(session.handle.clone(), &history);
+        let mut tools = json!([]);
+        restored.extend_tools(&mut tools);
+        assert_eq!(
+            tool_names(&tools),
+            vec!["srv__do__thing"],
+            "only the first __ is the server separator"
+        );
+    }
+
+    #[test]
+    fn search_ignores_always_load_tools() {
+        let (_inner, handle) = setup(vec![always_load_entry("eager", FakeTransport::new())]);
+        let result = handle.search_tools("tool").unwrap();
+        assert!(
+            result.contains(SEARCH_NO_MATCH),
+            "always_load tools are already declared: {result}"
+        );
+    }
+
+    #[test]
+    fn search_loads_stay_scoped_to_their_session() {
+        let (_inner, session_a) = setup(vec![fake_entry("srv", FakeTransport::new())]);
+        let session_b = session_a.fresh();
+        session_a.search_tools("tool").unwrap();
+
+        let mut tools_a = json!([]);
+        session_a.extend_tools(&mut tools_a);
+        assert_eq!(tool_names(&tools_a), vec![WIRE_TOOL_NAME]);
+
+        let mut tools_b = json!([]);
+        session_b.extend_tools(&mut tools_b);
+        assert_eq!(tool_names(&tools_b), vec![TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    /// `ready` carries the correctness of connecting in the background: a prompt
+    /// typed during startup must not ship before the servers settle.
+    #[test]
+    fn ready_settles_every_server_status() {
         smol::block_on(async {
-            let handle = start_with_config(McpConfig::default()).await;
-            assert!(handle.is_none());
+            assert!(start_with_config(McpConfig::default()).is_none());
 
             let mut disabled = stdio_raw(&["unused-disabled-cmd"]);
             disabled.enabled = false;
             let config = make_config(vec![
                 ("disabled-srv", disabled),
-                ("bad-srv", stdio_raw(&[])),
+                ("unparseable-srv", stdio_raw(&[])),
+                ("unspawnable-srv", stdio_raw(&[MISSING_PROGRAM])),
             ]);
-            let handle = start_with_config(config).await;
-            let handle = handle.unwrap();
+            let handle = start_with_config(config).unwrap();
+            handle.ready().await;
+
             let infos = handle.reader().load().infos.clone();
+            let status = |name: &str| {
+                &infos
+                    .iter()
+                    .find(|i| i.name == name)
+                    .unwrap_or_else(|| panic!("{name} must be published"))
+                    .status
+            };
+            let failed = |name: &str| matches!(status(name), McpServerStatus::Failed(_));
+            assert!(failed("unparseable-srv"));
+            assert!(failed("unspawnable-srv"));
+            assert_eq!(*status("disabled-srv"), McpServerStatus::Disabled);
+        });
+    }
 
-            let bad = infos.iter().find(|i| i.name == "bad-srv").unwrap();
-            assert!(matches!(bad.status, McpServerStatus::Failed(_)));
-            assert_eq!(bad.tool_count, 0);
-
-            let disabled = infos.iter().find(|i| i.name == "disabled-srv").unwrap();
-            assert_eq!(disabled.status, McpServerStatus::Disabled);
+    /// `sleep` spawns fine and never answers `initialize`, so its connect only
+    /// ends on the request timeout, far past the shutdown one. Shutdown has to
+    /// preempt it, or quitting during startup hangs.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_preempts_an_in_flight_connect() {
+        const BLOCKED: &str = "shutdown must not wait for an in-flight connect";
+        smol::block_on(async {
+            let config = make_config(vec![("slow-srv", stdio_raw(&["sleep", "60"]))]);
+            let handle = start_with_config(config).unwrap();
+            let started = Instant::now();
+            handle.shutdown().await;
+            assert!(started.elapsed() < MCP_SHUTDOWN_TIMEOUT, "{BLOCKED}");
         });
     }
 
@@ -926,7 +1776,7 @@ mod tests {
             assert!(handle.has_tool(TOOL_NAME));
             let mut tools = json!([]);
             handle.extend_tools(&mut tools);
-            assert_eq!(tools[0]["name"], WIRE_TOOL_NAME);
+            assert_eq!(tools[0]["name"], TOOL_SEARCH_TOOL_NAME);
 
             handle_toggle(&mut inner, "srv", false).await;
             publish(&inner, &handle.index, &handle.snapshot);
@@ -989,6 +1839,7 @@ mod tests {
                 Arc::clone(&index),
                 Arc::clone(&snapshot),
                 cmd_rx,
+                flume::bounded(0).0,
             ));
 
             let (ack_tx, ack_rx) = flume::bounded(1);

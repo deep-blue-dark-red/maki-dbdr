@@ -2,13 +2,15 @@
 //! `AgentHandles` bundles all flume channels to the agent. `dispatch()` processes
 //! `Action`s returned by `App::update()`. Scroll and drag events are coalesced from
 //! the queue to avoid jank.
+#![allow(dead_code)]
 
 pub mod animation;
 pub mod app;
 pub mod chat;
-pub mod clipboard;
-pub mod components;
 pub mod config;
+mod clipboard;
+mod color_compat;
+mod components;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;
@@ -21,6 +23,7 @@ pub mod splash;
 mod storage_writer;
 mod text_buffer;
 mod theme;
+pub use theme::BUNDLED_THEMES;
 pub mod update;
 
 mod agent;
@@ -55,6 +58,7 @@ pub enum RunOutcome {
 pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<RunOutcome> {
     let report = {
         let (_guard, mut terminal) = terminal::TerminalGuard::init()?;
+        color_compat::init();
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
         el.run(initial_prompt)?
     };

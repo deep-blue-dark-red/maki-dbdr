@@ -308,6 +308,7 @@ impl LocalEndpoint {
                     pricing: Some(crate::model::ModelPricing::ZERO),
                     supports_thinking: None,
                     supports_vision,
+                    tier: None,
                     provider_info: None,
                 })
             })
@@ -416,6 +417,7 @@ impl LocalEndpoint {
                 pricing: Some(crate::model::ModelPricing::ZERO),
                 supports_thinking: None,
                 supports_vision: None,
+                tier: None,
                 provider_info: None,
             })
             .collect();
@@ -503,6 +505,7 @@ pub(crate) const OLLAMA: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: Some("https://ollama.com/v1"),
     discovery_mode: DiscoveryMode::Ollama,
     compat: OpenAiCompatConfig {
+        slug: "ollama",
         api_key_env: "",
         base_url: "http://localhost:11434/v1",
         max_tokens_field: "max_tokens",
@@ -522,6 +525,7 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
     cloud_fallback_url: None,
     discovery_mode: DiscoveryMode::LlamaCpp,
     compat: OpenAiCompatConfig {
+        slug: "llama-cpp",
         api_key_env: "",
         base_url: "http://localhost:8080/v1",
         max_tokens_field: "max_tokens",

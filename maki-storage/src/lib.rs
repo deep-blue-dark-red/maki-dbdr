@@ -27,6 +27,9 @@ use tempfile::NamedTempFile;
 
 use paths::state_dir;
 
+#[cfg(windows)]
+const RENAME_ATTEMPTS: usize = 20;
+
 #[derive(Debug, Clone)]
 pub struct StateDir(PathBuf);
 
@@ -69,6 +72,9 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), StorageError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = NamedTempFile::new_in(parent)?;
     tmp.write_all(data)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(tmp.path(), metadata.permissions())?;
+    }
     tmp.as_file().sync_data()?;
     // `into_parts` drops the auto-cleanup-on-drop guarantee, but we need the
     // File handle closed (Windows can't rename an open file) and `persist()`
@@ -113,7 +119,7 @@ pub(crate) fn atomic_write_permissions(
 fn retry_rename(src: &Path, dest: &Path) -> std::io::Result<()> {
     let mut a: u64 = 0;
     let mut b: u64 = 1;
-    for _ in 0..20 {
+    for _ in 0..RENAME_ATTEMPTS {
         match fs::rename(src, dest) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -138,4 +144,80 @@ pub fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORIGINAL: &[u8] = b"original";
+    const OWNER_ONLY_FILE_MODE: u32 = 0o600;
+    const REPLACEMENT: &[u8] = b"replacement";
+    #[cfg(unix)]
+    const FILE_MODE_MASK: u32 = 0o777;
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(&path, ORIGINAL).unwrap();
+
+        atomic_write(&path, REPLACEMENT).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), REPLACEMENT);
+    }
+
+    #[test]
+    fn atomic_write_permissions_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(&path, ORIGINAL).unwrap();
+
+        atomic_write_permissions(&path, REPLACEMENT, OWNER_ONLY_FILE_MODE).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), REPLACEMENT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+
+        atomic_write(&path, ORIGINAL).unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & FILE_MODE_MASK,
+            OWNER_ONLY_FILE_MODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_destination_permissions() {
+        const MODE: u32 = 0o640;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        fs::write(&path, ORIGINAL).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(MODE)).unwrap();
+
+        atomic_write(&path, REPLACEMENT).unwrap();
+
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & FILE_MODE_MASK,
+            MODE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_cleans_up_temp_after_replacement_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(atomic_write(&destination, REPLACEMENT).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

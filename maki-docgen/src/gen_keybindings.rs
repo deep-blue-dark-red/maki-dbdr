@@ -3,10 +3,16 @@ use maki_ui::keybindings::{ALT_SEP, KEYBINDS, KeyLabel, KeybindContext, Platform
 const FRONTMATTER: &str = "\
 +++
 title = \"Keybindings\"
-weight = 7
+weight = 5
 [extra]
 group = \"Reference\"
 +++";
+
+const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
+    ("Session Picker", "`Ctrl+N`", "New session"),
+    ("Session Picker", "`Ctrl+R`", "Rename session"),
+    ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
+];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
@@ -26,19 +32,9 @@ fn label_str(label: KeyLabel) -> String {
             .map(|s| format!("`{s}`"))
             .collect::<Vec<_>>()
             .join(ALT_SEP),
-        KeyLabel::Action(name) => {
-            let label = maki_ui::keybindings::get_bind_label(name);
-            format!("`{label}`")
-        }
-        KeyLabel::ActionAlt(name1, name2) => {
-            let label1 = maki_ui::keybindings::get_bind_label(name1);
-            let label2 = maki_ui::keybindings::get_bind_label(name2);
-            format!("`{label1}`{ALT_SEP}`{label2}`")
-        }
-        KeyLabel::ActionMacAlt(name, _) => {
-            let label = maki_ui::keybindings::get_bind_label(name);
-            format!("`{label}`")
-        }
+        KeyLabel::Action(_) => "configurable".to_string(),
+        KeyLabel::ActionAlt(_, _) => "configurable".to_string(),
+        KeyLabel::ActionMacAlt(_, _) => "configurable".to_string(),
     }
 }
 
@@ -98,6 +94,10 @@ fn write_context_specific(out: &mut String) {
             kb.description
         ));
     }
+
+    for (ctx, key, desc) in LUA_CONTEXT_BINDS {
+        out.push_str(&format!("| {ctx} | {key} | {desc} |\n"));
+    }
 }
 
 fn write_inheritance(out: &mut String) {
@@ -142,6 +142,62 @@ pub fn generate() -> String {
 
     write_context_specific(&mut out);
     write_inheritance(&mut out);
+    write_overrides(&mut out);
 
     out
+}
+
+fn write_overrides(out: &mut String) {
+    out.push_str("\n## Overriding Keybindings\n\n");
+    out.push_str(
+        "Plugins and `init.lua` can rebind keys at runtime with \
+         `maki.keymap.set` and `maki.keymap.del`. The tables above are the \
+         built-in defaults. An override on the same key wins, unless a \
+         modal or overlay is open (help, plan form, permission prompt).\n\n",
+    );
+    out.push_str("Precedence, high to low:\n\n");
+    out.push_str(
+        "1. **Suspend** (`Ctrl+Z`, Unix). Always wins, non-remappable.\n\
+         2. **Modal and overlay keys.** An open modal or picker consumes \
+         its keys first, so they cannot be shadowed while open.\n\
+         3. **Lua overrides** from `maki.keymap.set`. Last set wins; \
+         binding the same key twice warns.\n\
+         4. **Built-in defaults.** An override on the same key shadows \
+         them; `maki.keymap.del` lifts the override so the default returns. \
+         Suspend is the only binding outside this layer, so every key is \
+         remappable except `Ctrl+Z`.\n\n",
+    );
+    out.push_str(
+        "Only single-key bindings can be overridden. Multi-key combinations \
+         and non-key rows (like `Type` to filter) cannot.\n\n",
+    );
+    out.push_str(
+        "The `/help` modal and the splash show default labels, not live \
+         overrides, but pressing the key still runs the override.\n\n",
+    );
+    out.push_str("### Recovering from a bad keymap\n\n");
+    out.push_str(
+        "If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal \
+         that won't close, a plugin that throws on load), boot without \
+         user `init.lua`:\n\n",
+    );
+    out.push_str("```bash\nmaki --no-plugins\n```\n\n");
+    out.push_str(
+        "Skips user `init.lua` files (global and project) but keeps the \
+         Lua host and builtin plugins running, so tools still work. \
+         `permissions.toml`, custom commands, and env files load as \
+         usual.\n\n",
+    );
+    out.push_str(
+        "The default keymap lives in Rust, not Lua, so `--no-plugins` \
+         never drops it.\n\n",
+    );
+    out.push_str("## Shell and images\n\n");
+    out.push_str(
+        "These are input conventions, not remappable key rows:\n\n\
+         - Prefix a line with `!` to run a shell command yourself (5 minute \
+         timeout). Use `!!` to hide the command and its output from the agent.\n\
+         - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
+         model supports vision. You can also paste image file paths.\n",
+    );
 }

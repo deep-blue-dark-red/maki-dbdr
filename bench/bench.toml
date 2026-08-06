@@ -1,0 +1,20 @@
+[matrix]
+models = [
+  "openrouter/deepseek/deepseek-v4-flash",
+  "openrouter/qwen/qwen3.7-plus",
+  "openrouter/z-ai/glm-5.2",
+]
+variants = ["baseline"]
+reps = 5
+concurrency = 3
+
+[run]
+maki_bin = "/Users/mcp/git/maki/target/release/maki"
+default_max_turns = 20
+default_timeout_s = 300
+keep_failed_workdirs = true
+
+[budget]
+# 0 disables the guard. Cost reporting depends on maki pricing tables
+# covering the model; token counts are always recorded regardless.
+max_usd_total = 25.0

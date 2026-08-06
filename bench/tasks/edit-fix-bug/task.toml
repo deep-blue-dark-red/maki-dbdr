@@ -1,0 +1,6 @@
+[task]
+id = "edit-fix-bug"
+category = "edit"
+prompt = "Running `python3 -m unittest discover -q` in this repo fails. Find the bug and fix it. Do not modify the tests."
+max_turns = 15
+timeout_s = 240

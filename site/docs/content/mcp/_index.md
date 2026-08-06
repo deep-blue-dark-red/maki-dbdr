@@ -1,6 +1,6 @@
 +++
 title = "MCP"
-weight = 6
+weight = 10
 [extra]
 group = "Reference"
 +++
@@ -47,16 +47,61 @@ headers = { Authorization = "Bearer tok123" }
 | `headers` | map | | HTTP only |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
+| `always_load` | bool | false | Skip tool search, load all tools upfront |
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
+One option lives at the top level of `mcp.toml`, outside any server:
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
+
+## Tool search
+
+Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
+
+So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+
+You don't configure anything for this. Add the server as usual:
+
+```toml
+[mcp.datadog]
+url = "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=all"
+```
+
+Ask about an incident, and the model searches for something like `datadog logs`, gets back the few matching tools, and the other hundred definitions never enter the conversation.
+
+With 10 or fewer tools across all your servers there is no search step: at that size, searching costs more than it saves, so everything loads upfront. The top-level `defer_tools` key moves that line:
+
+```toml
+defer_tools = 30
+
+[mcp.github]
+url = "https://api.githubcopilot.com/mcp/"
+```
+
+Set it to 0 to always defer, or above your tool count to never defer.
+
+If one server should skip the search step entirely, opt it out:
+
+```toml
+[mcp.linear]
+command = ["linear-mcp-server"]
+always_load = true
+```
+
+Good for small servers you rely on every turn. On a big server it defeats the point: every definition is back in your context on every request.
+
 ## Naming and namespacing
 
-Server names are ASCII alphanumeric, hyphens ok. Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
+Server names are ASCII alphanumeric, hyphens ok (no dots). Tools get prefixed with their server name: a `read` tool on the `filesystem` server becomes `filesystem__read`. Because of this, `__` is reserved and names can't collide with built-in tools.
+
+Permission rules for MCP tools use the same nested form under `[mcp.<server>]` in `permissions.toml`. See [Permissions](/docs/permissions/#mcp-tool-permissions).
 
 ## Runtime toggling
 
-Turn servers on/off from the MCP picker in the UI. Changes save back to your config.
+Open the MCP picker with `/mcp`. Turn servers on or off there; changes save back to your config (project or global, depending on which file defined the server).
 
 ## Status
 

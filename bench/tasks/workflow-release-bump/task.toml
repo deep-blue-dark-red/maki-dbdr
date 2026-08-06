@@ -1,0 +1,6 @@
+[task]
+id = "workflow-release-bump"
+category = "workflow"
+prompt = "Prepare the 1.2.0 release: (1) bump __version__ in pkg/version.py to 1.2.0, (2) create CHANGELOG.md starting with the header '# Changelog', (3) add a '## 1.2.0' section to CHANGELOG.md with at least one bullet, (4) update the version badge in README.md to 1.2.0."
+max_turns = 15
+timeout_s = 240

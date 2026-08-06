@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -14,12 +15,12 @@ use super::instructions::LoadedInstructions;
 use super::streaming::stream_with_retry;
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::mcp::McpHandle;
+use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, EventSender, ExtractedCommand,
-    InterruptSource, TurnCompleteEvent,
+    InterruptSource, SessionMailbox, TurnCompleteEvent,
 };
 use maki_config::ToolOutputLines;
 use maki_storage::id::SessionRef;
@@ -59,6 +60,7 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
@@ -93,7 +95,7 @@ pub struct Agent<'h> {
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
-    mcp: Option<McpHandle>,
+    mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
@@ -101,6 +103,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
@@ -141,6 +144,7 @@ impl<'h> Agent<'h> {
             post_tool_empty_retried: false,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            mailbox: params.mailbox,
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
@@ -151,7 +155,7 @@ impl<'h> Agent<'h> {
         }
     }
 
-    pub fn with_mcp(mut self, mcp: Option<McpHandle>) -> Self {
+    pub fn with_mcp(mut self, mcp: Option<McpSession>) -> Self {
         self.mcp = mcp;
         self
     }
@@ -185,20 +189,30 @@ impl<'h> Agent<'h> {
     }
 
     pub async fn run(&mut self, input: AgentInput) -> Result<(), AgentError> {
+        let AgentInput {
+            message,
+            mode,
+            images,
+            preamble,
+            thinking,
+            fast,
+            workflow,
+            prompt: _,
+        } = input;
         self.rollback_len = self.history.len();
-        let msg = Message::user_with_images(input.message.clone(), input.images);
-        self.history.push(msg);
-        self.mode = input.mode;
-        self.workflow = input.workflow;
-        self.opts = RequestOptions {
-            thinking: input.thinking,
-            fast: input.fast,
-        };
+        self.push_input_context(preamble);
+        if !message.trim().is_empty() || !images.is_empty() {
+            self.history
+                .push(Message::user_with_images(message.clone(), images));
+        }
+        self.mode = mode;
+        self.workflow = workflow;
+        self.opts = RequestOptions { thinking, fast };
 
         info!(
             model = %self.model.id,
             mode = ?self.mode,
-            message_len = input.message.len(),
+            message_len = message.len(),
             "agent run started"
         );
 
@@ -209,6 +223,17 @@ impl<'h> Agent<'h> {
         }
 
         result
+    }
+
+    fn push_input_context(&mut self, preamble: Vec<Message>) {
+        for message in preamble {
+            self.history.push(message);
+        }
+        if let Some(mailbox) = &self.mailbox {
+            for message in mailbox.drain() {
+                self.history.push(message);
+            }
+        }
     }
 
     async fn run_loop(&mut self) -> Result<(), AgentError> {
@@ -229,16 +254,31 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// `self.tools` holds base tools only; the MCP part is recomputed here
+    /// every turn so `tool_search` loads and late-connecting servers take
+    /// effect on the next request.
+    fn request_tools(&self) -> Cow<'_, Value> {
+        match &self.mcp {
+            Some(mcp) => {
+                let mut tools = self.tools.clone();
+                mcp.extend_tools(&mut tools);
+                Cow::Owned(tools)
+            }
+            None => Cow::Borrowed(&self.tools),
+        }
+    }
+
     async fn turn(&mut self) -> Result<TurnOutcome, AgentError> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        let tools = self.request_tools();
         let response = match stream_with_retry(
             &*self.provider,
             &self.model,
             self.history.as_slice(),
             &self.system,
-            &self.tools,
+            tools.as_ref(),
             &self.event_tx,
             &self.cancel,
             self.opts,
@@ -260,15 +300,12 @@ impl<'h> Agent<'h> {
         };
         self.num_turns += 1;
 
-        let has_tools = response.message.has_tool_calls();
-        let stop_reason = response.stop_reason;
-        let usage = response.usage;
         // expected = previous turn's uncached input + cache_creation (the prefix
         // that should be served from cache this turn). A large shortfall vs the
         // actual cache_read means a prompt-cache miss (history changed or the
         // provider evicted the cache, e.g. >5 min idle).
         if self.num_turns >= 2 {
-            let actual = usage.cache_read;
+            let actual = response.usage.cache_read;
             if self.last_cache_baseline.saturating_sub(actual) >= CACHE_MISS_DEVIANCE {
                 warn!(
                     self.num_turns,
@@ -280,7 +317,10 @@ impl<'h> Agent<'h> {
                 );
             }
         }
-        self.last_cache_baseline = usage.input + usage.cache_creation;
+        self.last_cache_baseline = response.usage.input + response.usage.cache_creation;
+
+        let has_tools = response.message.has_tool_calls();
+        let stop_reason = response.stop_reason;
         info!(
             input_tokens = response.usage.input,
             output_tokens = response.usage.output,
@@ -294,8 +334,10 @@ impl<'h> Agent<'h> {
         );
 
         self.emit_turn_complete(&response)?;
+        let usage = response.usage;
         self.total_usage += usage;
         self.context_size = usage.total_input();
+
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
@@ -377,6 +419,9 @@ impl<'h> Agent<'h> {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
+                cost: self
+                    .model
+                    .cost_of(&response.usage, self.opts.clamped(&self.model).fast),
                 context_size: Some(response.usage.context_tokens()),
             })))
     }
@@ -415,6 +460,7 @@ impl<'h> Agent<'h> {
             model: Arc::clone(&self.model),
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
+            session_id: self.session_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
@@ -465,12 +511,28 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
+            None,
         )
         .await?;
         self.rollback_len = self.history.len();
         self.event_tx.send(AgentEvent::CompactionDone)?;
         self.history
             .push(Message::synthetic(CONTINUE_AFTER_COMPACT.into()));
+        Ok(())
+    }
+
+    async fn do_checkpoint(&mut self) -> Result<(), AgentError> {
+        let (provider, model) =
+            resolve_compaction_model(&self.provider, &self.model, self.timeouts);
+        self.total_usage += compaction::checkpoint_history(
+            &*provider,
+            &model,
+            self.history,
+            &self.event_tx,
+            &self.cancel,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -487,9 +549,7 @@ impl<'h> Agent<'h> {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                 })?;
-                for msg in std::mem::take(&mut input.preamble) {
-                    self.history.push(msg);
-                }
+                self.push_input_context(std::mem::take(&mut input.preamble));
                 self.mode = input.mode.clone();
                 let display = input.message.clone();
                 let wrapped = format!(
@@ -501,26 +561,7 @@ impl<'h> Agent<'h> {
                 self.do_compact().await?;
             }
             ExtractedCommand::Checkpoint(_) => {
-                let (compact_provider, compact_model) =
-                    resolve_compaction_model(&self.provider, &self.model, self.timeouts);
-                compaction::checkpoint(
-                    &*compact_provider,
-                    &compact_model,
-                    self.history,
-                    &self.event_tx,
-                )
-                .await?;
-            }
-            ExtractedCommand::Rename(messages, _) => {
-                let (compact_provider, compact_model) =
-                    resolve_compaction_model(&self.provider, &self.model, self.timeouts);
-                compaction::rename_session(
-                    &*compact_provider,
-                    &compact_model,
-                    &messages,
-                    &self.event_tx,
-                )
-                .await?;
+                self.do_checkpoint().await?;
             }
         }
         Ok(true)
@@ -561,6 +602,7 @@ mod tests {
 
     use super::*;
     use crate::Envelope;
+    use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
 
     struct MockInterruptSource {
@@ -583,12 +625,14 @@ mod tests {
 
     struct MockProvider {
         responses: Mutex<Vec<StreamResponse>>,
+        captured_tools: Arc<Mutex<Vec<Value>>>,
     }
 
     impl MockProvider {
         fn new(responses: Vec<StreamResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                captured_tools: Arc::default(),
             }
         }
     }
@@ -599,12 +643,13 @@ mod tests {
             _: &'a Model,
             _: &'a [Message],
             _: &'a str,
-            _: &'a Value,
+            tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
+                self.captured_tools.lock().unwrap().push(tools.clone());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
@@ -666,6 +711,7 @@ mod tests {
                     std::path::PathBuf::from("/tmp"),
                 )),
                 session_id: None,
+                mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
@@ -694,6 +740,82 @@ mod tests {
             workflow: false,
             prompt: None,
         }
+    }
+
+    #[test]
+    fn run_ingests_preamble_then_mailbox_then_user_message() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            input.preamble = vec![Message::observation("preamble".into())];
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some("preamble"));
+            assert_eq!(history.as_slice()[1].user_text(), Some("mailbox"));
+            assert_eq!(history.as_slice()[2].user_text(), Some("hello"));
+        });
+    }
+
+    #[test]
+    fn queued_input_drains_preamble_and_mailbox() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            let mut input = default_input();
+            input.preamble = vec![Message::observation("preamble".into())];
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(input, 0)]);
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            agent.mailbox = Some(mailbox);
+            let mut agent = agent.with_interrupt_source(source);
+
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+
+            let text = history
+                .as_slice()
+                .iter()
+                .map(Message::user_text)
+                .collect::<Vec<_>>();
+            assert_eq!(text, [Some("preamble"), Some("mailbox"), Some("hello")]);
+            assert!(history.as_slice()[0].is_observation());
+            assert!(history.as_slice()[1].is_observation());
+        });
+    }
+
+    #[test]
+    fn wake_only_run_does_not_insert_an_empty_user_turn() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, "failed".into(), true).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+            let mut input = default_input();
+            input.message.clear();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice().len(), 2);
+            assert!(history.as_slice()[0].is_observation());
+            assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+        });
     }
 
     fn drain_events(rx: &flume::Receiver<Envelope>) -> Vec<Envelope> {
@@ -737,16 +859,56 @@ mod tests {
         StreamResponse {
             message: Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: tool_id.into(),
-                    name: tool_name.into(),
-                    input: serde_json::json!({"pattern": "*.nonexistent_test_xyz", "path": "/tmp"}),
-                }],
+                content: vec![ContentBlock::tool_use(
+                    tool_id,
+                    tool_name,
+                    serde_json::json!({"pattern": "*.nonexistent_test_xyz", "path": "/tmp"}),
+                )],
                 ..Default::default()
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
         }
+    }
+
+    fn tool_use_response(tool_name: &str, input: Value) -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("t1", tool_name, input)],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::ToolUse),
+        }
+    }
+
+    #[test]
+    fn mcp_definitions_refresh_per_request() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                tool_use_response(
+                    crate::mcp::TOOL_SEARCH_TOOL_NAME,
+                    serde_json::json!({"query": "fetch issue"}),
+                ),
+                text_response(StopReason::EndTurn),
+            ]);
+            let captured = Arc::clone(&provider.captured_tools);
+            let mut history = History::new(Vec::new());
+            let (agent, _event_rx) = make_agent(provider, &mut history);
+            let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
+                "srv.fetch_issue",
+                "Fetch a GitHub issue",
+            )])));
+            agent.run(default_input()).await.unwrap();
+
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            let first = tool_names(&captured[0]);
+            assert!(first.contains(&crate::mcp::TOOL_SEARCH_TOOL_NAME));
+            assert!(!first.contains(&"srv__fetch_issue"));
+            assert!(tool_names(&captured[1]).contains(&"srv__fetch_issue"));
+        });
     }
 
     fn small_context_model(context_window: u32, max_output_tokens: u32) -> Model {
@@ -929,6 +1091,7 @@ mod tests {
                         std::path::PathBuf::from("/tmp"),
                     )),
                     session_id: None,
+                    mailbox: None,
                     timeouts: maki_providers::Timeouts::default(),
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
@@ -1023,5 +1186,20 @@ mod tests {
                 .expect("expected Done event");
             assert_eq!(done, expected_turns);
         });
+    }
+
+    /// Wiring this to `None` to make the struct literal compile would
+    /// silently reintroduce the bug the field exists to fix.
+    #[test]
+    fn tool_context_carries_the_session() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        assert_eq!(agent.tool_context().session_id, None);
+
+        let session: SessionRef = "01965087-4c71-7f00-8000-000000000000"
+            .parse()
+            .expect("valid session id");
+        agent.session_id = Some(session.clone());
+        assert_eq!(agent.tool_context().session_id, Some(session));
     }
 }

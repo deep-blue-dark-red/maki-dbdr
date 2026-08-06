@@ -559,10 +559,13 @@ pub enum AgentEvent {
         stop_reason: Option<StopReason>,
     },
     AutoCompacting,
-    CompactionDone,
+    /// Emitted before a manual `/compact` or `/checkpoint` streams its summary,
+    /// so the UI can label the resulting block. `checkpoint` selects the label.
     CompactionStart {
         checkpoint: bool,
     },
+    CompactionDone,
+    /// Emitted by the rename subagent with the LLM-generated session title.
     RenameResult {
         title: String,
     },
@@ -823,6 +826,8 @@ pub struct TurnCompleteEvent {
     pub message: Message,
     pub usage: TokenUsage,
     pub model: String,
+    #[serde(skip)]
+    pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
 }

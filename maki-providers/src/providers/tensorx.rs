@@ -12,6 +12,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "tensorx",
     api_key_env: "TENSORX_API_KEY",
     base_url: "https://api.tensorx.ai/v1",
     max_tokens_field: "max_tokens",
@@ -215,6 +216,7 @@ impl Provider for TensorX {
                                 pricing,
                                 supports_thinking,
                                 supports_vision: Some(supports_vision),
+                                tier: None,
                                 provider_info: supported_params
                                     .map(|p| Arc::new(p) as Arc<dyn std::any::Any + Send + Sync>),
                             })

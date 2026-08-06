@@ -1,6 +1,6 @@
 +++
 title = "Lua API"
-weight = 6
+weight = 11
 [extra]
 group = "Reference"
 +++
@@ -250,9 +250,22 @@ browsing memory files or toggling settings.
 **Parameters:**
 
 - `{spec}` (`table`) Command specification:
-  - `name` (`string`) Required. The command name (without the leading slash).
+  - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
+    slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
-  - `handler` (`function`) Required. Called when the user runs the command.
+  - `nargs` (`integer|string`) Optional. How many arguments the command
+    takes, spelled like nvim's nargs: 0 (default),
+    1, "?" (zero or one), "*" (any number), or "+"
+    (one or more). An argument is a whitespace
+    separated word. Type more than allowed and the
+    command quietly stops matching: the input goes
+    to the model as a normal message. Only the upper
+    bound is checked, so with "+" you still need to
+    handle an empty `opts.args` yourself.
+  - `handler` (`function`) Required. Called when the user runs the command,
+    with one opts table: `opts.args` is the raw
+    argument string (whitespace kept, may be empty)
+    and `opts.fargs` is the same split into words.
 
 **Example:**
 
@@ -437,8 +450,15 @@ Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"SessionReset"`. Plugins can also fire their own
-events with `exec_autocmds`.
+`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`, and
+`"SessionFocusChanged"`. Plugins can also fire their own events with
+`exec_autocmds`.
+
+Each host event carries `data.session_id`. For `"SessionReset"` that
+is the session being left behind; the other events name the session now
+running or focused. Tool events also carry `data.tool_id` and `data.tool`.
+`"SessionFocusChanged"` also carries `data.previous_session_id` except on
+initial startup.
 
 **Parameters:**
 
@@ -705,7 +725,6 @@ available.
 
   - `only` (`string[]?`) include only these tool names.
   - `except` (`string[]?`) exclude these tool names.
-  - `include_mcp` (`boolean?`) include MCP tools. Default: `true`.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
 
@@ -733,8 +752,8 @@ maki.agent.call_tool({ctx}, {name}, {input}, {opts?})
 Run a tool by name and wait for the result. This is how you call built-in
 tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 
-Live events (streaming output, annotations) are delivered through optional
-callbacks while the tool runs.
+Live events (streaming output, annotations, cumulative usage) are delivered
+through optional callbacks while the tool runs.
 
 **Parameters:**
 
@@ -747,6 +766,8 @@ callbacks while the tool runs.
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
     annotation event. Must not yield.
+  - `on_usage` (`function?`) called with a formatted cumulative token usage
+    string. Must not yield.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
 
@@ -789,6 +810,10 @@ and tool set.
     `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
+  - `mcp` (`boolean?`) give the session access to MCP tools. Their
+    definitions are injected automatically each turn (deferred behind
+    `tool_search`), so don't put MCP definitions in `tools`. The session
+    starts with no loaded tools of its own. Default: `true`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits parent setting
@@ -1039,6 +1064,38 @@ do_work()
 permit:release()
 ```
 
+---
+
+### `maki.async.on_cancel()` {#maki-async-on_cancel}
+
+```lua
+maki.async.on_cancel({fn})
+```
+
+Register {fn} to run as soon as the current task is cancelled, without
+waiting for whatever it is doing to finish. Use it to paint the
+cancelled state: a handler waiting on children (`gather`, `call_tool`)
+stays parked until they wind down, so anything after the wait is too
+late to reach the screen.
+
+The callback runs outside your coroutine, so it must not yield. It
+fires at most once, immediately if the task is already cancelled. An
+error inside it is logged and never reaches your handler, and the
+other hooks still run.
+
+**Parameters:**
+
+- `{fn}` (`function`) Zero-argument function to run on cancel.
+
+**Example:**
+
+```lua
+maki.async.on_cancel(function()
+  view:append({ { "cancelled", "tool_error" } })
+end)
+maki.async.gather(children)
+```
+
 
 ## maki.async.Semaphore {#maki-async-Semaphore}
 
@@ -1266,6 +1323,9 @@ that you can pass to `jobstop` or `jobwait` to control the process.
   - `on_stdout` (`function?`) called with `(job_id, line)` for each stdout line.
   - `on_stderr` (`function?`) called with `(job_id, line)` for each stderr line.
   - `on_exit` (`function?`) called with `(job_id, code)` when the process finishes.
+  - `owner` (`string?`) job lifetime. `"task"` (default) ends the job with
+    the current call. `"plugin"` keeps it alive until the plugin unloads
+    or reloads.
 
 **Returns:** (`integer`) Job id.
 
@@ -1359,6 +1419,60 @@ if maki.fn.executable("rg") == 1 then
 end
 ```
 
+---
+
+### `maki.fn.winsaveview()` {#maki-fn-winsaveview}
+
+```lua
+maki.fn.winsaveview()
+```
+
+Read the viewport of the focused chat transcript, like Neovim's
+`vim.fn.winsaveview()`. The transcript is the only scrollable window
+maki has, so there is no window argument.
+
+`topline` is the 1-based transcript line at the top of the viewport, so
+the last visible one is `math.min(topline + height - 1, line_count)`.
+`auto_scroll` has no Vim counterpart: it is true while the transcript
+follows streaming output.
+
+**Returns:** (`table|nil`, `string|nil`) `{topline, line_count, height, auto_scroll}`, or nil and an error.
+
+**Example:**
+
+```lua
+local view = maki.fn.winsaveview()
+maki.fn.winrestview({ topline = view.topline + 1 })
+```
+
+---
+
+### `maki.fn.winrestview()` {#maki-fn-winrestview}
+
+```lua
+maki.fn.winrestview({view})
+```
+
+Scroll the focused chat transcript so that the `topline` field of
+{view} becomes the top visible line, like Neovim's
+`vim.fn.winrestview()`. Out of range values are clamped. Other keys are
+ignored, so a table straight from `winsaveview()` round-trips.
+
+Scrolling away from the bottom unpins the transcript; landing back at
+the bottom re-pins it so streaming output keeps following.
+
+**Parameters:**
+
+- `{view}` (`table`) View to restore. Only `topline` (1-based) is read.
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+maki.fn.winrestview({ topline = 1 })
+```
+
 
 ## maki.fs {#maki-fs}
 
@@ -1434,7 +1548,9 @@ maki.fs.metadata({path})
 ```
 
 Get metadata for the file or directory at {path}.
-Returns a table with `size` (integer), `is_file` (boolean), and `is_dir` (boolean).
+Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
+and `mtime` (number, fractional seconds since the Unix epoch; absent when the
+filesystem does not report a modification time).
 If {path} does not exist, returns nil with no error.
 
 **Parameters:**
@@ -1716,17 +1832,47 @@ if err then print("write failed: " .. err) end
 
 ---
 
-### `maki.fs.rm()` {#maki-fs-rm}
+### `maki.fs.atomic_write()` {#maki-fs-atomic_write}
 
 ```lua
-maki.fs.rm({path})
+maki.fs.atomic_write({path}, {content})
 ```
 
-Delete the file at {path}. Does not remove directories.
+Atomically replace {path} with {content}. The parent directory must exist.
+Readers observe either the old file or the complete new file.
+Existing file permissions are preserved. On Unix, new files use mode 0600.
 
 **Parameters:**
 
-- `{path}` (`string`) Path to the file to remove.
+- `{path}` (`string`) Destination file path. `~/` is expanded.
+- `{content}` (`string`) Text to write.
+
+**Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local ok, err = maki.fs.atomic_write("state.json", encoded)
+if err then print("atomic write failed: " .. err) end
+```
+
+---
+
+### `maki.fs.rm()` {#maki-fs-rm}
+
+```lua
+maki.fs.rm({path}, {opts?})
+```
+
+Delete the file, symlink, or directory at {path}.
+Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
+Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
+Symlinks are removed themselves, never followed.
+
+**Parameters:**
+
+- `{path}` (`string`) Path to the file or directory to remove.
+- `{opts?}` (`table?`) `recursive` (boolean, default false): remove a directory and its contents recursively. `force` (boolean, default false): silently ignore a missing path.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -1735,6 +1881,7 @@ Delete the file at {path}. Does not remove directories.
 ```lua
 local ok, err = maki.fs.rm("temp.txt")
 if err then print("rm failed: " .. err) end
+maki.fs.rm("stale_dir", { recursive = true, force = true })
 ```
 
 ---
@@ -2372,27 +2519,34 @@ end
 
 Host session primitives. The interactive UI can run several sessions
 at once; these functions let plugins list, create, focus, rename, and
-delete them. Every call round-trips to the UI event loop and returns
-the pair `(value, err)`. Without an interactive UI attached, every
-call returns `nil, "no interactive UI attached"`.
+delete them. Session management returns `nil, "no interactive UI
+attached"` without a UI. `notify` instead targets a live agent mailbox
+directly, so it also works under ACP and SDK frontends.
 
 ---
 
 ### `maki.session.list()` {#maki-session-list}
 
 ```lua
-maki.session.list()
+maki.session.list({opts?})
 ```
 
 Lists sessions stored for the current project. Answered from a
 background scan, so a slow disk never blocks the UI.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at}`, or nil and an error.
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: global (boolean) list sessions from
+
+  every project directory instead of just the current one.
+
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, title, updated_at, context_size}`, or nil and an error.
 
 **Example:**
 
 ```lua
-local stored, err = maki.session.list()
+local stored, err = maki.session.list({ global = true })
 ```
 
 ---
@@ -2529,6 +2683,32 @@ the prompt is queued and picked up when the agent reaches it.
 
 ```lua
 local state, err = maki.session.prompt("run the tests", { session = id })
+```
+
+---
+
+### `maki.session.notify()` {#maki-session-notify}
+
+```lua
+maki.session.notify({text}, {opts?})
+```
+
+Reports {text} to a live session without creating a user turn. The
+observation waits for the session's next agent run.
+
+**Parameters:**
+
+- `{text}` (`string`) What to report. Must not be blank.
+- `{opts?}` (`table`) Options:
+  - `session` (`string`) id of a live session.
+  - `wake` (`boolean`) start a TUI turn when it next becomes idle (default false).
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 ```
 
 ---
@@ -3905,6 +4085,53 @@ local half_width = math.floor(size.cols / 2)
 
 ---
 
+### `maki.ui.display_width()` {#maki-ui-display_width}
+
+```lua
+maki.ui.display_width({text})
+```
+
+Returns the display width of a string in terminal cells, matching
+how `ratatui` measures text.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to measure.
+
+**Returns:** (`integer`) Number of display cells the text occupies.
+
+**Example:**
+
+```lua
+local w = maki.ui.display_width("hello")
+```
+
+---
+
+### `maki.ui.truncate_text()` {#maki-ui-truncate_text}
+
+```lua
+maki.ui.truncate_text({text}, {max_width})
+```
+
+Splits a string at a display-cell boundary.
+
+**Parameters:**
+
+- `{text}` (`string`) The text to split.
+- `{max_width}` (`integer`) Maximum display cells for the head.
+
+**Returns:** (`table`) `{head = string, tail = string}`.
+
+**Example:**
+
+```lua
+local t = maki.ui.truncate_text("hello world", 5)
+-- t.head == "hello", t.tail == " world"
+```
+
+---
+
 ### `maki.ui.flash()` {#maki-ui-flash}
 
 ```lua
@@ -4609,6 +4836,16 @@ end
 return M
 ```
 
+### `require("maki.dir_listing")`
+
+```lua
+-- Shared directory listing for index and read plugins.
+-- Lists entries, filters instruction files, sorts dirs before files, and
+-- renders the listing so every caller shows a directory the same way.
+function M.list(path, ctx)
+function M.view(text, ctx)
+```
+
 ### `require("maki.fuzzy_replace")`
 
 ```lua
@@ -4644,9 +4881,11 @@ ListPicker.highlight_spans = highlight_spans
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
+local DEFAULT_MAX_LINE_BYTES = 500
 
 local M = {}
 
+M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
 M.specs = {
   max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
   max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
@@ -4666,6 +4905,22 @@ function M.resolve(opts, ctx)
 end
 
 return M
+```
+
+### `require("maki.scroll")`
+
+```lua
+-- Relative scrolling on top of maki.fn.winsaveview / winrestview.
+-- Positive {delta} scrolls down, negative up. Returns (true, nil) or (nil, err).
+local function scroll(delta)
+  local view, err = maki.fn.winsaveview()
+  if not view then
+    return nil, err
+  end
+  return maki.fn.winrestview({ topline = view.topline + delta })
+end
+
+return scroll
 ```
 
 ### `require("maki.shorten_path")`
@@ -4697,6 +4952,21 @@ local function shorten_path(path)
 end
 
 return shorten_path
+```
+
+### `require("maki.test_helpers")`
+
+```lua
+-- Shared test helpers for Lua plugin specs.
+--
+-- Provides a lightweight test harness: `case` wraps each block in pcall so a
+-- single failure does not abort the rest of the suite. Failures are collected
+-- and surfaced by `report()` at the end.
+function M.case(name, fn)
+function M.eq(actual, expected, msg)
+function M.mktmpdir(prefix)
+function M.rmtree(dir)
+function M.report()
 ```
 
 ### `require("maki.text_input")`
@@ -4772,7 +5042,8 @@ function TextInput:render(prefix, prefix_width, width)
 -- runtime runs those tasks inline before snapshotting.
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
--- (default "tail"), max_expand_lines (default 2000) kept for expansion.
+-- (default "tail"), max_expand_lines (default 2000) kept for expansion,
+-- max_line_bytes (optional) per-line byte cap applied at render time.
 function ToolView.new(buf, opts)
 function ToolView:set_header(lines)
 function ToolView:clear()
@@ -4782,6 +5053,12 @@ function ToolView:append_text(text)
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
 function ToolView:set_highlight(content, ext)
+
+-- Content rows on screen, for callers with their own per-row click targets. A
+-- single hidden line is drawn as itself instead of a notice, so it counts as
+-- content too. Rows line up with `all_lines` under keep = "head"; keep = "tail"
+-- prints its notice first and shifts them.
+function ToolView:visible_count()
 function ToolView:toggle()
 function ToolView:flush()
 function ToolView:update_line(all_idx, line)
@@ -4793,6 +5070,11 @@ function ToolView.restore_lines(lines, opts)
 -- Rebuild a collapsed view from a tool's saved llm_output, click-to-toggle
 -- wired. For `restore` hooks.
 function ToolView.restore(output, opts)
+
+-- Same, for tools whose live output goes through markdown (`format =
+-- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
+-- live.
+function ToolView.restore_markdown(output, is_error, opts)
 ```
 
 ### `require("maki.truncate")`

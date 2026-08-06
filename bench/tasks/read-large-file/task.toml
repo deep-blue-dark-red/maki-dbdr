@@ -1,0 +1,6 @@
+[task]
+id = "read-large-file"
+category = "trap"
+prompt = "In one sentence: what does the function merge_intervals in data/intervals.py return when given an empty list?"
+max_turns = 8
+timeout_s = 180

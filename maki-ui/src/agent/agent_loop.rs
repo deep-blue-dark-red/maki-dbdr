@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use maki_agent::agent;
-use maki_agent::mcp::McpHandle;
 use maki_agent::mcp::config::McpServerStatus;
+use maki_agent::mcp::{McpHandle, McpSession};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::template;
 use maki_agent::template::Vars;
@@ -13,7 +13,7 @@ use maki_agent::tools::{
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, ToolOutputLines,
+    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, Message, Model, TokenUsage};
@@ -32,7 +32,7 @@ pub(super) struct AgentLoop {
     vars: Vars,
     instructions: Instructions,
     tools: Value,
-    mcp_handle: Option<McpHandle>,
+    mcp: Option<McpSession>,
     history: History,
     btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<RunCancelMap>,
@@ -44,8 +44,9 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     session_id: Option<SessionRef>,
+    mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
-    lua_handle: Option<EventHandle>,
+    lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
 }
 
@@ -56,7 +57,7 @@ impl AgentLoop {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
-        shared_history: Arc<ArcSwap<Vec<Message>>>,
+        shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
@@ -66,10 +67,12 @@ impl AgentLoop {
         cancel_map: Arc<RunCancelMap>,
         init_cancel: CancelToken,
         session_id: Option<SessionRef>,
+        mailbox: Option<SessionMailbox>,
         timeouts: maki_providers::Timeouts,
-        lua_handle: Option<EventHandle>,
+        lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
     ) -> Self {
+        let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
             model_slot,
             config,
@@ -77,7 +80,7 @@ impl AgentLoop {
             vars: Vars::default(),
             instructions: Instructions::default(),
             tools: Value::Null,
-            mcp_handle,
+            mcp,
             history: History::restored(initial_history).with_mirror(shared_history),
             btw_system,
             cancel_map,
@@ -89,6 +92,7 @@ impl AgentLoop {
             answer_rx: Arc::new(async_lock::Mutex::new(answer_rx)),
             queue,
             session_id,
+            mailbox,
             timeouts,
             lua_handle,
             subagent_cancels,
@@ -147,8 +151,12 @@ impl AgentLoop {
 
         let slot = self.model_slot.load();
         self.tools = self.build_tools(&slot.model, false);
-        if let Some(ref mcp) = self.mcp_handle {
-            mcp.extend_tools(&mut self.tools);
+        if let Some(ref mcp) = self.mcp {
+            // The queue is drained right after this, and a prompt typed during
+            // startup must still carry the MCP tools.
+            if self.init_cancel.race(mcp.ready()).await.is_err() {
+                return false;
+            }
             spawn_oauth_for_needs_auth(mcp);
         }
         !self.init_cancel.is_cancelled()
@@ -158,24 +166,21 @@ impl AgentLoop {
         let slot = self.model_slot.load();
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::compact(&*provider, &model, &mut self.history, event_tx).await
+        agent::compact(&*provider, &model, &mut self.history, event_tx, None).await
     }
 
     async fn do_checkpoint(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
         let (provider, model) =
             agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::checkpoint(&*provider, &model, &mut self.history, event_tx).await
+        agent::checkpoint(&*provider, &model, &mut self.history, event_tx, None).await
     }
 
-    async fn do_rename(
-        &mut self,
-        event_tx: &EventSender,
-        messages: Vec<maki_providers::Message>,
-    ) -> Result<(), AgentError> {
+    async fn do_rename(&mut self, event_tx: &EventSender, messages: Vec<Message>) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
-        let (provider, model) =
-            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
+        let model = slot.model.clone();
+        let provider = Arc::clone(&slot.provider);
+        drop(slot);
         agent::rename_session(&*provider, &model, &messages, event_tx).await
     }
 
@@ -194,12 +199,8 @@ impl AgentLoop {
         }
         self.rebuild_tools(&slot.model, input.workflow);
 
-        for msg in std::mem::take(&mut input.preamble) {
-            self.history.push(msg);
-        }
-
         if let Some(ref prompt_ref) = input.prompt {
-            let Some(ref mcp) = self.mcp_handle else {
+            let Some(ref mcp) = self.mcp else {
                 return Err(AgentError::Tool {
                     tool: "mcp_prompt".into(),
                     message: "MCP not available".into(),
@@ -222,14 +223,11 @@ impl AgentLoop {
                     },
                     PromptRole::User => Message::user(text),
                 };
-                self.history.push(msg);
+                input.preamble.push(msg);
             }
         }
 
-        let prompt_slots = match self.lua_handle.as_ref() {
-            Some(h) => h.collect_prompt_slots_async().await,
-            None => maki_agent::prompt::ResolvedSlots::default(),
-        };
+        let prompt_slots = self.lua_handle.collect_prompt_slots_async().await;
         let system = agent::build_system_prompt(
             &self.vars,
             &input.mode,
@@ -251,6 +249,7 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
+                mailbox: self.mailbox.clone(),
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
@@ -269,7 +268,7 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
-        .with_mcp(self.mcp_handle.clone());
+        .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;
         drop(agent);
@@ -283,12 +282,10 @@ impl AgentLoop {
         result
     }
 
+    /// Base tools only. MCP definitions are injected per request by
+    /// `Agent::request_tools`; baking them here would freeze the catalog.
     fn rebuild_tools(&mut self, model: &Model, workflow: bool) {
-        let mut tools = self.build_tools(model, workflow);
-        if let Some(ref mcp) = self.mcp_handle {
-            mcp.extend_tools(&mut tools);
-        }
-        self.tools = tools;
+        self.tools = self.build_tools(model, workflow);
     }
 
     fn build_tools(&self, model: &Model, workflow: bool) -> Value {
@@ -322,7 +319,9 @@ impl AgentLoop {
     }
 
     fn set_cancel_trigger(&self, run_id: u64, trigger: CancelTrigger) {
-        self.cancel_map.insert(run_id, trigger);
+        // One trigger per run, and `clear_cancel_trigger` drops the whole
+        // key, so the slot is not worth carrying around.
+        let _ = self.cancel_map.insert(run_id, trigger);
     }
 
     fn clear_cancel_trigger(&self, run_id: u64) {

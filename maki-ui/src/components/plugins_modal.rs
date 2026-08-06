@@ -40,9 +40,9 @@ impl PluginsModal {
         }
     }
 
-    pub fn open(&mut self, event_handle: &Option<EventHandle>) {
+    pub fn open(&mut self, event_handle: &EventHandle) {
         self.open = true;
-        self.event_handle = event_handle.clone();
+        self.event_handle = Some(event_handle.clone());
         self.selected = 0;
         self.refresh();
     }
@@ -96,8 +96,20 @@ impl PluginsModal {
         }
     }
 
-    fn toggle(&self, _name: &str, _currently_loaded: bool) {
-        // Toggle plugin state in UI context
+    fn toggle(&self, name: &str, currently_loaded: bool) {
+        let mut settings = crate::components::settings_picker::UserSettings::load();
+        if let Some(handle) = &self.event_handle {
+            if currently_loaded {
+                handle.unload_plugin(name);
+                if !settings.disabled_plugins.contains(&name.to_string()) {
+                    settings.disabled_plugins.push(name.to_string());
+                }
+            } else {
+                handle.load_builtin(name);
+                settings.disabled_plugins.retain(|p| p != name);
+            }
+        }
+        settings.save();
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -230,7 +242,7 @@ impl Overlay for PluginsModal {
 }
 
 fn build_plugin_list() -> Vec<PluginInfo> {
-    let registry = ToolRegistry::new();
+    let registry = ToolRegistry::global();
     let snapshot = registry.iter();
     let loaded_plugins: std::collections::HashSet<String> = snapshot
         .iter()
@@ -243,13 +255,12 @@ fn build_plugin_list() -> Vec<PluginInfo> {
         })
         .collect();
 
-    maki_config::DEFAULT_BUILTINS
-        .iter()
-        .filter(|name| **name != "lib")
-        .map(|name| PluginInfo {
-            name: (*name).to_string(),
-            source_path: PathBuf::from(format!("plugins/{name}")),
-            is_loaded: loaded_plugins.contains(*name),
+    maki_lua::bundled_plugins()
+        .filter(|(name, _)| *name != "lib") // lib is internal, not user-facing
+        .map(|(name, source_path)| PluginInfo {
+            name: name.to_string(),
+            source_path: PathBuf::from(source_path),
+            is_loaded: loaded_plugins.contains(name),
         })
         .collect()
 }

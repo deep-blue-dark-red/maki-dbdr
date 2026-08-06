@@ -1,0 +1,8 @@
+{
+  "entries": [],
+  "inherits": [],
+  "exclude": [
+    "hackernews",
+    "ssh"
+  ]
+}

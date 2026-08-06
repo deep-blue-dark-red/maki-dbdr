@@ -7,6 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use crate::components::settings_picker::UserSettings;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SkillsJson {
@@ -155,7 +156,8 @@ impl SkillsModal {
                     if !path_str.is_empty() {
                         let path = std::path::Path::new(&path_str);
                         if path_str.starts_with('~') || path_str.starts_with('/') || path.is_absolute() {
-                            let _resolved = if let Some(stripped) = path_str.strip_prefix("~/") {
+                            let mut settings = UserSettings::load();
+                            let resolved = if let Some(stripped) = path_str.strip_prefix("~/") {
                                 if let Some(home) = maki_storage::paths::home() {
                                     home.join(stripped).to_string_lossy().into_owned()
                                 } else {
@@ -164,6 +166,10 @@ impl SkillsModal {
                             } else {
                                 path_str.clone()
                             };
+                            if !settings.skills_dirs.contains(&resolved) {
+                                settings.skills_dirs.push(resolved);
+                                settings.save();
+                            }
                         } else {
                             if !self.skills_json.entries.iter().any(|e| e.path == path_str) {
                                 self.skills_json.entries.push(SkillEntry { path: path_str });
@@ -262,7 +268,14 @@ impl SkillsModal {
             }
             KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete if self.focus == Focus::Folders => {
                 if let Some(folder) = self.folders.get(self.selected_folder) {
+                    let path_str = folder.path.to_string_lossy().into_owned();
+                    let mut settings = UserSettings::load();
                     let mut changed = false;
+                    if let Some(pos) = settings.skills_dirs.iter().position(|x| x == &path_str) {
+                        settings.skills_dirs.remove(pos);
+                        settings.save();
+                        changed = true;
+                    }
                     if let Some(pos) = self.skills_json.entries.iter().position(|e| e.path == folder.display_path) {
                         self.skills_json.entries.remove(pos);
                         let _ = save_skills_json(&self.cwd, &self.skills_json);
@@ -615,6 +628,26 @@ pub fn discover_skills_and_folders(
     let mut skills = Vec::new();
 
     // 1. Global config skills (loaded from maki.config)
+    let settings = UserSettings::load();
+    for dir_str in &settings.skills_dirs {
+        let path = std::path::PathBuf::from(dir_str);
+        let tag = determine_folder_tag(&path, cwd);
+        let display_path = if let Some(home) = maki_storage::paths::home() {
+            if let Ok(rel) = path.strip_prefix(&home) {
+                format!("~/{}", rel.display())
+            } else {
+                dir_str.clone()
+            }
+        } else {
+            dir_str.clone()
+        };
+        folders.push(FolderInfo {
+            path,
+            display_path,
+            tag,
+            is_enabled: true,
+        });
+    }
 
     // 2. Project workspace directories (local standard folders)
     let project_dirs = [
@@ -738,5 +771,29 @@ mod tests {
         let (name, desc) = parsed.unwrap();
         assert_eq!(name, "my-skill");
         assert_eq!(desc, "does some things");
+    }
+
+    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    #[test]
+    fn test_find_project_ancestors_stops_at_git() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let sub = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Without .git, should go all the way to root
+        let ancestors = find_project_ancestors(&sub);
+        assert!(ancestors.contains(&root.to_path_buf()));
+
+        // Create .git in sub/a
+        let git_dir = root.join("a").join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+
+        let ancestors = find_project_ancestors(&sub);
+        assert!(ancestors.contains(&root.join("a").join("b").join("c")));
+        assert!(ancestors.contains(&root.join("a").join("b")));
+        assert!(ancestors.contains(&root.join("a")));
+        // Should NOT contain root since parent has .git
+        assert!(!ancestors.contains(&root.to_path_buf()));
     }
 }

@@ -1,0 +1,6 @@
+[task]
+id = "comprehension-backoff"
+category = "comprehension"
+prompt = "How is the retry backoff delay computed for HTTP requests in this repo? Name the function that computes it and describe the formula in one sentence."
+max_turns = 10
+timeout_s = 180

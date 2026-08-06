@@ -2,12 +2,16 @@ use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 
 use crossterm::event::KeyEvent;
-use maki_providers::{Message, Role};
+use maki_providers::{ContentBlock, Message, Role};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 const TITLE: &str = " Rewind ";
 const PREVIEW_MAX_LEN: usize = 80;
+pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
+
+/// Maps a message index in the History messages vec to the corresponding
+/// display segment index (0-based across user + assistant text + tool blocks).
 pub(crate) fn display_msg_index_for_turn(messages: &[Message], turn_msg_idx: usize) -> usize {
     let mut display_idx = 0;
     for (i, msg) in messages.iter().enumerate() {
@@ -19,26 +23,17 @@ pub(crate) fn display_msg_index_for_turn(messages: &[Message], turn_msg_idx: usi
             Role::Assistant => {
                 for block in &msg.content {
                     let non_empty = match block {
-                        maki_providers::ContentBlock::Text { text } if !text.is_empty() => true,
-                        maki_providers::ContentBlock::Thinking { thinking, .. }
-                            if !thinking.is_empty() =>
-                        {
-                            true
-                        }
-                        maki_providers::ContentBlock::ToolUse { .. } => true,
+                        ContentBlock::Text { text } => !text.is_empty(),
+                        ContentBlock::ToolUse { .. } => true,
                         _ => false,
                     };
-                    if non_empty {
-                        display_idx += 1;
-                    }
+                    display_idx += non_empty as usize;
                 }
             }
         }
     }
-    0
+    display_idx
 }
-
-pub(crate) const NO_TURNS_MSG: &str = "No user turns to rewind to";
 
 pub enum RewindPickerAction {
     Consumed,
@@ -74,7 +69,7 @@ impl RewindPicker {
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
         for (msg_idx, msg) in messages.iter().enumerate() {
-            if !matches!(msg.role, Role::User) {
+            if !matches!(msg.role, Role::User) || msg.is_observation() {
                 continue;
             }
             let Some(full_text) = msg.user_text() else {
@@ -92,7 +87,7 @@ impl RewindPicker {
             };
             entries.push(RewindEntry {
                 turn_index: msg_idx,
-                segment_index: 0,
+                segment_index: display_msg_index_for_turn(messages, msg_idx),
                 prompt_preview: preview,
                 prompt_text: full_text.to_owned(),
             });
@@ -128,7 +123,7 @@ impl RewindPicker {
     pub fn handle_key(&mut self, key: KeyEvent) -> RewindPickerAction {
         match self.picker.handle_key(key) {
             PickerAction::Consumed => RewindPickerAction::Consumed,
-            PickerAction::Select(_, entry) => RewindPickerAction::Select(entry),
+            PickerAction::Select(entry) => RewindPickerAction::Select(entry),
             PickerAction::Close => RewindPickerAction::Close,
             PickerAction::Toggle(..) => RewindPickerAction::Consumed,
         }
@@ -225,9 +220,10 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_messages_are_excluded() {
+    fn synthetic_messages_and_observations_are_excluded() {
         let mut picker = RewindPicker::new();
         let msgs = vec![
+            Message::observation("build failed".into()),
             user_msg("real prompt"),
             assistant_msg(),
             Message::synthetic("[Cancelled by user]".into()),
@@ -235,7 +231,7 @@ mod tests {
         picker.open(&msgs).unwrap();
         let item = picker.picker.selected_item().unwrap();
         assert!(item.label().contains("real prompt"));
-        assert_eq!(item.turn_index, 0);
+        assert_eq!(item.turn_index, 1);
     }
 
     #[test]

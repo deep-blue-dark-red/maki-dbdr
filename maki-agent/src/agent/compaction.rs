@@ -6,7 +6,7 @@ use maki_providers::{
 };
 use tracing::info;
 
-use super::history::History;
+use super::history::{History, remove_orphaned_tool_results};
 use super::streaming::stream_with_retry;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
@@ -14,30 +14,57 @@ use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
 pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
 
-pub(super) async fn compact_history(
+/// Framing line prepended to an interleaved checkpoint summary in history. Not a
+/// locator: checkpoints are append-only, so nothing is ever matched or removed.
+pub(super) const CHECKPOINT_INTRO: &str = "Progress summary since last checkpoint:";
+
+/// Stream a summary of `history` under the compaction system prompt using
+/// `user_prompt` as the final instruction. Mutates nothing; the caller decides
+/// what to do with the response (replace history vs. append a checkpoint).
+///
+/// `strip` removes images/thinking/old tool-results to shrink the request. It's
+/// right for compaction (history is about to be discarded) but not for
+/// checkpoint: an unstripped request shares the main conversation's cached
+/// prefix, so it rides the prompt cache instead of forcing a full reprocess.
+#[allow(clippy::too_many_arguments)]
+async fn run_summary_stream(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
-    history: &mut History,
+    history: &History,
+    user_prompt: &str,
+    strip: bool,
     event_tx: &EventSender,
     cancel: &CancelToken,
-) -> Result<TokenUsage, AgentError> {
-    let compact_start = std::time::Instant::now();
+    target_tokens: Option<usize>,
+) -> Result<StreamResponse, AgentError> {
     let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
-    strip_images(&mut compaction_history);
-    strip_thinking(&mut compaction_history);
-    strip_old_tool_results(&mut compaction_history);
-    compaction_history.push(Message::user(crate::prompt::COMPACTION_USER.to_string()));
+    remove_orphaned_tool_results(&mut compaction_history);
+    if strip {
+        strip_images(&mut compaction_history);
+        strip_thinking(&mut compaction_history);
+        strip_old_tool_results(&mut compaction_history);
+    }
+    compaction_history.push(Message::user(user_prompt.to_string()));
 
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
     let mut last_error = None;
+
+    let mut system_prompt = crate::prompt::COMPACTION_SYSTEM.to_string();
+    if let Some(target) = target_tokens {
+        let approx_words = (target as f64 * 0.75).round() as usize;
+        system_prompt.push_str(&format!(
+            "\n\nLENGTH CONSTRAINT: keep the whole block under ~{} words (~{} tokens). Shed detail in the FIDELITY order; never drop MISSION, GIT, or the final [NEXT].",
+            approx_words, target
+        ));
+    }
 
     for attempt in 0..max_attempts {
         match stream_with_retry(
             provider,
             model,
             &compaction_history,
-            crate::prompt::COMPACTION_SYSTEM,
+            &system_prompt,
             &empty_tools,
             event_tx,
             cancel,
@@ -48,18 +75,9 @@ pub(super) async fn compact_history(
         {
             Ok(response) => {
                 if attempt > 0 {
-                    info!(
-                        attempt,
-                        "compaction succeeded after truncating oldest rounds"
-                    );
+                    info!(attempt, "summary succeeded after truncating oldest rounds");
                 }
-                return Ok(finish_compact(
-                    response,
-                    history,
-                    event_tx,
-                    compact_start,
-                    model,
-                ));
+                return Ok(response);
             }
             Err(e) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
@@ -70,6 +88,29 @@ pub(super) async fn compact_history(
     }
 
     Err(last_error.unwrap())
+}
+
+pub(super) async fn compact_history(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    target_tokens: Option<usize>,
+) -> Result<TokenUsage, AgentError> {
+    let compact_start = std::time::Instant::now();
+    let response = run_summary_stream(
+        provider,
+        model,
+        history,
+        crate::prompt::COMPACTION_USER,
+        true,
+        event_tx,
+        cancel,
+        target_tokens,
+    )
+    .await?;
+    Ok(finish_compact(response, history, event_tx, compact_start, model))
 }
 
 fn finish_compact(
@@ -83,6 +124,7 @@ fn finish_compact(
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
+        cost: model.cost_of(&response.usage, false),
         context_size: Some(response.usage.output),
     })));
 
@@ -105,65 +147,14 @@ pub async fn compact(
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
+    target_tokens: Option<usize>,
 ) -> Result<(), AgentError> {
+    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: false });
     let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel).await?;
+    let usage = compact_history(provider, model, history, event_tx, &cancel, target_tokens).await?;
 
     event_tx.send(AgentEvent::Done {
         usage,
-        num_turns: 1,
-        stop_reason: None,
-    })?;
-
-    Ok(())
-}
-
-/// Emit a re-anchoring checkpoint: stream a CHECKPOINT-mode delta summary and
-/// append it to `history`, keeping the full conversation intact — unlike
-/// `compact`, which replaces it. Checkpoints are append-only (interleaved), so
-/// each new one covers only new work and the prompt cache prefix is never
-/// invalidated. Does not emit `Done` here; the agent loop sends it.
-pub async fn checkpoint(
-    provider: &dyn maki_providers::provider::Provider,
-    model: &Model,
-    history: &mut History,
-    event_tx: &EventSender,
-) -> Result<(), AgentError> {
-    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: true });
-    let cancel = CancelToken::none();
-
-    let mut checkpoint_history: Vec<Message> = history.as_slice().to_vec();
-    strip_images(&mut checkpoint_history);
-    strip_thinking(&mut checkpoint_history);
-    strip_old_tool_results(&mut checkpoint_history);
-    checkpoint_history.push(Message::user(crate::prompt::CHECKPOINT_USER.to_string()));
-
-    let empty_tools = serde_json::json!([]);
-    let response = stream_with_retry(
-        provider,
-        model,
-        &checkpoint_history,
-        crate::prompt::COMPACTION_SYSTEM,
-        &empty_tools,
-        event_tx,
-        &cancel,
-        RequestOptions::default(),
-        None,
-    )
-    .await?;
-
-    let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
-        message: response.message.clone(),
-        usage: response.usage,
-        model: model.id.clone(),
-        context_size: Some(response.usage.output),
-    })));
-
-    history.push(Message::user(crate::prompt::CHECKPOINT_INTRO.to_string()));
-    history.push(response.message);
-
-    event_tx.send(AgentEvent::Done {
-        usage: response.usage,
         num_turns: 1,
         stop_reason: None,
     })?;
@@ -180,14 +171,16 @@ pub async fn rename_session(
     messages: &[Message],
     event_tx: &EventSender,
 ) -> Result<(), AgentError> {
-    let empty_tools = serde_json::json!([]);
-    let (prov_tx, prov_rx) = flume::unbounded::<maki_providers::ProviderEvent>();
+    use maki_providers::ProviderEvent;
+
+    let system = include_str!("../prompts/session_name.md");
+    let (prov_tx, prov_rx) = flume::unbounded::<ProviderEvent>();
     let _ = provider
         .stream_message(
             model,
             messages,
-            crate::prompt::SESSION_NAME_SYSTEM,
-            &empty_tools,
+            system,
+            &serde_json::Value::Null,
             &prov_tx,
             RequestOptions::default(),
             None,
@@ -197,7 +190,7 @@ pub async fn rename_session(
 
     let mut title = String::new();
     while let Ok(event) = prov_rx.try_recv() {
-        if let maki_providers::ProviderEvent::TextDelta { text } = event {
+        if let ProviderEvent::TextDelta { text } = event {
             title.push_str(&text);
         }
     }
@@ -206,6 +199,62 @@ pub async fn rename_session(
         let _ = event_tx.send(AgentEvent::RenameResult { title });
     }
     Ok(())
+}
+
+/// Emit a re-anchoring checkpoint: stream a CHECKPOINT-mode delta summary and
+/// append it to history, keeping the full conversation intact — unlike `compact`,
+/// which replaces it. Checkpoints are append-only (interleaved), so each new one
+/// covers only new work and the prompt cache prefix is never invalidated.
+pub async fn checkpoint(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    target_tokens: Option<usize>,
+) -> Result<(), AgentError> {
+    let usage =
+        checkpoint_history(provider, model, history, event_tx, &CancelToken::none(), target_tokens)
+            .await?;
+
+    event_tx.send(AgentEvent::Done {
+        usage,
+        num_turns: 1,
+        stop_reason: None,
+    })?;
+
+    Ok(())
+}
+
+/// Stream a CHECKPOINT-mode delta summary and append it to `history`
+/// (append-only: nothing is removed, so the cached prefix stays intact). Sends
+/// unstripped history so the request rides the main conversation's prompt cache.
+/// Emits the labeling `CompactionStart` but not `Done`, so it is safe to call
+/// mid-run (unlike `checkpoint`).
+pub(super) async fn checkpoint_history(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    target_tokens: Option<usize>,
+) -> Result<TokenUsage, AgentError> {
+    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: true });
+    let response = run_summary_stream(
+        provider,
+        model,
+        history,
+        crate::prompt::CHECKPOINT_USER,
+        false,
+        event_tx,
+        cancel,
+        target_tokens,
+    )
+    .await?;
+
+    history.push(Message::user(CHECKPOINT_INTRO.into()));
+    history.push(response.message);
+
+    Ok(response.usage)
 }
 
 pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
@@ -266,39 +315,26 @@ fn truncate_oldest_round(messages: &mut Vec<Message>) {
         return;
     }
 
-    let mut remove_count = 1;
-
-    if matches!(messages.first().map(|m| &m.role), Some(Role::Assistant)) {
-        let has_tool_calls = messages[0].has_tool_calls();
-        if has_tool_calls {
-            let next_has_tool_results = messages.get(1).is_some_and(|m| {
-                matches!(m.role, Role::User)
-                    && m.content
-                        .iter()
-                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-            });
-            if next_has_tool_results {
-                remove_count = 2;
-            }
-        }
-    } else if matches!(messages.first().map(|m| &m.role), Some(Role::User))
-        && matches!(messages.get(1).map(|m| &m.role), Some(Role::Assistant))
+    let removed_user = matches!(messages.remove(0).role, Role::User);
+    if removed_user
+        && messages.len() > 1
+        && matches!(
+            messages.first().map(|message| &message.role),
+            Some(Role::Assistant)
+        )
     {
-        // Dropping a lone user message would leave assistant-first, which some providers reject.
-        // Remove the assistant too to keep the conversation well-formed.
-        remove_count = 2;
+        messages.remove(0);
     }
+    remove_orphaned_tool_results(messages);
 
-    messages.drain(..remove_count);
-
-    // After draining, the first message might still be an assistant (e.g. consecutive
-    // assistant messages). Keep draining until the first message is user or we're empty.
-    while messages.len() > 1 && matches!(messages.first().map(|m| &m.role), Some(Role::Assistant)) {
-        let mut drop = 1;
-        if matches!(messages.get(1).map(|m| &m.role), Some(Role::User)) {
-            drop = 2;
-        }
-        messages.drain(..drop);
+    while messages.len() > 1
+        && matches!(
+            messages.first().map(|message| &message.role),
+            Some(Role::Assistant)
+        )
+    {
+        messages.remove(0);
+        remove_orphaned_tool_results(messages);
     }
 }
 
@@ -325,13 +361,17 @@ mod tests {
     use crate::AgentConfig;
 
     struct MockProvider {
-        responses: Mutex<Vec<StreamResponse>>,
+        responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
+        requests: Mutex<Vec<Vec<Message>>>,
+        system_prompts: Mutex<Vec<String>>,
     }
 
     impl MockProvider {
-        fn new(responses: Vec<StreamResponse>) -> Self {
+        fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+                system_prompts: Mutex::new(vec![]),
             }
         }
     }
@@ -340,17 +380,19 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             _: &'a Model,
-            _: &'a [Message],
-            _: &'a str,
+            messages: &'a [Message],
+            system_prompt: &'a str,
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            self.system_prompts.lock().unwrap().push(system_prompt.to_string());
             Box::pin(async {
+                self.requests.lock().unwrap().push(messages.to_vec());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
-                Ok(responses.remove(0))
+                responses.remove(0)
             })
         }
 
@@ -386,8 +428,9 @@ mod tests {
     #[test]
     fn compact_replaces_history_with_summary() {
         smol::block_on(async {
-            let provider: std::sync::Arc<dyn Provider> =
-                std::sync::Arc::new(MockProvider::new(vec![text_response(StopReason::EndTurn)]));
+            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
+                vec![Ok(text_response(StopReason::EndTurn))],
+            ));
             let model = default_model();
             let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(vec![
@@ -406,6 +449,7 @@ mod tests {
                 &model,
                 &mut history,
                 &EventSender::new(raw_tx, 0),
+                None,
             )
             .await
             .unwrap();
@@ -414,6 +458,111 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    #[test]
+    fn checkpoint_appends_without_removing() {
+        smol::block_on(async {
+            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
+                vec![
+                    Ok(text_response(StopReason::EndTurn)),
+                    Ok(text_response(StopReason::EndTurn)),
+                ],
+            ));
+            let model = default_model();
+            let (raw_tx, _rx) = flume::unbounded();
+            let tx = EventSender::new(raw_tx, 0);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text: "reply".into() }],
+                    ..Default::default()
+                },
+            ]);
+
+            // First checkpoint: history retained, intro+summary appended at the end.
+            checkpoint(&*provider, &model, &mut history, &tx, None)
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 4, "original 2 kept + intro + summary");
+            assert_eq!(history.as_slice()[2].user_text(), Some(CHECKPOINT_INTRO));
+
+            // Second checkpoint: append-only — prior checkpoint is NOT removed, so
+            // the prefix is unchanged and the cache stays warm.
+            checkpoint(&*provider, &model, &mut history, &tx, None)
+                .await
+                .unwrap();
+            assert_eq!(history.len(), 6, "checkpoints interleave, not supersede");
+            let intros = history
+                .as_slice()
+                .iter()
+                .filter(|m| m.user_text() == Some(CHECKPOINT_INTRO))
+                .count();
+            assert_eq!(intros, 2, "both checkpoints retained in order");
+            // Original turns still at the front — prefix preserved.
+            assert_eq!(history.as_slice()[0].user_text(), Some("first"));
+        });
+    }
+
+    #[test]
+    fn compact_preparation_removes_orphan_result_and_tool_image() {
+        use std::sync::Arc;
+
+        use maki_providers::{ImageMediaType, ImageSource};
+
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let image = ContentBlock::Image {
+                source: ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8=")),
+            };
+            let mut orphan = Message {
+                role: Role::User,
+                content: vec![tool_result("orphan"), image.clone()],
+                ..Default::default()
+            };
+            orphan.content.push(ContentBlock::Text {
+                text: "keep text".into(),
+            });
+            let chat_image = Message {
+                role: Role::User,
+                content: vec![image],
+                ..Default::default()
+            };
+            let mut history = History::new(vec![orphan, chat_image]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            let request = &requests[0];
+            assert!(
+                !request
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(
+                        block,
+                        ContentBlock::ToolResult { .. } | ContentBlock::Image { .. }
+                    ))
+            );
+            assert!(
+                request.iter().flat_map(|message| &message.content).any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "keep text")
+                )
+            );
+            assert!(request.iter().flat_map(|message| &message.content).any(
+                |block| matches!(block, ContentBlock::Text { text } if text == IMAGE_PLACEHOLDER)
+            ));
         });
     }
 
@@ -553,6 +702,151 @@ mod tests {
         );
     }
 
+    fn tool_use(id: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(id, "bash", serde_json::json!({}))],
+            ..Default::default()
+        }
+    }
+
+    fn tool_result(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.into(),
+            content: "output".into(),
+            is_error: false,
+        }
+    }
+
+    #[track_caller]
+    fn assert_tool_results_have_calls(messages: &[Message]) {
+        for (index, message) in messages.iter().enumerate() {
+            for block in &message.content {
+                let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                    continue;
+                };
+                assert!(matches!(message.role, Role::User));
+                assert!(index > 0);
+                assert!(
+                    messages[index - 1]
+                        .tool_uses()
+                        .any(|(id, _, _)| id == tool_use_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_history_retries_without_reproduced_orphan() {
+        smol::block_on(async {
+            const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
+
+            let provider = MockProvider::new(vec![
+                Err(AgentError::Api {
+                    status: 413,
+                    message: "prompt is too long".into(),
+                }),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("request".into()),
+                tool_use(TOOL_USE_ID),
+                Message {
+                    role: Role::User,
+                    content: vec![tool_result(TOOL_USE_ID)],
+                    ..Default::default()
+                },
+                Message::user("prompt".into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0]
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
+            assert!(
+                !requests[1]
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_keeps_observation_before_dependent_reply() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::observation("[monitor] build failed".into()),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "I will fix it".into(),
+                    }],
+                    ..Default::default()
+                },
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert!(requests[0][0].is_observation());
+            assert!(matches!(requests[0][1].role, Role::Assistant));
+        });
+    }
+
+    #[test]
+    fn truncate_oldest_round_preserves_text_beside_orphan() {
+        let mut messages = vec![
+            Message::user("request".into()),
+            tool_use("expected"),
+            Message {
+                role: Role::User,
+                content: vec![
+                    tool_result("mismatched"),
+                    ContentBlock::Text {
+                        text: "keep me".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            Message::user("prompt".into()),
+        ];
+
+        truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            matches!(&messages[0].content[..], [ContentBlock::Text { text }] if text == "keep me")
+        );
+        assert_tool_results_have_calls(&messages);
+    }
+
     #[test]
     fn truncate_oldest_round_removes_single_user_message() {
         let mut messages = vec![
@@ -560,6 +854,7 @@ mod tests {
             Message::user("second".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "second"));
     }
@@ -569,11 +864,7 @@ mod tests {
         let mut messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }],
+                content: vec![ContentBlock::tool_use("t1", "bash", serde_json::json!({}))],
                 ..Default::default()
             },
             Message {
@@ -588,6 +879,7 @@ mod tests {
             Message::user("keep me".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "keep me")
@@ -599,16 +891,13 @@ mod tests {
         let mut messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }],
+                content: vec![ContentBlock::tool_use("t1", "bash", serde_json::json!({}))],
                 ..Default::default()
             },
             Message::user("no tool result".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "no tool result")
@@ -619,6 +908,7 @@ mod tests {
     fn truncate_oldest_round_noop_on_single_message() {
         let mut messages = vec![Message::user("only".into())];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
     }
 
@@ -635,6 +925,7 @@ mod tests {
             Message::user("keep me".into()),
         ];
         truncate_oldest_round(&mut messages);
+        assert_tool_results_have_calls(&messages);
         assert_eq!(messages.len(), 1);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "keep me")
@@ -655,11 +946,7 @@ mod tests {
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "t1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }],
+                content: vec![ContentBlock::tool_use("t1", "bash", serde_json::json!({}))],
                 ..Default::default()
             },
             Message {
@@ -674,7 +961,38 @@ mod tests {
             Message::user("keep me".into()),
         ];
         truncate_oldest_round(&mut messages);
-        assert!(!messages.is_empty());
-        assert!(matches!(messages[0].role, Role::User));
+        assert_tool_results_have_calls(&messages);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(&messages[0].content[..], [ContentBlock::Text { text }] if text == "keep me")
+        );
+    }
+
+    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    #[test]
+    fn compact_appends_length_constraint_to_system_prompt() {
+        smol::block_on(async {
+            let provider = std::sync::Arc::new(MockProvider::new(vec![Ok(text_response(
+                StopReason::EndTurn,
+            ))]));
+            let model = default_model();
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("hi".into())]);
+
+            compact(
+                &*provider,
+                &model,
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                Some(100),
+            )
+            .await
+            .unwrap();
+
+            let prompts = provider.system_prompts.lock().unwrap();
+            assert_eq!(prompts.len(), 1);
+            assert!(prompts[0].contains("LENGTH CONSTRAINT:"));
+            assert!(prompts[0].contains("~100 tokens"));
+        });
     }
 }

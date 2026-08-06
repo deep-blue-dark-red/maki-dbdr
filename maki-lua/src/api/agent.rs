@@ -3,29 +3,28 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::tool_dispatch::{self, Emit};
-use maki_agent::cancel::CancelMap;
+use maki_agent::cancel::{CancelMap, CancelSlot};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
+use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
     Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope, EventSender,
-    History, SubagentInfo, ToolDoneEvent,
+    History, McpSession, SubagentInfo, ToolDoneEvent,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
-use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig};
+use maki_providers::{ContentBlock, Model, ModelError, Role, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::StoredThinking;
 use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table, Value as LuaValue};
@@ -35,6 +34,7 @@ use tracing::info;
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
@@ -73,22 +73,39 @@ fn dispatch_ctx<'a>(ctx: &'a LuaCtx, method: &str) -> Result<&'a AgentContext, S
         .ok_or_else(|| ctx.cap_err(&format!("maki.agent.{method}")))
 }
 
-type Pair<T> = (Option<T>, Option<String>);
-
-fn err_pair<T>(err: impl ToString) -> Pair<T> {
-    (None, Some(err.to_string()))
-}
-
-/// `maki.agent.*` convention: wrong argument types throw; every value or
-/// runtime failure (including a ctx without dispatch capability) returns
-/// `(nil, err)`.
-macro_rules! try_pair {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return Ok(err_pair(e)),
+/// Forwards subagent events to the parent, stamped with the subagent identity.
+/// Usage takes two paths: live on the tool header while the run goes on (last
+/// turn's tokens plus the run's summed cost), and one total per run on
+/// `usage_tx`, which `prompt` waits for.
+async fn relay_session_events(
+    sub_rx: flume::Receiver<Envelope>,
+    parent_tx: EventSender,
+    subagent_info: Arc<OnceLock<SubagentInfo>>,
+    usage_tx: flume::Sender<TokenUsage>,
+    live_sink: Option<flume::Sender<ToolLive>>,
+) {
+    let mut cost = None;
+    while let Ok(mut envelope) = sub_rx.recv_async().await {
+        match &envelope.event {
+            AgentEvent::TurnComplete(turn) => {
+                add_cost(&mut cost, turn.cost);
+                if let Some(sink) = &live_sink {
+                    let _ = sink.send(ToolLive::Usage(turn.usage.format_sum_cost(cost)));
+                }
+            }
+            AgentEvent::Done { usage, .. } => {
+                let _ = usage_tx.send(*usage);
+                continue;
+            }
+            AgentEvent::Error { .. }
+            | AgentEvent::ToolOutput { .. }
+            | AgentEvent::ToolPending { .. }
+            | AgentEvent::SubagentHistory { .. } => continue,
+            _ => {}
         }
-    };
+        envelope.subagent = subagent_info.get().cloned();
+        let _ = parent_tx.send_envelope(envelope);
+    }
 }
 
 /// Look up the model that the current agent is using, or pick a cheaper one.
@@ -190,7 +207,6 @@ async fn system_prompt(
 /// Optional fields:
 ///   `only` (string[]?) - include only these tool names.
 ///   `except` (string[]?) - exclude these tool names.
-///   `include_mcp` (boolean?) - include MCP tools. Default: `true`.
 ///   `workflow` (boolean?) - use workflow-mode descriptions. Default: `false`.
 ///   `spec` (string?) - evaluate capability exclusions against this model spec.
 /// @return (table?, string?) Array of tool definition tables, or `(nil, err)` on failure.
@@ -212,7 +228,6 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 
     let only: Option<Vec<String>> = opts.get("only")?;
     let except: Option<Vec<String>> = opts.get("except")?;
-    let include_mcp: bool = opts.get::<Option<bool>>("include_mcp")?.unwrap_or(true);
     let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
     let spec_str: Option<String> = opts.get("spec")?;
 
@@ -242,12 +257,9 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         audience,
         workflow,
     };
-    let mut defs =
-        ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
-
-    if include_mcp && let Some(ref mcp) = agent.mcp {
-        mcp.extend_tools(&mut defs);
-    }
+    // Base definitions only: the session injects MCP definitions per
+    // request, so baking them into a tools array would freeze the catalog.
+    let defs = ToolRegistry::global().definitions(&vars, &ctx_desc, model.supports_tool_examples());
 
     Ok((Some(json_to_lua(&lua, &defs)?), None))
 }
@@ -255,8 +267,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 /// Run a tool by name and wait for the result. This is how you call built-in
 /// tools (like `read`, `bash`, `glob`) from Lua without going through the LLM.
 ///
-/// Live events (streaming output, annotations) are delivered through optional
-/// callbacks while the tool runs.
+/// Live events (streaming output, annotations, cumulative usage) are delivered
+/// through optional callbacks while the tool runs.
 ///
 /// @param ctx LuaCtx Agent context.
 /// @param name string Tool name, e.g. `"bash"`, `"read"`.
@@ -267,6 +279,8 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
 ///     annotation event. Must not yield.
+///   `on_usage` (function?) - called with a formatted cumulative token usage
+///     string. Must not yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
 /// @example
 /// local out, err = maki.agent.call_tool(ctx, "bash", {
@@ -286,14 +300,15 @@ async fn call_tool(
     let input_json = lua_to_json(&lua, &input)?;
     let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
     let mut tctx = agent.to_tool_context();
-    let (mut on_buf, mut on_ann, mut rx) = (None, None, None);
+    let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
     if let Some(o) = opts {
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
-        if on_buf.is_some() || on_ann.is_some() {
+        on_usage = o.get::<Option<Function>>("on_usage")?;
+        if on_buf.is_some() || on_ann.is_some() || on_usage.is_some() {
             let (tx, r) = flume::unbounded();
             tctx.live_sink = Some(tx);
             rx = Some(r);
@@ -307,6 +322,7 @@ async fn call_tool(
         tool: &name,
         on_buf,
         on_ann,
+        on_usage,
     };
     let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
@@ -342,6 +358,10 @@ async fn call_tool(
 ///     `(string)` or `(nil, err)`.
 ///   `name` (string?) - display name for logs and UI.
 ///   `audience` (string?) - tool audience for capability gating. Default: `"general_sub"`.
+///   `mcp` (boolean?) - give the session access to MCP tools. Their
+///     definitions are injected automatically each turn (deferred behind
+///     `tool_search`), so don't put MCP definitions in `tools`. The session
+///     starts with no loaded tools of its own. Default: `true`.
 ///   `thinking` (string|integer?) - thinking mode: `"off"`, `"adaptive"`, an
 ///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
 ///     `"max"`), or a budget integer (token count). Inherits parent setting
@@ -381,6 +401,7 @@ async fn session(
     let fast: bool = opts
         .get::<Option<bool>>("fast")?
         .unwrap_or(agent_ctx.opts.fast);
+    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(true);
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
@@ -420,6 +441,7 @@ async fn session(
                     .map_err(|_| format!("local_tools.{name}: 'description' is required"))
             );
             let input_schema = lua_to_json(&lua, &spec.get::<LuaValue>("input_schema")?)?;
+            let sanitized_schema = sanitize_tool_input_schema(input_schema);
             let handler = try_pair!(
                 spec.get::<Function>("handler")
                     .map_err(|_| format!("local_tools.{name}: 'handler' is required"))
@@ -427,7 +449,7 @@ async fn session(
             defs.push(serde_json::json!({
                 "name": name,
                 "description": description,
-                "input_schema": input_schema,
+                "input_schema": sanitized_schema,
             }));
             let weak = lua.weak();
             local_map.insert(
@@ -457,50 +479,35 @@ async fn session(
         None => agent_ctx.opts.thinking,
     };
 
-    let session_id = MakiId::generate();
     let (sub_tx, sub_rx) = flume::unbounded::<Envelope>();
     let sub_event_tx = EventSender::new(sub_tx, agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
-    let total_input = Arc::new(AtomicU32::new(0));
-    let total_output = Arc::new(AtomicU32::new(0));
+    let (usage_tx, usage_rx) = flume::unbounded();
 
-    {
-        let info = Arc::clone(&subagent_info);
-        let ti = Arc::clone(&total_input);
-        let to = Arc::clone(&total_output);
-        let parent_tx = parent_tx.clone();
-        smol::spawn(async move {
-            while let Ok(mut envelope) = sub_rx.recv_async().await {
-                match &envelope.event {
-                    AgentEvent::Done { usage, .. } => {
-                        ti.fetch_add(usage.total_input(), Ordering::Relaxed);
-                        to.fetch_add(usage.output, Ordering::Relaxed);
-                        continue;
-                    }
-                    AgentEvent::Error { .. }
-                    | AgentEvent::ToolOutput { .. }
-                    | AgentEvent::ToolPending { .. }
-                    | AgentEvent::SubagentHistory { .. } => continue,
-                    _ => {}
-                }
-                envelope.subagent = info.get().cloned();
-                let _ = parent_tx.send_envelope(envelope);
-            }
-        })
-        .detach();
-    }
+    smol::spawn(relay_session_events(
+        sub_rx,
+        parent_tx.clone(),
+        Arc::clone(&subagent_info),
+        usage_tx,
+        agent_ctx.live_sink.clone(),
+    ))
+    .detach();
 
     // Register a cancel trigger so the child token does not fire on drop
-    // and kill the subagent at birth.
+    // and kill the subagent at birth. The fallback key gets its own id:
+    // it keys `subagent_cancels`, so sharing the session id would make two
+    // subagents running at once collide.
     let ui_id = agent_ctx
         .tool_use_id
         .clone()
-        .unwrap_or_else(|| format!("session-{session_id}"));
+        .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
     let (child_trigger, child_cancel) = agent_ctx.cancel.child();
-    agent_ctx
+    // Several sessions can share one `ui_id`, so keep the slot and retire
+    // only ours on close instead of clearing the whole key.
+    let cancel_slot = agent_ctx
         .subagent_cancels
         .insert(ui_id.clone(), child_trigger);
 
@@ -514,7 +521,8 @@ async fn session(
             config: agent_ctx.config.clone(),
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
-            session_id: Some(session_id.into()),
+            session_id: agent_ctx.session_id.clone(),
+            mailbox: None,
             timeouts: agent_ctx.timeouts,
             file_tracker: FileReadTracker::fresh(),
             prompt_slots: Arc::clone(&agent_ctx.prompt_slots),
@@ -526,7 +534,11 @@ async fn session(
         tools: tools_json,
         thinking,
         fast,
-        mcp: agent_ctx.mcp.clone(),
+        mcp: agent_ctx
+            .mcp
+            .as_ref()
+            .filter(|_| mcp_enabled)
+            .map(McpSession::fresh),
         history: History::new(Vec::new()),
         sub_event_tx,
         child_cancel,
@@ -534,12 +546,13 @@ async fn session(
         answer_tx: Some(answer_tx),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id,
+        cancel_slot,
         parent_event_tx: parent_tx,
         subagent_info,
         local_tools: Arc::new(local_map),
         name,
-        total_input,
-        total_output,
+        usage: TokenUsage::default(),
+        usage_rx,
         start: Instant::now(),
         closed: false,
     };
@@ -581,6 +594,7 @@ struct LiveCallbacks<'a> {
     tool: &'a str,
     on_buf: Option<Function>,
     on_ann: Option<Function>,
+    on_usage: Option<Function>,
 }
 
 impl LiveCallbacks<'_> {
@@ -588,6 +602,7 @@ impl LiveCallbacks<'_> {
         let res = match ev {
             ToolLive::Buf(buf) => call_opt(&self.on_buf, BufHandle::foreign(buf)).await,
             ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
+            ToolLive::Usage(usage) => call_opt(&self.on_usage, usage).await,
         };
         if let Some(Err(e)) = res {
             tracing::warn!(tool = self.tool, error = %e, "call_tool callback failed");
@@ -646,7 +661,9 @@ struct SessionState {
     tools: JsonValue,
     thinking: ThinkingConfig,
     fast: bool,
-    mcp: Option<maki_agent::mcp::McpHandle>,
+    /// Fresh per session so `tool_search` loads never leak between a
+    /// subagent and its parent.
+    mcp: Option<McpSession>,
     history: History,
     sub_event_tx: EventSender,
     child_cancel: maki_agent::cancel::CancelToken,
@@ -655,13 +672,16 @@ struct SessionState {
     parent_cancels: Arc<CancelMap<String>>,
     /// Stable identity for UI, cancel, and history. Falls back to a synthetic
     /// id for workflow-mode sessions (no model-issued tool call exists).
+    /// Shared with any sibling session the same tool call opened.
     ui_id: String,
+    /// Which registration under [`ui_id`](Self::ui_id) is ours.
+    cancel_slot: CancelSlot,
     parent_event_tx: EventSender,
     subagent_info: Arc<OnceLock<SubagentInfo>>,
     local_tools: LocalTools,
     name: String,
-    total_input: Arc<AtomicU32>,
-    total_output: Arc<AtomicU32>,
+    usage: TokenUsage,
+    usage_rx: flume::Receiver<TokenUsage>,
     start: Instant,
     closed: bool,
 }
@@ -672,7 +692,7 @@ impl SessionState {
             return;
         }
         self.closed = true;
-        self.parent_cancels.remove(&self.ui_id);
+        self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
             tool_use_id: self.ui_id.clone(),
@@ -681,8 +701,8 @@ impl SessionState {
         info!(
             name = %self.name,
             duration_ms = self.start.elapsed().as_millis() as u64,
-            input_tokens = self.total_input.load(Ordering::Relaxed),
-            output_tokens = self.total_output.load(Ordering::Relaxed),
+            input_tokens = self.usage.total_input(),
+            output_tokens = self.usage.output,
             "subagent session closed",
         );
     }
@@ -772,6 +792,16 @@ async fn prompt(
     if let Err(e) = result {
         return Ok((None, Some(e.to_string())));
     }
+    // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
+    // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
+    // live channel before `dispatch_racing_live` drains it for the last time.
+    match s.usage_rx.recv_async().await {
+        Ok(usage) => s.usage += usage,
+        Err(_) => tracing::warn!(
+            name = %s.name,
+            "subagent usage tracker stopped, token counts may lag"
+        ),
+    }
 
     let text = s
         .history
@@ -790,8 +820,8 @@ async fn prompt(
     let tbl = lua.create_table()?;
     tbl.set("text", text)?;
     tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
-    tbl.set("input_tokens", s.total_input.load(Ordering::Relaxed))?;
-    tbl.set("output_tokens", s.total_output.load(Ordering::Relaxed))?;
+    tbl.set("input_tokens", s.usage.total_input())?;
+    tbl.set("output_tokens", s.usage.output)?;
     Ok((Some(tbl), None))
 }
 
@@ -833,6 +863,8 @@ fn call_local_tool(
 
 #[cfg(test)]
 mod tests {
+    use maki_agent::TurnCompleteEvent;
+    use maki_providers::Message;
     use serde_json::json;
 
     use super::*;
@@ -862,5 +894,103 @@ mod tests {
         assert!(raised.contains("boom"), "got: {raised}");
         let wrong = call("function() return 42 end", input).unwrap_err();
         assert!(wrong.contains("expected string"), "got: {wrong}");
+    }
+
+    const RUN_ID: u64 = 7;
+    const PARENT_ID: &str = "task-1";
+    const IGNORED_ERROR: &str = "handled by the session caller";
+    const DONE_USAGE: TokenUsage = tokens(150, 30);
+
+    const fn tokens(input: u32, output: u32) -> TokenUsage {
+        TokenUsage {
+            input,
+            output,
+            cache_creation: 0,
+            cache_read: 0,
+        }
+    }
+
+    fn envelope(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: RUN_ID,
+        }
+    }
+
+    fn turn(usage: TokenUsage, cost: f64) -> AgentEvent {
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message::default(),
+            usage,
+            model: "test-model".into(),
+            cost: Some(cost),
+            context_size: None,
+        }))
+    }
+
+    #[test]
+    fn relay_session_events_reports_live_usage_and_done_total() {
+        let (sub_tx, sub_rx) = flume::unbounded();
+        let (parent_raw_tx, parent_rx) = flume::unbounded();
+        let subagent_info = Arc::new(OnceLock::new());
+        subagent_info
+            .set(SubagentInfo {
+                parent_tool_use_id: PARENT_ID.into(),
+                name: "research".into(),
+                prompt: None,
+                model: None,
+                answer_tx: None,
+            })
+            .unwrap();
+        let (usage_tx, usage_rx) = flume::unbounded();
+        let (live_tx, live_rx) = flume::unbounded();
+
+        for event in [
+            turn(tokens(100, 20), 0.25),
+            turn(tokens(50, 10), 0.5),
+            AgentEvent::Error {
+                message: IGNORED_ERROR.into(),
+            },
+            AgentEvent::Done {
+                usage: DONE_USAGE,
+                num_turns: 2,
+                stop_reason: None,
+            },
+        ] {
+            sub_tx.send(envelope(event)).unwrap();
+        }
+        drop(sub_tx);
+
+        smol::block_on(relay_session_events(
+            sub_rx,
+            EventSender::new(parent_raw_tx, RUN_ID),
+            subagent_info,
+            usage_tx,
+            Some(live_tx),
+        ));
+
+        let live = live_rx
+            .drain()
+            .map(|event| match event {
+                ToolLive::Usage(usage) => usage,
+                _ => panic!("relay must only publish usage"),
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            tokens(100, 20).format_sum_cost(Some(0.25)),
+            tokens(50, 10).format_sum_cost(Some(0.75)),
+        ];
+        assert_eq!(live, expected);
+        assert_eq!(usage_rx.try_recv(), Ok(DONE_USAGE));
+
+        let forwarded = parent_rx.drain().collect::<Vec<_>>();
+        assert_eq!(forwarded.len(), expected.len());
+        assert!(forwarded.iter().all(|envelope| {
+            matches!(envelope.event, AgentEvent::TurnComplete(_))
+                && envelope
+                    .subagent
+                    .as_ref()
+                    .is_some_and(|info| info.parent_tool_use_id == PARENT_ID)
+        }));
     }
 }

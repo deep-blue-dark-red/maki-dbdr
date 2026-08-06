@@ -1,6 +1,6 @@
 +++
 title = "Keybindings"
-weight = 7
+weight = 5
 [extra]
 group = "Reference"
 +++
@@ -13,41 +13,45 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit / clear input |
-| `Ctrl+H` | Show keybindings |
-| `Ctrl+N` / `Ctrl+P` | Next / previous task chat |
-| `Ctrl+F` | Search messages |
-| `Ctrl+S` | File picker |
-| `Ctrl+O` | Open plan in editor |
-| `Ctrl+T` | Toggle plan panel |
-| `Ctrl+X` | Open tasks |
+| configurable | Quit / clear input |
+| configurable | Show keybindings |
+| configurable | Next / previous task chat |
+| configurable | Search messages |
+| configurable | File picker |
+| configurable | Toggle verbose mode |
+| configurable | Open sessions list |
+| configurable | Switch to next session |
+| configurable | Switch to previous session |
+| configurable | Open plan in editor |
+| configurable | Toggle plan panel |
+| configurable | Open tasks |
 
 ## Editing
 
 | Key | Action |
 |-----|--------|
 | `Enter` | Submit prompt |
-| `\+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
+| `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
 | `Tab` | Toggle mode |
 | `/command` | Open command palette |
-| `Ctrl+W` | Delete word backward |
+| configurable | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
-| `Ctrl+A` | Jump to start of line |
+| configurable | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
-| `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
-| `Ctrl+E` | Jump to end of line |
-| `Ctrl+G` | Scroll to top |
-| `Ctrl+B` | Scroll to bottom |
-| `Ctrl+Q` | Pop queue |
+| configurable | Scroll half page up / down |
+| configurable | Jump to end of line |
+| configurable | Scroll to top |
+| configurable | Scroll to bottom |
+| configurable | Pop queue |
 | `Esc Esc` | Rewind |
-| `Alt+O` | Edit input in external editor |
+| configurable | Edit input in external editor |
 
 ### macOS-specific
 
 | Key | Action |
 |-----|--------|
 | `Ctrl+Del` / `⌥Del` | Delete word forward |
-| `Ctrl+K` | Delete to end of line |
+| configurable | Delete to end of line |
 
 ## While Streaming
 
@@ -92,7 +96,7 @@ Some pickers add extra bindings on top of the defaults:
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Rewind Picker, Goto Picker, Theme Picker, Settings Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 
@@ -111,12 +115,19 @@ The `/help` modal and the splash show default labels, not live overrides, but pr
 
 ### Recovering from a bad keymap
 
-If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without plugins:
+If an override leaves Maki stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without user `init.lua`:
 
 ```bash
 maki --no-plugins
 ```
 
-This skips the Lua host and runs the full default keymap from Rust, so quit, Esc, scroll, and suspend always work.
+Skips user `init.lua` files (global and project) but keeps the Lua host and builtin plugins running, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
 
-The defaults live in Rust, not Lua, so `--no-plugins` never drops them.
+The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
+
+## Shell and images
+
+These are input conventions, not remappable key rows:
+
+- Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
+- `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.

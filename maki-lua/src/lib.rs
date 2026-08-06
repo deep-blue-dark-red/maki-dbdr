@@ -12,13 +12,13 @@ pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::util::command::{
     Anchor, Axis, Border, Dimension, Edge, FloatConfig, FloatConfigPatch, HintReader, HintSnapshot,
     LuaCommandInfo, LuaCommandReader, SessionReply, SessionRequest, Split, TitlePos, UiAction,
-    WinCommand, WinEvent,
+    WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
-pub use loader::{EventHandle, PluginHost};
+pub use loader::{bundled_plugins, EventHandle, PluginHost};
 pub use plugin_permissions::{Permission, PluginPermissions};
-pub use runtime::{RestoreItem, WARM_TOOL_CAP};
+pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
 
 pub mod test_support {
     use crate::KeymapReader;
@@ -55,6 +55,17 @@ pub mod test_support {
                 Request::RestoreToolAsync { item, .. } => ("restore", item.clicks),
                 _ => ("other", Vec::new()),
             })
+        }
+
+        /// Next fired autocmd as `(event, data)`, skipping other requests.
+        pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::FireAutocmd { event, data } = req {
+                    return Some((event, data));
+                }
+            }
+            None
         }
     }
 

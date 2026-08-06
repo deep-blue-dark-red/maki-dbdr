@@ -40,13 +40,13 @@ fn key_spans(label: ResolvedLabel, pad: usize, prefix: &str) -> Vec<Span<'static
                 theme.keybind_key,
             )]
         }
-        ResolvedLabel::Alt(a, b) => multi_key_spans(&[a, b], pad, prefix, &theme),
-        ResolvedLabel::Multi(keys) => multi_key_spans(&keys, pad, prefix, &theme),
+        ResolvedLabel::Alt(a, b) => multi_key_spans(&[a.as_str(), b.as_str()], pad, prefix, &theme),
+        ResolvedLabel::Multi(keys) => multi_key_spans(&keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(), pad, prefix, &theme),
     }
 }
 
 fn multi_key_spans(
-    keys: &[String],
+    keys: &[&str],
     pad: usize,
     prefix: &str,
     theme: &crate::theme::Theme,
@@ -54,7 +54,7 @@ fn multi_key_spans(
     let sep_w = UnicodeWidthStr::width(ALT_SEP);
     let content_w: usize = keys
         .iter()
-        .map(|k| UnicodeWidthStr::width(k.as_str()))
+        .map(|k| UnicodeWidthStr::width(*k))
         .sum::<usize>()
         + sep_w * keys.len().saturating_sub(1);
     let trailing = pad.saturating_sub(content_w);
@@ -70,7 +70,7 @@ fn multi_key_spans(
         } else if i == keys.len() - 1 {
             format!("{k}{:trailing$}", "")
         } else {
-            k.clone()
+            (*k).to_string()
         };
         spans.push(Span::styled(text, theme.keybind_key));
     }

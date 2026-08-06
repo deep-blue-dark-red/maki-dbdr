@@ -24,10 +24,11 @@ use crate::{
 use super::KeyPool;
 
 const API_VERSION: &str = "2023-06-01";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
+const API_ORIGIN: &str = "https://api.anthropic.com";
+const MESSAGES_PATH: &str = "/v1/messages";
+const MODELS_PATH: &str = "/v1/models?limit=1000";
+const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
@@ -39,7 +40,7 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
     slug: "anthropic",
     display_name: "Anthropic",
     protocol: maki_config::providers::Protocol::Anthropic,
-    default_base_url: "https://api.anthropic.com/v1/messages",
+    default_base_url: API_ORIGIN,
     default_api_key_env: ENV_VAR,
     default_model: "anthropic/claude-sonnet-4-6",
     plans: None,
@@ -163,7 +164,7 @@ fn credits_limit(u: &OauthUsage) -> Option<UsageLimit> {
     };
     Some(UsageLimit {
         label: "Usage credits".into(),
-        percentage: percent.round() as u32,
+        percentage: Some(percent.round() as u32),
         reset_at: None,
         detail,
     })
@@ -177,7 +178,7 @@ impl From<OauthUsage> for ProviderUsage {
             .filter_map(|l| {
                 Some(UsageLimit {
                     label: limit_label(l),
-                    percentage: l.percent?.round() as u32,
+                    percentage: Some(l.percent?.round() as u32),
                     reset_at: l.resets_at.as_deref().and_then(parse_reset),
                     detail: None,
                 })
@@ -194,7 +195,7 @@ impl From<OauthUsage> for ProviderUsage {
                 let w = w.as_ref()?;
                 Some(UsageLimit {
                     label: label.into(),
-                    percentage: w.utilization?.round() as u32,
+                    percentage: Some(w.utilization?.round() as u32),
                     reset_at: w.resets_at.as_deref().and_then(parse_reset),
                     detail: None,
                 })
@@ -205,21 +206,43 @@ impl From<OauthUsage> for ProviderUsage {
     }
 }
 
+/// Reduce a `base_url` to a bare origin, tolerating a trailing `/v1/messages`
+/// (which Anthropic base URLs historically included) and any query string
+/// (e.g. `?beta=true` from Claude Code style endpoints).
+fn origin(base_url: &str) -> &str {
+    let without_query = base_url.split(['?', '#']).next().unwrap_or(base_url);
+    let trimmed = without_query.trim_end_matches('/');
+    trimmed.strip_suffix(MESSAGES_PATH).unwrap_or(trimmed)
+}
+
+/// True when `base_url` targets the real Anthropic API, directly or via the
+/// construction-time base-URL override (so quota stays visible behind a proxy).
+fn first_party(base_url: &str, configured_override: Option<&str>) -> bool {
+    let target = origin(base_url);
+    target.contains("api.anthropic.com")
+        || configured_override.is_some_and(|configured| origin(configured) == target)
+}
+
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
 /// API; API keys and anthropic-protocol third-party endpoints have none.
-fn usage_eligible(auth: &super::ResolvedAuth) -> bool {
+fn usage_eligible(auth: &super::ResolvedAuth, configured_override: Option<&str>) -> bool {
     auth.headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
         && auth
             .base_url
             .as_deref()
-            .is_none_or(|u| u.contains("api.anthropic.com"))
+            .is_none_or(|url| first_party(url, configured_override))
 }
 
-fn resolve_auth_from_key(key: &str) -> super::ResolvedAuth {
+fn resolve_anthropic_base_url() -> Option<String> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::resolve_base_url("anthropic", config.get("anthropic"))
+}
+
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> super::ResolvedAuth {
     super::ResolvedAuth {
-        base_url: Some("https://api.anthropic.com/v1/messages".into()),
+        base_url,
         headers: vec![("x-api-key".into(), key.to_string())],
     }
 }
@@ -230,12 +253,16 @@ pub struct Anthropic {
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
     stream_timeout: Duration,
+    /// Env / `providers.toml` / inventory default, resolved once at construction.
+    /// Reused by key rotation / reload so they do not re-parse providers.toml.
+    resolved_base_url: Option<String>,
 }
 
 impl Anthropic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
-        let resolved = resolve_auth_from_key(pool.current());
+        let resolved_base_url = resolve_anthropic_base_url();
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
         debug!(keys = pool.len(), "using API key authentication");
         Ok(Self {
             client: super::http_client(timeouts),
@@ -243,6 +270,7 @@ impl Anthropic {
             key_pool: Some(pool),
             system_prefix: None,
             stream_timeout: timeouts.stream,
+            resolved_base_url,
         })
     }
 
@@ -256,6 +284,10 @@ impl Anthropic {
             key_pool: None,
             system_prefix: None,
             stream_timeout: timeouts.stream,
+            // Custom / dynamic callers own their base URL; treating it as the
+            // anthropic override would make every third-party endpoint look
+            // first party and poll `/api/oauth/usage` against it.
+            resolved_base_url: None,
         }
     }
 
@@ -264,9 +296,10 @@ impl Anthropic {
         self
     }
 
-    fn build_request(&self, method: &str, url: Option<&str>) -> isahc::http::request::Builder {
+    fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
         let auth = self.auth.lock().unwrap();
-        let url = url.unwrap_or_else(|| auth.base_url.as_deref().unwrap_or(MESSAGES_URL));
+        let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
+        let url = format!("{}{path}", origin(base));
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -285,7 +318,7 @@ impl Anthropic {
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
-            .build_request("POST", None)
+            .build_request("POST", MESSAGES_PATH)
             .header("content-type", "application/json");
         let mut betas = Vec::new();
         if fast {
@@ -313,12 +346,12 @@ impl Anthropic {
         let mut after_id: Option<String> = None;
 
         loop {
-            let mut url = MODELS_URL.to_string();
+            let mut path = MODELS_PATH.to_string();
             if let Some(cursor) = &after_id {
-                url.push_str(&format!("&after_id={cursor}"));
+                path.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request("GET", Some(&url)).body(())?;
+            let request = self.build_request("GET", &path).body(())?;
             let mut response = self.client.send_async(request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
@@ -406,7 +439,8 @@ impl Provider for Anthropic {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
-            *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
+            *self.auth.lock().unwrap() =
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
             debug!("reloaded Anthropic auth from env");
             Ok(())
         })
@@ -414,20 +448,25 @@ impl Provider for Anthropic {
 
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, resolve_auth_from_key)))
+            let base_url = self.resolved_base_url.clone();
+            Ok(self.key_pool.as_ref().is_some_and(|p| {
+                p.rotate_auth(&self.auth, |key| {
+                    resolve_auth_from_key(key, base_url.clone())
+                })
+            }))
         })
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
-            if !usage_eligible(&self.auth.lock().unwrap()) {
+            if !usage_eligible(
+                &self.auth.lock().unwrap(),
+                self.resolved_base_url.as_deref(),
+            ) {
                 return Ok(None);
             }
             let request = self
-                .build_request("GET", Some(USAGE_URL))
+                .build_request("GET", USAGE_PATH)
                 .header("anthropic-beta", OAUTH_BETA)
                 .body(())?;
             let mut response = self.client.send_async(request).await?;
@@ -498,6 +537,7 @@ mod tests {
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -528,14 +568,14 @@ mod tests {
         assert!(usage.plan.is_none());
         assert_eq!(usage.limits.len(), 4);
         assert_eq!(usage.limits[0].label, "Current session");
-        assert_eq!(usage.limits[0].percentage, 14);
+        assert_eq!(usage.limits[0].percentage, Some(14));
         assert_eq!(usage.limits[0].reset_at, Some(1770415200000));
         assert_eq!(usage.limits[1].label, "Current week (all models)");
-        assert_eq!(usage.limits[1].percentage, 2);
+        assert_eq!(usage.limits[1].percentage, Some(2));
         assert_eq!(usage.limits[2].label, "Current week (Fable)");
-        assert_eq!(usage.limits[2].percentage, 3);
+        assert_eq!(usage.limits[2].percentage, Some(3));
         assert_eq!(usage.limits[3].label, "Usage credits");
-        assert_eq!(usage.limits[3].percentage, 2);
+        assert_eq!(usage.limits[3].percentage, Some(2));
         assert_eq!(usage.limits[3].reset_at, None);
         assert_eq!(usage.limits[3].detail.as_deref(), Some("$2.33 spent"));
     }
@@ -553,14 +593,14 @@ mod tests {
         let usage: ProviderUsage = parsed.into();
         assert_eq!(usage.limits.len(), 5);
         assert_eq!(usage.limits[0].label, "Current session");
-        assert_eq!(usage.limits[0].percentage, 35);
+        assert_eq!(usage.limits[0].percentage, Some(35));
         assert_eq!(usage.limits[0].reset_at, Some(1770415200000));
         assert_eq!(usage.limits[1].label, "Current week (all models)");
         assert_eq!(usage.limits[2].label, "Current week (Sonnet)");
         assert_eq!(usage.limits[3].label, "Current week (Opus)");
-        assert_eq!(usage.limits[3].percentage, 3);
+        assert_eq!(usage.limits[3].percentage, Some(3));
         assert_eq!(usage.limits[4].label, "Usage credits");
-        assert_eq!(usage.limits[4].percentage, 2);
+        assert_eq!(usage.limits[4].percentage, Some(2));
         assert_eq!(usage.limits[4].detail.as_deref(), Some("$2.33 spent"));
     }
 
@@ -580,6 +620,7 @@ mod tests {
 
     #[test_case("Authorization", None, true ; "bearer_default_url_eligible")]
     #[test_case("authorization", Some("https://api.anthropic.com/v1/messages"), true ; "bearer_anthropic_url_eligible")]
+    #[test_case("authorization", Some("https://api.anthropic.com"), true ; "bearer_anthropic_origin_eligible")]
     #[test_case("x-api-key", None, false ; "api_key_not_eligible")]
     #[test_case("Authorization", Some("https://proxy.example.com/v1/messages"), false ; "foreign_base_url_not_eligible")]
     fn usage_eligibility(header: &str, base_url: Option<&str>, expected: bool) {
@@ -587,7 +628,44 @@ mod tests {
             base_url: base_url.map(String::from),
             headers: vec![(header.into(), "token".into())],
         };
-        assert_eq!(usage_eligible(&auth), expected);
+        assert_eq!(usage_eligible(&auth, None), expected);
+    }
+
+    #[test]
+    fn with_auth_keeps_third_party_endpoint_ineligible() {
+        let mut auth = crate::providers::ResolvedAuth::bearer("token");
+        auth.base_url = Some(THIRD_PARTY_BASE_URL.into());
+        let provider = Anthropic::with_auth(
+            Arc::new(Mutex::new(auth)),
+            crate::providers::Timeouts::default(),
+        );
+        assert!(provider.resolved_base_url.is_none());
+        assert!(!usage_eligible(
+            &provider.auth.lock().unwrap(),
+            provider.resolved_base_url.as_deref()
+        ));
+    }
+
+    #[test]
+    fn usage_eligible_when_url_matches_configured_override() {
+        let auth = crate::providers::ResolvedAuth {
+            base_url: Some(THIRD_PARTY_BASE_URL.into()),
+            headers: vec![("Authorization".into(), "token".into())],
+        };
+        assert!(usage_eligible(&auth, Some(THIRD_PARTY_BASE_URL)));
+        assert!(!usage_eligible(
+            &auth,
+            Some("https://other-proxy.example.com")
+        ));
+    }
+
+    #[test_case("https://api.anthropic.com/v1/messages", "https://api.anthropic.com" ; "strips_messages_path")]
+    #[test_case("https://proxy.example.com/v1/messages/", "https://proxy.example.com" ; "strips_messages_path_with_trailing_slash")]
+    #[test_case("https://api.anthropic.com", "https://api.anthropic.com" ; "origin_unchanged")]
+    #[test_case("http://localhost:8080/", "http://localhost:8080" ; "trims_trailing_slash")]
+    #[test_case("https://api.anthropic.com/v1/messages?beta=true", "https://api.anthropic.com" ; "strips_query_string")]
+    fn origin_normalizes(input: &str, expected: &str) {
+        assert_eq!(origin(input), expected);
     }
 
     fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {

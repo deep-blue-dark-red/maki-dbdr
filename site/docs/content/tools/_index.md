@@ -1,13 +1,13 @@
 +++
 title = "Tools"
-weight = 3
+weight = 6
 [extra]
 group = "Reference"
 +++
 
 # Tools
 
-Maki ships with 20 built-in tools. This is the full reference.
+Maki ships with 21 built-in tools in this reference (19 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -29,8 +29,8 @@ Read a file or directory. Returns contents with line numbers (1-indexed).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | no | Max number of lines to read. Omitting the limit reads up to 2000 lines. |
-| `offset` | integer | no | Line number to start from (1-indexed) |
+| `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
+| `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
 | `path` | string | yes | Absolute path to the file or directory |
 
 ### `write` *(lua plugin)*
@@ -91,7 +91,7 @@ Find files by glob pattern.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `path` | string | no | cwd | Directory to search in |
-| `pattern` | string | no |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
+| `pattern` | string | yes |  | Glob pattern (e.g. **/*.rs, src/**/*.ts) |
 
 ### `grep` *(lua plugin)*
 
@@ -126,7 +126,7 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ### `batch` *(lua plugin)*
 
-Executes multiple independent tool calls concurrently to reduce round-trips.
+Run independent tool calls in parallel (1-25). Not for dependent or output-filtering chains — use code_execution. Don't nest batch in batch.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -134,12 +134,12 @@ Executes multiple independent tool calls concurrently to reduce round-trips.
 
 ### `code_execution` *(lua plugin)*
 
-Execute Python code in a sandboxed interpreter with tools as callable functions.
+Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency via asyncio.gather. Libs: re, asyncio, sys, os, json. No imports, no network. 30s default timeout.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file')`. Use `await asyncio.gather(...)` for concurrency. |
-| `timeout` | integer | no | 30, max 300 | Timeout in seconds |
+| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await asyncio.gather(...)` for concurrency. |
+| `timeout` | integer | no | 30 | Script execution timeout in seconds |
 
 ### `question` *(lua plugin)*
 
@@ -181,17 +181,26 @@ Persistent, project-scoped scratchpad for learnings, patterns, decisions, and go
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | Command: view, write, delete |
-| `content` | string | no | File content for 'write' |
-| `path` | string | no | Relative path (e.g. 'architecture.md'). Omit to list all. |
+| `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
+| `content` | string | no | Body for write (frontmatter added automatically). |
+| `path` | string | no | Relative path, e.g. 'architecture.md'. |
+| `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
 ### `skill` *(lua plugin)*
 
-Load a skill that provides instructions and workflows for specific tasks.
+Load a task-specific playbook by name.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | yes | Name of the skill to load |
+| `name` | string | no | Skill name; omit to list available skills |
+
+### `skill_test` *(lua plugin)*
+
+Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `skill` | string | yes | Skill name to test |
 
 ## Web
 
@@ -201,7 +210,7 @@ Fetch a URL and return its contents.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `format` | string | no |  | Output format: markdown (default), text, or html |
+| `format` | string | no |  | Output format: markdown (default), text, html, or json |
 | `timeout` | integer | no | 30, max 120 | Timeout in seconds |
 | `url` | string | yes |  | URL to fetch (http:// or https://) |
 

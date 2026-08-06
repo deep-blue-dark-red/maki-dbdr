@@ -2,6 +2,9 @@
 //! `Message.display_text`: `Some("")` marks a message as synthetic (sent to the API but hidden
 //! from the UI). `user_text()` returns `None` for these, so system-injected messages
 //! (cancel markers, compaction prompts) stay invisible without a separate type.
+//! `Message.kind` answers a different question. Synthetic text is ours and
+//! trusted, it is just not worth showing. An observation comes from outside,
+//! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -148,6 +151,8 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -160,15 +165,67 @@ pub enum ContentBlock {
     },
 }
 
+/// Who a message came from, which `role` cannot say. Providers only
+/// accept user and assistant, so anything the host wants to report has to
+/// travel as a user message, and without this there is no way to tell it
+/// apart from the user actually typing. A prefix in the text would not do:
+/// a log line can print one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// Someone said this, the user or the model.
+    #[default]
+    Turn,
+    /// The host noticed it and passed it to the model. It stays in session
+    /// history for conversation order but is hidden from user-facing views.
+    Observation,
+}
+
+impl MessageKind {
+    fn is_turn(&self) -> bool {
+        matches!(self, Self::Turn)
+    }
+}
+
+impl ContentBlock {
+    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
+        Self::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+            thought_signature: None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Skipped when it is `Turn`, so sessions written before this existed
+    /// load unchanged.
+    #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
+    pub kind: MessageKind,
 }
 
 impl Message {
+    /// Something the host saw, reported to the model without pretending
+    /// the user said it.
+    pub fn observation(text: String) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text }],
+            kind: MessageKind::Observation,
+            ..Default::default()
+        }
+    }
+
+    pub fn is_observation(&self) -> bool {
+        self.kind == MessageKind::Observation
+    }
+
     pub fn user(text: String) -> Self {
         Self {
             role: Role::User,
@@ -182,6 +239,7 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: ai_text }],
             display_text: Some(display),
+            ..Default::default()
         }
     }
 
@@ -205,6 +263,7 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text }],
             display_text: Some(String::new()),
+            ..Default::default()
         }
     }
 
@@ -225,7 +284,9 @@ impl Message {
 
     pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &Value)> {
         self.content.iter().filter_map(|b| match b {
-            ContentBlock::ToolUse { id, name, input } => Some((id.as_str(), name.as_str(), input)),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some((id.as_str(), name.as_str(), input)),
             _ => None,
         })
     }
@@ -239,7 +300,7 @@ impl Message {
 
 impl TitleSource for Message {
     fn first_user_text(&self) -> Option<&str> {
-        if !self.role.is_user() {
+        if !self.role.is_user() || self.is_observation() {
             return None;
         }
         self.user_text()
@@ -313,6 +374,24 @@ const THINKING_USAGE: &str =
 /// never told us its output window. 32k matches common frontier thinking
 /// caps. Explicit user budgets never go through this.
 const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
+
+/// First Claude version that speaks adaptive thinking. Opus got there a
+/// generation early, at 4.7; the other families joined at 5.
+const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
+const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+const OPUS: &str = "opus";
+
+/// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
+/// Copilot writes the version with a dot, hence the two separators. Legacy ids
+/// put the version first (`claude-3-5-sonnet-20241022`), so a numeric family
+/// tells us there is no modern version to read here.
+fn claude_version(model_id: &str) -> Option<(&str, (u32, u32))> {
+    let mut parts = model_id.strip_prefix("claude-")?.split(['-', '.']);
+    let family = parts.next().filter(|f| f.parse::<u32>().is_err())?;
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((family, (major, minor)))
+}
 
 /// How a provider's effort knob speaks: which levels its API accepts, what
 /// `adaptive` means there, and whether "off" needs an explicit string.
@@ -469,21 +548,18 @@ impl ThinkingConfig {
         }
     }
 
-    /// Version check, not an allowlist, so future Opus releases work
-    /// automatically. Splits on `-` and `.` since Copilot uses dotted ids
-    /// (`claude-opus-4.7`).
+    /// Models from [`ADAPTIVE_SINCE`] on reject `type: "enabled"` with a 400. A
+    /// version check, not an allowlist, so future releases and new families
+    /// work automatically.
     fn requires_adaptive(model_id: &str) -> bool {
-        let Some(version) = model_id.strip_prefix("claude-opus-") else {
-            return false;
-        };
-        let mut parts = version.split(['-', '.']);
-        let (Some(Ok(major)), Some(Ok(minor))) = (
-            parts.next().map(str::parse::<u32>),
-            parts.next().map(str::parse::<u32>),
-        ) else {
-            return false;
-        };
-        (major, minor) >= (4, 7)
+        claude_version(model_id).is_some_and(|(family, version)| {
+            version
+                >= if family == OPUS {
+                    ADAPTIVE_SINCE_OPUS
+                } else {
+                    ADAPTIVE_SINCE
+                }
+        })
     }
 
     pub fn apply_reasoning_effort(self, body: &mut Value, dialect: &EffortDialect, model: &Model) {
@@ -615,7 +691,8 @@ pub struct UsageLimit {
     /// Human-readable label for the window, provided by the provider.
     pub label: String,
     /// Usage percentage within the window, 0-100.
-    pub percentage: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percentage: Option<u32>,
     /// When the window resets, as epoch milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<u64>,
@@ -663,6 +740,24 @@ mod tests {
         let msg = Message::user_with_images(String::new(), vec![source]);
         assert_eq!(msg.content.len(), 1);
         assert!(matches!(&msg.content[0], ContentBlock::Image { .. }));
+    }
+
+    #[test]
+    fn message_kind_is_backward_compatible() {
+        let old: Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "hello" }]
+        }))
+        .unwrap();
+        assert_eq!(old.kind, MessageKind::Turn);
+
+        let turn = serde_json::to_value(Message::user("hello".into())).unwrap();
+        assert!(turn.get("kind").is_none());
+
+        let observation = Message::observation("built".into());
+        assert_eq!(observation.first_user_text(), None);
+        let observation = serde_json::to_value(observation).unwrap();
+        assert_eq!(observation["kind"], "observation");
     }
 
     #[test_case(ImageMediaType::Png,  "image/png"  ; "png")]
@@ -789,9 +884,10 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_7")]
     #[test_case(ThinkingConfig::Effort(Low), "claude-opus-4-7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}) ; "effort_low_passthrough")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4-8-1m", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_4_8_long_context")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-0", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_future_opus_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-5-1m", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_opus_5_unparsable_minor")]
     #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.7", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_copilot_dotted_id")]
-    #[test_case(ThinkingConfig::Budget(10000), "claude-opus-4.6", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_copilot_dotted_4_6")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-sonnet-5", json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}) ; "budget_adaptive_sonnet_5")]
+    #[test_case(ThinkingConfig::Budget(10000), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 4096}}) ; "budget_legacy_dated_id")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));

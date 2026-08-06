@@ -12,6 +12,7 @@ use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
+    slug: "mistral",
     api_key_env: "MISTRAL_API_KEY",
     base_url: "https://api.mistral.ai/v1",
     max_tokens_field: "max_tokens",
@@ -69,7 +70,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 262_144,
+            max_output_tokens: None,
             context_window: 262_144,
         },
         ModelEntry {
@@ -85,7 +86,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 262_144,
+            max_output_tokens: None,
             context_window: 262_144,
         },
         ModelEntry {
@@ -101,7 +102,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.00,
                 fast: None,
             },
-            max_output_tokens: 262_144,
+            max_output_tokens: None,
             context_window: 262_144,
         },
     ]
@@ -252,6 +253,7 @@ impl Provider for Mistral {
                         pricing: None,
                         supports_thinking,
                         supports_vision: Some(supports_vision),
+                        tier: None,
                         provider_info: None,
                     })
                 })

@@ -161,26 +161,22 @@ pub(crate) fn open_in_editor(
     }
 }
 
-pub(crate) fn run_view_log_command(
-    command_line: &str,
+pub(crate) fn run_shell_command(
+    cmd: &str,
     terminal: &mut ratatui::DefaultTerminal,
-) -> Result<i32, String> {
+) -> Result<(), String> {
     teardown();
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let result = std::process::Command::new(&shell)
+    let status = std::process::Command::new("sh")
         .arg("-c")
-        .arg(command_line)
+        .arg(cmd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status();
-
     resume(terminal);
-
-    match result {
-        Ok(status) => Ok(status.code().unwrap_or(-1)),
-        Err(e) => Err(format!("Failed to run command {command_line}: {e}")),
+    match status {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to run command: {e}")),
     }
 }
 

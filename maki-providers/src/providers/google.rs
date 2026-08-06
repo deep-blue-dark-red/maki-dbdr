@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::SessionRef;
+use maki_storage::id::{MakiId, SessionRef};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -61,7 +61,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.31,
                 fast: None,
             },
-            max_output_tokens: 65_536,
+            max_output_tokens: Some(65_536),
             context_window: 1_048_576,
         },
         ModelEntry {
@@ -77,7 +77,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.04,
                 fast: None,
             },
-            max_output_tokens: 65_536,
+            max_output_tokens: Some(65_536),
             context_window: 1_048_576,
         },
         ModelEntry {
@@ -93,15 +93,20 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 cache_read: 0.01,
                 fast: None,
             },
-            max_output_tokens: 65_536,
+            max_output_tokens: Some(65_536),
             context_window: 1_048_576,
         },
     ]
 }
 
-fn resolve_auth_from_key(key: &str) -> ResolvedAuth {
+fn resolve_google_base_url() -> Option<String> {
+    let config = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::resolve_base_url("google", config.get("google"))
+}
+
+fn resolve_auth_from_key(key: &str, base_url: Option<String>) -> ResolvedAuth {
     ResolvedAuth {
-        base_url: None,
+        base_url,
         headers: vec![("x-goog-api-key".into(), key.to_string())],
     }
 }
@@ -111,17 +116,21 @@ pub struct Google {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     stream_timeout: Duration,
+    /// Env / `providers.toml` / inventory default, resolved once at construction.
+    resolved_base_url: Option<String>,
 }
 
 impl Google {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("google", ENV_VAR)?;
-        let resolved = resolve_auth_from_key(pool.current());
+        let resolved_base_url = resolve_google_base_url();
+        let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone());
         Ok(Self {
             client: http_client(timeouts),
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
+            resolved_base_url,
         })
     }
 
@@ -129,11 +138,13 @@ impl Google {
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
     ) -> Self {
+        let resolved_base_url = auth.lock().unwrap().base_url.clone();
         Self {
             client: http_client(timeouts),
             auth,
             key_pool: None,
             stream_timeout: timeouts.stream,
+            resolved_base_url,
         }
     }
 
@@ -283,17 +294,20 @@ impl Provider for Google {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let pool = KeyPool::resolve("google", ENV_VAR)?;
-            *self.auth.lock().unwrap() = resolve_auth_from_key(pool.current());
+            *self.auth.lock().unwrap() =
+                resolve_auth_from_key(pool.current(), self.resolved_base_url.clone());
             Ok(())
         })
     }
 
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, resolve_auth_from_key)))
+            let base_url = self.resolved_base_url.clone();
+            Ok(self.key_pool.as_ref().is_some_and(|p| {
+                p.rotate_auth(&self.auth, |key| {
+                    resolve_auth_from_key(key, base_url.clone())
+                })
+            }))
         })
     }
 }
@@ -342,21 +356,34 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     parts.push(part);
                 }
                 ContentBlock::RedactedThinking { .. } => {}
-                ContentBlock::ToolUse { id: _, name, input } => {
-                    parts.push(json!({
+                ContentBlock::ToolUse {
+                    id: _,
+                    name,
+                    input,
+                    thought_signature,
+                } => {
+                    let mut part = json!({
                         "functionCall": {
                             "name": name,
                             "args": input,
                         }
-                    }));
+                    });
+                    if let Some(sig) = thought_signature {
+                        part["thoughtSignature"] = json!(sig);
+                    }
+                    parts.push(part);
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
                 } => {
-                    let mut response_val = serde_json::from_str(content)
-                        .unwrap_or_else(|_| json!({"result": content}));
+                    let parsed = serde_json::from_str::<Value>(content);
+                    let mut response_val = match parsed {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        Ok(other) => json!({"result": other}),
+                        Err(_) => json!({"result": content}),
+                    };
                     if *is_error {
                         response_val = json!({"error": response_val});
                     }
@@ -468,6 +495,8 @@ struct SsePart {
 struct SseFunctionCall {
     name: String,
     args: Option<Value>,
+    #[serde(default)]
+    thought_signature: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -500,6 +529,43 @@ struct ApiModelInfo {
     name: String,
     #[serde(default)]
     supported_generation_methods: Vec<String>,
+}
+
+/// Append `text` to the last block when it is already a `Text`, else push a new
+/// `Text` block. Gemini streams a single assistant message as many small text
+/// parts across SSE chunks; coalescing keeps them as one content block so
+/// session restore renders one `maki>` block instead of one per delta.
+fn push_or_extend_text(blocks: &mut Vec<ContentBlock>, text: String) {
+    if let Some(ContentBlock::Text { text: prev }) = blocks.last_mut() {
+        prev.push_str(&text);
+    } else {
+        blocks.push(ContentBlock::Text { text });
+    }
+}
+
+/// Same as `push_or_extend_text` for thinking parts. The `thoughtSignature`
+/// arrives on the final thinking delta, so a later signature overwrites an
+/// earlier one; a `Some` on an earlier delta is preserved if the last is None.
+fn push_or_extend_thinking(
+    blocks: &mut Vec<ContentBlock>,
+    text: String,
+    signature: Option<String>,
+) {
+    if let Some(ContentBlock::Thinking {
+        thinking: prev,
+        signature: prev_sig,
+    }) = blocks.last_mut()
+    {
+        prev.push_str(&text);
+        if signature.is_some() {
+            *prev_sig = signature;
+        }
+    } else {
+        blocks.push(ContentBlock::Thinking {
+            thinking: text,
+            signature,
+        });
+    }
 }
 
 async fn parse_sse(
@@ -555,8 +621,9 @@ async fn parse_sse(
 
             for part in parts {
                 if let Some(func_call) = part.function_call {
-                    let id = format!("call_{}", func_call.name);
+                    let id = format!("call_{}_{}", func_call.name, MakiId::generate());
                     let input = func_call.args.unwrap_or_default();
+                    let thought_signature = func_call.thought_signature.or(part.thought_signature);
                     event_tx
                         .send_async(ProviderEvent::ToolUseStart {
                             id: id.clone(),
@@ -567,6 +634,7 @@ async fn parse_sse(
                         id,
                         name: func_call.name,
                         input,
+                        thought_signature,
                     });
                     stop_reason = Some(StopReason::ToolUse);
                 } else if let Some(text) = part.text {
@@ -576,15 +644,13 @@ async fn parse_sse(
                                 .send_async(ProviderEvent::ThinkingDelta { text: text.clone() })
                                 .await?;
                         }
-                        content_blocks.push(ContentBlock::Thinking {
-                            thinking: text,
-                            signature: part.thought_signature,
-                        });
+                        push_or_extend_thinking(&mut content_blocks, text, part.thought_signature);
                     } else if !text.is_empty() {
+                        // TODO: preserve part.thought_signature if ContentBlock::Text adds signature support.
                         event_tx
                             .send_async(ProviderEvent::TextDelta { text: text.clone() })
                             .await?;
-                        content_blocks.push(ContentBlock::Text { text });
+                        push_or_extend_text(&mut content_blocks, text);
                     }
                 }
             }
@@ -746,11 +812,11 @@ mod tests {
         let messages = vec![
             Message {
                 role: Role::Assistant,
-                content: vec![ContentBlock::ToolUse {
-                    id: "call_1".into(),
-                    name: "read_file".into(),
-                    input: json!({"path": "/tmp/a"}),
-                }],
+                content: vec![ContentBlock::tool_use(
+                    "call_1",
+                    "read_file",
+                    json!({"path": "/tmp/a"}),
+                )],
                 ..Default::default()
             },
             Message {
@@ -768,6 +834,82 @@ mod tests {
         assert_eq!(
             result[1]["parts"][0]["functionResponse"]["name"],
             "read_file"
+        );
+    }
+
+    #[test_case("not json at all", json!({"result": "not json at all"}) ; "non_json_wraps_string")]
+    #[test_case(r#""a json string""#, json!({"result": "a json string"}) ; "json_scalar_wraps")]
+    #[test_case("42", json!({"result": 42}) ; "json_number_wraps")]
+    #[test_case(r#"{"out": "ok"}"#, json!({"out": "ok"}) ; "json_object_passes_through")]
+    fn convert_messages_tool_result_response_is_always_struct(content: &str, expected: Value) {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("call_1", "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: content.into(),
+                    is_error: false,
+                }],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["response"],
+            expected
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_result_error_wraps_response() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use("call_1", "read", json!({}))],
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "boom".into(),
+                    is_error: true,
+                }],
+                ..Default::default()
+            },
+        ];
+        let result = convert_messages(&messages);
+        assert_eq!(
+            result[1]["parts"][0]["functionResponse"]["response"],
+            json!({"error": {"result": "boom"}})
+        );
+    }
+
+    #[test]
+    fn convert_messages_tool_use_preserves_thought_signature() {
+        const SIG: &str = "sig-abc";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "/tmp/a"}),
+                thought_signature: Some(SIG.into()),
+            }],
+            ..Default::default()
+        }];
+        let result = convert_messages(&messages);
+        assert_eq!(result[0]["parts"][0]["functionCall"]["name"], "read_file");
+        assert_eq!(result[0]["parts"][0]["thoughtSignature"], SIG);
+        assert!(
+            result[0]["parts"][0]["functionCall"]
+                .get("thoughtSignature")
+                .is_none()
         );
     }
 
@@ -906,8 +1048,8 @@ mod tests {
         assert!(!models.is_empty());
         for entry in models {
             assert!(!entry.prefixes.is_empty());
-            assert!(entry.max_output_tokens > 0);
-            assert!(entry.context_window >= entry.max_output_tokens);
+            assert!(entry.max_output_tokens.is_some_and(|t| t > 0));
+            assert!(entry.context_window >= entry.max_output_tokens.unwrap());
         }
     }
 
@@ -929,6 +1071,78 @@ mod tests {
             &result.message.content[0],
             ContentBlock::Text { text } if text == "hello"
         ));
+    }
+
+    #[test]
+    fn parse_sse_coalesces_text_deltas_into_one_block() {
+        let event = |text: &str| {
+            format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\"}}]}}}}]}}\n\n",
+                text
+            )
+        };
+        let mut data = String::new();
+        data.push_str(&event("Hello, "));
+        data.push_str(&event("world."));
+        let response = mock_response(data.leak().as_bytes());
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert_eq!(
+            result.message.content.len(),
+            1,
+            "expected one coalesced text block"
+        );
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Text { text } if text == "Hello, world."
+        ));
+    }
+
+    #[test]
+    fn parse_sse_coalesces_thinking_deltas_keeps_last_signature() {
+        let event = |text: &str, sig: Option<&str>| match sig {
+            Some(s) => format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true,\"thoughtSignature\":\"{}\"}}]}}}}]}}\n\n",
+                text, s
+            ),
+            None => format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\",\"thought\":true}}]}}}}]}}\n\n",
+                text
+            ),
+        };
+        let mut data = String::new();
+        data.push_str(&event("reasoning... ", None));
+        data.push_str(&event("more.", Some("sig-final")));
+        let response = mock_response(data.leak().as_bytes());
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert_eq!(result.message.content.len(), 1);
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::Thinking { thinking, signature }
+                if thinking == "reasoning... more." && signature.as_deref() == Some("sig-final")
+        ));
+    }
+
+    #[test]
+    fn parse_sse_parallel_same_name_tool_calls_get_unique_ids() {
+        let part = r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}"#;
+        let payload = format!(r#"{{"candidates":[{{"content":{{"parts":[{part},{part}]}}}}]}}"#,);
+        let data = format!("data: {payload}\n\n");
+        let response = mock_response(data.leak().as_bytes());
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        let ids: Vec<&str> = result
+            .message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "expected two tool calls");
+        assert_ne!(ids[0], ids[1], "ids must be unique for parallel calls");
     }
 
     #[test]
@@ -957,6 +1171,29 @@ mod tests {
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::ToolUse { name, .. } if name == "bash"
+        ));
+    }
+
+    #[test_case(
+        r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"}},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}"#
+        ; "part_level"
+    )]
+    #[test_case(
+        r#"{"functionCall":{"name":"bash","args":{"cmd":"ls"},"thoughtSignature":"CvcQAdHtim/pKv/c0ClPFkYA=="}}"#
+        ; "nested_fallback"
+    )]
+    fn parse_sse_tool_call_captures_thought_signature(part_json: &str) {
+        const SIG: &str = "CvcQAdHtim/pKv/c0ClPFkYA==";
+        let payload = format!(
+            r#"{{"candidates":[{{"content":{{"parts":[{part_json}]}},"finishReason":"STOP"}}],"usageMetadata":{{"promptTokenCount":5,"candidatesTokenCount":15}}}}"#,
+        );
+        let data = format!("data: {payload}\n\n");
+        let response = mock_response(data.leak().as_bytes());
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert!(matches!(
+            &result.message.content[0],
+            ContentBlock::ToolUse { thought_signature: Some(s), .. } if s == SIG
         ));
     }
 

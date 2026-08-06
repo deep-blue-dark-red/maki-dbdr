@@ -80,7 +80,7 @@ impl App {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
                 + panel_h
-                + self.input_box.height(inner.width)
+                + self.input_box.height(inner.width).min(max_bottom)
         } else {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             if panel_h > 0 { panel_h + 1 } else { 1 }
@@ -244,16 +244,14 @@ impl App {
             };
         }
 
-        render_if_open!(self.export_picker);
-        render_if_open!(self.settings_picker);
-        render_if_open!(self.skills_modal);
-        render_if_open!(self.plugins_modal);
-        render_if_open!(self.goto_picker);
         render_if_open!(self.rewind_picker);
+        render_if_open!(self.goto_picker);
         render_if_open!(self.theme_picker);
+        render_if_open!(self.settings_picker);
         render_if_open!(self.model_picker);
         render_if_open!(self.login_picker);
         render_if_open!(self.mcp_picker);
+        render_if_open!(self.export_picker);
 
         overlay_rect
     }
@@ -268,11 +266,19 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.plugins_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.skills_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         if self.usage_modal.is_open() {
             let quota = self.usage_slot.load();
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
-                by_model: &self.state.session.meta.usage_by_model,
+                by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
                 quota: quota.as_deref(),
@@ -285,18 +291,6 @@ impl App {
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
-        }
-        if self.skills_modal.is_open() {
-            let r = self.skills_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
-        }
-        if self.plugins_modal.is_open() {
-            let r = self.plugins_modal.view(frame, full);
-            if r.width > 0 {
-                overlay_rect = r;
-            }
         }
         overlay_rect
     }
@@ -314,9 +308,9 @@ impl App {
                 .as_deref()
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
-                usage: &chat.token_usage,
                 global_usage: &self.state.token_usage,
                 context_size: chat.context_size,
+                cost: chat.cost,
                 pricing: &self.state.model.pricing,
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
@@ -331,9 +325,9 @@ impl App {
             restoring: self.restoring.load(Ordering::Relaxed),
             streaming_info: None,
             streaming_active: false,
-            verbose: false,
-            last_turn_stats: self.turn_stats.as_ref(),
-            show_token_stats: self.show_token_stats,
+            verbose: self.verbose,
+            last_turn_stats: self.last_turn_stats.as_ref(),
+            show_token_stats: self.ui_config.show_token_stats,
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

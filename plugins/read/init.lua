@@ -1,3 +1,4 @@
+local dir_listing = require("maki.dir_listing")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
@@ -5,17 +6,18 @@ local output_limits = require("maki.output_limits")
 local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- **Required: offset and limit**. Max limit value = 500 (auto truncated).
+- **offset** and **limit** are required. Use offset=1 to read from the first line.
+- Use limit=0 to read until the end of file (capped at 2000 lines).
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
-- `wc -l` can tell you the total number of lines.
+- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
 - Call in parallel when reading multiple files.
 - Avoid tiny repeated slices - read a larger window if you need more context.]]
 
-local DEFAULT_MAX_OUTPUT_LINES = 500
+local DEFAULT_MAX_OUTPUT_LINES = 2000
 
 local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
@@ -98,17 +100,6 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
   return buf
 end
 
-local function build_dir_view(text, ctx)
-  local buf = maki.ui.buf()
-  local view = ToolView.new(buf, read_view_opts(ctx))
-  view:append_text(text)
-  view:finish()
-  buf:on("click", function()
-    view:toggle()
-  end)
-  return buf
-end
-
 local function read_file(path, offset, limit, ctx)
   local content, err = maki.fs.read(path)
   if not content then
@@ -125,8 +116,9 @@ local function read_file(path, offset, limit, ctx)
   end
   local total_lines = #all_lines
 
-  local start = math.max(offset or 1, 1)
-  local max_lines = limit or opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local start = math.max(offset, 1)
+  local default_max = opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
+  local max_lines = limit == 0 and default_max or math.min(limit, default_max)
   local max_line_bytes = opts.max_line_bytes
 
   local lines = {}
@@ -183,41 +175,18 @@ local function read_file(path, offset, limit, ctx)
 end
 
 local function list_dir(path, ctx)
-  local entries, err = maki.fs.dir(path)
-  if not entries then
+  local listing, err = dir_listing.list(path, ctx)
+  if not listing then
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
 
-  local sorted = {}
-  for _, entry in ipairs(entries) do
-    local name, typ = entry[1], entry[2]
-    if typ == "directory" then
-      sorted[#sorted + 1] = { name .. "/", true }
-    elseif not ctx:is_instruction_file(name) then
-      sorted[#sorted + 1] = { name, false }
-    end
-  end
-  table.sort(sorted, function(a, b)
-    if a[2] ~= b[2] then
-      return a[2]
-    end
-    return a[1] < b[1]
-  end)
-
-  local names = {}
-  for _, e in ipairs(sorted) do
-    names[#names + 1] = e[1]
-  end
-  local text = table.concat(names, "\n")
-
-  local instructions = ctx:find_instructions(path)
   local result = {
-    llm_output = text,
-    body = build_dir_view(text, ctx),
-    annotation = #sorted .. " entries",
+    llm_output = listing.text,
+    body = dir_listing.view(listing.text, ctx),
+    annotation = listing.count .. " entries",
   }
-  if #instructions > 0 then
-    result.instructions = instructions
+  if listing.instructions then
+    result.instructions = listing.instructions
   end
   return result
 end
@@ -226,7 +195,7 @@ maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
 - When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit unless known already.]],
+- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
 })
 
 maki.api.register_tool({
@@ -243,10 +212,15 @@ maki.api.register_tool({
         required = true,
         alias = "file_path",
       },
-      offset = { type = "integer", description = "Line number to start from (1-indexed)" },
+      offset = {
+        type = "integer",
+        description = "Line number to start from (1-indexed). Use 1 for the first line.",
+        required = true,
+      },
       limit = {
         type = "integer",
-        description = "Max number of lines to read. Omitting the limit reads up to 2000 lines.",
+        description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
+        required = true,
       },
     },
   },
@@ -255,9 +229,9 @@ maki.api.register_tool({
     local buf = maki.ui.buf()
     local s = shorten_path(input.path or "")
     local start = input.offset or 1
-    if input.limit then
+    if input.limit and input.limit > 0 then
       s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
-    elseif input.offset then
+    else
       s = s .. ":" .. start
     end
     buf:line({ { s, "path" } })

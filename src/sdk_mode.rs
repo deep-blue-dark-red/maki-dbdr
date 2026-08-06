@@ -477,7 +477,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let working_dir = cwd.to_string_lossy().into_owned();
     let (session_id, initial_history) = resolve_session(&cli, &working_dir)?;
 
-    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start_connected(&cwd));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -654,11 +654,11 @@ fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Mess
         let session = StoredSession::load(session_ref.id(), &storage)
             .map_err(|e| eyre!("load session {id}: {e}"))?;
         let resumed = (!cli.fork_session).then_some(session_ref);
-        (resumed, session.messages)
+        (resumed, session.take_messages())
     } else if cli.continue_session {
         let storage = StateDir::resolve().context("resolve state dir")?;
         match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(SessionRef::from(session.id)), session.messages),
+            Ok(Some(session)) => (Some(SessionRef::from(session.id)), session.take_messages()),
             _ => (None, Vec::new()),
         }
     } else {
@@ -933,15 +933,15 @@ impl EventPump {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
-            | AgentEvent::CompactionStart { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
+            | AgentEvent::CompactionStart { .. }
+            | AgentEvent::RenameResult { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. }
-            | AgentEvent::RenameResult { .. } => {}
+            | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,

@@ -22,7 +22,8 @@ use crate::template;
 use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, PermissionsConfig, ToolOutput, ToolOutputLines,
+    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
+    ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -60,8 +61,8 @@ impl SessionStore {
     }
 
     fn record_turn(&mut self, messages: &[Message], model_spec: String) {
-        self.session.messages = messages.to_vec();
-        self.session.model = model_spec;
+        self.session.replace_messages(messages.to_vec());
+        self.session.set_model(model_spec);
         self.session.update_title_if_default();
         self.save();
     }
@@ -100,7 +101,6 @@ fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
-    mcp_handle: Option<&McpHandle>,
     workflow: bool,
 ) -> AgentSetup {
     let vars = template::env_vars();
@@ -110,7 +110,6 @@ fn setup(
         model,
         config,
         excluded_tools,
-        mcp_handle,
         workflow,
         ToolRegistry::global(),
     );
@@ -122,12 +121,13 @@ fn setup(
     }
 }
 
+/// Base definitions only. MCP definitions are injected per request by
+/// `Agent::request_tools`; storing them here would freeze the catalog.
 fn tool_definitions(
     vars: &template::Vars,
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
-    mcp_handle: Option<&McpHandle>,
     workflow: bool,
     registry: &ToolRegistry,
 ) -> Value {
@@ -137,13 +137,17 @@ fn tool_definitions(
         audience: ToolAudience::MAIN,
         workflow,
     };
-    let mut tools = registry.definitions(vars, &ctx, model.supports_tool_examples());
+    registry.definitions(vars, &ctx, model.supports_tool_examples())
+}
 
-    if let Some(handle) = mcp_handle {
-        handle.extend_tools(&mut tools);
+/// Names advertised to SDK clients: base tools plus what the first request
+/// would carry from MCP (always-load definitions and `tool_search`).
+fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String> {
+    let mut probe = tools.clone();
+    if let Some(mcp) = mcp {
+        mcp.extend_tools(&mut probe);
     }
-
-    tools
+    extract_tool_names(&probe)
 }
 
 pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
@@ -157,7 +161,6 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.mcp_handle.as_ref(),
         params.workflow,
     );
 
@@ -169,13 +172,15 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.model,
     );
 
-    let tool_names = extract_tool_names(&tools);
+    let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
+    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
     let session_id = MakiId::generate();
     let session_ref = SessionRef::from(session_id);
     let session_ref_clone = session_ref.clone();
+    let mailbox = SessionMailbox::register(session_id);
     let fast = params.fast;
     let workflow = params.workflow;
     let task = smol::spawn({
@@ -208,6 +213,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                         working_dir_path,
                     )),
                     session_id: Some(session_ref_clone.clone()),
+                    mailbox: Some(mailbox.clone()),
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
@@ -223,7 +229,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                 },
             )
             .with_loaded_instructions(instructions.loaded)
-            .with_mcp(params.mcp_handle);
+            .with_mcp(mcp);
 
             let result = agent
                 .run(AgentInput {
@@ -299,11 +305,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.model,
         &params.config,
         &params.excluded_tools,
-        params.mcp_handle.as_ref(),
         params.workflow,
     );
 
-    let tool_names = extract_tool_names(&tools);
+    let mcp = params
+        .mcp_handle
+        .clone()
+        .map(|h| McpSession::new(h, &params.initial_history));
+    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
@@ -318,6 +327,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             (id, SessionRef::from(id))
         }
     };
+    let mailbox = SessionMailbox::register(session_id);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let permissions = Arc::new(PermissionManager::new(
@@ -367,7 +377,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                                 &new_model,
                                 &params.config,
                                 &params.excluded_tools,
-                                params.mcp_handle.as_ref(),
                                 params.workflow,
                                 ToolRegistry::global(),
                             );
@@ -418,6 +427,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
                         session_id: Some(session_ref_clone.clone()),
+                        mailbox: Some(mailbox.clone()),
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
@@ -435,7 +445,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_loaded_instructions(instructions.loaded.clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
-                .with_mcp(params.mcp_handle.clone());
+                .with_mcp(mcp.clone());
 
                 let result = agent.run(input).await;
                 drop(agent);
@@ -520,7 +530,7 @@ mod tests {
         assert_eq!(loaded.id, session_id());
         assert_eq!(loaded.cwd, CWD);
         assert_eq!(loaded.model, MODEL_SPEC);
-        assert!(loaded.messages.is_empty());
+        assert!(loaded.messages().is_empty());
     }
 
     #[test]
@@ -531,8 +541,25 @@ mod tests {
         store.record_turn(&messages, MODEL_SPEC.into());
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.title, generate_title(&messages));
+    }
+
+    #[test]
+    fn record_turn_persists_observations() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        store.record_turn(
+            &[
+                Message::user("fix the login bug".into()),
+                Message::observation("build failed".into()),
+            ],
+            MODEL_SPEC.into(),
+        );
+
+        let loaded = load(&tmp);
+        assert_eq!(loaded.messages().len(), 2);
+        assert!(loaded.messages()[1].is_observation());
     }
 
     #[test]
@@ -543,7 +570,7 @@ mod tests {
         drop(store);
 
         let mut store = store_in(&tmp);
-        assert_eq!(store.session.messages.len(), 1);
+        assert_eq!(store.session.messages().len(), 1);
 
         let messages = vec![
             Message::user("first prompt".into()),
@@ -552,7 +579,7 @@ mod tests {
         store.record_turn(&messages, "other/model".into());
 
         let loaded = load(&tmp);
-        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
     }
 
@@ -560,5 +587,23 @@ mod tests {
     fn extract_tool_names_filters_valid_entries() {
         let tools = serde_json::json!([{"name": "read"}, {"type": "function"}, {"name": "bash"}]);
         assert_eq!(extract_tool_names(&tools), vec!["read", "bash"]);
+    }
+
+    #[test]
+    fn advertised_names_show_tool_search_not_deferred_tools() {
+        let base = serde_json::json!([{"name": "read"}]);
+        let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+        let names = advertised_tool_names(&base, Some(&mcp));
+        assert_eq!(
+            names,
+            vec!["read", crate::mcp::TOOL_SEARCH_TOOL_NAME],
+            "clients must see the search tool, not deferred definitions"
+        );
+        assert_eq!(
+            base,
+            serde_json::json!([{"name": "read"}]),
+            "probing must not bake MCP entries into the base tools"
+        );
+        assert_eq!(advertised_tool_names(&base, None), vec!["read"]);
     }
 }

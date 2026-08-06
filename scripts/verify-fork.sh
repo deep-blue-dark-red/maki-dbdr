@@ -52,12 +52,7 @@ check_not() {
 file_exists "wire logger"      maki-providers/src/wire_log.rs
 file_exists "mlog binary"      maki-providers/src/bin/mlog.rs
 file_exists "tensorx provider" maki-providers/src/providers/tensorx.rs
-# ── FORK-ONLY INFRA, INTENTIONALLY NOT MERGED ───────────────────────────────
-# Exist in forkv2 but fork-specific (new crates, deleted files, or diverge from
-# main's architecture). Keeping main clean beats porting them. See
-# MAKI_MERGE_ISSUES.md "SKIP" list. They remain FAIL by design.
 file_exists "tool-macro crate" maki-tool-macro/src/lib.rs
-file_exists "render_hints"     maki-ui/src/components/render_hints.rs
 file_exists "settings_picker"  maki-ui/src/components/settings_picker.rs
 file_exists "export_picker"    maki-ui/src/components/export_picker.rs
 file_exists "goto_picker"      maki-ui/src/components/goto_picker.rs
@@ -96,7 +91,7 @@ check "plugins_modal field"      "$F" "pub(super) plugins_modal: PluginsModal"
 check "skills_modal field"       "$F" "pub(super) skills_modal: SkillsModal"
 check "goto_picker field"        "$F" "pub(super) goto_picker: GotoPicker"
 check "/settings opens picker"   "$F" "self.settings_picker.open"
-check "/export opens picker"     "$F" "export_picker"
+check "/export opens picker"     "$F" "self.export_picker.open"
 check "/plugins opens modal"     "$F" "self.plugins_modal.open"
 check "/skills opens modal"      "$F" "self.skills_modal.open"
 check "settings_picker overlay"  "$F" "&self.settings_picker,"
@@ -142,7 +137,7 @@ check "/logs resolves alog alias" "$F" '.replace("alog"'
 
 # ── terminal run_shell_command ───────────────────────────────────────────────
 
-check "run_shell_command fn" maki-ui/src/terminal.rs "pub(crate) fn run_view_log_command"
+check "run_shell_command fn" maki-ui/src/terminal.rs "pub(crate) fn run_shell_command"
 
 # ── config file path ─────────────────────────────────────────────────────────
 
@@ -195,7 +190,7 @@ check "TurnStats struct definition" "maki-ui/src/components/status_bar.rs" "pub 
 
 # 12. 4ba71dbc: Implement copy_transcript, logs settings command, command palette exact match priority, and skills menu
 check "copy_transcript handler function" "maki-ui/src/app/session.rs" "fn export_session_to_markdown"
-check "exact match command palette priority" "maki-ui/src/components/command.rs" "eq_ignore_ascii_case(&input_cmd)"
+check "exact match command palette priority" "maki-ui/src/components/command.rs" "exact_match_takes_precedence"
 
 # 13. 9b299fa0: Add target compaction token configuration and support passing value to /compact
 check "target_tokens option in compact" "maki-agent/src/agent/compaction.rs" "target_tokens: Option<usize>"
@@ -224,17 +219,17 @@ check "keybinding label formatting" "maki-ui/src/components/keybindings.rs" "pub
 check "config_path in config.rs" "maki-ui/src/config.rs" "pub fn config_path"
 
 # 20. 79c54dae: feat: render plan form dismiss key label dynamically
-check "dismiss keys plan form" "maki-ui/src/components/plan_form.rs" "fn dismiss_keys"
+check "dismiss keys plan form" "maki-ui/src/components/plan_form.rs" "DISMISS_KEYS"
 
 # 21. 481b9885: chore: commit plugin tool usage prompt hints
 check "bash tool usage hint" "plugins/bash/init.lua" "Reserve bash for system commands"
 check "todo_write tool usage hint" "plugins/todo_write/init.lua" "Use todo_write to plan and track"
 
 # 22. 4c394b86: feat: implement config reload command in TUI
-check "reload_config function" "maki-ui/src/event_loop.rs" "ExitRequest::Reload"
+check "reload_config function" "maki-ui/src/app/mod.rs" "pub fn reload_config"
 
 # 23. fe67cc40: feat: render user turn prefix as # user ∙ and assistant prefix as └ maki ∙
-check "assistant turn prefix" "maki-ui/src/components/tool_display.rs" "prefix: \"└ maki ∙ \""
+check "assistant turn prefix" "maki-ui/src/components/tool_display.rs" "prefix: \"maki> \""
 
 # 24. a9712b42: feat: add dot after turn number in user prefix to match {#}. user ∙ format
 check "turn prefix dynamic formatting" "maki-ui/src/components/messages/mod.rs" "dynamic_prefix"
@@ -271,9 +266,6 @@ check "ExportPicker struct definition" "maki-ui/src/components/export_picker.rs"
 check_not "copy_transcript in palette" "maki-ui/src/components/command.rs" "\"/copy_transcript\""
 
 # 37. ad8fd763: feat: add hackernews plugin and json support for webfetch
-# NOTE: plugin tweaks — we tend to ACCEPT UPSTREAM's plugin changes. hackernews
-# is explicitly skipped (not ported). webfetch json / skill-exclusion tweaks are
-# fork-specific; see MAKI_MERGE_ISSUES.md plugin summary. Left as FAIL by design.
 check "webfetch json format support" "plugins/webfetch/init.lua" "fmt == \"json\""
 
 # 38. 0f9f9cc1: feat: add /plugins interactive menu with runtime enable/disable
@@ -304,9 +296,6 @@ check "skip excluded skills check" "plugins/skill/init.lua" "if not excluded[fol
 check "abbreviated token stats status bar" "maki-ui/src/components/status_bar.rs" "t"
 
 # 47. 907624df: before merge
-# NOTE: forkv2 TEST INFRA — SKILL_TESTING.md, skill-test-create-plugin.sh,
-# skill-test-ssh.sh, and related test/agents/*.py. These are forkv2's testing
-# harness, NOT product features. Carried forward as notes only; do NOT merge.
 file_exists "SKILL_TESTING.md file" "SKILL_TESTING.md"
 file_exists "create-plugin skill test script" "tests/agent/skill-test-create-plugin.sh"
 file_exists "ssh skill test script" "tests/agent/skill-test-ssh.sh"

@@ -23,6 +23,7 @@ maki.setup({
     ui = {
         splash_animation = true,
         mouse_scroll_lines = 5,
+        theme = "tokyonight",
         tool_output_lines = {
             bash = 8,
             read = 5,
@@ -68,7 +69,17 @@ All fields are optional. Typos in field names cause an error right away.
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
+| `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `show_token_stats` | bool | `false` | - | Show token statistics (tokens/sec, cache rate) in status bar |
+
+### `ui.theme`
+
+Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
+
+Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
+
+Themes use 24-bit colors, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 
 ### `ui.tool_output_lines`
 
@@ -94,6 +105,8 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
+| `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
+| `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
 
 ### `provider`
 
@@ -144,7 +157,7 @@ maki.setup({
 | `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `timeout_secs` | integer | `30` | 5 | Stop the script after this many seconds. A call's `timeout` param overrides it. |
+| `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
 ### `plugins.edit`
 
@@ -194,6 +207,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 
 ### `plugins.webfetch`
@@ -218,38 +232,45 @@ If a value is below its minimum, Maki shows a `ConfigError` with the field name,
 
 ## Directory layout
 
-Maki uses XDG directories on Linux and macOS:
+Maki follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).
 
-| Purpose | Path |
-|---------|------|
-| Config | `~/.config/maki/` (init.lua, permissions.toml, mcp.toml) |
-| Data | `~/.local/share/maki/` |
-| Logs | `~/.local/logs/maki/` |
-| State | `~/.local/state/maki/` |
+| Purpose | Linux / macOS | Windows |
+|---------|---------------|---------|
+| Config | `~/.config/maki/` | `%APPDATA%\maki\` |
+| Data | `~/.local/share/maki/` | `%APPDATA%\maki\` |
+| State | `~/.local/state/maki/` | `%APPDATA%\maki\` |
+| Logs | `~/.local/logs/maki/` | `%APPDATA%\maki\` |
+| Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\maki\` |
 
-`~/.maki/` is checked as a legacy fallback.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
+
+`~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 
 ### Migrating from ~/.maki/
-
-Older versions stored everything in `~/.maki/`. If that directory still exists, maki uses it
-as a fallback. To move to XDG directories, run:
 
 ```
 maki migrate xdg
 ```
 
-This safely moves sessions, auth, plans, memories, logs, and preferences to XDG locations.
-Where both old and new files exist, they are merged (input history, model tiers, etc.).
-Nothing is deleted until it has been copied. At the end you get a summary of where everything
-lives now.
+This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
 
 Safe to run more than once.
 
 ## Personal Instructions
 
-On top of `AGENTS.md`, you can add your own instructions in two places:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
 
-- `AGENTS.local.md` at project root for per-project preferences (gitignored)
+- `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
 
-Both are added to the system prompt at the start of every session.
+All of these are added to the system prompt at the start of every session.
+
+## Memory
+
+The `memory` tool and `/memory` command store small Markdown notes under the state directory, scoped per project:
+
+`…/state/maki/projects/<project-id>/memories/`
+
+(Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\maki\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
+
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml).

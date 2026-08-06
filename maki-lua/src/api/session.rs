@@ -1,49 +1,49 @@
-//! `maki.session`: host session primitives. Every call round-trips to the UI
-//! event loop, which owns the live session runtimes and the session store;
-//! the loop answers `list` from a background task so slow scans never block.
+//! `maki.session`: host session primitives. Session management round-trips to
+//! the UI event loop, which owns live runtimes and storage. `notify` posts
+//! directly to the agent mailbox so synchronous callbacks can use it.
 
+use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_storage::id::MakiId;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 
-use crate::api::util::command::{SessionReply, SessionRequest, UiAction};
+use crate::api::util::command::{SessionRequest, UiAction, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 
-const NO_UI_ERR: &str = "no interactive UI attached";
-
-type Pair = (Value, Option<String>);
-
-fn err_pair(err: impl ToString) -> Pair {
-    (Value::Nil, Some(err.to_string()))
-}
+const BLANK_NOTIFY_ERR: &str = "text must not be blank";
+const SESSION_REQUIRED_ERR: &str = "session is required";
 
 async fn roundtrip(
     lua: Lua,
     tx: Option<flume::Sender<UiAction>>,
     req: SessionRequest,
-) -> LuaResult<Pair> {
-    let Some(tx) = tx else {
-        return Ok(err_pair(NO_UI_ERR));
-    };
-    let (reply_tx, reply_rx) = flume::bounded::<SessionReply>(1);
-    if tx.try_send(UiAction::Session { req, reply_tx }).is_err() {
-        return Ok(err_pair(NO_UI_ERR));
-    }
-    match reply_rx.recv_async().await {
-        Ok(Ok(value)) => Ok((json_to_lua(&lua, &value)?, None)),
-        Ok(Err(e)) => Ok(err_pair(e)),
-        Err(_) => Ok(err_pair("ui event loop dropped the request")),
-    }
+) -> LuaResult<Pair<Value>> {
+    let reply =
+        try_pair!(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::Session { req, reply_tx }).await);
+    let value = try_pair!(reply);
+    Ok((Some(json_to_lua(&lua, &value)?), None))
 }
 
 /// Lists sessions stored for the current project. Answered from a
 /// background scan, so a slow disk never blocks the UI.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, updated_at}`, or nil and an error.
+/// @param opts table? Optional fields: global (boolean) list sessions from
+///   every project directory instead of just the current one.
+/// @return (table|nil, string|nil) Array of `{id, title, updated_at, context_size}`, or nil and an error.
 /// @example
-/// local stored, err = maki.session.list()
+/// local stored, err = maki.session.list({ global = true })
 #[lua_fn]
-async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair> {
-    roundtrip(lua, tx, SessionRequest::List).await
+async fn list(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let global = match opts {
+        Some(opts) => opts.get("global").unwrap_or(false),
+        None => false,
+    };
+    roundtrip(lua, tx, SessionRequest::List { global }).await
 }
 
 /// Lists the sessions currently running in this UI. Status is "working",
@@ -53,7 +53,7 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
-async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair> {
+async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
@@ -63,7 +63,7 @@ async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair> {
+async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Current).await
 }
 
@@ -78,7 +78,7 @@ async fn focus(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
 }
 
@@ -94,7 +94,7 @@ async fn delete(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     id: String,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
 }
 
@@ -110,7 +110,7 @@ async fn new(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Option<Table>,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     let (prompt, focus) = match opts {
         Some(opts) => (opts.get("prompt")?, opts.get("focus").unwrap_or(false)),
         None => (None, false),
@@ -135,12 +135,44 @@ async fn prompt(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     text: String,
     opts: Option<Table>,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     let id = match opts {
         Some(opts) => opts.get("session")?,
         None => None,
     };
     roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
+}
+
+/// Reports {text} to a live session without creating a user turn. The
+/// observation waits for the session's next agent run.
+///
+/// @param text string What to report. Must not be blank.
+/// @param opts table Options:
+///   `session` (string) id of a live session.
+///   `wake` (boolean) start a TUI turn when it next becomes idle (default false).
+/// @return (boolean|nil, string|nil) true, or nil and an error.
+/// @example
+/// maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+#[lua_fn]
+fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    if text.trim().is_empty() {
+        return Ok(err_pair(BLANK_NOTIFY_ERR));
+    }
+    let Some(opts) = opts else {
+        return Ok(err_pair(SESSION_REQUIRED_ERR));
+    };
+    let Some(raw_id) = opts.get::<Option<String>>("session")? else {
+        return Ok(err_pair(SESSION_REQUIRED_ERR));
+    };
+    let session_id: MakiId = match raw_id.parse() {
+        Ok(id) => id,
+        Err(error) => return Ok(err_pair(error)),
+    };
+    let wake = opts.get("wake").unwrap_or(false);
+    if let Err(error) = SessionMailbox::notify(session_id, text, wake) {
+        return Ok(err_pair(error));
+    }
+    Ok((Some(true), None))
 }
 
 /// Renames a session, live or stored.
@@ -155,7 +187,7 @@ async fn set_title(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     opts: Table,
-) -> LuaResult<Pair> {
+) -> LuaResult<Pair<Value>> {
     let req = SessionRequest::SetTitle {
         id: opts.get("id")?,
         title: opts.get("title")?,
@@ -166,16 +198,18 @@ async fn set_title(
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once; these functions let plugins list, create, focus, rename, and
-    /// delete them. Every call round-trips to the UI event loop and returns
-    /// the pair `(value, err)`. Without an interactive UI attached, every
-    /// call returns `nil, "no interactive UI attached"`.
+    /// delete them. Session management returns `nil, "no interactive UI
+    /// attached"` without a UI. `notify` instead targets a live agent mailbox
+    /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::util::command::NO_UI_ERR;
+    use mlua::Value;
     use serde_json::json;
     use test_case::test_case;
 
@@ -238,6 +272,77 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+    }
+
+    #[test]
+    fn notify_is_synchronous_and_queues_an_observation() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.notify('built', { session = session_id })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        let messages = mailbox.drain();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].is_observation());
+        assert_eq!(messages[0].user_text(), Some("built"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn waking_notify_sets_the_mailbox_wake_flag() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.notify('failed', { session = session_id, wake = true })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        assert_eq!(mailbox.claim_wake().len(), 1);
+    }
+
+    #[test]
+    fn notify_rejects_missing_and_non_live_sessions() {
+        let lua = lua_with_session(None);
+        let (_, missing): (Value, Option<String>) =
+            lua.load("return session.notify('built')").eval().unwrap();
+        assert_eq!(missing.as_deref(), Some(SESSION_REQUIRED_ERR));
+
+        let id = MakiId::generate();
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        let (_, not_live): (Value, Option<String>) = lua
+            .load("return session.notify('built', { session = session_id })")
+            .eval()
+            .unwrap();
+        assert_eq!(not_live, Some(format!("session not live: {id}")));
+    }
+
+    #[test]
+    fn notify_rejects_blank_text_and_invalid_session_ids() {
+        let lua = lua_with_session(None);
+        let (_, blank): (Value, Option<String>) = lua
+            .load("return session.notify(' ', { session = 'invalid' })")
+            .eval()
+            .unwrap();
+        assert_eq!(blank.as_deref(), Some(BLANK_NOTIFY_ERR));
+
+        let (_, invalid): (Value, Option<String>) = lua
+            .load("return session.notify('built', { session = 'invalid' })")
+            .eval()
+            .unwrap();
+        assert!(invalid.is_some_and(|error| error.contains("invalid base58")));
     }
 
     #[test]

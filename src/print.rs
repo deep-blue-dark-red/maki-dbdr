@@ -143,7 +143,7 @@ pub fn run(
     config: AgentConfig,
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
-    lua_handle: Option<EventHandle>,
+    lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
 ) -> Result<()> {
@@ -158,13 +158,10 @@ pub fn run(
 
     let images = load_images(&image_paths)?;
 
-    let prompt_slots = lua_handle
-        .as_ref()
-        .map(|h| h.collect_prompt_slots())
-        .unwrap_or_default();
+    let prompt_slots = lua_handle.collect_prompt_slots();
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start(&cwd));
+    let (mcp_handle, mcp_config_errors) = smol::block_on(maki_agent::mcp::start_connected(&cwd));
     if !mcp_config_errors.is_empty() {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
@@ -238,16 +235,16 @@ pub fn run(
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
-            | AgentEvent::CompactionStart { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
+            | AgentEvent::CompactionStart { .. }
+            | AgentEvent::RenameResult { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. }
-            | AgentEvent::RenameResult { .. } => {}
+            | AgentEvent::PromptProgress { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,

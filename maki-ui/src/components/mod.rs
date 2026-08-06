@@ -1,7 +1,9 @@
 pub(crate) mod btw_modal;
 pub(crate) mod code_view;
 pub mod command;
+pub(crate) mod export_picker;
 pub(crate) mod file_picker;
+pub(crate) mod goto_picker;
 pub(crate) mod form;
 pub(crate) mod help_modal;
 pub mod input;
@@ -17,14 +19,12 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
 pub mod queue_panel;
-pub(crate) mod export_picker;
-pub(crate) mod goto_picker;
-pub(crate) mod plugins_modal;
 pub(crate) mod rewind_picker;
-pub(crate) mod settings_picker;
-pub(crate) mod skills_modal;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
+pub(crate) mod plugins_modal;
+pub(crate) mod settings_picker;
+pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
 pub mod status_bar;
 pub(crate) mod streaming_content;
@@ -32,7 +32,6 @@ pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -178,7 +177,6 @@ impl ModalScroll {
 
 pub struct LoadedSession {
     pub messages: Vec<Message>,
-    pub tool_outputs: HashMap<String, ToolOutput>,
     pub model_spec: String,
 }
 
@@ -209,14 +207,15 @@ pub enum Action {
     RefreshUsage,
     Compact,
     Checkpoint,
-    RenameSession(Vec<maki_providers::Message>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
     EditInputInEditor,
+    Btw(String),
+    RenameSession(Vec<maki_providers::Message>),
+    Suspend,
+    Quit,
     EditSystemPrompt,
     RunLogsCommand,
-    Btw(String),
-    Suspend,
 }
 
 const ERROR_DISPLAY: Duration = Duration::from_secs(5);
@@ -364,6 +363,11 @@ pub enum DisplayRole {
     Tool(Box<ToolRole>),
     Error,
     Done,
+    /// A manual `/compact` (checkpoint=false) or `/checkpoint` (checkpoint=true)
+    /// summary block, labeled distinctly in the transcript.
+    Compaction {
+        checkpoint: bool,
+    },
 }
 
 impl DisplayRole {
