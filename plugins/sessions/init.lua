@@ -420,6 +420,42 @@ local function handle_rename_key(key)
   end
 end
 
+-- Reloads the stored-session scan for the board's current `global` scope.
+-- Called on open and again whenever the scope is toggled.
+local function load_stored()
+  local this_board = board
+  board.loading = true
+  board.stored = nil
+  refresh()
+  maki.async.run(function()
+    local stored, err = maki.session.list({ global = board.global })
+    if board ~= this_board then
+      return
+    end
+    if err then
+      maki.ui.flash(err)
+      stored = {}
+    end
+    -- A delete may have landed while the scan was in flight; never let the
+    -- stale snapshot resurrect that session as a ghost row.
+    local kept = {}
+    for _, st in ipairs(stored) do
+      if not board.deleted[st.id] then
+        kept[#kept + 1] = st
+      end
+    end
+    board.stored = kept
+    board.loading = false
+    refresh()
+  end)
+end
+
+local function toggle_global()
+  board.global = not board.global
+  maki.ui.flash(board.global and GLOBAL_ON_HINT or GLOBAL_OFF_HINT)
+  load_stored()
+end
+
 local function handle_key(key)
   if key == "ctrl+c" then
     close()
@@ -465,42 +501,6 @@ local function handle_key(key)
       render()
     end
   end
-end
-
--- Reloads the stored-session scan for the board's current `global` scope.
--- Called on open and again whenever the scope is toggled.
-local function load_stored()
-  local this_board = board
-  board.loading = true
-  board.stored = nil
-  refresh()
-  maki.async.run(function()
-    local stored, err = maki.session.list({ global = board.global })
-    if board ~= this_board then
-      return
-    end
-    if err then
-      maki.ui.flash(err)
-      stored = {}
-    end
-    -- A delete may have landed while the scan was in flight; never let the
-    -- stale snapshot resurrect that session as a ghost row.
-    local kept = {}
-    for _, st in ipairs(stored) do
-      if not board.deleted[st.id] then
-        kept[#kept + 1] = st
-      end
-    end
-    board.stored = kept
-    board.loading = false
-    refresh()
-  end)
-end
-
-local function toggle_global()
-  board.global = not board.global
-  maki.ui.flash(board.global and GLOBAL_ON_HINT or GLOBAL_OFF_HINT)
-  load_stored()
 end
 
 local function open()

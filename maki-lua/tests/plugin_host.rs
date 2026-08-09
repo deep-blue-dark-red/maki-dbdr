@@ -3703,6 +3703,99 @@ fn job_callbacks_fire_while_command_handler_parked() {
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "job:hi"));
 }
 
+/// Regression for a real production bug in `plugins/sessions/init.lua`:
+/// `handle_key` called `toggle_global()` at line 456, but `toggle_global`
+/// was declared with `local function` *after* `handle_key` in the file.
+/// `local function` isn't hoisted — Lua resolves the reference at the
+/// lexical point it's written, so inside `handle_key`, `toggle_global`
+/// wasn't yet a local and fell through to an (unset, nil) global. Every
+/// press of the sessions picker's "Ctrl+Shift+M: all projects" hint threw
+/// "attempt to call a nil value", confirmed three times in production logs
+/// (`command handler failed`, `[string "sessions"]:456`). The fix is
+/// ordering: define a `local function` before anything that calls it.
+#[test]
+fn local_function_referenced_before_its_declaration_resolves_to_nil() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(reg).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        -- `helper` is called here, textually before its own `local
+        -- function` statement below — the exact shape of the bug.
+        local function handle_key()
+            local ok, err = pcall(helper)
+            if ok then
+                maki.ui.flash("ok")
+            else
+                maki.ui.flash("error:" .. tostring(err))
+            end
+        end
+
+        local function helper()
+            maki.ui.flash("helper-ran")
+        end
+
+        maki.api.register_command({
+            name = "/repro",
+            handler = handle_key,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
+    handle.run_command(Arc::from("p"), Arc::from("/repro"), String::new());
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command handler never responded");
+    match action {
+        maki_lua::UiAction::Flash(msg) => {
+            assert!(
+                msg.starts_with("error:") && msg.contains("nil value"),
+                "expected a nil-call error (matching the production bug), got: {msg}"
+            );
+        }
+        _ => panic!("expected a Flash action"),
+    }
+}
+
+/// Same shape as the bug above, but with the callee declared first — the
+/// fix actually applied to `plugins/sessions/init.lua` (moving
+/// `load_stored`/`toggle_global` above `handle_key`). Declaring before use
+/// makes the reference resolve to the real local function.
+#[test]
+fn local_function_referenced_after_its_declaration_resolves_correctly() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(reg).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        local function helper()
+            maki.ui.flash("helper-ran")
+        end
+
+        local function handle_key()
+            helper()
+        end
+
+        maki.api.register_command({
+            name = "/repro",
+            handler = handle_key,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    let handle = host.event_handle();
+    handle.run_command(Arc::from("p"), Arc::from("/repro"), String::new());
+
+    let action = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("command handler never responded");
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "helper-ran"));
+}
+
 /// read tool requires offset and limit; missing fields should fail schema validation.
 mod read_tool_required_params {
     use super::*;
