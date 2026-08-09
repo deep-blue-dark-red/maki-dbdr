@@ -1043,6 +1043,17 @@ impl App {
         if key::SHIFT_SESSION_UP.matches(key) {
             return self.shift_session(1);
         }
+        if key::TOGGLE_GLOBAL_SESSIONS.matches(key) {
+            let mut settings = UserSettings::load();
+            settings.global_sessions = !settings.global_sessions;
+            settings.save();
+            if settings.global_sessions {
+                self.status_bar.flash("Global sessions enabled".into());
+            } else {
+                self.status_bar.flash("Global sessions disabled".into());
+            }
+            return vec![];
+        }
         if key::EDIT_INPUT.matches(key) {
             return vec![Action::EditInputInEditor];
         }
