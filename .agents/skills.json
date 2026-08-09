@@ -1,7 +1,5 @@
 {
   "entries": [],
   "inherits": [],
-  "exclude": [
-    "hackernews"
-  ]
+  "exclude": []
 }
