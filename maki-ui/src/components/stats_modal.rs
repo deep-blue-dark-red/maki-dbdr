@@ -992,24 +992,18 @@ mod tests {
         assert!(line.spans.iter().any(|s| s.content.contains('𐄂')));
     }
 
-    /// The round part of the "turn.round" label is 0-indexed for display
-    /// (first round of a turn reads ".0", a tool-triggered continuation
-    /// reads ".1", ...) even though `Turn.id` itself — the agent's own
-    /// round counter — is 1-indexed internally.
     #[test]
-    fn turn_label_round_is_zero_indexed_for_display() {
+    fn turn_label_uses_event_id() {
         let theme = theme::current();
-        let mut first_round = sample_turn(1);
-        first_round.user_turn = 1;
-        let line = turn_row(&first_round, &theme);
+        let first_turn = sample_turn(1);
+        let line = turn_row(&first_turn, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.trim_start().starts_with("1.0"), "got: {text:?}");
+        assert_eq!(text.split_whitespace().next(), Some("1"));
 
-        let mut continuation = sample_turn(2);
-        continuation.user_turn = 1;
-        let line = turn_row(&continuation, &theme);
+        let second_turn = sample_turn(2);
+        let line = turn_row(&second_turn, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.trim_start().starts_with("1.1"), "got: {text:?}");
+        assert_eq!(text.split_whitespace().next(), Some("2"));
     }
 
     #[test]
