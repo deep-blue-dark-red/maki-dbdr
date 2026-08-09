@@ -237,6 +237,17 @@ pub fn run(mut cli: Cli) -> Result<()> {
     let (mut stack, _) = build_stack(&cli, &cwd, &storage, None)?;
 
     setup::init_logging(&stack.config.storage);
+    // A distinct, one-time-per-process marker: `maki.log` is one shared,
+    // append-only file across every run, with no session id on most lines
+    // (only headless mode's persistence errors carry one). Without this,
+    // there's no way to isolate "just this session"'s logs from history —
+    // `log_command` greps backward for it to find where this run started.
+    tracing::info!(
+        pid = std::process::id(),
+        version = maki_storage::version::CURRENT,
+        cwd = %cwd.display(),
+        "maki starting"
+    );
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
