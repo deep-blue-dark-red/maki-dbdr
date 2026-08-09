@@ -925,6 +925,11 @@ mod tests {
             model: "test-model".into(),
             cost: Some(cost),
             context_size: None,
+            cache_miss: false,
+            turn_id: 0,
+            duration_ms: None,
+            ttfb_ms: None,
+            api_error_count: 0,
         }))
     }
 

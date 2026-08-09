@@ -12,7 +12,7 @@ use maki_providers::{
 use super::compaction::{self, CONTINUE_AFTER_COMPACT};
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
-use super::streaming::stream_with_retry;
+use super::streaming::{estimate_input_tokens, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
@@ -27,8 +27,6 @@ use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
-/// Tokens of expected-vs-actual cache_read deviation that flags a prompt-cache miss.
-const CACHE_MISS_DEVIANCE: u32 = 10_000;
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -90,7 +88,6 @@ pub struct Agent<'h> {
     total_usage: TokenUsage,
     context_size: u32,
     num_turns: u32,
-    last_cache_baseline: u32,
     recent_calls: RecentCalls,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
@@ -112,6 +109,7 @@ pub struct Agent<'h> {
     audience: ToolAudience,
     workflow: bool,
     local_tools: LocalTools,
+    turn_state: super::turn_state::TurnState,
 }
 
 impl<'h> Agent<'h> {
@@ -134,7 +132,6 @@ impl<'h> Agent<'h> {
             total_usage: TokenUsage::default(),
             context_size: 0,
             num_turns: 0,
-            last_cache_baseline: 0,
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
@@ -152,6 +149,7 @@ impl<'h> Agent<'h> {
             audience: params.audience,
             workflow: false,
             local_tools: LocalTools::default(),
+            turn_state: super::turn_state::TurnState::new(),
         }
     }
 
@@ -272,23 +270,50 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        let tools = self.request_tools();
+        // Cloned eagerly (rather than kept as `Cow`) because the token-state
+        // bookkeeping below needs `&mut self` while `tools` is still in use
+        // for the request below; a borrowed `Cow` tied to `&self` would
+        // conflict with those mutations.
+        let tools = self.request_tools().into_owned();
         let mut model = (*self.model).clone();
         if let Some(max) = model.max_output_tokens {
             model.max_output_tokens = Some(max.min(self.config.max_output_tokens));
         } else {
             model.max_output_tokens = Some(self.config.max_output_tokens);
         }
+        let estimated_tokens = estimate_input_tokens(self.history.as_slice(), &self.system, &tools);
+        let turn_idx = (self.num_turns + 1) as usize;
+        if self.num_turns == 0 {
+            let turn_0_est = estimate_input_tokens(&[], &self.system, &tools);
+            let turn_1_est = estimated_tokens.saturating_sub(turn_0_est);
+            self.turn_state.record_estimate(0, turn_0_est);
+            self.turn_state.record_estimate(1, turn_1_est);
+        } else {
+            let prev_sum = self.turn_state.sum_estimate_before(turn_idx);
+            let turn_n_est = estimated_tokens.saturating_sub(prev_sum);
+            self.turn_state.record_estimate(turn_idx, turn_n_est);
+        }
+
+        let _ = self.event_tx.send(AgentEvent::PromptProgress {
+            processed: 0,
+            total: estimated_tokens,
+            cache: 0,
+        });
+
+        let mut first_byte_at = None;
+        let mut api_error_count = 0u32;
         let response = match stream_with_retry(
             &*self.provider,
             &model,
             self.history.as_slice(),
             &self.system,
-            tools.as_ref(),
+            &tools,
             &self.event_tx,
             &self.cancel,
             self.opts,
             self.session_id.as_ref(),
+            &mut first_byte_at,
+            &mut api_error_count,
         )
         .await
         {
@@ -306,24 +331,43 @@ impl<'h> Agent<'h> {
         };
         self.num_turns += 1;
 
-        // expected = previous turn's uncached input + cache_creation (the prefix
-        // that should be served from cache this turn). A large shortfall vs the
-        // actual cache_read means a prompt-cache miss (history changed or the
-        // provider evicted the cache, e.g. >5 min idle).
-        if self.num_turns >= 2 {
+        let turn_idx = self.num_turns as usize;
+        if let Some(at) = first_byte_at {
+            self.turn_state.record_first_byte(turn_idx, at);
+        }
+        self.turn_state.record_api_errors(turn_idx, api_error_count);
+        let cumulative_exact = response.usage.total_input();
+        if turn_idx == 1 {
+            let turn_0_exact = if response.usage.cache_read + response.usage.cache_creation > 0 {
+                response.usage.cache_read + response.usage.cache_creation
+            } else {
+                self.turn_state.turns[0].input_estimate
+            };
+            let turn_1_exact = cumulative_exact.saturating_sub(turn_0_exact);
+            self.turn_state.record_exact(0, turn_0_exact);
+            self.turn_state.record_exact(1, turn_1_exact);
+        } else {
+            // Sum of all prior turns' exact (or estimated) input sizes: the
+            // prefix that should now be served from the provider's prompt
+            // cache. Reused below for the cache-miss check so it's only
+            // computed once per turn.
+            let expected = self.turn_state.sum_exact_before(turn_idx);
+            let turn_n_exact = cumulative_exact.saturating_sub(expected);
+            self.turn_state.record_exact(turn_idx, turn_n_exact);
+
             let actual = response.usage.cache_read;
-            if self.last_cache_baseline.saturating_sub(actual) >= CACHE_MISS_DEVIANCE {
+            if self.turn_state.record_cache_check(turn_idx, expected, actual) {
                 warn!(
                     self.num_turns,
-                    expected = self.last_cache_baseline,
+                    expected,
                     actual,
+                    delta = expected.saturating_sub(actual),
                     "cache miss detected (expected - actual >= {}); \
                      history may have changed or the cache expired (>5 min)",
-                    CACHE_MISS_DEVIANCE
+                    super::turn_state::CACHE_MISS_DEVIANCE
                 );
             }
         }
-        self.last_cache_baseline = response.usage.input + response.usage.cache_creation;
 
         let has_tools = response.message.has_tool_calls();
         let stop_reason = response.stop_reason;
@@ -339,7 +383,19 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
-        self.emit_turn_complete(&response)?;
+        let cost = self
+            .model
+            .cost_of(&response.usage, self.opts.clamped(&self.model).fast);
+        self.turn_state.record_response(
+            turn_idx,
+            response.usage.cache_read,
+            response.usage.cache_creation,
+            response.usage.output,
+            cost,
+        );
+        self.turn_state.record_turn_complete(turn_idx);
+
+        self.emit_turn_complete(&response, cost, &self.turn_state.turns[turn_idx])?;
         let usage = response.usage;
         self.total_usage += usage;
         self.context_size = usage.total_input();
@@ -369,6 +425,18 @@ impl<'h> Agent<'h> {
             }
 
             self.history.push(response.message);
+
+            // No tools ran this turn, but fire `TurnToolsDone` anyway (with
+            // zero counts) so every turn terminates with the same event the
+            // UI appends its per-turn stats line on — keeping disk writes to
+            // one cheap append per turn.
+            let _ = self.event_tx.send(AgentEvent::TurnToolsDone {
+                turn_id: turn_idx,
+                tool_call_count: 0,
+                tool_error_count: 0,
+                tool_duration_ms: 0,
+                tool_calls: Vec::new(),
+            });
 
             if stop_reason == Some(StopReason::MaxTokens)
                 && self.num_turns <= self.config.max_continuation_turns
@@ -419,16 +487,24 @@ impl<'h> Agent<'h> {
         }
     }
 
-    fn emit_turn_complete(&self, response: &StreamResponse) -> Result<(), AgentError> {
+    fn emit_turn_complete(
+        &self,
+        response: &StreamResponse,
+        cost: Option<f64>,
+        turn: &super::turn_state::Turn,
+    ) -> Result<(), AgentError> {
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
                 message: response.message.clone(),
                 usage: response.usage,
                 model: self.model.id.clone(),
-                cost: self
-                    .model
-                    .cost_of(&response.usage, self.opts.clamped(&self.model).fast),
+                cost,
                 context_size: Some(response.usage.context_tokens()),
+                cache_miss: turn.is_cache_miss,
+                turn_id: turn.id,
+                duration_ms: turn.duration.map(|d| d.as_millis() as u64),
+                ttfb_ms: turn.ttfb().map(|d| d.as_millis() as u64),
+                api_error_count: turn.api_error_count,
             })))
     }
 
@@ -449,7 +525,8 @@ impl<'h> Agent<'h> {
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
         self.post_tool_empty_retried = false;
         let ctx = self.tool_context();
-        tool_dispatch::process_tool_calls(
+        let turn_idx = self.num_turns as usize;
+        let records = tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
             self.mcp.as_ref(),
@@ -457,7 +534,17 @@ impl<'h> Agent<'h> {
             &self.event_tx,
             &ctx,
         )
-        .await
+        .await?;
+        self.turn_state.record_tool_calls(turn_idx, records);
+        let turn = &self.turn_state.turns[turn_idx];
+        let _ = self.event_tx.send(AgentEvent::TurnToolsDone {
+            turn_id: turn.id,
+            tool_call_count: turn.tool_calls.len(),
+            tool_error_count: turn.tool_error_count(),
+            tool_duration_ms: turn.tool_duration().as_millis() as u64,
+            tool_calls: turn.tool_calls.clone(),
+        });
+        Ok(())
     }
 
     fn tool_context(&self) -> ToolContext {

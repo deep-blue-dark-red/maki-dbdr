@@ -288,6 +288,12 @@ impl App {
                 overlay_rect = r;
             }
         }
+        if self.stats_modal.is_open() {
+            let r = self.stats_modal.view(frame, full, &self.turn_history);
+            if r.width > 0 {
+                overlay_rect = r;
+            }
+        }
         let r = self.float_mgr.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
@@ -306,11 +312,27 @@ impl App {
                 .turn_start
                 .map(|s| s.elapsed())
                 .unwrap_or(std::time::Duration::ZERO);
+            let input_tokens = chat.prompt_progress_tokens().unwrap_or(chat.context_size);
+            let live_output_tokens = chat.streaming_output_tokens();
+            let tool_active = chat.in_progress_count() > 0;
+            // Carry the last non-zero count forward: the live streaming
+            // buffer is empty between rounds (e.g. while a tool call is
+            // executing), but the status bar should keep showing the
+            // turn's output-token progress rather than blanking to 0.
+            if live_output_tokens > 0 {
+                self.last_seen_output_tokens = live_output_tokens;
+            }
+            let output_tokens = if live_output_tokens > 0 {
+                live_output_tokens
+            } else {
+                self.last_seen_output_tokens
+            };
             Some(StreamingInfo {
                 duration,
-                input_tokens: chat.prompt_progress_tokens().unwrap_or(0),
-                output_tokens: chat.streaming_output_tokens(),
+                input_tokens,
+                output_tokens,
                 active_tools: Vec::new(),
+                tool_active,
             })
         } else {
             self.last_done_info.clone()
@@ -348,7 +370,7 @@ impl App {
             streaming_active: is_streaming,
             verbose: self.verbose,
             last_turn_stats: self.last_turn_stats.as_ref(),
-            show_token_stats: self.ui_config.show_token_stats,
+            show_token_stats: self.show_token_stats,
             cache_miss_warning: self.cache_miss_warning.clone(),
         };
         self.status_bar.view(frame, status_area, &ctx);

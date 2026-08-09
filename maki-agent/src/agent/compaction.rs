@@ -60,6 +60,8 @@ async fn run_summary_stream(
     }
 
     for attempt in 0..max_attempts {
+        let mut first_byte_at = None;
+        let mut api_error_count = 0u32;
         match stream_with_retry(
             provider,
             model,
@@ -70,6 +72,8 @@ async fn run_summary_stream(
             cancel,
             RequestOptions::default(),
             None,
+            &mut first_byte_at,
+            &mut api_error_count,
         )
         .await
         {
@@ -126,6 +130,14 @@ fn finish_compact(
         model: model.id.clone(),
         cost: model.cost_of(&response.usage, false),
         context_size: Some(response.usage.output),
+        // Compaction summarization isn't tracked by `TurnState`'s
+        // cache-miss deviance check (it's a one-off summarization call,
+        // not part of the regular turn sequence).
+        cache_miss: false,
+        turn_id: 0,
+        duration_ms: Some(compact_start.elapsed().as_millis() as u64),
+        ttfb_ms: None,
+        api_error_count: 0,
     })));
 
     let new_history = vec![

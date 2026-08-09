@@ -1,7 +1,5 @@
 //! Queue for messages typed while the agent is busy.
 
-use std::time::Instant;
-
 use maki_agent::AgentInput;
 
 use super::{Action, App, Status, format_with_images};
@@ -209,7 +207,7 @@ impl App {
     /// so no dedup needed.
     pub(super) fn on_queue_item_consumed(&mut self, text: &str, image_count: usize) {
         self.status = Status::Streaming;
-        self.turn_start = Some(Instant::now());
+        self.start_turn_timer();
         self.main_chat()
             .show_user_message(format_with_images(text, image_count));
     }
@@ -242,7 +240,7 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
-        self.turn_start = Some(Instant::now());
+        self.start_turn_timer();
         self.last_done_info = None;
         self.cache_miss_warning = None;
         self.fire_session_autocmd("TurnStart", serde_json::json!({}));

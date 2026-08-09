@@ -33,6 +33,10 @@ pub struct StreamingInfo {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub active_tools: Vec<String>,
+    /// Whether a tool call is currently executing (as opposed to waiting on
+    /// the API for the next response). Shown as `Working`, distinct from
+    /// `Waiting` for the no-text-yet, no-tool-running case.
+    pub tool_active: bool,
 }
 
 pub struct TurnStats {
@@ -144,7 +148,7 @@ impl StatusBar {
             } else {
                 let duration_secs = info.duration.as_secs();
                 let mut stats = Vec::new();
-                let is_working = info.output_tokens > 0;
+                let is_working = info.output_tokens > 0 || info.tool_active;
                 let status_label = if !ctx.streaming_active {
                     "Done   "
                 } else if is_working {
@@ -153,8 +157,15 @@ impl StatusBar {
                     "Waiting"
                 };
 
-                if !is_working && info.input_tokens > 0 {
-                    stats.push(format!("↑ {} t", format_tokens(info.input_tokens)));
+                if !is_working {
+                    let tokens = if info.input_tokens > 0 {
+                        info.input_tokens
+                    } else {
+                        ctx.stats.context_size
+                    };
+                    if tokens > 0 {
+                        stats.push(format!("↑ {} t", format_tokens(tokens)));
+                    }
                 } else if is_working && info.output_tokens > 0 {
                     stats.push(format!("↓ {} t", format_tokens(info.output_tokens)));
                 }
@@ -192,28 +203,10 @@ impl StatusBar {
         if ctx.show_token_stats
             && let Some(stats) = ctx.last_turn_stats
         {
-            let mark = if stats.last_turn_cache_miss { "𐄂" } else { "✓" };
-            let abbrev = format!(
-                "CR {:.1}% {} CH ${:.2} CM ${:.2}",
-                stats.cache_rate * 100.0,
-                mark,
-                stats.cache_hit_cost,
-                stats.cache_miss_cost,
-            );
+            let (full, abbrev) = format_token_stats(stats);
             token_stats_idx = Some(left_spans.len());
             token_stats_abbrev = Some(abbrev);
-            left_spans.push(Span::styled(
-                format!(
-                    " PP {:.1} t/s | TG {:.1} t/s | CR {:.1}% {} CH ${:.2} CM ${:.2}",
-                    stats.pp_tps,
-                    stats.tg_tps,
-                    stats.cache_rate * 100.0,
-                    mark,
-                    stats.cache_hit_cost,
-                    stats.cache_miss_cost,
-                ),
-                theme::current().status_dim,
-            ));
+            left_spans.push(Span::styled(full, theme::current().status_dim));
         }
 
         if ctx.restoring {
@@ -384,6 +377,29 @@ impl StatusBar {
             right_area,
         );
     }
+}
+
+/// Builds the `show_token_stats` status-bar text in full (`PP/TG/CR/CH/CM`)
+/// and abbreviated (`CR/CH/CM` only, dropped when space runs out) forms.
+/// Both start with a double leading space, since either can be spliced
+/// directly after the previous span. The `CH $.. CM $..` cost figures are
+/// omitted entirely when both are zero (e.g. the model has no known
+/// pricing) instead of showing a meaningless "CH $0.00 CM $0.00".
+fn format_token_stats(stats: &TurnStats) -> (String, String) {
+    let mark = if stats.last_turn_cache_miss { "𐄂" } else { "✓" };
+    let cost_suffix = if stats.cache_hit_cost == 0.0 && stats.cache_miss_cost == 0.0 {
+        String::new()
+    } else {
+        format!(" CH ${:.2} CM ${:.2}", stats.cache_hit_cost, stats.cache_miss_cost)
+    };
+    let abbrev = format!("  CR {:.1}% {mark}{cost_suffix}", stats.cache_rate * 100.0);
+    let full = format!(
+        "  PP {:.1} t/s | TG {:.1} t/s | CR {:.1}% {mark}{cost_suffix}",
+        stats.pp_tps,
+        stats.tg_tps,
+        stats.cache_rate * 100.0,
+    );
+    (full, abbrev)
 }
 
 fn shorten_model_id(model_id: &str) -> String {
@@ -563,5 +579,41 @@ mod tests {
         bar.flash("Copied".into());
         bar.clear_flash();
         assert!(bar.flash.is_none());
+    }
+
+    fn turn_stats(cache_hit_cost: f64, cache_miss_cost: f64) -> TurnStats {
+        TurnStats {
+            pp_tps: 12.3,
+            tg_tps: 45.6,
+            cache_rate: 0.5,
+            last_turn_cache_miss: false,
+            cache_hit_cost,
+            cache_miss_cost,
+        }
+    }
+
+    #[test]
+    fn format_token_stats_omits_cost_when_both_zero() {
+        let (full, abbrev) = format_token_stats(&turn_stats(0.0, 0.0));
+        assert!(!full.contains("CH $"), "full: {full:?}");
+        assert!(!full.contains("CM $"), "full: {full:?}");
+        assert!(!abbrev.contains("CH $"), "abbrev: {abbrev:?}");
+        assert!(!abbrev.contains("CM $"), "abbrev: {abbrev:?}");
+    }
+
+    #[test]
+    fn format_token_stats_shows_cost_when_either_nonzero() {
+        let (full, _) = format_token_stats(&turn_stats(0.0, 0.01));
+        assert!(full.contains("CH $0.00 CM $0.01"), "full: {full:?}");
+
+        let (full, _) = format_token_stats(&turn_stats(0.02, 0.0));
+        assert!(full.contains("CH $0.02 CM $0.00"), "full: {full:?}");
+    }
+
+    #[test]
+    fn format_token_stats_both_forms_start_with_a_space() {
+        let (full, abbrev) = format_token_stats(&turn_stats(0.0, 0.0));
+        assert!(full.starts_with(' '), "full: {full:?}");
+        assert!(abbrev.starts_with(' '), "abbrev: {abbrev:?}");
     }
 }

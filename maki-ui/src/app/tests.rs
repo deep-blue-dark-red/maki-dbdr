@@ -186,6 +186,11 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         model: model.into(),
         cost,
         context_size: None,
+        cache_miss: false,
+        turn_id: 0,
+        duration_ms: None,
+        ttfb_ms: None,
+        api_error_count: 0,
     }))
 }
 
@@ -4339,6 +4344,60 @@ fn checkpoint_command_sets_turn_start() {
     assert!(app.turn_start.is_some());
 }
 
+/// `TurnComplete` fires once per internal continuation round (tool calls
+/// make the agent auto-continue within one user-facing turn), not once per
+/// turn. Regression test: it must not reset `turn_start`, or the status
+/// bar's duration collapses back to ~0s every time a tool-call round
+/// finishes, instead of reflecting the whole turn.
+#[test]
+fn turn_start_survives_turn_complete_mid_turn() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+    app.round_start = Some(std::time::Instant::now());
+
+    app.update(agent_msg(turn_complete(TokenUsage::default(), "test-model", None)));
+
+    assert!(
+        app.turn_start.is_some(),
+        "turn_start must survive an internal TurnComplete round"
+    );
+    let text = status_bar_text(&mut app);
+    assert!(
+        text.contains("5s"),
+        "expected duration to still reflect the whole turn, got: {text}"
+    );
+}
+
+/// A tool call executing between two streamed responses has no live output
+/// text yet, but it is not "waiting on the API" either — the status bar
+/// should say `Working`, not `Waiting`, and should keep showing the
+/// previous round's output-token count rather than blanking to 0.
+#[test]
+fn tool_call_in_progress_shows_working_not_waiting() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.turn_start = Some(std::time::Instant::now());
+    app.round_start = Some(std::time::Instant::now());
+
+    app.update(agent_msg(turn_complete(
+        TokenUsage {
+            output: 42,
+            ..Default::default()
+        },
+        "test-model",
+        None,
+    )));
+    app.update(agent_msg(tool_start("t1", "bash")));
+
+    let text = status_bar_text(&mut app);
+    assert!(text.contains("Working"), "expected Working, got: {text}");
+    assert!(!text.contains("Waiting"), "expected no Waiting, got: {text}");
+    assert!(text.contains("42"), "expected carried-forward token count, got: {text}");
+}
+
 /// `chat.cost` stays `None` until the first priced turn completes, but a
 /// model with known pricing should show `$0.000` from turn zero rather than
 /// omitting the cost segment entirely until something has been spent.
@@ -4347,4 +4406,87 @@ fn cost_shows_zero_before_any_turn_completes_for_priced_model() {
     let mut app = test_app();
     let text = status_bar_text(&mut app);
     assert!(text.contains("$0.000"), "expected $0.000 before any turn, got: {text}");
+}
+
+fn turn_complete_full(usage: TokenUsage, turn_id: usize, cache_miss: bool) -> AgentEvent {
+    AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+        message: Default::default(),
+        usage,
+        model: "test-model".into(),
+        cost: Some(0.01),
+        context_size: None,
+        cache_miss,
+        turn_id,
+        duration_ms: Some(1234),
+        ttfb_ms: Some(200),
+        api_error_count: 0,
+    }))
+}
+
+/// `/stats` should collect one row per `TurnComplete`, and a later
+/// `TurnToolsDone` for the same `turn_id` should patch the matching row's
+/// tool stats in place rather than appending a new one.
+#[test]
+fn stats_records_a_row_per_turn_and_patches_tool_stats() {
+    let mut app = test_app();
+    app.run_id = 1;
+    let usage = TokenUsage {
+        input: 100,
+        output: 50,
+        cache_read: 20,
+        cache_creation: 0,
+    };
+    app.update(agent_msg(turn_complete_full(usage, 1, false)));
+    assert_eq!(app.turn_history.len(), 1);
+    assert_eq!(app.turn_history[0].id, 1);
+    assert_eq!(app.turn_history[0].tool_call_count, 0);
+
+    app.update(agent_msg(AgentEvent::TurnToolsDone {
+        turn_id: 1,
+        tool_call_count: 2,
+        tool_error_count: 1,
+        tool_duration_ms: 500,
+        tool_calls: vec![
+            maki_agent::agent::turn_state::ToolCallRecord {
+                id: "t1".into(),
+                tool: "bash".into(),
+                args: serde_json::json!({"cmd": "ls"}),
+                duration_ms: 400,
+                is_error: false,
+            },
+            maki_agent::agent::turn_state::ToolCallRecord {
+                id: "t2".into(),
+                tool: "read".into(),
+                args: serde_json::json!({"path": "/x"}),
+                duration_ms: 100,
+                is_error: true,
+            },
+        ],
+    }));
+
+    assert_eq!(app.turn_history.len(), 1, "must patch, not append");
+    assert_eq!(app.turn_history[0].tool_call_count, 2);
+    assert_eq!(app.turn_history[0].tool_error_count, 1);
+    assert_eq!(app.turn_history[0].tool_duration_ms, 500);
+    assert_eq!(app.turn_history[0].tool_calls.len(), 2);
+    assert_eq!(app.turn_history[0].tool_calls[0].tool, "bash");
+    assert!(!app.turn_history[0].tool_calls[0].is_error);
+    assert_eq!(app.turn_history[0].tool_calls[1].tool, "read");
+    assert!(app.turn_history[0].tool_calls[1].is_error);
+}
+
+#[test]
+fn stats_command_toggles_modal_and_new_clears_history() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(turn_complete_full(TokenUsage::default(), 1, false)));
+    assert_eq!(app.turn_history.len(), 1);
+
+    app.execute_command(cmd("/stats"));
+    assert!(app.stats_modal.is_open());
+    app.execute_command(cmd("/stats"));
+    assert!(!app.stats_modal.is_open());
+
+    app.reset_session();
+    assert!(app.turn_history.is_empty());
 }

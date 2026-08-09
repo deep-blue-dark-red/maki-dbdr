@@ -610,6 +610,18 @@ pub enum AgentEvent {
         total: u32,
         cache: u32,
     },
+    /// Tool calls triggered by a turn's response finished. Sent separately
+    /// from `TurnComplete` because tool dispatch happens *after* that
+    /// event fires (so its own tool-call stats aren't known yet). Carries
+    /// the per-call records (tool name, args, duration, error) so the UI
+    /// can drill into exactly what each tool call did.
+    TurnToolsDone {
+        turn_id: usize,
+        tool_call_count: usize,
+        tool_error_count: usize,
+        tool_duration_ms: u64,
+        tool_calls: Vec<super::agent::turn_state::ToolCallRecord>,
+    },
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
@@ -830,6 +842,23 @@ pub struct TurnCompleteEvent {
     pub cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
+    /// Whether this turn's response looked like a prompt-cache miss (the
+    /// server read far fewer `cache_read` tokens than expected). More
+    /// accurate than checking `usage.cache_read == 0`, which also flags
+    /// the first real turn of every run — there's nothing to have cached
+    /// yet at that point, so it isn't a meaningful miss.
+    pub cache_miss: bool,
+    /// 1-based turn index, matching `Agent::num_turns` at completion. Ties
+    /// this event to a later `TurnToolsDone { turn_id, .. }`, if any.
+    pub turn_id: usize,
+    /// Wall-clock time from dispatching the request to this response
+    /// arriving.
+    pub duration_ms: Option<u64>,
+    /// Time to the first streamed byte of the response.
+    pub ttfb_ms: Option<u64>,
+    /// Number of retried API errors before this turn's request ultimately
+    /// succeeded.
+    pub api_error_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

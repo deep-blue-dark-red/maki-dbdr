@@ -150,6 +150,9 @@ impl Chat {
                 self.messages_panel.register_live_buf(id, body);
             }
             AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. } => {}
+            // Handled in `App::update` (needs `turn_history`, which lives
+            // above `Chat`), same as `TurnComplete` above.
+            AgentEvent::TurnToolsDone { .. } => {}
             AgentEvent::PromptProgress {
                 processed,
                 total,
@@ -343,7 +346,9 @@ impl Chat {
         self.messages_panel.message_count()
     }
 
-    #[cfg(test)]
+    /// Number of tool calls currently executing. Used by the status bar to
+    /// show `Working` (a tool is running) instead of `Waiting` (no text and
+    /// no tool activity yet) while streaming.
     pub fn in_progress_count(&self) -> usize {
         self.messages_panel.in_progress_count()
     }
@@ -355,8 +360,12 @@ impl Chat {
     }
 
     /// Live input-token count while the prompt is being uploaded, if known.
+    ///
+    /// `prompt_progress()` only returns `Some` while `processed < total`
+    /// (see the `AgentEvent::PromptProgress` handler above), so `total` is
+    /// always the larger of the two here.
     pub fn prompt_progress_tokens(&self) -> Option<u32> {
-        self.messages_panel.prompt_progress().map(|p| p.processed)
+        self.messages_panel.prompt_progress().map(|p| p.total)
     }
 
     #[cfg(test)]

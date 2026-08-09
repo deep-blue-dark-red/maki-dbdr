@@ -388,7 +388,7 @@ pub(super) async fn process_tool_calls(
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
-) -> Result<(), AgentError> {
+) -> Result<Vec<super::turn_state::ToolCallRecord>, AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
         .tool_uses()
@@ -400,6 +400,7 @@ pub(super) async fn process_tool_calls(
     let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
+    let mut records: Vec<super::turn_state::ToolCallRecord> = Vec::new();
     for (id, name, input) in tool_uses {
         debug!(
             tool = %name,
@@ -410,6 +411,15 @@ pub(super) async fn process_tool_calls(
         if recent_calls.is_doom_loop(&name, &input) {
             warn!(tool = %name, "doom loop detected, skipping execution");
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
+            // Doom-loop-skipped calls never actually ran, but they're still a
+            // tool call that resulted in an error, so they're worth counting.
+            records.push(super::turn_state::ToolCallRecord {
+                id,
+                tool: name.clone(),
+                args: input.clone(),
+                duration_ms: 0,
+                is_error: true,
+            });
         } else {
             runnable.push((id, name.clone(), input.clone()));
         }
@@ -422,15 +432,19 @@ pub(super) async fn process_tool_calls(
 
     let mut set = TaskSet::new();
     let mut spawned_ids: Vec<String> = Vec::new();
+    let mut spawned_names: Vec<String> = Vec::new();
     for (id, name, input) in runnable {
         spawned_ids.push(id.clone());
+        spawned_names.push(name.clone());
         let event_tx_clone = ctx.event_tx.clone();
         let tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             ..ctx.clone()
         };
+        let args = input.clone();
         let mcp_owned = mcp.cloned();
         set.spawn(async move {
+            let started = Instant::now();
             let done = run(
                 &tool_ctx.registry,
                 mcp_owned.as_ref(),
@@ -441,24 +455,40 @@ pub(super) async fn process_tool_calls(
                 Emit::Notify,
             )
             .await;
+            let duration = started.elapsed();
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
-            done
+            (done, duration, args)
         });
     }
 
-    let results: Vec<ToolDoneEvent> = set
+    let mut results: Vec<ToolDoneEvent> = Vec::new();
+    for ((r, id), name) in set
         .join_all()
         .await
         .into_iter()
         .zip(spawned_ids)
-        .map(|(r, id)| match r {
-            Ok(out) => out,
+        .zip(spawned_names)
+    {
+        let (out, duration, args) = match r {
+            Ok((out, duration, args)) => (out, duration, args),
             Err(e) => {
                 error!(error = %e, "tool task panicked");
-                ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}"))
+                (
+                    ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}")),
+                    std::time::Duration::ZERO,
+                    serde_json::Value::Null,
+                )
             }
-        })
-        .collect();
+        };
+        records.push(super::turn_state::ToolCallRecord {
+            id: out.id.clone(),
+            tool: name,
+            args,
+            duration_ms: duration.as_millis() as u64,
+            is_error: out.is_error,
+        });
+        results.push(out);
+    }
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
@@ -467,7 +497,7 @@ pub(super) async fn process_tool_calls(
         message: Box::new(tool_msg.clone()),
     })?;
     history.push(tool_msg);
-    Ok(())
+    Ok(records)
 }
 
 /// Test-only entry that skips native lookup, letting plan-mode and MCP tests

@@ -26,6 +26,7 @@ pub(crate) mod plugins_modal;
 pub(crate) mod settings_picker;
 pub(crate) mod skills_modal;
 pub(crate) mod split_layout;
+pub mod stats_modal;
 pub mod status_bar;
 pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;

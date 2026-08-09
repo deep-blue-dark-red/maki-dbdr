@@ -47,6 +47,7 @@ use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
+use crate::components::stats_modal::{StatsModal, TurnSnapshot};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
@@ -68,6 +69,11 @@ use maki_providers::{Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
+
+/// Number of completed turns buffered in memory before a batched append to
+/// the per-session `turn_stats.jsonl` log. Keeps disk writes off the hot
+/// path; the buffer is also flushed on quit and on session reset.
+const TURN_STATS_BUFFER: usize = 16;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -185,9 +191,33 @@ pub struct App {
     /// Last completed turn's streaming summary, shown as `Done` in the status bar
     /// after the run ends (status returns to Idle).
     pub(super) last_done_info: Option<crate::components::status_bar::StreamingInfo>,
+    /// One row per completed turn this session, shown by `/stats`. Grows
+    /// for the life of the session; cleared on `/new`.
+    pub(super) turn_history: Vec<TurnSnapshot>,
+    /// Monotonic 0-based index handed out to each `TurnComplete` as its
+    /// `event_id` (the simple "turn" column). Never reset within a session.
+    pub(super) event_id_counter: usize,
+    /// Serialized turn-stats records (JSON lines) waiting to be appended to
+    /// the per-session JSONL log. Buffered to avoid a disk write per turn;
+    /// flushed when full, on quit, or on session reset.
+    pub(super) pending_turn_stats: Vec<String>,
+    pub(super) stats_modal: StatsModal,
     /// Warning shown when idle >5 min with a large context (cache likely dropped).
     pub(super) cache_miss_warning: Option<String>,
+    /// Anchor for the *whole* user-facing turn, spanning every internal
+    /// continuation round (tool calls trigger automatic re-prompting inside
+    /// `maki-agent`). Only reset at the true start of a turn — never on an
+    /// individual round's `TurnComplete`, or the status bar's duration
+    /// resets to ~0s every time a tool call happens mid-turn.
     turn_start: Option<Instant>,
+    /// Anchor for just the *current* internal round, used to compute that
+    /// round's pp/tg tokens-per-second. Reset every `TurnComplete`, unlike
+    /// `turn_start`.
+    round_start: Option<Instant>,
+    /// Last non-zero output-token count seen this turn, carried forward so
+    /// the status bar still shows `↓ N t` while a tool call is running and
+    /// the live per-round streaming buffer is momentarily empty.
+    last_seen_output_tokens: u32,
     /// When the last turn completed; used to detect stale-cache risk on idle.
     last_turn_at: Option<Instant>,
 
@@ -290,8 +320,14 @@ impl App {
             last_esc: None,
             last_turn_stats: None,
             last_done_info: None,
+            turn_history: Vec::new(),
+            event_id_counter: 0,
+            pending_turn_stats: Vec::new(),
+            stats_modal: StatsModal::new(),
             cache_miss_warning: None,
             turn_start: None,
+            round_start: None,
+            last_seen_output_tokens: 0,
             last_turn_at: None,
             storage,
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -358,6 +394,56 @@ impl App {
             );
         }
         self.lua_event_handle.fire_autocmd(event, data);
+    }
+
+    /// Buffers a completed turn for the per-session JSONL log under
+    /// `logs_dir()/<session_id>/turn_stats.jsonl`. Does not hit disk; the
+    /// record is appended in a batch when the buffer fills, on quit, or on
+    /// session reset (see [`App::flush_turn_stats`]). Each record is a
+    /// `PersistedTurn` including its per-tool-call records (with args).
+    pub(super) fn record_turn_stat(&mut self, turn: &TurnSnapshot) {
+        match serde_json::to_string(&crate::components::stats_modal::PersistedTurn::from(turn)) {
+            Ok(line) => self.pending_turn_stats.push(line),
+            Err(_) => return,
+        }
+        if self.pending_turn_stats.len() >= TURN_STATS_BUFFER {
+            self.flush_turn_stats();
+        }
+    }
+
+    /// Appends all buffered turn-stats records to the per-session JSONL log
+    /// in a single batched write. No-op if the buffer is empty or the logs
+    /// dir is unavailable. Called when the buffer fills, on quit, and on
+    /// session reset (while the outgoing session is still current).
+    pub(super) fn flush_turn_stats(&mut self) {
+        if self.pending_turn_stats.is_empty() {
+            return;
+        }
+        let session_id = self.state.session.id.to_string();
+        let Ok(base) = maki_storage::paths::logs_dir() else {
+            return;
+        };
+        let dir = base.join(&session_id);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let path = dir.join("turn_stats.jsonl");
+        let mut buf = String::with_capacity(self.pending_turn_stats.len() * 128);
+        for line in &self.pending_turn_stats {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        self.pending_turn_stats.clear();
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let _ = file.write_all(buf.as_bytes());
     }
 
     pub fn tick_error_expiry(&mut self) {
@@ -477,6 +563,10 @@ impl App {
         }
         if self.usage_modal.is_open() {
             self.usage_modal.scroll(delta);
+            return None;
+        }
+        if self.stats_modal.is_open() {
+            self.stats_modal.scroll(delta);
             return None;
         }
         let pos = Position::new(column, row);
@@ -715,6 +805,11 @@ impl App {
                 return Some(vec![Action::RefreshUsage]);
             }
             self.usage_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.stats_modal.is_open() {
+            self.stats_modal.handle_key(key);
             return Some(vec![]);
         }
 
@@ -1154,6 +1249,7 @@ impl App {
 
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
+        self.flush_turn_stats();
         self.exit_request = req;
         vec![]
     }
@@ -1432,48 +1528,102 @@ impl App {
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
                 self.state.context_size = ctx_size;
-                if let Some(start) = self.turn_start.take() {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let total = tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
-                    let (pp_tps, tg_tps) = if elapsed > 0.0 {
-                        (total as f64 / elapsed, tc.usage.output as f64 / elapsed)
-                    } else {
-                        (0.0, 0.0)
-                    };
-                    let cum = &self.state.token_usage;
-                    let cum_total = cum.input + cum.cache_creation + cum.cache_read;
-                    let cache_rate = if cum_total > 0 {
-                        cum.cache_read as f64 / cum_total as f64
-                    } else {
-                        0.0
-                    };
-                    let cache_hit_cost = TokenUsage {
-                        cache_read: tc.usage.cache_read,
-                        ..Default::default()
-                    }
-                    .cost(&self.state.model.pricing, self.state.fast);
-                    let cache_miss_cost = TokenUsage {
-                        input: total,
-                        ..Default::default()
-                    }
-                    .cost(&self.state.model.pricing, self.state.fast);
-                    self.last_turn_stats = Some(
-                        crate::components::status_bar::TurnStats {
-                            pp_tps,
-                            tg_tps,
-                            cache_rate,
-                            last_turn_cache_miss: tc.usage.cache_read == 0,
-                            cache_hit_cost,
-                            cache_miss_cost,
-                        },
-                    );
-                    self.last_done_info = Some(crate::components::status_bar::StreamingInfo {
-                        duration: start.elapsed(),
-                        input_tokens: total,
-                        output_tokens: tc.usage.output,
-                        active_tools: Vec::new(),
-                    });
+                // `TurnComplete` fires once per internal continuation round
+                // (tool calls make the agent auto-continue), not once per
+                // user-facing turn. `round_start` measures just this round
+                // (for pp/tg rate), while `turn_start` keeps running from
+                // the true start of the turn so the displayed duration
+                // reflects total time, not the latest round alone.
+                let round_elapsed = self
+                    .round_start
+                    .replace(Instant::now())
+                    .map(|start| start.elapsed().as_secs_f64())
+                    .unwrap_or(0.0);
+                let total = tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
+                let (pp_tps, tg_tps) = if round_elapsed > 0.0 {
+                    (total as f64 / round_elapsed, tc.usage.output as f64 / round_elapsed)
+                } else {
+                    (0.0, 0.0)
+                };
+                let cum = &self.state.token_usage;
+                let cum_total = cum.input + cum.cache_creation + cum.cache_read;
+                let cache_rate = if cum_total > 0 {
+                    cum.cache_read as f64 / cum_total as f64
+                } else {
+                    0.0
+                };
+                let cache_hit_cost = TokenUsage {
+                    cache_read: tc.usage.cache_read,
+                    ..Default::default()
                 }
+                .cost(&self.state.model.pricing, self.state.fast);
+                let cache_miss_cost = TokenUsage {
+                    input: total,
+                    ..Default::default()
+                }
+                .cost(&self.state.model.pricing, self.state.fast);
+                self.last_turn_stats = Some(
+                    crate::components::status_bar::TurnStats {
+                        pp_tps,
+                        tg_tps,
+                        cache_rate,
+                        last_turn_cache_miss: tc.cache_miss,
+                        cache_hit_cost,
+                        cache_miss_cost,
+                    },
+                );
+                if tc.usage.output > 0 {
+                    self.last_seen_output_tokens = tc.usage.output;
+                }
+                self.last_done_info = Some(crate::components::status_bar::StreamingInfo {
+                    duration: self.turn_start.map(|s| s.elapsed()).unwrap_or_default(),
+                    input_tokens: total,
+                    output_tokens: tc.usage.output,
+                    active_tools: Vec::new(),
+                    tool_active: false,
+                });
+                // `tc.turn_id` is the agent's own round counter, which
+                // resets to 1 at the start of every user-submitted turn
+                // (a fresh `Agent` is built per turn); it's only unique
+                // *within* one turn. Mirror `goto_picker`'s exact turn
+                // count: `Role::User` alone isn't enough, since tool
+                // results and synthetic continuation prompts (nudges,
+                // post-compaction "continue") are *also* sent with
+                // `Role::User` at the API level — `user_text()` is `None`
+                // for both, so only a message the human actually typed
+                // counts. `turn_id == 1` is the first round of a real user
+                // turn, i.e. a human turn (later rounds auto-continue after
+                // tool calls).
+                let user_turn = self
+                    .state
+                    .session
+                    .messages()
+                    .iter()
+                    .filter(|m| m.is_user_turn())
+                    .count();
+                let event_id = self.event_id_counter;
+                self.event_id_counter += 1;
+                let human_turn = tc.turn_id == 1;
+                self.turn_history.push(TurnSnapshot {
+                    event_id,
+                    id: tc.turn_id,
+                    user_turn,
+                    human_turn,
+                    received_at: jiff::Timestamp::now(),
+                    input: tc.usage.input,
+                    cache_read: tc.usage.cache_read,
+                    cache_creation: tc.usage.cache_creation,
+                    output: tc.usage.output,
+                    cache_miss: tc.cache_miss,
+                    cost: tc.cost,
+                    api_duration_ms: tc.duration_ms,
+                    ttfb_ms: tc.ttfb_ms,
+                    api_error_count: tc.api_error_count,
+                    tool_call_count: 0,
+                    tool_error_count: 0,
+                    tool_duration_ms: 0,
+                    tool_calls: Vec::new(),
+                });
             }
             self.last_turn_at = Some(Instant::now());
             self.update_cache_miss_warning();
@@ -1483,6 +1633,25 @@ impl App {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
                 self.chats[0].set_tool_turn_usage(tool_id, formatted);
             }
+        }
+
+        if chat_idx == 0
+            && let AgentEvent::TurnToolsDone {
+                turn_id,
+                tool_call_count,
+                tool_error_count,
+                tool_duration_ms,
+                tool_calls,
+            } = &envelope.event
+            && let Some(turn) = self.turn_history.iter_mut().rev().find(|t| t.id == *turn_id)
+        {
+            turn.tool_call_count = *tool_call_count;
+            turn.tool_error_count = *tool_error_count;
+            turn.tool_duration_ms = *tool_duration_ms;
+            turn.tool_calls = tool_calls.clone();
+            let snap = turn.clone();
+            self.record_turn_stat(&snap);
+            return vec![];
         }
 
         let plan_path = if self.state.mode == Mode::Plan {
@@ -1530,6 +1699,7 @@ impl App {
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
+                        self.flush_turn_stats();
                         self.exit_request = ExitRequest::Success;
                     }
                     if self.state.session.title == "New session" {
@@ -1549,6 +1719,7 @@ impl App {
                         serde_json::json!({ "message": message }),
                     );
                     if self.exit_on_done {
+                        self.flush_turn_stats();
                         self.exit_request = ExitRequest::Error;
                     }
                 }
@@ -1591,6 +1762,17 @@ impl App {
         idx
     }
 
+    /// Arms both turn timers for a fresh turn: `turn_start` (total duration,
+    /// spans every internal continuation round) and `round_start` (current
+    /// round only, for pp/tg tokens-per-second). Also clears the carried-
+    /// forward output-token count from any previous turn.
+    pub(super) fn start_turn_timer(&mut self) {
+        let now = Instant::now();
+        self.turn_start = Some(now);
+        self.round_start = Some(now);
+        self.last_seen_output_tokens = 0;
+    }
+
     fn execute_command(&mut self, cmd: ParsedCommand) -> Vec<Action> {
         self.input_box.discard();
         match cmd.name.as_str() {
@@ -1604,7 +1786,7 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
-                self.turn_start = Some(Instant::now());
+                self.start_turn_timer();
                 vec![Action::Compact]
             }
             "/checkpoint" => {
@@ -1613,7 +1795,7 @@ impl App {
                     return vec![];
                 }
                 self.status = Status::Streaming;
-                self.turn_start = Some(Instant::now());
+                self.start_turn_timer();
                 vec![Action::Checkpoint]
             }
             "/help" => {
@@ -1639,6 +1821,10 @@ impl App {
                 } else {
                     vec![]
                 }
+            }
+            "/stats" => {
+                self.stats_modal.toggle();
+                vec![]
             }
             "/btw" => {
                 let question = cmd.args.trim().to_string();
@@ -1890,13 +2076,14 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 18] {
+    fn overlays(&self) -> [&dyn Overlay; 19] {
         [
             &self.help_modal,
             &self.export_picker,
             &self.plugins_modal,
             &self.skills_modal,
             &self.usage_modal,
+            &self.stats_modal,
             &self.btw_modal,
             &self.float_mgr,
             &self.search_modal,
@@ -1913,13 +2100,14 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
         [
             &mut self.help_modal,
             &mut self.export_picker,
             &mut self.plugins_modal,
             &mut self.skills_modal,
             &mut self.usage_modal,
+            &mut self.stats_modal,
             &mut self.btw_modal,
             &mut self.float_mgr,
             &mut self.search_modal,

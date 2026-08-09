@@ -42,6 +42,12 @@ impl App {
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if self.stats_modal.is_open()
+                            && zone == SelectionZone::Overlay
+                            && self.stats_modal.handle_mouse_click(event.row, event.column)
+                        {
+                            return;
+                        }
                         if zone == SelectionZone::Messages {
                             let area = self.msg_area();
                             self.chats[self.active_chat].handle_click(event.row, area);

@@ -55,6 +55,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/stats",
+        description: "Show per-turn stats for this session",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/queue",
         description: "Remove items from queue",
         max_args: 0,

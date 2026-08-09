@@ -244,7 +244,8 @@ pub fn run(
             | AgentEvent::CompactionStart { .. }
             | AgentEvent::RenameResult { .. }
             | AgentEvent::Nudge
-            | AgentEvent::PromptProgress { .. } => {}
+            | AgentEvent::PromptProgress { .. }
+            | AgentEvent::TurnToolsDone { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,
