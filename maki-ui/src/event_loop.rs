@@ -610,6 +610,9 @@ impl<'t> EventLoop<'t> {
             let _pause = self.input.pause();
             terminal::open_in_editor(path, self.terminal)
         };
+        if matches!(crate::config::config_path(), Ok(p) if p == path) {
+            crate::components::settings_picker::UserSettings::reload();
+        }
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -1095,9 +1098,7 @@ impl<'t> EventLoop<'t> {
                             self.sessions[idx].app.flash(format!("Failed to create system.md: {e}"));
                             return;
                         }
-                        if let Err(e) = terminal::open_in_editor(&path, self.terminal) {
-                            self.sessions[idx].app.flash(e);
-                        }
+                        self.open_editor(idx, &path);
                     }
                     Err(e) => self.sessions[idx].app.flash(format!("Failed to get config directory: {e}")),
                 }

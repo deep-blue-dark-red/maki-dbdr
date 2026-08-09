@@ -1,10 +1,61 @@
 use std::mem;
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use ratatui::style::{Color, Style};
 
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_STRS: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
 const SPINNER_FRAME_MS: u128 = 80;
+
+/// The single-glyph "dot" spinner: no per-frame shape animation, just an
+/// alternating color (see `dot_spinner_color`).
+const DOT_GLYPH: char = '●';
+const DOT_STR: &str = "● ";
+const DOT_COLOR_PERIOD_MS: u128 = 750;
+
+/// Blank placeholders matching the width of a live glyph, used when spinners
+/// are disabled so fixed-width layouts don't shift.
+const BLANK_CHAR: char = ' ';
+const BLANK_STR: &str = "  ";
+
+/// Which glyph the spinner renders as. `Braille` is the original animated
+/// frame cycle; `Dot` is a single glyph whose color alternates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpinnerStyle {
+    Braille,
+    Dot,
+}
+
+/// Global, user-configurable spinner behavior. Mirrors the `theme::current()`
+/// / `theme::set()` pattern: deeply-nested render call sites read this
+/// directly rather than threading `UserSettings` through every signature.
+#[derive(Debug, Clone, Copy)]
+pub struct SpinnerConfig {
+    pub enabled: bool,
+    pub style: SpinnerStyle,
+}
+
+impl Default for SpinnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            style: SpinnerStyle::Braille,
+        }
+    }
+}
+
+static SPINNER_CONFIG: LazyLock<ArcSwap<SpinnerConfig>> =
+    LazyLock::new(|| ArcSwap::from_pointee(SpinnerConfig::default()));
+
+pub fn spinner_config() -> Arc<SpinnerConfig> {
+    SPINNER_CONFIG.load_full()
+}
+
+pub fn set_spinner_config(cfg: SpinnerConfig) {
+    SPINNER_CONFIG.store(Arc::new(cfg));
+}
 
 pub fn spinner_frame(elapsed_ms: u128) -> char {
     SPINNER_FRAMES[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len()]
@@ -12,6 +63,55 @@ pub fn spinner_frame(elapsed_ms: u128) -> char {
 
 pub fn spinner_str(elapsed_ms: u128) -> &'static str {
     SPINNER_STRS[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_STRS.len()]
+}
+
+/// Config-aware single-char spinner glyph: honors the active enabled/style
+/// setting, falling back to a blank space (same width) when disabled.
+pub fn active_spinner_frame(elapsed_ms: u128) -> char {
+    let cfg = spinner_config();
+    if !cfg.enabled {
+        return BLANK_CHAR;
+    }
+    match cfg.style {
+        SpinnerStyle::Braille => spinner_frame(elapsed_ms),
+        SpinnerStyle::Dot => DOT_GLYPH,
+    }
+}
+
+/// Config-aware spinner glyph + trailing space, mirroring `spinner_str`.
+/// Falls back to a same-width blank when disabled.
+pub fn active_spinner_str(elapsed_ms: u128) -> &'static str {
+    let cfg = spinner_config();
+    if !cfg.enabled {
+        return BLANK_STR;
+    }
+    match cfg.style {
+        SpinnerStyle::Braille => spinner_str(elapsed_ms),
+        SpinnerStyle::Dot => DOT_STR,
+    }
+}
+
+/// Color for the dot spinner: alternates between `success` and yellow every
+/// `DOT_COLOR_PERIOD_MS`.
+pub fn dot_spinner_color(elapsed_ms: u128, success: Color) -> Color {
+    if (elapsed_ms / DOT_COLOR_PERIOD_MS).is_multiple_of(2) {
+        success
+    } else {
+        Color::Yellow
+    }
+}
+
+/// Resolves the `Style` to paint the active spinner glyph with: unchanged
+/// for braille, alternating success/yellow fg for dot. `success` supplies
+/// the theme's success color (e.g. `theme::current().tool_success`); only
+/// its `fg` is used, defaulting to green if unset.
+pub fn active_spinner_style(elapsed_ms: u128, base: Style, success: Style) -> Style {
+    match spinner_config().style {
+        SpinnerStyle::Braille => base,
+        SpinnerStyle::Dot => {
+            base.fg(dot_spinner_color(elapsed_ms, success.fg.unwrap_or(Color::Green)))
+        }
+    }
 }
 
 /// Spinners need a consistent time reference. Using a static epoch avoids
@@ -169,6 +269,11 @@ impl std::fmt::Debug for Typewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `SPINNER_CONFIG` is a process-global; serialize tests that mutate it
+    /// so they don't race under cargo's default parallel test execution.
+    static SPINNER_CONFIG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn spinner_wraps_around() {
@@ -176,6 +281,54 @@ mod tests {
         let wrapped = spinner_frame(SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u128);
         assert_eq!(first, wrapped);
         assert_ne!(first, spinner_frame(SPINNER_FRAME_MS));
+    }
+
+    #[test]
+    fn dot_color_alternates_every_750ms() {
+        let green = Color::Green;
+        assert_eq!(dot_spinner_color(0, green), green);
+        assert_eq!(dot_spinner_color(749, green), green);
+        assert_eq!(dot_spinner_color(750, green), Color::Yellow);
+        assert_eq!(dot_spinner_color(1499, green), Color::Yellow);
+        assert_eq!(dot_spinner_color(1500, green), green);
+    }
+
+    #[test]
+    fn disabled_config_suppresses_glyph() {
+        let _guard = SPINNER_CONFIG_TEST_LOCK.lock().unwrap();
+        let saved = *spinner_config();
+        set_spinner_config(SpinnerConfig {
+            enabled: false,
+            style: SpinnerStyle::Dot,
+        });
+        assert_eq!(active_spinner_frame(0), BLANK_CHAR);
+        assert_eq!(active_spinner_str(0), BLANK_STR);
+        // Restore default so other tests relying on spinner_config() (if any
+        // are added later) aren't affected by ordering.
+        set_spinner_config(saved);
+    }
+
+    #[test]
+    fn dot_style_overrides_glyph_and_color() {
+        let _guard = SPINNER_CONFIG_TEST_LOCK.lock().unwrap();
+        let saved = *spinner_config();
+        set_spinner_config(SpinnerConfig {
+            enabled: true,
+            style: SpinnerStyle::Dot,
+        });
+        assert_eq!(active_spinner_frame(0), DOT_GLYPH);
+        assert_eq!(active_spinner_str(0), DOT_STR);
+        let base = Style::default();
+        let success = Style::default().fg(Color::Green);
+        assert_eq!(
+            active_spinner_style(0, base, success).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            active_spinner_style(750, base, success).fg,
+            Some(Color::Yellow)
+        );
+        set_spinner_config(saved);
     }
 
     #[test]

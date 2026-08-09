@@ -1,7 +1,7 @@
 use super::{DisplayMessage, ToolStatus};
 
 use super::code_view;
-use crate::animation::{spinner_frame, spinner_str};
+use crate::animation::{self, active_spinner_frame, active_spinner_str};
 use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
@@ -345,7 +345,7 @@ impl ToolLineBuilder {
             if let Some(first_line) = snapshot.lines.first() {
                 let line_idx = self.lines.len();
                 let spinners = &mut self.spinner_lines;
-                bake_spans(&first_line.spans, &mut spans, spinner_str(0), |span_idx| {
+                bake_spans(&first_line.spans, &mut spans, active_spinner_str(0), 0, |span_idx| {
                     spinners.push((line_idx, span_idx));
                 });
             }
@@ -377,8 +377,14 @@ impl ToolLineBuilder {
         }
         let (text, style) = match indicator {
             Indicator::InProgress => {
-                let ch = spinner_frame(started_at.elapsed().as_millis());
-                (format!("{ch} "), theme::current().spinner)
+                let elapsed = started_at.elapsed().as_millis();
+                let ch = active_spinner_frame(elapsed);
+                let style = animation::active_spinner_style(
+                    elapsed,
+                    theme::current().spinner,
+                    theme::current().tool_success,
+                );
+                (format!("{ch} "), style)
             }
             Indicator::Success => (TOOL_INDICATOR.into(), theme::current().tool_success),
             Indicator::Error => (TOOL_INDICATOR.into(), theme::current().tool_error),
@@ -475,9 +481,10 @@ impl ToolLineBuilder {
         let base = self.lines.len();
         self.snapshot_base = Some(base);
         let total = snapshot.lines.len();
-        let frame = spinner_str(started_at.elapsed().as_millis());
+        let elapsed = started_at.elapsed().as_millis();
+        let frame = active_spinner_str(elapsed);
         let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame);
+            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, elapsed);
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
@@ -522,13 +529,19 @@ fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static 
 fn bake_spans(
     src: &[SnapshotSpan],
     out: &mut Vec<Span<'static>>,
-    spinner_frame: &'static str,
+    frame_str: &'static str,
+    elapsed_ms: u128,
     mut on_spinner: impl FnMut(usize),
 ) {
     for span in src {
         if matches!(&span.style, SpanStyle::Named(n) if n == SPINNER_STYLE_NAME) {
             on_spinner(out.len());
-            out.push(Span::styled(spinner_frame, theme::current().spinner));
+            let style = animation::active_spinner_style(
+                elapsed_ms,
+                theme::current().spinner,
+                theme::current().tool_success,
+            );
+            out.push(Span::styled(frame_str, style));
         } else {
             out.push(Span::styled(
                 span.text.clone(),
@@ -542,7 +555,8 @@ fn snapshot_to_lines_range(
     snapshot: &BufferSnapshot,
     indent: &str,
     range: std::ops::Range<usize>,
-    spinner_frame: &'static str,
+    frame_str: &'static str,
+    elapsed_ms: u128,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut spinners = Vec::new();
     let lines = snapshot.lines[range]
@@ -550,7 +564,7 @@ fn snapshot_to_lines_range(
         .enumerate()
         .map(|(i, sline)| {
             let mut spans = vec![Span::raw(indent.to_string())];
-            bake_spans(&sline.spans, &mut spans, spinner_frame, |span_idx| {
+            bake_spans(&sline.spans, &mut spans, frame_str, elapsed_ms, |span_idx| {
                 spinners.push((i, span_idx));
             });
             Line::from(spans)
@@ -1690,7 +1704,7 @@ mod tests {
             text: "content".into(),
             style: SpanStyle::Default,
         }]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ");
+        let (lines, _) = snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", 0);
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
         assert_eq!(first_span.content.as_ref(), ">>");
@@ -1712,7 +1726,7 @@ mod tests {
                 style: SpanStyle::Default,
             },
         ]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ");
+        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", 0);
         let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
     }
@@ -1735,7 +1749,7 @@ mod tests {
                 },
             ],
         ]);
-        let (lines, spinners) = snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ");
+        let (lines, spinners) = snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", 0);
         assert_eq!(spinners, vec![(1, 2)]);
         assert_eq!(lines[1].spans[2].content.as_ref(), "⠹ ");
     }

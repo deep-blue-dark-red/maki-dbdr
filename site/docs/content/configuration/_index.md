@@ -231,6 +231,25 @@ maki.setup({
 
 If a value is below its minimum, Maki shows a `ConfigError` with the field name, value, and minimum.
 
+## User Settings (`user.config`)
+
+Separate from `init.lua`, a handful of interactive-UI preferences live in `user.config`, a flat `key = value` file stored next to `init.lua` in the config directory (see [Directory layout](#directory-layout) below). Open it in-app with `/settings` — boolean options toggle inline; everything else opens `user.config` in `$EDITOR`. You can also edit the file by hand.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `user_prompt_prefix` | string | `{n}‧ you ∙ ` | Template for the line(s) shown before each of your turns. `{n}` is replaced with the 1-based turn number. Wrap the value in `"..."` to preserve leading/trailing spaces, and use `\n` for a multi-line prefix (each `\n`-separated segment before the last becomes its own leader line; the last segment shares the first line with your message) — e.g. `user_prompt_prefix = "> "`, or `user_prompt_prefix = "---\n{n}> "` for a separator line above a numbered prompt |
+| `spinner_enabled` | bool | `true` | Show the animated spinner for in-progress tool calls |
+| `spinner_style` | string | `braille` | Spinner glyph: `braille` (the default animated frame cycle) or `dot`, a single `●` that alternates between the theme's success color and yellow every 750ms |
+| `override_expand_string` | string | `click to expand` | Hint text shown next to collapsed/truncated content |
+| `log_command` | string | `tail -n 30 alog \| jlf -c \| less -R` | Shell command run by `/logs`; `alog`/`{}`/`<path>` are replaced with the log file path |
+| `export_path` | string | `cwd` | Default directory for exported transcripts; `cwd` means the current working directory |
+| `global_sessions` | bool | `false` | Show sessions from all projects, not just the current one |
+| `skills_dir` | string (repeatable) | - | Extra directory to search for skills; repeat the line to add more than one |
+| `disabled_plugin` | string (repeatable) | - | Name of a plugin to disable; repeat the line to disable more than one |
+| `keybind` | `shortcut=action` (repeatable) | - | Rebind a keyboard action |
+
+`/settings` lists a few additional toggles not in this table.
+
 ## Directory layout
 
 Maki follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).

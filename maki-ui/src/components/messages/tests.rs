@@ -855,6 +855,26 @@ fn toggle_expand_collapse_truncated_tool() {
 }
 
 #[test]
+fn test_override_expand_string() {
+    let settings = crate::components::settings_picker::UserSettings {
+        override_expand_string: Some("[+]".to_string()),
+        ..Default::default()
+    };
+    settings.save();
+
+    let text = crate::markdown::truncation_notice(5);
+    assert!(text.contains("[+]"));
+    assert!(!text.contains("click to expand"));
+
+    // Reset settings back to default
+    let default_settings = crate::components::settings_picker::UserSettings {
+        override_expand_string: None,
+        ..Default::default()
+    };
+    default_settings.save();
+}
+
+#[test]
 fn extract_selection_copies_visible_content_only() {
     let panel = panel_with_long_tool(200);
     let area = Rect::new(0, 0, 80, 24);

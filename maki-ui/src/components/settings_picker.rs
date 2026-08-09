@@ -7,6 +7,10 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use crate::theme;
 
+use std::sync::{Arc, LazyLock};
+
+use arc_swap::ArcSwap;
+
 const TITLE: &str = " Settings ";
 const MAX_VISIBLE: u16 = 10;
 
@@ -32,6 +36,14 @@ pub struct UserSettings {
     pub disabled_plugins: Vec<String>,
     #[serde(default)]
     pub global_sessions: bool,
+    #[serde(default)]
+    pub override_expand_string: Option<String>,
+    #[serde(default = "default_true")]
+    pub spinner_enabled: bool,
+    #[serde(default = "default_spinner_style")]
+    pub spinner_style: String,
+    #[serde(default)]
+    pub user_prompt_prefix: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -41,6 +53,14 @@ fn default_true() -> bool {
 fn default_log_command() -> Option<String> {
     Some("tail -n 30 alog | jlf -c | less -R".to_string())
 }
+
+fn default_spinner_style() -> String {
+    "braille".to_string()
+}
+
+/// Default template for the user-turn prefix; `{n}` is replaced with the
+/// 1-based turn number. See [`UserSettings::user_prompt_prefix_template`].
+const DEFAULT_USER_PROMPT_PREFIX: &str = "{n}‧ you ∙ ";
 
 impl Default for UserSettings {
     fn default() -> Self {
@@ -55,17 +75,66 @@ impl Default for UserSettings {
             export_path: None,
             disabled_plugins: Vec::new(),
             global_sessions: false,
+            override_expand_string: None,
+            spinner_enabled: true,
+            spinner_style: default_spinner_style(),
+            user_prompt_prefix: None,
         }
     }
 }
 
+/// In-memory cache of `user.config`, mirroring the `theme::current()` /
+/// `animation::spinner_config()` pattern: reading settings happens on hot
+/// render paths (e.g. the user-prompt prefix, truncation hints), so `load()`
+/// must not hit disk every call. Populated lazily, kept current by `save()`,
+/// and force-refreshed by `reload()` after the file is hand-edited.
+static SETTINGS_CACHE: LazyLock<ArcSwap<UserSettings>> =
+    LazyLock::new(|| ArcSwap::from_pointee(crate::config::load_config()));
+
 impl UserSettings {
     pub fn load() -> Self {
-        crate::config::load_config()
+        if cfg!(test) {
+            // `config::config_path()` returns a distinct file per test
+            // thread under `cfg!(test)`; the process-wide cache below would
+            // leak settings between concurrently-running tests, so bypass
+            // it and always hit disk here, same as before caching existed.
+            return crate::config::load_config();
+        }
+        (**SETTINGS_CACHE.load()).clone()
+    }
+
+    /// Re-reads `user.config` from disk and refreshes the cache. Call after
+    /// the file may have been edited outside `save()` (e.g. in `$EDITOR`).
+    pub fn reload() -> Self {
+        let fresh = crate::config::load_config();
+        if !cfg!(test) {
+            SETTINGS_CACHE.store(Arc::new(fresh.clone()));
+        }
+        fresh
     }
 
     pub fn save(&self) {
         crate::config::save_config(self);
+        if !cfg!(test) {
+            SETTINGS_CACHE.store(Arc::new(self.clone()));
+        }
+    }
+
+    /// The hint text shown next to collapsed/truncated content ("click to
+    /// expand" by default, or the user's `override_expand_string`).
+    pub fn expand_hint(&self) -> String {
+        self.override_expand_string
+            .clone()
+            .unwrap_or_else(|| "click to expand".to_string())
+    }
+
+    /// The template for the prefix shown before each user turn (default
+    /// `"{n}‧ you ∙ "`, or the user's `override`). `{n}` is replaced with the
+    /// 1-based turn number.
+    pub fn user_prompt_prefix_template(&self) -> String {
+        self.user_prompt_prefix
+            .clone()
+            .unwrap_or_else(|| DEFAULT_USER_PROMPT_PREFIX.to_string())
     }
 
     pub fn resolved_export_path(&self, cwd: &std::path::Path) -> std::path::PathBuf {
@@ -109,6 +178,7 @@ pub enum SettingsPickerAction {
     OpenSystemConfig,
     Closed,
     ToggleGlobalSessions(bool),
+    ToggleSpinnerEnabled(bool),
 }
 
 #[derive(Clone)]
@@ -143,6 +213,7 @@ impl SettingsPicker {
             SettingItem { name: "show-reasoning".to_string() },
             SettingItem { name: "show-token-stats".to_string() },
             SettingItem { name: "global-sessions".to_string() },
+            SettingItem { name: "spinner-enabled".to_string() },
             SettingItem {
                 name: format!("log-command: {}", settings.log_command.as_deref().unwrap_or("less +G {}")),
             },
@@ -154,6 +225,12 @@ impl SettingsPicker {
                         .unwrap_or_else(|| "none".to_string())
                 ),
             },
+            SettingItem {
+                name: format!("spinner-style: {}", settings.spinner_style),
+            },
+            SettingItem {
+                name: format!("user-prompt-prefix: {}", settings.user_prompt_prefix_template()),
+            },
             SettingItem { name: "open user.config in editor".to_string() },
             SettingItem { name: "open maki init.lua in editor".to_string() },
         ];
@@ -163,6 +240,9 @@ impl SettingsPicker {
             settings.show_reasoning,
             settings.show_token_stats,
             settings.global_sessions,
+            settings.spinner_enabled,
+            false,
+            false,
             false,
             false,
             false,
@@ -199,10 +279,13 @@ impl SettingsPicker {
                 2 => SettingsPickerAction::ToggleShowReasoning(val),
                 3 => SettingsPickerAction::ToggleShowTokenStats(val),
                 4 => SettingsPickerAction::ToggleGlobalSessions(val),
-                5 => SettingsPickerAction::EditLogCommand,
+                5 => SettingsPickerAction::ToggleSpinnerEnabled(val),
                 6 => SettingsPickerAction::EditLogCommand,
-                7 => SettingsPickerAction::OpenUserConfig,
-                8 => SettingsPickerAction::OpenSystemConfig,
+                7 => SettingsPickerAction::EditLogCommand,
+                8 => SettingsPickerAction::EditLogCommand,
+                9 => SettingsPickerAction::EditLogCommand,
+                10 => SettingsPickerAction::OpenUserConfig,
+                11 => SettingsPickerAction::OpenSystemConfig,
                 _ => SettingsPickerAction::Consumed,
             },
             PickerAction::Close => SettingsPickerAction::Closed,

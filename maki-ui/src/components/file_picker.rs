@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
 
-use crate::animation::spinner_frame;
+use crate::animation::{self, active_spinner_frame};
 use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
@@ -463,8 +463,10 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
     let mut spans = vec![super::chevron_span()];
 
     if s.walking {
-        let ch = spinner_frame(s.started_at.elapsed().as_millis());
-        spans.push(Span::styled(format!("{ch} "), t.item_desc));
+        let elapsed = s.started_at.elapsed().as_millis();
+        let ch = active_spinner_frame(elapsed);
+        let style = animation::active_spinner_style(elapsed, t.item_desc, t.tool_success);
+        spans.push(Span::styled(format!("{ch} "), style));
     }
 
     spans.extend([

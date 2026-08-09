@@ -129,7 +129,8 @@ pub fn truncation_notice(count: usize) -> String {
         should_truncate(count),
         "truncation_notice called with count={count} below threshold"
     );
-    format!("{TRUNCATION_PREFIX} ({count} lines) click to expand")
+    let expand_hint = crate::components::settings_picker::UserSettings::load().expand_hint();
+    format!("{TRUNCATION_PREFIX} ({count} lines) {expand_hint}")
 }
 
 pub struct Truncated<'a> {
@@ -155,6 +156,17 @@ fn prefix_line(prefix: &str, style: Style) -> Line<'static> {
     }
 }
 
+/// User-customizable prefixes (e.g. `user_prompt_prefix`) may embed `\n` to
+/// span multiple lines. A `Span` can't hold a line break, so split it here:
+/// every segment but the last becomes its own standalone leader line, and
+/// the last segment is returned separately to splice onto the first content
+/// line, same as a single-line prefix always has.
+fn split_prefix(prefix: &str) -> (Vec<&str>, &str) {
+    let mut parts: Vec<&str> = prefix.split('\n').collect();
+    let last = parts.pop().unwrap_or("");
+    (parts, last)
+}
+
 /// Inline block kinds (paragraph, heading, list) share line 1 with their
 /// prefix. Standalone kinds (code, table, hr) need a separate leader line.
 fn shares_line_with_prefix(kind: &LineKind) -> bool {
@@ -171,23 +183,25 @@ pub fn plain_lines(
     prefix_style: Style,
 ) -> Vec<Line<'static>> {
     let text = text.trim_start_matches('\n');
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (leader_lines, last_frag) = split_prefix(prefix);
+    let mut lines: Vec<Line<'static>> = leader_lines
+        .iter()
+        .map(|l| prefix_line(l, prefix_style))
+        .collect();
     let mut first_line = true;
 
+    // `text.split('\n')` always yields at least one (possibly empty) item,
+    // so this loop always runs and `lines` ends up non-empty.
     for line in text.split('\n') {
         let mut spans: Vec<Span<'static>> = Vec::new();
         if first_line {
-            if !prefix.is_empty() {
-                spans.push(prefix_span(prefix, prefix_style));
+            if !last_frag.is_empty() {
+                spans.push(prefix_span(last_frag, prefix_style));
             }
             first_line = false;
         }
         spans.push(Span::styled(line.to_owned(), text_style));
         lines.push(Line::from(spans));
-    }
-
-    if lines.is_empty() {
-        lines.push(prefix_line(prefix, prefix_style));
     }
 
     lines
@@ -206,18 +220,20 @@ pub(crate) fn paint_semantic(
         .iter()
         .map(|l| paint_line(l, text_style, &t))
         .collect();
+    let (leader_lines, last_frag) = split_prefix(prefix);
 
     if lines.is_empty() {
-        lines.push(prefix_line(prefix, prefix_style));
-        return lines;
+        lines.push(prefix_line(last_frag, prefix_style));
+    } else if shares_line_with_prefix(&semantic[0].kind) {
+        if !last_frag.is_empty() {
+            lines[0].spans.insert(0, prefix_span(last_frag, prefix_style));
+        }
+    } else if !last_frag.is_empty() {
+        lines.insert(0, prefix_line(last_frag, prefix_style));
     }
 
-    if shares_line_with_prefix(&semantic[0].kind) {
-        if !prefix.is_empty() {
-            lines[0].spans.insert(0, prefix_span(prefix, prefix_style));
-        }
-    } else if !prefix.is_empty() {
-        lines.insert(0, prefix_line(prefix, prefix_style));
+    for l in leader_lines.into_iter().rev() {
+        lines.insert(0, prefix_line(l, prefix_style));
     }
 
     lines
@@ -389,6 +405,25 @@ mod tests {
         let style = Style::default();
         let lines = text_to_lines(input, "p> ", style, style, TEST_WIDTH);
         assert_eq!(lines_text(&lines)[0], expected);
+    }
+
+    #[test]
+    fn multiline_prefix_emits_leader_lines_then_inlines_last_segment() {
+        let style = Style::default();
+        let lines = text_to_lines("hello", "---\np> ", style, style, TEST_WIDTH);
+        let texts = lines_text(&lines);
+        assert_eq!(texts, vec!["---".to_string(), "p> hello".to_string()]);
+    }
+
+    #[test]
+    fn multiline_prefix_on_plain_lines_prepends_leader_lines() {
+        let style = Style::default();
+        let lines = plain_lines("hello\nworld", "---\np> ", style, style);
+        let texts = lines_text(&lines);
+        assert_eq!(
+            texts,
+            vec!["---".to_string(), "p> hello".to_string(), "world".to_string()]
+        );
     }
 
     #[test]

@@ -312,6 +312,11 @@ impl App {
             subagent_answers: HashMap::new(),
             verbose: false,
         };
+        let startup_settings = UserSettings::load();
+        crate::animation::set_spinner_config(crate::animation::SpinnerConfig {
+            enabled: startup_settings.spinner_enabled,
+            style: spinner_style_from_str(&startup_settings.spinner_style),
+        });
         app.model_picker
             .set_recents(maki_storage::model::read_recents(&app.storage));
         *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.to_string());
@@ -887,6 +892,21 @@ impl App {
                     }
                     vec![]
                 }
+                SettingsPickerAction::ToggleSpinnerEnabled(val) => {
+                    let mut settings = UserSettings::load();
+                    settings.spinner_enabled = val;
+                    settings.save();
+                    crate::animation::set_spinner_config(crate::animation::SpinnerConfig {
+                        enabled: val,
+                        style: spinner_style_from_str(&settings.spinner_style),
+                    });
+                    if val {
+                        self.status_bar.flash("Spinner enabled".into());
+                    } else {
+                        self.status_bar.flash("Spinner disabled".into());
+                    }
+                    vec![]
+                }
                 SettingsPickerAction::EditLogCommand => {
                     self.settings_picker.close();
                     if let Ok(path) = crate::config::config_path() {
@@ -1130,6 +1150,10 @@ impl App {
     pub fn reload_config(&mut self) {
         let settings = UserSettings::load();
         self.show_token_stats = settings.show_token_stats;
+        crate::animation::set_spinner_config(crate::animation::SpinnerConfig {
+            enabled: settings.spinner_enabled,
+            style: spinner_style_from_str(&settings.spinner_style),
+        });
         self.status_bar.flash("Configuration reloaded".to_string());
     }
 
@@ -2071,6 +2095,13 @@ impl App {
 
 fn is_streaming_stop_key(key: KeyEvent) -> bool {
     key::QUIT.matches(key) || key.code == KeyCode::Esc
+}
+
+fn spinner_style_from_str(s: &str) -> crate::animation::SpinnerStyle {
+    match s {
+        "dot" => crate::animation::SpinnerStyle::Dot,
+        _ => crate::animation::SpinnerStyle::Braille,
+    }
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

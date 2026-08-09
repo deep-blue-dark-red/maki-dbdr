@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::animation::{self, active_spinner_str, animation_elapsed_ms};
 use crate::components::split_layout::SplitReq;
 use crate::components::{
     Overlay,
@@ -595,9 +595,12 @@ fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
                 SpanStyle::Named(n)
                     if n == SPINNER_STYLE_NAME || n.starts_with(SPINNER_STYLE_PREFIX) =>
                 {
+                    let elapsed = animation_elapsed_ms();
+                    let base =
+                        theme::style_by_name(n.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(n));
                     Span::styled(
-                        spinner_str(animation_elapsed_ms()),
-                        theme::style_by_name(n.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(n)),
+                        active_spinner_str(elapsed),
+                        animation::active_spinner_style(elapsed, base, theme::current().tool_success),
                     )
                 }
                 style => Span::styled(span.text.clone(), resolve_span_style(style)),

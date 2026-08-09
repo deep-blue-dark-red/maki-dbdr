@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher};
 
-use crate::animation::{animation_elapsed_ms, spinner_str};
+use crate::animation::{self, active_spinner_str, animation_elapsed_ms};
 use crate::components::Overlay;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
@@ -747,10 +747,16 @@ fn render_list<T: PickerItem>(
         });
         let label = format!("  {}", item.label());
         let suffix = item.suffix();
+        let spin_elapsed = animation_elapsed_ms();
         let detail: Option<&str> = if item.is_spinning() {
-            Some(spinner_str(animation_elapsed_ms()))
+            Some(active_spinner_str(spin_elapsed))
         } else {
             item.detail()
+        };
+        let detail_style = if item.is_spinning() {
+            animation::active_spinner_style(spin_elapsed, detail_style, t.tool_success)
+        } else {
+            detail_style
         };
         let suffix_gap = 2usize;
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);

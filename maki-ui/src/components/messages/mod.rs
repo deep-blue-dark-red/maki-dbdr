@@ -15,7 +15,7 @@ use super::tool_display::{
 use super::{
     DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
 };
-use crate::animation::spinner_str;
+use crate::animation::{self, active_spinner_str};
 use crate::components::keybindings::key;
 use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
 use crate::render_worker::RenderWorker;
@@ -1197,9 +1197,10 @@ impl MessagesPanel {
     }
 
     fn update_spinners(&mut self) {
+        let elapsed = self.started_at.elapsed().as_millis();
         let spinner_span = Span::styled(
-            spinner_str(self.started_at.elapsed().as_millis()),
-            theme::current().spinner,
+            active_spinner_str(elapsed),
+            animation::active_spinner_style(elapsed, theme::current().spinner, theme::current().tool_success),
         );
         for seg in self.cache.segments_mut() {
             seg.update_spinners(&spinner_span);
@@ -1311,7 +1312,9 @@ impl MessagesPanel {
                         .iter()
                         .filter(|m| m.role == DisplayRole::User)
                         .count();
-                    dynamic_prefix = format!("{turn_num}‧ you ∙ ");
+                    let template = crate::components::settings_picker::UserSettings::load()
+                        .user_prompt_prefix_template();
+                    dynamic_prefix = template.replace("{n}", &turn_num.to_string());
                     &dynamic_prefix
                 } else {
                     style.prefix
@@ -1367,11 +1370,13 @@ impl MessagesPanel {
 /// views when `show_thinking` is off.
 fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
     let theme = theme::current();
+    let expand_hint = crate::components::settings_picker::UserSettings::load().expand_hint();
+    let formatted_hint = format!("({expand_hint})");
     vec![
         Line::from(Span::styled(THINKING_HIDDEN_HEADER, theme.thinking)),
         Line::from(vec![
             Span::styled(format!("({line_count} lines) "), theme.tool_dim),
-            Span::styled("(click to expand)", theme.thinking),
+            Span::styled(formatted_hint, theme.thinking),
         ]),
     ]
 }

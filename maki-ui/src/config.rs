@@ -29,6 +29,55 @@ pub fn config_path() -> Result<PathBuf, std::io::Error> {
     Ok(parent.join("user.config"))
 }
 
+/// `user.config` is a flat one-line-per-setting format, so a value that
+/// needs an embedded newline (e.g. a multi-line `user_prompt_prefix`) is
+/// written as a literal `\n` escape. Unescapes `\n`, `\t`, and `\\`;
+/// anything else after a backslash is left as-is.
+fn unescape_config_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Inverse of [`unescape_config_value`], applied when writing a value back
+/// out so a raw newline in memory doesn't break the one-line-per-setting
+/// file format.
+fn escape_config_value(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
+}
+
+/// Extracts a `key = value` value, honoring surrounding `"..."` quotes.
+/// `raw_val` is the unmodified text after `=` (its trailing whitespace was
+/// already removed by the caller's line-level `trim()`, but leading
+/// whitespace right after `=` has not been). Quoted values keep their inner
+/// whitespace exactly (so a trailing space, e.g. in `user_prompt_prefix`,
+/// survives); unquoted values are fully trimmed, matching every other
+/// setting in this file.
+fn parse_string_value(raw_val: &str) -> &str {
+    let s = raw_val.trim_start();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s.trim_end()
+    }
+}
+
 pub fn default_skills_dirs() -> Vec<String> {
     let mut dirs = Vec::new();
     if let Ok(config_dir) = maki_storage::paths::config_dir() {
@@ -95,9 +144,9 @@ pub fn load_config() -> UserSettings {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some((key, val)) = line.split_once('=') {
+        if let Some((key, raw_val)) = line.split_once('=') {
             let key = key.trim();
-            let val = val.trim();
+            let val = raw_val.trim();
             match key {
                 "show_system_prompt" => settings.show_system_prompt = val.parse().unwrap_or(false),
                 "api_logging" => settings.api_logging = val.parse().unwrap_or(false),
@@ -109,6 +158,16 @@ pub fn load_config() -> UserSettings {
                 "export_path" => settings.export_path = Some(val.to_string()),
                 "disabled_plugin" => settings.disabled_plugins.push(val.to_string()),
                 "global_sessions" => settings.global_sessions = val.parse().unwrap_or(false),
+                "spinner_enabled" => settings.spinner_enabled = val.parse().unwrap_or(true),
+                "spinner_style" => settings.spinner_style = val.to_string(),
+                "override_expand_string" => {
+                    settings.override_expand_string =
+                        Some(unescape_config_value(parse_string_value(raw_val)));
+                }
+                "user_prompt_prefix" => {
+                    settings.user_prompt_prefix =
+                        Some(unescape_config_value(parse_string_value(raw_val)));
+                }
                 "keybind" => {
                     if let Some((shortcut, action)) = val.split_once('=') {
                         let shortcut = shortcut.trim();
@@ -142,11 +201,19 @@ pub fn save_config(settings: &UserSettings) {
     lines.push(format!("show_reasoning = {}", settings.show_reasoning));
     lines.push(format!("show_token_stats = {}", settings.show_token_stats));
     lines.push(format!("global_sessions = {}", settings.global_sessions));
+    lines.push(format!("spinner_enabled = {}", settings.spinner_enabled));
+    lines.push(format!("spinner_style = {}", settings.spinner_style));
     if let Some(ref cmd) = settings.log_command {
         lines.push(format!("log_command = {}", cmd));
     }
     if let Some(tokens) = settings.compact_tokens {
         lines.push(format!("compact_tokens = {}", tokens));
+    }
+    if let Some(ref expand_str) = settings.override_expand_string {
+        lines.push(format!("override_expand_string = \"{}\"", escape_config_value(expand_str)));
+    }
+    if let Some(ref prefix) = settings.user_prompt_prefix {
+        lines.push(format!("user_prompt_prefix = \"{}\"", escape_config_value(prefix)));
     }
     for dir in &settings.skills_dirs {
         lines.push(format!("skills_dir = {}", dir));
@@ -201,4 +268,39 @@ pub fn save_config(settings: &UserSettings) {
     }
 
     let _ = fs::write(&path, lines.join("\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::components::settings_picker::UserSettings;
+
+    #[test]
+    fn escape_unescape_round_trips_newlines_and_backslashes() {
+        let original = "---\n{n}> \\literal";
+        let escaped = escape_config_value(original);
+        assert_eq!(escaped, "---\\n{n}> \\\\literal");
+        assert_eq!(unescape_config_value(&escaped), original);
+    }
+
+    #[test]
+    fn unescape_leaves_unknown_escapes_untouched() {
+        assert_eq!(unescape_config_value(r"\q"), r"\q");
+    }
+
+    #[test]
+    fn save_then_load_round_trips_multiline_user_prompt_prefix() {
+        let settings = UserSettings {
+            user_prompt_prefix: Some("---\n{n}> ".to_string()),
+            ..Default::default()
+        };
+        settings.save();
+
+        let loaded = load_config();
+        assert_eq!(loaded.user_prompt_prefix.as_deref(), Some("---\n{n}> "));
+
+        // Reset so other tests sharing this thread's config file (test mode
+        // pins one file per OS thread) don't see this value.
+        UserSettings::default().save();
+    }
 }
