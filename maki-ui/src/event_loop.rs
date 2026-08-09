@@ -1115,7 +1115,11 @@ impl<'t> EventLoop<'t> {
                     .replace("<path>", &log_path_str)
                     .replace("alog", &log_path_str)
                     .replace("{}", &log_path_str);
-                if let Err(e) = terminal::run_shell_command(&cmd_string, self.terminal) {
+                let result = {
+                    let _pause = self.input.pause();
+                    terminal::run_shell_command(&cmd_string, self.terminal)
+                };
+                if let Err(e) = result {
                     self.sessions[idx].app.flash(e);
                 }
             }
