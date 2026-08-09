@@ -3,7 +3,7 @@ use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::rewind_picker::{RewindEntry, display_msg_index_for_turn, NO_TURNS_MSG};
 
 use crossterm::event::KeyEvent;
-use maki_providers::{Message, Role};
+use maki_providers::Message;
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
@@ -31,7 +31,7 @@ impl GotoPicker {
         let mut turn_num = 0usize;
         let mut entries: Vec<RewindEntry> = Vec::new();
         for (msg_idx, msg) in messages.iter().enumerate() {
-            if !matches!(msg.role, Role::User) {
+            if !msg.is_user_turn() {
                 continue;
             }
             let Some(full_text) = msg.user_text() else {

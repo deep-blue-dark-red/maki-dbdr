@@ -275,6 +275,14 @@ impl Message {
         }
     }
 
+    /// Whether this message is a turn the human actually typed. `Role::User`
+    /// alone isn't enough: tool results and synthetic continuation prompts
+    /// (nudges, post-compaction "continue") are *also* sent with
+    /// `Role::User` at the API level, but `user_text()` is `None` for both.
+    pub fn is_user_turn(&self) -> bool {
+        matches!(self.role, Role::User) && self.user_text().is_some()
+    }
+
     pub fn first_text_content(&self) -> Option<&str> {
         self.content.iter().find_map(|b| match b {
             ContentBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
