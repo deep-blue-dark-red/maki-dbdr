@@ -23,6 +23,7 @@ pub struct TextBuffer {
     lines: Vec<String>,
     raw_x: usize,
     cursor_y: usize,
+    revision: u64,
 }
 
 impl TextBuffer {
@@ -32,7 +33,16 @@ impl TextBuffer {
             lines,
             raw_x: 0,
             cursor_y: 0,
+            revision: 0,
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn bump(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn value(&self) -> String {
@@ -77,6 +87,7 @@ impl TextBuffer {
         let bx = self.byte_x();
         self.lines[self.cursor_y].insert(bx, c);
         self.raw_x = self.x() + 1;
+        self.bump();
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -89,6 +100,7 @@ impl TextBuffer {
                 let bx = self.byte_x();
                 self.lines[self.cursor_y].insert_str(bx, chunk);
                 self.raw_x = self.x() + chunk.chars().count();
+                self.bump();
             }
         }
     }
@@ -101,6 +113,7 @@ impl TextBuffer {
         self.lines.insert(self.cursor_y + 1, right);
         self.raw_x = 0;
         self.cursor_y += 1;
+        self.bump();
     }
 
     pub fn remove_char(&mut self) {
@@ -111,6 +124,7 @@ impl TextBuffer {
             let bx = Self::char_to_byte(self.current_line(), x - 1);
             self.lines[self.cursor_y].remove(bx);
             self.raw_x = x - 1;
+            self.bump();
         }
     }
 
@@ -121,6 +135,7 @@ impl TextBuffer {
         } else {
             let bx = self.byte_x();
             self.lines[self.cursor_y].remove(bx);
+            self.bump();
         }
     }
 
@@ -179,11 +194,13 @@ impl TextBuffer {
         let byte_start = Self::char_to_byte(self.current_line(), x);
         let byte_end = Self::char_to_byte(self.current_line(), new_x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
+        self.bump();
     }
 
     pub fn kill_to_end_of_line(&mut self) {
         let bx = self.byte_x();
         self.lines[self.cursor_y].truncate(bx);
+        self.bump();
     }
 
     pub fn remove_word_before_cursor(&mut self) {
@@ -198,6 +215,7 @@ impl TextBuffer {
         let byte_end = Self::char_to_byte(line, x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
         self.raw_x = new_x;
+        self.bump();
     }
 
     pub fn move_word_left(&mut self) {
@@ -260,6 +278,7 @@ impl TextBuffer {
         self.lines = vec![String::new()];
         self.raw_x = 0;
         self.cursor_y = 0;
+        self.bump();
     }
 
     pub fn move_to_end(&mut self) {
@@ -271,6 +290,7 @@ impl TextBuffer {
         if self.cursor_y + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_y + 1);
             self.lines[self.cursor_y].push_str(&next);
+            self.bump();
         }
     }
 
@@ -287,6 +307,7 @@ impl TextBuffer {
         let byte_x = Self::char_to_byte(&self.lines[self.cursor_y], self.x());
         self.lines[self.cursor_y].drain(..byte_x);
         self.raw_x = 0;
+        self.bump();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {

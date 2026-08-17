@@ -1,8 +1,6 @@
-use std::cmp::Ordering;
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use serde::Serialize;
 use maki_providers::format_tokens;
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -11,11 +9,13 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use serde::Serialize;
+use std::cmp::Ordering;
 
-use crate::components::{ModalScroll, hint_line};
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{ModalScroll, hint_line};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -248,12 +248,17 @@ impl SortState {
                 SortColumn::Turn => (b.user_turn, b.id).cmp(&(a.user_turn, a.id)),
                 SortColumn::Time => b.received_at.as_second().cmp(&a.received_at.as_second()),
                 SortColumn::Input => b.input.cmp(&a.input),
-                SortColumn::Cache => (b.cache_read + b.cache_creation).cmp(&(a.cache_read + a.cache_creation)),
+                SortColumn::Cache => {
+                    (b.cache_read + b.cache_creation).cmp(&(a.cache_read + a.cache_creation))
+                }
                 SortColumn::Pct => num(a.cache_rate(), b.cache_rate(), true),
                 SortColumn::Out => b.output.cmp(&a.output),
                 SortColumn::Total => b.total_duration_ms().cmp(&a.total_duration_ms()),
                 SortColumn::Tool => b.tool_duration_ms.cmp(&a.tool_duration_ms),
-                SortColumn::Api => b.api_duration_ms.unwrap_or(0).cmp(&a.api_duration_ms.unwrap_or(0)),
+                SortColumn::Api => b
+                    .api_duration_ms
+                    .unwrap_or(0)
+                    .cmp(&a.api_duration_ms.unwrap_or(0)),
                 SortColumn::ToolErr => b.tool_error_count.cmp(&a.tool_error_count),
                 SortColumn::ApiErr => b.api_error_count.cmp(&a.api_error_count),
                 SortColumn::Cost => match (a.cost, b.cost) {
@@ -269,12 +274,17 @@ impl SortState {
                 SortColumn::Turn => a.event_id.cmp(&b.event_id),
                 SortColumn::Time => a.received_at.as_second().cmp(&b.received_at.as_second()),
                 SortColumn::Input => a.input.cmp(&b.input),
-                SortColumn::Cache => (a.cache_read + a.cache_creation).cmp(&(b.cache_read + b.cache_creation)),
+                SortColumn::Cache => {
+                    (a.cache_read + a.cache_creation).cmp(&(b.cache_read + b.cache_creation))
+                }
                 SortColumn::Pct => num(a.cache_rate(), b.cache_rate(), false),
                 SortColumn::Out => a.output.cmp(&b.output),
                 SortColumn::Total => a.total_duration_ms().cmp(&b.total_duration_ms()),
                 SortColumn::Tool => a.tool_duration_ms.cmp(&b.tool_duration_ms),
-                SortColumn::Api => a.api_duration_ms.unwrap_or(0).cmp(&b.api_duration_ms.unwrap_or(0)),
+                SortColumn::Api => a
+                    .api_duration_ms
+                    .unwrap_or(0)
+                    .cmp(&b.api_duration_ms.unwrap_or(0)),
                 SortColumn::ToolErr => a.tool_error_count.cmp(&b.tool_error_count),
                 SortColumn::ApiErr => a.api_error_count.cmp(&b.api_error_count),
                 SortColumn::Cost => match (a.cost, b.cost) {
@@ -485,7 +495,8 @@ impl StatsModal {
         }
 
         let total_cost: f64 = turns.iter().filter_map(|t| t.cost).sum::<f64>() + 0.0;
-        let user_turns: std::collections::HashSet<usize> = turns.iter().map(|t| t.user_turn).collect();
+        let user_turns: std::collections::HashSet<usize> =
+            turns.iter().map(|t| t.user_turn).collect();
         let mut lines = Vec::new();
         if self.searching {
             lines.push(self.search_line(theme));
@@ -501,7 +512,11 @@ impl StatsModal {
         lines.push(Line::default());
         lines.push(self.header_line(theme));
         for &i in idx {
-            lines.push(self.row_line(&turns[i], theme));
+            let turn = &turns[i];
+            lines.push(self.row_line(turn, theme));
+            for call in &turn.tool_calls {
+                lines.push(tool_call_line(call, theme));
+            }
         }
         lines.push(Line::default());
         lines.push(hint_line(&[
@@ -608,30 +623,43 @@ fn truncate_cell(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
     }
-    s.chars().take(width.saturating_sub(1)).chain(['…']).collect()
+    s.chars()
+        .take(width.saturating_sub(1))
+        .chain(['…'])
+        .collect()
 }
 
 fn header_row(theme: &crate::theme::Theme) -> Line<'static> {
     Line::from(Span::styled(
         format!(
             "{PREFIX}{:<COL_TURN$} {:<COL_TIME$} {:>COL_TOKENS$} {:>COL_TOKENS$} {:>COL_PCT$}% {:>COL_MARK$} {:>COL_TOKENS$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_ERR$} {:>COL_ERR$} {:>COL_COST$} {:<COL_UPSTREAM$}",
-            "turn", "time", "in", "cache", "cch", "", "out", "total", "tool", "api", "tE", "aE", "cost", "upstream",
+            "turn",
+            "time",
+            "in",
+            "cache",
+            "cch",
+            "",
+            "out",
+            "total",
+            "tool",
+            "api",
+            "tE",
+            "aE",
+            "cost",
+            "upstream",
         ),
         theme.status_dim,
     ))
 }
 
 fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
-    let fg = Style::new().fg(theme.foreground);    let time = t
+    let fg = Style::new().fg(theme.foreground);
+    let time = t
         .received_at
         .to_zoned(TimeZone::system())
         .strftime("%Y-%m-%d %H:%M:%S")
         .to_string();
-    let mark_style = if t.cache_miss {
-        theme.tool_error
-    } else {
-        fg
-    };
+    let mark_style = if t.cache_miss { theme.tool_error } else { fg };
     let mark = if t.cache_miss { "𐄂" } else { "✓" };
     let cost = match t.cost {
         Some(c) => format!("{c:>COL_COST$.4}"),
@@ -655,7 +683,10 @@ fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
         Span::styled(format!("{time:<COL_TIME$} "), fg),
         Span::styled(format!("{:>COL_TOKENS$} ", format_tokens(t.input)), fg),
         Span::styled(
-            format!("{:>COL_TOKENS$} ", format_tokens(t.cache_read + t.cache_creation)),
+            format!(
+                "{:>COL_TOKENS$} ",
+                format_tokens(t.cache_read + t.cache_creation)
+            ),
             fg,
         ),
         Span::styled(format!("{:>COL_PCT$.0}% ", t.cache_rate() * 100.0), fg),
@@ -686,7 +717,10 @@ fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
 /// visually with the row's `✓`/`𐄂` cache-miss mark one line up, which means
 /// something entirely different; the error slot stays reserved either way so
 /// the names still line up.
-fn tool_call_line(rec: &maki_agent::agent::turn_state::ToolCallRecord, theme: &crate::theme::Theme) -> Line<'static> {
+fn tool_call_line(
+    rec: &maki_agent::agent::turn_state::ToolCallRecord,
+    theme: &crate::theme::Theme,
+) -> Line<'static> {
     const BRANCH: &str = "└ ";
     const MARK_SLOT: usize = 2;
     let fg = Style::new().fg(theme.foreground);
@@ -697,10 +731,7 @@ fn tool_call_line(rec: &maki_agent::agent::turn_state::ToolCallRecord, theme: &c
     Line::from(vec![
         Span::raw(" ".repeat(indent as usize)),
         Span::raw(BRANCH),
-        Span::styled(
-            if rec.is_error { "✗ " } else { "  " },
-            theme.tool_error,
-        ),
+        Span::styled(if rec.is_error { "✗ " } else { "  " }, theme.tool_error),
         Span::styled(
             format!("{:<name_width$}", truncate_cell(&rec.tool, name_width)),
             fg,
@@ -790,11 +821,17 @@ fn column_ranges() -> Vec<(u16, u16)> {
 }
 
 fn pct_index() -> usize {
-    column_defs().iter().position(|(c, _, _)| *c == Some(SortColumn::Pct)).unwrap()
+    column_defs()
+        .iter()
+        .position(|(c, _, _)| *c == Some(SortColumn::Pct))
+        .unwrap()
 }
 
 fn column_idx(col: SortColumn) -> usize {
-    column_defs().iter().position(|(c, _, _)| *c == Some(col)).unwrap()
+    column_defs()
+        .iter()
+        .position(|(c, _, _)| *c == Some(col))
+        .unwrap()
 }
 
 fn column_at_index(idx: usize) -> SortColumn {
@@ -810,7 +847,7 @@ fn row_search_text(t: &TurnSnapshot) -> String {
         .strftime("%Y-%m-%d %H:%M:%S")
         .to_string();
     format!(
-        "{} {time} {} {} {} {} {:.2} {} {} {} {} {:.4}",
+        "{} {time} {} {} {} {} {:.2} {} {} {} {} {:.4} {} {}",
         t.event_id,
         t.input,
         t.cache_read + t.cache_creation,
@@ -822,6 +859,12 @@ fn row_search_text(t: &TurnSnapshot) -> String {
         t.tool_error_count,
         t.api_error_count,
         t.cost.unwrap_or(0.0),
+        t.tool_calls
+            .iter()
+            .map(|c| c.tool.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        upstream_name(t),
     )
 }
 
@@ -830,10 +873,19 @@ fn row_search_text(t: &TurnSnapshot) -> String {
 /// BOLD modifier layered on their existing styling.
 fn highlight_query(line: &mut Line<'static>, query: &str, matcher: &mut Matcher) {
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let atom = Atom::new(query, CaseMatching::Smart, Normalization::Smart, AtomKind::Fuzzy, false);
+    let atom = Atom::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
     let mut buf = Vec::new();
     let mut indices = Vec::new();
-    if atom.indices(Utf32Str::new(&text, &mut buf), matcher, &mut indices).is_none() {
+    if atom
+        .indices(Utf32Str::new(&text, &mut buf), matcher, &mut indices)
+        .is_none()
+    {
         return;
     }
     // Flatten the row into (char, style) pairs so the global match indices
@@ -904,7 +956,10 @@ mod tests {
             "header/row width differ\nheader: {header:?}\nrow:    {row:?}"
         );
         let cell = |s: &str, start: u16, end: u16| -> String {
-            s.chars().skip(start as usize).take((end - start) as usize).collect()
+            s.chars()
+                .skip(start as usize)
+                .take((end - start) as usize)
+                .collect()
         };
         for (i, (_, label, width)) in column_defs().iter().enumerate() {
             let (start, end) = column_ranges()[i];
@@ -1101,7 +1156,11 @@ mod tests {
         t.input = 0;
         t.cache_read = 0;
         t.cache_creation = 10_000;
-        assert!((t.cache_rate() - 1.0).abs() < 1e-9, "got: {}", t.cache_rate());
+        assert!(
+            (t.cache_rate() - 1.0).abs() < 1e-9,
+            "got: {}",
+            t.cache_rate()
+        );
     }
 
     /// A later turn mostly re-reading an already-established cache, with a
@@ -1112,7 +1171,11 @@ mod tests {
         t.input = 500;
         t.cache_read = 9_500;
         t.cache_creation = 0;
-        assert!((t.cache_rate() - 0.95).abs() < 1e-9, "got: {}", t.cache_rate());
+        assert!(
+            (t.cache_rate() - 0.95).abs() < 1e-9,
+            "got: {}",
+            t.cache_rate()
+        );
     }
 
     #[test]
@@ -1283,6 +1346,10 @@ mod tests {
             };
             col = st.next_column().column;
         }
-        assert_eq!(col, SortColumn::Cost, "cycling {n} columns returns to start");
+        assert_eq!(
+            col,
+            SortColumn::Cost,
+            "cycling {n} columns returns to start"
+        );
     }
 }

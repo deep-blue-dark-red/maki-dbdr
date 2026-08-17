@@ -379,16 +379,18 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     is_error,
                 } => {
                     let trimmed = content.trim_start();
-                    let mut response_val = if (trimmed.starts_with('{') || trimmed.starts_with('['))
-                        && let Ok(val) = serde_json::from_str::<Value>(content)
-                    {
-                        match val {
-                            Value::Object(map) => Value::Object(map),
-                            other => json!({"result": other}),
-                        }
-                    } else {
-                        json!({"result": content})
-                    };
+                    let starts_json = trimmed.chars().next().is_some_and(|c| {
+                        matches!(c, '{' | '[' | '"' | '-' | 't' | 'f' | 'n' | '0'..='9')
+                    });
+                    let mut response_val =
+                        if starts_json && let Ok(val) = serde_json::from_str::<Value>(content) {
+                            match val {
+                                Value::Object(map) => Value::Object(map),
+                                other => json!({"result": other}),
+                            }
+                        } else {
+                            json!({"result": content})
+                        };
                     if *is_error {
                         response_val = json!({"error": response_val});
                     }
@@ -846,6 +848,10 @@ mod tests {
     #[test_case("not json at all", json!({"result": "not json at all"}) ; "non_json_wraps_string")]
     #[test_case(r#""a json string""#, json!({"result": "a json string"}) ; "json_scalar_wraps")]
     #[test_case("42", json!({"result": 42}) ; "json_number_wraps")]
+    #[test_case("-1.5", json!({"result": -1.5}) ; "json_negative_float_wraps")]
+    #[test_case("true", json!({"result": true}) ; "json_bool_wraps")]
+    #[test_case("null", json!({"result": null}) ; "json_null_wraps")]
+    #[test_case("[1, 2]", json!({"result": [1, 2]}) ; "json_array_wraps")]
     #[test_case(r#"{"out": "ok"}"#, json!({"out": "ok"}) ; "json_object_passes_through")]
     fn convert_messages_tool_result_response_is_always_struct(content: &str, expected: Value) {
         let messages = vec![

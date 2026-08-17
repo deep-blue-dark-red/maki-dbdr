@@ -54,6 +54,10 @@ const NIL_WITHOUT_FINISH_MSG: &str =
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
 const HANDLER_TIMEOUT_MSG: &str = "timeout";
 const MAX_INFLIGHT_TOOLS: usize = 64;
+/// Log a tool call's gate wait when it exceeds this. Gate waits mean the
+/// concurrent-tool cap is hit, which only happens under heavy parallelism;
+/// below the threshold the wait is too small to matter for diagnosis.
+const GATE_WAIT_REPORT_THRESHOLD: Duration = Duration::from_millis(5);
 /// Finished tools kept clickable without a restore round-trip. Purely a
 /// cache: a click that misses it falls back to the restore item carried
 /// by the request, so eviction only costs latency, never correctness.
@@ -1033,7 +1037,18 @@ impl InflightGate {
     /// and the cap still holds because no coroutine is created before its
     /// guard exists.
     async fn acquire(self: &Rc<Self>) -> GateGuard {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
         self.wait_below(MAX_INFLIGHT_TOOLS).await;
+        if let Some(started) = started {
+            let waited = started.elapsed();
+            if waited >= GATE_WAIT_REPORT_THRESHOLD {
+                tracing::debug!(
+                    wait_ms = waited.as_millis(),
+                    inflight = self.count.get(),
+                    "lua tool call waited for inflight-tool gate"
+                );
+            }
+        }
         GateGuard::new(self)
     }
 }
@@ -1406,6 +1421,13 @@ impl LuaRuntime {
             tracing::debug!(error = %e, "native codegen failed");
         }
         true
+    }
+
+    fn codegen_backlog_len(&self) -> usize {
+        self.codegen_queue
+            .as_ref()
+            .map(|q| q.lock().expect("codegen queue").len())
+            .unwrap_or(0)
     }
 
     fn drop_plugin_keys(&mut self, name: &str) {
@@ -2268,6 +2290,63 @@ async fn run_tool_start(
 
 /// Two layers of deadline enforcement: the watchdog interrupt catches
 /// tight CPU loops, the dispatch loop catches I/O waits.
+const TOOL_CALL_PERF_MSG: &str = "lua tool call";
+
+#[derive(Clone, Copy)]
+struct ToolCallPerf {
+    enabled: bool,
+    started: Option<Instant>,
+    setup_done: Option<Instant>,
+    executed: Duration,
+}
+
+impl ToolCallPerf {
+    /// Only captures timing when DEBUG logs are enabled, so the common
+    /// `RUST_LOG=info` run pays a single branch, not a timestamp each phase.
+    fn begin() -> Self {
+        let enabled = tracing::enabled!(tracing::Level::DEBUG);
+        Self {
+            enabled,
+            started: enabled.then(Instant::now),
+            setup_done: None,
+            executed: Duration::ZERO,
+        }
+    }
+
+    fn setup_finished(mut self) -> Self {
+        if self.enabled {
+            self.setup_done = Some(Instant::now());
+        }
+        self
+    }
+
+    fn add_executed(&mut self, d: Duration) {
+        self.executed += d;
+    }
+
+    fn finish(self, plugin: &str, tool: &str, reply_kind: &str) {
+        let Some(started) = self.started else {
+            return;
+        };
+        let total_us = started.elapsed().as_micros();
+        let setup_us = self
+            .setup_done
+            .map(|t| t.duration_since(started).as_micros())
+            .unwrap_or(0);
+        tracing::debug!(
+            plugin,
+            tool,
+            reply_kind,
+            total_us,
+            setup_us,
+            executed_us = self.executed.as_micros(),
+            TOOL_CALL_PERF_MSG,
+        );
+    }
+}
+
+/// Two layers of deadline enforcement: the watchdog interrupt catches
+/// tight CPU loops, the dispatch loop catches I/O waits.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_call(
     lua: Lua,
@@ -2299,6 +2378,8 @@ async fn run_tool_call(
         return ToolCallReply::err("plugin host shutting down");
     }
 
+    let perf = ToolCallPerf::begin();
+
     let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
     ctx.finish_tx = Some(finish_tx);
     let cancel = ctx.cancel.clone();
@@ -2327,6 +2408,7 @@ async fn run_tool_call(
         Ok(at) => at,
         Err(e) => return ToolCallReply::err(strip_traceback(&e)),
     };
+    let mut perf = perf.setup_finished();
     if let Some(id) = &live_id {
         live_tasks
             .borrow_mut()
@@ -2365,7 +2447,13 @@ async fn run_tool_call(
 
     // `tool.rs` timeout is the absolute backstop; the dispatch loop
     // and watchdog interrupt enforce the per-plugin deadline from TaskCell.
+    let exec_started = perf.enabled.then(Instant::now);
     let reply = call_future.await;
+    if let Some(started) = exec_started {
+        perf.add_executed(started.elapsed());
+    }
+    let reply_kind = if reply.result.is_err() { "error" } else { "ok" };
+    perf.finish(&plugin, &tool, reply_kind);
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
         // Best-effort cache: any tool with a root buf can serve clicks.
@@ -2547,6 +2635,17 @@ pub fn spawn(
                             reply,
                             live,
                         } => {
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let backlog = rt.codegen_backlog_len();
+                                if backlog > 0 {
+                                    tracing::debug!(
+                                        plugin = %plugin,
+                                        tool = %tool,
+                                        backlog,
+                                        "lua tool call started before native codegen drained"
+                                    );
+                                }
+                            }
                             let lua = rt.lua.clone();
                             let plugins = Rc::clone(&rt.plugins);
                             let live_tasks = Rc::clone(&rt.live_tasks);

@@ -79,6 +79,17 @@ pub struct InputBox {
     max_input_lines: u16,
     last_total_lines: u16,
     last_content_height: u16,
+    render_cache: Option<(RenderKey, Vec<Line<'static>>)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    revision: u64,
+    cursor: (usize, usize),
+    ew: usize,
+    focused: bool,
+    streaming: bool,
+    image_count: usize,
 }
 
 impl InputBox {
@@ -172,6 +183,7 @@ impl InputBox {
             max_input_lines,
             last_total_lines: 1,
             last_content_height: 1,
+            render_cache: None,
         }
     }
 
@@ -347,73 +359,22 @@ impl InputBox {
         let max_scroll = self.max_scroll();
         self.scroll_y = self.scroll_y.min(max_scroll);
 
-        let is_empty = self.buffer.value().is_empty();
-        let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
-            let placeholder_base = theme::current().input_placeholder;
-            if streaming {
-                vec![Line::from(vec![
-                    super::chevron_span(),
-                    if focused {
-                        Span::styled("Q", placeholder_base.reversed())
-                    } else {
-                        Span::styled("Q", placeholder_base)
-                    },
-                    Span::styled("ueue another prompt...", placeholder_base),
-                ])]
-            } else {
-                vec![Line::from(vec![
-                    super::chevron_span(),
-                    if focused {
-                        Span::styled("A", placeholder_base.reversed())
-                    } else {
-                        Span::styled("A", placeholder_base)
-                    },
-                    Span::styled("sk maki to ", placeholder_base),
-                    Span::styled(
-                        self.placeholder_hint,
-                        placeholder_base.add_modifier(ratatui::style::Modifier::ITALIC),
-                    ),
-                    Span::styled("...", placeholder_base),
-                ])]
-            }
-        } else {
-            let cursor_y = self.buffer.y();
-            let cursor_x = self.buffer.x();
-            self.buffer
-                .lines()
-                .iter()
-                .enumerate()
-                .flat_map(|(i, line)| {
-                    let is_cursor_line = i == cursor_y && focused;
-                    let shell_spans = if i == 0 {
-                        shell_highlight_spans(line)
-                    } else {
-                        None
-                    };
-                    wrap_line(
-                        line,
-                        ew,
-                        is_cursor_line,
-                        cursor_x,
-                        i == 0,
-                        shell_spans.as_deref(),
-                    )
-                })
-                .collect()
+        let key = RenderKey {
+            revision: self.buffer.revision(),
+            cursor: (self.buffer.x(), self.buffer.y()),
+            ew,
+            focused,
+            streaming,
+            image_count: self.pending_images.len(),
         };
-
-        if !self.pending_images.is_empty() {
-            let n = self.pending_images.len();
-            let label = match n {
-                1 => "1 image".to_string(),
-                _ => format!("{n} images"),
-            };
-            styled_lines.push(Line::from(Span::styled(
-                label,
-                theme::current().input_placeholder,
-            )));
-        }
-
+        let styled_lines = match &self.render_cache {
+            Some((k, lines)) if *k == key => lines.clone(),
+            _ => {
+                let lines = render_lines(self, ew, focused, streaming);
+                self.render_cache = Some((key, lines.clone()));
+                lines
+            }
+        };
         let text = Text::from(styled_lines);
         let mut block = Block::default()
             .borders(Borders::TOP | Borders::BOTTOM)
@@ -463,6 +424,78 @@ fn random_placeholder_hint() -> &'static str {
 
 fn effective_width(content_width: usize) -> usize {
     content_width.saturating_sub(PREFIX_WIDTH as usize)
+}
+
+fn render_lines(input: &InputBox, ew: usize, focused: bool, streaming: bool) -> Vec<Line<'static>> {
+    let is_empty =
+        input.buffer.line_count() <= 1 && input.buffer.lines().first().is_none_or(String::is_empty);
+    if is_empty && input.pending_images.is_empty() {
+        let placeholder_base = theme::current().input_placeholder;
+        return if streaming {
+            vec![Line::from(vec![
+                super::chevron_span(),
+                if focused {
+                    Span::styled("Q", placeholder_base.reversed())
+                } else {
+                    Span::styled("Q", placeholder_base)
+                },
+                Span::styled("ueue another prompt...", placeholder_base),
+            ])]
+        } else {
+            vec![Line::from(vec![
+                super::chevron_span(),
+                if focused {
+                    Span::styled("A", placeholder_base.reversed())
+                } else {
+                    Span::styled("A", placeholder_base)
+                },
+                Span::styled("sk maki to ", placeholder_base),
+                Span::styled(
+                    input.placeholder_hint,
+                    placeholder_base.add_modifier(ratatui::style::Modifier::ITALIC),
+                ),
+                Span::styled("...", placeholder_base),
+            ])]
+        };
+    }
+
+    let cursor_y = input.buffer.y();
+    let cursor_x = input.buffer.x();
+    let mut lines: Vec<Line> = input
+        .buffer
+        .lines()
+        .iter()
+        .enumerate()
+        .flat_map(|(i, line)| {
+            let is_cursor_line = i == cursor_y && focused;
+            let shell_spans = if i == 0 {
+                shell_highlight_spans(line)
+            } else {
+                None
+            };
+            wrap_line(
+                line,
+                ew,
+                is_cursor_line,
+                cursor_x,
+                i == 0,
+                shell_spans.as_deref(),
+            )
+        })
+        .collect();
+
+    if !input.pending_images.is_empty() {
+        let n = input.pending_images.len();
+        let label = match n {
+            1 => "1 image".to_string(),
+            _ => format!("{n} images"),
+        };
+        lines.push(Line::from(Span::styled(
+            label,
+            theme::current().input_placeholder,
+        )));
+    }
+    lines
 }
 
 fn wrap_line(

@@ -13,15 +13,25 @@ const STREAMING_MAX_LINE_BYTES: usize = 5_000;
 ///
 /// Memoizes the rendered line tree under a content-addressed key so
 /// repaints during streaming are free when nothing changed. The key
-/// combines a 64-bit hash of the visible text, its byte length, the
-/// render width, and the theme generation. Length is part of the key
-/// alongside the hash because hashing alone could in principle collide;
-/// requiring both makes accidental reuse on different buffers
-/// astronomically unlikely.
+/// combines a 64-bit hash and the byte length of the visible text with
+/// the render width and theme generation. When the caller streams a
+/// monotonic prefix (never the case with a different buffer at the same
+/// byte length), it can assert length-only identity to skip hashing the
+/// whole visible text on every frame.
 #[derive(Default)]
 struct StreamingCache {
     key: Option<CacheKey>,
     lines: Vec<Line<'static>>,
+}
+
+/// How a streamed block is painted. The three travel together everywhere:
+/// `set_style` replaces all of them at once, and the cache only needs them
+/// to repaint, never to decide whether a repaint is due.
+#[derive(Clone, Copy)]
+struct Paint<'a> {
+    prefix: &'a str,
+    text_style: Style,
+    prefix_style: Style,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,19 +68,32 @@ impl StreamingCache {
         &mut self,
         renderer: &mut Renderer,
         visible: &str,
-        prefix: &str,
-        text_style: Style,
-        prefix_style: Style,
+        paint: Paint<'_>,
         width: u16,
+        monotonic: bool,
     ) -> bool {
         let theme_gen = theme::generation();
-        let key = CacheKey::for_text(visible, width, theme_gen);
+        let key = if monotonic {
+            CacheKey {
+                hash: 0,
+                byte_len: visible.len(),
+                width,
+                theme_gen,
+            }
+        } else {
+            CacheKey::for_text(visible, width, theme_gen)
+        };
         if self.key == Some(key) {
             return false;
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
         let semantic = renderer.render(text.as_ref(), width, theme_gen);
-        self.lines = paint_semantic(&semantic, prefix, text_style, prefix_style);
+        self.lines = paint_semantic(
+            &semantic,
+            paint.prefix,
+            paint.text_style,
+            paint.prefix_style,
+        );
         self.key = Some(key);
         true
     }
@@ -80,9 +103,7 @@ pub(crate) struct StreamingContent {
     typewriter: Typewriter,
     cache: StreamingCache,
     renderer: Renderer,
-    prefix: &'static str,
-    text_style: Style,
-    prefix_style: Style,
+    paint: Paint<'static>,
 }
 
 impl StreamingContent {
@@ -96,9 +117,11 @@ impl StreamingContent {
             typewriter: Typewriter::with_speed(ms_per_char),
             cache: StreamingCache::default(),
             renderer: Renderer::unwrapped(),
-            prefix,
-            text_style,
-            prefix_style,
+            paint: Paint {
+                prefix,
+                text_style,
+                prefix_style,
+            },
         }
     }
 
@@ -135,9 +158,11 @@ impl StreamingContent {
     }
 
     pub fn set_style(&mut self, prefix: &'static str, text_style: Style, prefix_style: Style) {
-        self.prefix = prefix;
-        self.text_style = text_style;
-        self.prefix_style = prefix_style;
+        self.paint = Paint {
+            prefix,
+            text_style,
+            prefix_style,
+        };
         self.cache.invalidate();
     }
 
@@ -146,10 +171,9 @@ impl StreamingContent {
         self.cache.get_or_update(
             &mut self.renderer,
             self.typewriter.visible(),
-            self.prefix,
-            self.text_style,
-            self.prefix_style,
+            self.paint,
             width,
+            true,
         );
         &self.cache.lines
     }
@@ -174,7 +198,7 @@ impl std::fmt::Debug for StreamingContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamingContent")
             .field("typewriter", &self.typewriter)
-            .field("prefix", &self.prefix)
+            .field("prefix", &self.paint.prefix)
             .finish()
     }
 }
@@ -252,15 +276,28 @@ mod tests {
             cache.get_or_update(
                 &mut renderer,
                 &full_text[..end],
-                prefix,
-                style,
-                style,
+                Paint {
+                    prefix,
+                    text_style: style,
+                    prefix_style: style,
+                },
                 width,
+                true,
             );
             end += step;
         }
 
-        cache.get_or_update(&mut renderer, full_text, prefix, style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            full_text,
+            Paint {
+                prefix,
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         let incremental = cache_lines_text(&cache);
         let expected = full_render_lines(full_text, prefix, width);
         assert_eq!(
@@ -276,10 +313,30 @@ mod tests {
         let mut cache = StreamingCache::default();
         let mut renderer = fresh_renderer();
 
-        cache.get_or_update(&mut renderer, "partial text", "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            "partial text",
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
 
         let text = "block1\n```py\nx=1\n```\nblock2\n```js\ny=2\n```\ntail";
-        cache.get_or_update(&mut renderer, text, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            text,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
 
         let expected = full_render_lines(text, "", width);
         assert_eq!(cache_lines_text(&cache), expected);
@@ -292,9 +349,29 @@ mod tests {
         let mut cache = StreamingCache::default();
         let mut renderer = fresh_renderer();
         let text = "hello\n```rust\nfn x(){}\n```\nafter";
-        cache.get_or_update(&mut renderer, text, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            text,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         cache.invalidate();
-        cache.get_or_update(&mut renderer, text, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            text,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         assert_eq!(cache_lines_text(&cache), full_render_lines(text, "", width));
     }
 
@@ -309,11 +386,31 @@ mod tests {
         let second = "*italic txt*!";
         assert_eq!(first.len(), second.len());
 
-        cache.get_or_update(&mut renderer, first, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            first,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            false,
+        );
         let first_lines = cache_lines_text(&cache);
         assert_eq!(first_lines, full_render_lines(first, "", width));
 
-        cache.get_or_update(&mut renderer, second, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            second,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            false,
+        );
         let second_lines = cache_lines_text(&cache);
         assert_eq!(second_lines, full_render_lines(second, "", width));
         assert_ne!(
@@ -329,9 +426,29 @@ mod tests {
         let mut renderer = fresh_renderer();
         let text = "```rust\nfn extremely_long_function_name_that_definitely_will_not_fit(arg_one: &str, arg_two: usize) {}\n```";
 
-        cache.get_or_update(&mut renderer, text, "", style, style, 200);
+        cache.get_or_update(
+            &mut renderer,
+            text,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            200,
+            true,
+        );
         let wide = cache.lines.len();
-        cache.get_or_update(&mut renderer, text, "", style, style, 30);
+        cache.get_or_update(
+            &mut renderer,
+            text,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            30,
+            true,
+        );
         let narrow = cache.lines.len();
         assert!(
             narrow > wide,
@@ -355,14 +472,34 @@ mod tests {
         let mut cache = StreamingCache::default();
         let mut renderer = fresh_renderer();
 
-        cache.get_or_update(&mut renderer, base, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            base,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         let mut prev_count = cache.lines.len();
 
         let chars: Vec<char> = suffix.chars().collect();
         for i in 1..=chars.len() {
             let partial: String = chars[..i].iter().collect();
             let text = format!("{base}{partial}");
-            cache.get_or_update(&mut renderer, &text, "", style, style, width);
+            cache.get_or_update(
+                &mut renderer,
+                &text,
+                Paint {
+                    prefix: "",
+                    text_style: style,
+                    prefix_style: style,
+                },
+                width,
+                true,
+            );
             assert!(
                 cache.lines.len() >= prev_count.saturating_sub(1),
                 "line count dropped from {prev_count} to {} at partial {partial:?}",
@@ -380,11 +517,31 @@ mod tests {
         let mut renderer = fresh_renderer();
 
         let base = "| A | B |\n| --- | --- |\n| 1 | 2 |";
-        cache.get_or_update(&mut renderer, base, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            base,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         let base_lines = cache_lines_text(&cache);
 
         let partial = format!("{base}\n| 3 | in pro");
-        cache.get_or_update(&mut renderer, &partial, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            &partial,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         let partial_lines = cache_lines_text(&cache);
         assert!(
             partial_lines.len() > base_lines.len(),
@@ -397,7 +554,17 @@ mod tests {
         );
 
         let complete = format!("{base}\n| 3 | in progress |");
-        cache.get_or_update(&mut renderer, &complete, "", style, style, width);
+        cache.get_or_update(
+            &mut renderer,
+            &complete,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            width,
+            true,
+        );
         let complete_lines = cache_lines_text(&cache);
         let has_complete_content = complete_lines.iter().any(|l| l.contains("in progress"));
         assert!(
@@ -438,7 +605,17 @@ mod tests {
         let style = Style::default();
         let mut cache = StreamingCache::default();
         let mut renderer = fresh_renderer();
-        let repopulated = cache.get_or_update(&mut renderer, "hello", "", style, style, 80);
+        let repopulated = cache.get_or_update(
+            &mut renderer,
+            "hello",
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            80,
+            true,
+        );
         assert!(repopulated, "first call must repopulate (return true)");
     }
 
@@ -447,8 +624,28 @@ mod tests {
         let style = Style::default();
         let mut cache = StreamingCache::default();
         let mut renderer = fresh_renderer();
-        cache.get_or_update(&mut renderer, "hello", "", style, style, 80);
-        let hit = cache.get_or_update(&mut renderer, "hello", "", style, style, 80);
+        cache.get_or_update(
+            &mut renderer,
+            "hello",
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            80,
+            true,
+        );
+        let hit = cache.get_or_update(
+            &mut renderer,
+            "hello",
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            80,
+            true,
+        );
         assert!(
             !hit,
             "second identical call must be a cache hit (return false)"
@@ -484,7 +681,17 @@ mod tests {
         let style = Style::default();
         let mut cache = StreamingCache::default();
         let mut renderer = fresh_renderer();
-        let repopulated = cache.get_or_update(&mut renderer, "", "", style, style, 80);
+        let repopulated = cache.get_or_update(
+            &mut renderer,
+            "",
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            80,
+            true,
+        );
         assert!(repopulated);
         assert!(
             !cache.lines.is_empty(),
@@ -499,11 +706,31 @@ mod tests {
         let mut renderer = fresh_renderer();
 
         let first_block = "```rust\nfn a() {}\n```";
-        cache.get_or_update(&mut renderer, first_block, "", style, style, 80);
+        cache.get_or_update(
+            &mut renderer,
+            first_block,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            80,
+            true,
+        );
         let after_first = cache_lines_text(&cache);
 
         let both_blocks = "```rust\nfn a() {}\n```\ntext\n```python\ndef b(): pass\n```";
-        cache.get_or_update(&mut renderer, both_blocks, "", style, style, 80);
+        cache.get_or_update(
+            &mut renderer,
+            both_blocks,
+            Paint {
+                prefix: "",
+                text_style: style,
+                prefix_style: style,
+            },
+            80,
+            true,
+        );
         let after_both = cache_lines_text(&cache);
 
         assert!(
