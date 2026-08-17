@@ -672,23 +672,43 @@ fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
 }
 
 /// Detail line under a turn row for one tool call: name, duration, and an
-/// error marker. Indented under its turn so the per-call breakdown reads as
-/// a child list of the aggregate row above.
+/// error marker. Reads as a child list of the aggregate row above it.
+///
+/// Both offsets are derived from `column_ranges`, never hardcoded, so the
+/// line cannot drift out of alignment when a column changes width or a new
+/// one is added:
+/// - the branch starts at the `time` column, the first field wide enough to
+///   hold it (starting earlier lands it inside the narrow `turn` column);
+/// - the duration lands in the `tool` column, so the per-call figures read
+///   as a decomposition of the aggregate directly above them.
+///
+/// Only failures are marked. A tick on every successful call collides
+/// visually with the row's `✓`/`𐄂` cache-miss mark one line up, which means
+/// something entirely different; the error slot stays reserved either way so
+/// the names still line up.
 fn tool_call_line(rec: &maki_agent::agent::turn_state::ToolCallRecord, theme: &crate::theme::Theme) -> Line<'static> {
-    const PAD: &str = "    ";
+    const BRANCH: &str = "└ ";
+    const MARK_SLOT: usize = 2;
     let fg = Style::new().fg(theme.foreground);
-    let mark_style = if rec.is_error {
-        theme.tool_error
-    } else {
-        fg
-    };
-    let mark = if rec.is_error { "✗" } else { "✓" };
+    let (indent, _) = column_ranges()[column_idx(SortColumn::Time)];
+    let (tool_start, _) = column_ranges()[column_idx(SortColumn::Tool)];
+    let name_start = indent as usize + BRANCH.chars().count() + MARK_SLOT;
+    let name_width = (tool_start as usize).saturating_sub(name_start);
     Line::from(vec![
-        Span::raw(PAD),
-        Span::raw("└ "),
-        Span::styled(format!("{:<16}", rec.tool), fg),
-        Span::styled(duration_secs(rec.duration_ms), theme.tool_dim),
-        Span::styled(format!("  {mark}"), mark_style),
+        Span::raw(" ".repeat(indent as usize)),
+        Span::raw(BRANCH),
+        Span::styled(
+            if rec.is_error { "✗ " } else { "  " },
+            theme.tool_error,
+        ),
+        Span::styled(
+            format!("{:<name_width$}", truncate_cell(&rec.tool, name_width)),
+            fg,
+        ),
+        Span::styled(
+            format!("{:>COL_DURATION$}", duration_secs(rec.duration_ms)),
+            theme.tool_dim,
+        ),
     ])
 }
 
@@ -860,6 +880,125 @@ mod tests {
 
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Every rendered cell must occupy exactly the range `column_ranges`
+    /// reports, in both the header and a data row — that mapping is what
+    /// mouse header-clicks hit-test against, so drift silently sorts the
+    /// wrong column.
+    #[test]
+    fn header_and_row_cells_match_column_ranges() {
+        let theme = theme::current();
+        let flat = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let header = flat(header_row(&theme));
+        let mut t = sample_turn(1);
+        t.upstream = Some(maki_providers::Upstream {
+            name: Some("AtlasCloud".into()),
+            generation_id: None,
+        });
+        let row = flat(turn_row(&t, &theme));
+
+        assert_eq!(
+            header.chars().count(),
+            row.chars().count(),
+            "header/row width differ\nheader: {header:?}\nrow:    {row:?}"
+        );
+        let cell = |s: &str, start: u16, end: u16| -> String {
+            s.chars().skip(start as usize).take((end - start) as usize).collect()
+        };
+        for (i, (_, label, width)) in column_defs().iter().enumerate() {
+            let (start, end) = column_ranges()[i];
+            // The pct column renders its trailing `%` inside the cell, which
+            // `column_ranges` already widens for.
+            let head = cell(&header, start, end);
+            let head = head.trim_end().trim_end_matches('%');
+            assert!(
+                head.ends_with(label),
+                "header cell {i} ({label}) misaligned: {:?}",
+                cell(&header, start, end)
+            );
+            assert_eq!(
+                cell(&row, start, end).chars().count(),
+                (end - start) as usize,
+                "row cell {i} ({label}, w={width}) misaligned: {:?}",
+                cell(&row, start, end)
+            );
+        }
+        // The upstream is the last column, so a row that has one must end
+        // with it rather than spilling past the header width.
+        assert!(row.contains("AtlasCloud"), "row: {row:?}");
+    }
+
+    /// A tool-call detail line decomposes the row's aggregate `tool` time, so
+    /// its duration has to sit in that column. It used to render at a fixed
+    /// 16-char name offset, landing under `time` ~44 columns to the left.
+    #[test]
+    fn tool_call_duration_sits_in_the_tool_column() {
+        let theme = theme::current();
+        let rec = maki_agent::agent::turn_state::ToolCallRecord {
+            id: "t1".into(),
+            tool: "bash".into(),
+            args: serde_json::Value::Null,
+            duration_ms: 500,
+            is_error: false,
+        };
+        let line: String = tool_call_line(&rec, &theme)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let (start, end) = column_ranges()[column_idx(SortColumn::Tool)];
+        let cell: String = line
+            .chars()
+            .skip(start as usize)
+            .take((end - start) as usize)
+            .collect();
+        assert_eq!(cell.trim(), "0.50s", "child line: {line:?}");
+        assert_eq!(line.chars().count(), end as usize, "child line: {line:?}");
+
+        // The branch starts exactly at the `time` column, not inside `turn`.
+        let (time_start, _) = column_ranges()[column_idx(SortColumn::Time)];
+        assert_eq!(
+            line.chars().take(time_start as usize).collect::<String>(),
+            " ".repeat(time_start as usize),
+            "child line indent: {line:?}"
+        );
+        assert!(
+            line.chars().nth(time_start as usize) == Some('└'),
+            "branch not at the time column: {line:?}"
+        );
+    }
+
+    /// Successful calls carry no tick: the row's `✓` one line up is the
+    /// cache-miss mark, and duplicating the glyph for tool success read as
+    /// the same signal. Failures still stand out, and the reserved slot
+    /// keeps names aligned across both cases.
+    #[test]
+    fn only_failed_tool_calls_are_marked() {
+        let theme = theme::current();
+        let render = |is_error: bool| -> String {
+            let rec = maki_agent::agent::turn_state::ToolCallRecord {
+                id: "t1".into(),
+                tool: "bash".into(),
+                args: serde_json::Value::Null,
+                duration_ms: 500,
+                is_error,
+            };
+            tool_call_line(&rec, &theme)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let ok = render(false);
+        let failed = render(true);
+        assert!(!ok.contains('✓') && !ok.contains('✗'), "ok: {ok:?}");
+        assert!(failed.contains('✗'), "failed: {failed:?}");
+        assert_eq!(
+            ok.find("bash").map(|i| ok[..i].chars().count()),
+            failed.find("bash").map(|i| failed[..i].chars().count()),
+            "name column shifts between ok and failed\nok:     {ok:?}\nfailed: {failed:?}"
+        );
     }
 
     fn sample_turn(id: usize) -> TurnSnapshot {
