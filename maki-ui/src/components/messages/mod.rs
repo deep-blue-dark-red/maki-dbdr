@@ -5,7 +5,8 @@ mod selection;
 mod tests;
 
 use self::render::RenderCursor;
-use self::segment::{Segment, SegmentCache, wrapped_line_count};
+use self::segment::{Segment, SegmentCache};
+use crate::components::wrap::WrapIndex;
 
 use super::tool_display::{
     RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
@@ -781,19 +782,19 @@ impl MessagesPanel {
             }
             streaming_heights.push(collapsed_thinking_lines.len() as u16);
         } else if !self.streaming_thinking.is_empty() {
-            let lines = self.streaming_thinking.render_lines(width);
+            self.streaming_thinking.render_lines(width);
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(wrapped_line_count(lines, width));
+            streaming_heights.push(self.streaming_thinking.wrapped_height());
         }
 
         if !self.streaming_text.is_empty() {
-            let lines = self.streaming_text.render_lines(width);
+            self.streaming_text.render_lines(width);
             if cached_count > 0 || !streaming_heights.is_empty() {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(wrapped_line_count(lines, width));
+            streaming_heights.push(self.streaming_text.wrapped_height());
         }
 
         let cached_height = self.cache.total_height(width);
@@ -813,6 +814,10 @@ impl MessagesPanel {
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll_top, viewport);
+        // Both are short and rebuilt per frame anyway; indexing them keeps
+        // one shape for every block the cursor paints.
+        let spacer_wrap = WrapIndex::build(&spacer_lines, width);
+        let collapsed_wrap = WrapIndex::build(&collapsed_thinking_lines, width);
 
         for (i, seg) in self.cache.segments().iter().enumerate() {
             if cursor.past_bottom() {
@@ -821,7 +826,14 @@ impl MessagesPanel {
             let h = seg.height(width);
             let highlight = self.highlight_segment == Some(i);
             let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
-            cursor.render(seg.lines(), h, style, highlight, frame);
+            cursor.render(
+                seg.lines(),
+                h,
+                |skip, rows| seg.window(skip, rows, width),
+                style,
+                highlight,
+                frame,
+            );
         }
 
         let mut height_idx = 0usize;
@@ -836,15 +848,36 @@ impl MessagesPanel {
             if cached_count > 0 || height_idx > 0 {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
-                cursor.render(&spacer_lines, h, None, false, frame);
+                cursor.render(
+                    &spacer_lines,
+                    h,
+                    |skip, rows| spacer_wrap.window(skip, rows),
+                    None,
+                    false,
+                    frame,
+                );
             }
             if height_idx < streaming_heights.len() {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
                 if collapsed {
-                    cursor.render(&collapsed_thinking_lines, h, None, false, frame);
+                    cursor.render(
+                        &collapsed_thinking_lines,
+                        h,
+                        |skip, rows| collapsed_wrap.window(skip, rows),
+                        None,
+                        false,
+                        frame,
+                    );
                 } else {
-                    cursor.render(sc.cached_lines(), h, None, false, frame);
+                    cursor.render(
+                        sc.cached_lines(),
+                        h,
+                        |skip, rows| sc.window(skip, rows),
+                        None,
+                        false,
+                        frame,
+                    );
                 }
             }
         }

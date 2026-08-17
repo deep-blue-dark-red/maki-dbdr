@@ -575,7 +575,10 @@ fn wrapped_line_count_cases(input: &[&str], width: u16, expected: u16) {
         .iter()
         .map(|s| Line::from(Span::raw(s.to_string())))
         .collect();
-    assert_eq!(wrapped_line_count(&lines, width), expected);
+    assert_eq!(
+        crate::components::wrap::wrapped_line_count(&lines, width),
+        expected
+    );
 }
 
 #[test]

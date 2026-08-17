@@ -1,4 +1,5 @@
 use crate::animation::Typewriter;
+use crate::components::wrap::WrapIndex;
 use crate::markdown::paint_semantic;
 use crate::theme;
 
@@ -104,6 +105,11 @@ pub(crate) struct StreamingContent {
     cache: StreamingCache,
     renderer: Renderer,
     paint: Paint<'static>,
+    /// Rebuilt by `render_lines` whenever the painted lines or the width
+    /// move. The live block is the one thing on screen that grows every
+    /// frame, so re-measuring it from scratch each time was the single
+    /// largest repaint cost during streaming.
+    wrap: Option<WrapIndex>,
 }
 
 impl StreamingContent {
@@ -122,6 +128,7 @@ impl StreamingContent {
                 text_style,
                 prefix_style,
             },
+            wrap: None,
         }
     }
 
@@ -132,11 +139,13 @@ impl StreamingContent {
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
+        self.wrap = None;
         self.renderer = Renderer::unwrapped();
     }
 
     pub fn take_all(&mut self) -> String {
         self.cache.invalidate();
+        self.wrap = None;
         self.renderer = Renderer::unwrapped();
         self.typewriter.take_all()
     }
@@ -164,6 +173,7 @@ impl StreamingContent {
             prefix_style,
         };
         self.cache.invalidate();
+        self.wrap = None;
     }
 
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
@@ -175,11 +185,30 @@ impl StreamingContent {
             width,
             true,
         );
+        if !self
+            .wrap
+            .as_ref()
+            .is_some_and(|w| w.describes(&self.cache.lines, width))
+        {
+            self.wrap = Some(WrapIndex::build(&self.cache.lines, width));
+        }
         &self.cache.lines
     }
 
     pub fn cached_lines(&self) -> &[Line<'static>] {
         &self.cache.lines
+    }
+
+    /// Display rows the cached lines occupy. Valid only after `render_lines`
+    /// has run for the current width, which is how the view calls it.
+    pub fn wrapped_height(&self) -> u16 {
+        self.wrap.as_ref().map_or(0, WrapIndex::total)
+    }
+
+    pub fn window(&self, skip: u16, rows: u16) -> (std::ops::Range<usize>, u16) {
+        self.wrap
+            .as_ref()
+            .map_or((0..0, 0), |w| w.window(skip, rows))
     }
 
     #[cfg(test)]

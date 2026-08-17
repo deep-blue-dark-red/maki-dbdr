@@ -2,9 +2,10 @@ use crate::render_worker::RenderWorker;
 
 use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
+use crate::components::wrap::WrapIndex;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::ops::Range;
 
 const INST_SUFFIX: &str = "__inst";
 
@@ -18,12 +19,6 @@ pub fn instruction_id(parent_id: &str) -> String {
 
 pub fn instruction_parent(id: &str) -> Option<&str> {
     id.strip_suffix(INST_SUFFIX)
-}
-
-#[derive(Clone, Copy, Default)]
-struct CachedHeight {
-    at_width: u16,
-    height: u16,
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -50,7 +45,7 @@ pub(super) struct Segment {
     /// show_thinking toggle breaks.
     pub msg_index: Option<usize>,
     pub truncation: SectionFlags,
-    cached_height: Cell<Option<CachedHeight>>,
+    wrap: RefCell<Option<WrapIndex>>,
     pending_highlight: Option<u64>,
     highlight_range: Option<(usize, usize)>,
     highlight_key: HighlightKey,
@@ -93,33 +88,35 @@ impl Segment {
 
     pub fn set_lines(&mut self, lines: Vec<Line<'static>>) {
         self.lines = lines;
-        self.invalidate_height();
+        self.invalidate_wrap();
+    }
+
+    /// Runs the wrap index, rebuilding it if it no longer describes the lines.
+    /// Every read goes through here so no caller can act on a stale index.
+    fn with_wrap<R>(&self, width: u16, f: impl FnOnce(&WrapIndex) -> R) -> R {
+        let mut slot = self.wrap.borrow_mut();
+        if !slot
+            .as_ref()
+            .is_some_and(|w| w.describes(&self.lines, width))
+        {
+            *slot = Some(WrapIndex::build(&self.lines, width));
+        }
+        f(slot.as_ref().expect("wrap index just built"))
     }
 
     pub fn height(&self, width: u16) -> u16 {
-        if let Some(c) = self.cached_height.get()
-            && c.at_width == width
-        {
-            return c.height;
-        }
-        let h = wrapped_line_count(&self.lines, width);
-        self.cached_height.set(Some(CachedHeight {
-            at_width: width,
-            height: h,
-        }));
-        h
+        self.with_wrap(width, WrapIndex::total)
     }
 
     /// Maps a display row (after wrapping) back to the source line index.
     pub fn source_line_at(&self, rel_row: u16, width: u16) -> Option<usize> {
-        let mut acc = 0u16;
-        for (i, line) in self.lines.iter().enumerate() {
-            acc = acc.saturating_add(wrapped_line_count(std::slice::from_ref(line), width));
-            if rel_row < acc {
-                return Some(i);
-            }
-        }
-        None
+        self.with_wrap(width, |w| w.source_line_at(rel_row))
+    }
+
+    /// The source lines to paint for `rows` display rows starting `skip` rows
+    /// in, and the rows to scroll within the first of them.
+    pub fn window(&self, skip: u16, rows: u16, width: u16) -> (Range<usize>, u16) {
+        self.with_wrap(width, |w| w.window(skip, rows))
     }
 
     /// Maps a source line to a 1-based row in the tool's live buffer, or 0
@@ -133,8 +130,8 @@ impl Segment {
         }
     }
 
-    fn invalidate_height(&self) {
-        self.cached_height.set(None);
+    fn invalidate_wrap(&self) {
+        *self.wrap.borrow_mut() = None;
     }
 
     pub fn update_spinners(&mut self, span: &Span<'static>) {
@@ -218,7 +215,7 @@ impl Segment {
             self.lines.splice(start..end, indented);
             self.highlight_range = Some((start, new_end));
             self.shift_after(end, new_end as isize - end as isize);
-            self.invalidate_height();
+            self.invalidate_wrap();
         }
         self.pending_highlight = None;
     }
@@ -340,15 +337,6 @@ impl SegmentCache {
         self.msg_count = 0;
         self.segments.clear();
     }
-}
-
-pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
-    }
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
 }
 
 #[cfg(test)]

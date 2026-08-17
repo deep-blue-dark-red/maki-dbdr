@@ -32,6 +32,7 @@ pub(crate) mod streaming_content;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
 pub(crate) mod usage_modal;
+pub(crate) mod wrap;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
