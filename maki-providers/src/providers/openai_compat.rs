@@ -410,11 +410,14 @@ struct ChunkDelta {
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
+// Variant order matters: serde tries untagged variants in declaration order, so
+// the overwhelmingly common plain-string delta should be attempted first. The
+// two shapes are structurally disjoint, so this is purely a speed win.
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 enum ContentDelta {
-    Array(Vec<ContentDeltaPart>),
     String(String),
+    Array(Vec<ContentDeltaPart>),
 }
 
 #[derive(Deserialize, Debug)]
