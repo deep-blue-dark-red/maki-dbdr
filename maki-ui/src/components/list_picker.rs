@@ -84,7 +84,6 @@ impl FooterSpec {
     }
 }
 
-
 struct State<T> {
     items: Vec<T>,
     filtered: Vec<usize>,

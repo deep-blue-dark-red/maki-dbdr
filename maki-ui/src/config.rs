@@ -1,5 +1,5 @@
+use crate::components::keybindings::{get_configured_bind, key_event_to_string, update_bind};
 use crate::components::settings_picker::UserSettings;
-use crate::components::keybindings::{update_bind, get_configured_bind, key_event_to_string};
 use std::fs;
 use std::path::PathBuf;
 
@@ -23,9 +23,9 @@ pub fn config_path() -> Result<PathBuf, std::io::Error> {
         }));
     }
     let config_dir = maki_storage::paths::config_dir()?;
-    let parent = config_dir.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "No parent config dir")
-    })?;
+    let parent = config_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent config dir"))?;
     Ok(parent.join("user.config"))
 }
 
@@ -59,7 +59,9 @@ fn unescape_config_value(s: &str) -> String {
 /// out so a raw newline in memory doesn't break the one-line-per-setting
 /// file format.
 fn escape_config_value(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 /// Extracts a `key = value` value, honoring surrounding `"..."` quotes.
@@ -86,7 +88,11 @@ pub fn default_skills_dirs() -> Vec<String> {
     if let Some(home) = maki_storage::paths::home() {
         dirs.push(home.join(".agents/skills").to_string_lossy().into_owned());
         dirs.push(home.join(".claude/skills").to_string_lossy().into_owned());
-        dirs.push(home.join(".config/opencode/skills").to_string_lossy().into_owned());
+        dirs.push(
+            home.join(".config/opencode/skills")
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     dirs.push("/Users/mcp/.gemini/config/skills".to_string());
     dirs
@@ -196,7 +202,10 @@ pub fn save_config(settings: &UserSettings) {
 
     let mut lines = Vec::new();
     lines.push("# Maki UI Configuration".to_string());
-    lines.push(format!("show_system_prompt = {}", settings.show_system_prompt));
+    lines.push(format!(
+        "show_system_prompt = {}",
+        settings.show_system_prompt
+    ));
     lines.push(format!("api_logging = {}", settings.api_logging));
     lines.push(format!("show_reasoning = {}", settings.show_reasoning));
     lines.push(format!("show_token_stats = {}", settings.show_token_stats));
@@ -210,10 +219,16 @@ pub fn save_config(settings: &UserSettings) {
         lines.push(format!("compact_tokens = {}", tokens));
     }
     if let Some(ref expand_str) = settings.override_expand_string {
-        lines.push(format!("override_expand_string = \"{}\"", escape_config_value(expand_str)));
+        lines.push(format!(
+            "override_expand_string = \"{}\"",
+            escape_config_value(expand_str)
+        ));
     }
     if let Some(ref prefix) = settings.user_prompt_prefix {
-        lines.push(format!("user_prompt_prefix = \"{}\"", escape_config_value(prefix)));
+        lines.push(format!(
+            "user_prompt_prefix = \"{}\"",
+            escape_config_value(prefix)
+        ));
     }
     for dir in &settings.skills_dirs {
         lines.push(format!("skills_dir = {}", dir));
@@ -263,7 +278,11 @@ pub fn save_config(settings: &UserSettings) {
 
     for &action in actions {
         if let Some(bind) = get_configured_bind(action) {
-            lines.push(format!("keybind = {}={}", key_event_to_string(&bind.to_key_event()), action));
+            lines.push(format!(
+                "keybind = {}={}",
+                key_event_to_string(&bind.to_key_event()),
+                action
+            ));
         }
     }
 

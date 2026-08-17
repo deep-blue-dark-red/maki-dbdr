@@ -356,7 +356,10 @@ impl<'h> Agent<'h> {
             self.turn_state.record_exact(turn_idx, turn_n_exact);
 
             let actual = response.usage.cache_read;
-            if self.turn_state.record_cache_check(turn_idx, expected, actual) {
+            if self
+                .turn_state
+                .record_cache_check(turn_idx, expected, actual)
+            {
                 warn!(
                     self.num_turns,
                     expected,

@@ -1,11 +1,11 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 
+use crate::theme;
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use crate::theme;
 
 use std::sync::{Arc, LazyLock};
 
@@ -159,7 +159,9 @@ impl UserSettings {
         if let Ok(config_dir) = maki_storage::paths::config_dir() {
             let path = config_dir.join("settings.json");
             let file_data = std::fs::read(&path).ok();
-            if let Some(settings) = file_data.and_then(|data| serde_json::from_slice::<Self>(&data).ok()) {
+            if let Some(settings) =
+                file_data.and_then(|data| serde_json::from_slice::<Self>(&data).ok())
+            {
                 return settings;
             }
         }
@@ -203,24 +205,37 @@ impl SettingsPicker {
         }
     }
 
-    pub fn open(
-        &mut self,
-        settings: &UserSettings,
-    ) {
+    pub fn open(&mut self, settings: &UserSettings) {
         let items = vec![
-            SettingItem { name: "show-system-prompt".to_string() },
-            SettingItem { name: "api-logging".to_string() },
-            SettingItem { name: "show-reasoning".to_string() },
-            SettingItem { name: "show-token-stats".to_string() },
-            SettingItem { name: "global-sessions".to_string() },
-            SettingItem { name: "spinner-enabled".to_string() },
             SettingItem {
-                name: format!("log-command: {}", settings.log_command.as_deref().unwrap_or("less +G {}")),
+                name: "show-system-prompt".to_string(),
+            },
+            SettingItem {
+                name: "api-logging".to_string(),
+            },
+            SettingItem {
+                name: "show-reasoning".to_string(),
+            },
+            SettingItem {
+                name: "show-token-stats".to_string(),
+            },
+            SettingItem {
+                name: "global-sessions".to_string(),
+            },
+            SettingItem {
+                name: "spinner-enabled".to_string(),
+            },
+            SettingItem {
+                name: format!(
+                    "log-command: {}",
+                    settings.log_command.as_deref().unwrap_or("less +G {}")
+                ),
             },
             SettingItem {
                 name: format!(
                     "compact-tokens: {}",
-                    settings.compact_tokens
+                    settings
+                        .compact_tokens
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "none".to_string())
                 ),
@@ -229,10 +244,17 @@ impl SettingsPicker {
                 name: format!("spinner-style: {}", settings.spinner_style),
             },
             SettingItem {
-                name: format!("user-prompt-prefix: {}", settings.user_prompt_prefix_template()),
+                name: format!(
+                    "user-prompt-prefix: {}",
+                    settings.user_prompt_prefix_template()
+                ),
             },
-            SettingItem { name: "open user.config in editor".to_string() },
-            SettingItem { name: "open maki init.lua in editor".to_string() },
+            SettingItem {
+                name: "open user.config in editor".to_string(),
+            },
+            SettingItem {
+                name: "open maki init.lua in editor".to_string(),
+            },
         ];
         let enabled = vec![
             settings.show_system_prompt,

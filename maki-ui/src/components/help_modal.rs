@@ -41,7 +41,12 @@ fn key_spans(label: ResolvedLabel, pad: usize, prefix: &str) -> Vec<Span<'static
             )]
         }
         ResolvedLabel::Alt(a, b) => multi_key_spans(&[a.as_str(), b.as_str()], pad, prefix, &theme),
-        ResolvedLabel::Multi(keys) => multi_key_spans(&keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(), pad, prefix, &theme),
+        ResolvedLabel::Multi(keys) => multi_key_spans(
+            &keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            pad,
+            prefix,
+            &theme,
+        ),
     }
 }
 

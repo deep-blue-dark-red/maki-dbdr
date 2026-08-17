@@ -7,10 +7,10 @@
 pub mod animation;
 pub mod app;
 pub mod chat;
-pub mod config;
 mod clipboard;
 mod color_compat;
 mod components;
+pub mod config;
 pub use components::command::{BUILTIN_COMMANDS, BuiltinCommand};
 pub use components::keybindings;
 mod highlight;

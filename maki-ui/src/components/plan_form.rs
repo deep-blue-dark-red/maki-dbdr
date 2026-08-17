@@ -185,7 +185,10 @@ impl PlanForm {
             ("↑↓".to_string(), "select".to_string()),
             ("Space".to_string(), "toggle parallel".to_string()),
             ("Enter".to_string(), "confirm".to_string()),
-            (key::OPEN_EDITOR.label().to_string(), "edit plan".to_string()),
+            (
+                key::OPEN_EDITOR.label().to_string(),
+                "edit plan".to_string(),
+            ),
             (dismiss_keys(), "dismiss".to_string()),
         ];
         lines.push(hint_line(&hint_pairs));

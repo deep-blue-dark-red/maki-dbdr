@@ -1086,7 +1086,12 @@ fn read_last_meta(file: &mut File) -> Option<(String, u64, u32)> {
         let content = buf.strip_suffix(b"\n").unwrap_or(&buf);
         if let Some(nl) = content.iter().rposition(|&b| b == b'\n') {
             let last_line = &content[nl + 1..];
-            if let Ok(ScanRecord::Meta { title, updated_at, context_size }) = serde_json::from_slice(last_line) {
+            if let Ok(ScanRecord::Meta {
+                title,
+                updated_at,
+                context_size,
+            }) = serde_json::from_slice(last_line)
+            {
                 return Some((title, updated_at, context_size));
             }
             return None;

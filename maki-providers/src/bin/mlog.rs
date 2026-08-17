@@ -121,10 +121,7 @@ fn print_transcript(records: &[Record]) {
         };
 
         for msg in messages.iter().skip(prev_len) {
-            let role = msg
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("message");
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("message");
             println!("\n\x1b[1;35m[{}] {role}\x1b[0m", ts(*ts_ms));
             println!("{}", render_content(msg));
         }

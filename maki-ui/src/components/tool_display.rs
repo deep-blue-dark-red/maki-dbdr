@@ -345,9 +345,15 @@ impl ToolLineBuilder {
             if let Some(first_line) = snapshot.lines.first() {
                 let line_idx = self.lines.len();
                 let spinners = &mut self.spinner_lines;
-                bake_spans(&first_line.spans, &mut spans, active_spinner_str(0), 0, |span_idx| {
-                    spinners.push((line_idx, span_idx));
-                });
+                bake_spans(
+                    &first_line.spans,
+                    &mut spans,
+                    active_spinner_str(0),
+                    0,
+                    |span_idx| {
+                        spinners.push((line_idx, span_idx));
+                    },
+                );
             }
         } else {
             spans.push(Span::styled(header.to_owned(), theme::current().tool));
@@ -564,9 +570,15 @@ fn snapshot_to_lines_range(
         .enumerate()
         .map(|(i, sline)| {
             let mut spans = vec![Span::raw(indent.to_string())];
-            bake_spans(&sline.spans, &mut spans, frame_str, elapsed_ms, |span_idx| {
-                spinners.push((i, span_idx));
-            });
+            bake_spans(
+                &sline.spans,
+                &mut spans,
+                frame_str,
+                elapsed_ms,
+                |span_idx| {
+                    spinners.push((i, span_idx));
+                },
+            );
             Line::from(spans)
         })
         .collect();

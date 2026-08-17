@@ -114,7 +114,13 @@ pub(super) async fn compact_history(
         target_tokens,
     )
     .await?;
-    Ok(finish_compact(response, history, event_tx, compact_start, model))
+    Ok(finish_compact(
+        response,
+        history,
+        event_tx,
+        compact_start,
+        model,
+    ))
 }
 
 fn finish_compact(
@@ -225,9 +231,15 @@ pub async fn checkpoint(
     event_tx: &EventSender,
     target_tokens: Option<usize>,
 ) -> Result<(), AgentError> {
-    let usage =
-        checkpoint_history(provider, model, history, event_tx, &CancelToken::none(), target_tokens)
-            .await?;
+    let usage = checkpoint_history(
+        provider,
+        model,
+        history,
+        event_tx,
+        &CancelToken::none(),
+        target_tokens,
+    )
+    .await?;
 
     event_tx.send(AgentEvent::Done {
         usage,
@@ -400,7 +412,10 @@ mod tests {
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-            self.system_prompts.lock().unwrap().push(system_prompt.to_string());
+            self.system_prompts
+                .lock()
+                .unwrap()
+                .push(system_prompt.to_string());
             Box::pin(async {
                 self.requests.lock().unwrap().push(messages.to_vec());
                 let mut responses = self.responses.lock().unwrap();
@@ -478,12 +493,11 @@ mod tests {
     #[test]
     fn checkpoint_appends_without_removing() {
         smol::block_on(async {
-            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
-                vec![
+            let provider: std::sync::Arc<dyn Provider> =
+                std::sync::Arc::new(MockProvider::new(vec![
                     Ok(text_response(StopReason::EndTurn)),
                     Ok(text_response(StopReason::EndTurn)),
-                ],
-            ));
+                ]));
             let model = default_model();
             let (raw_tx, _rx) = flume::unbounded();
             let tx = EventSender::new(raw_tx, 0);
@@ -491,7 +505,9 @@ mod tests {
                 Message::user("first".into()),
                 Message {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::Text { text: "reply".into() }],
+                    content: vec![ContentBlock::Text {
+                        text: "reply".into(),
+                    }],
                     ..Default::default()
                 },
             ]);

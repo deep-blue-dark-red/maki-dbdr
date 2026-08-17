@@ -1,6 +1,6 @@
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction};
-use crate::components::rewind_picker::{RewindEntry, display_msg_index_for_turn, NO_TURNS_MSG};
+use crate::components::rewind_picker::{NO_TURNS_MSG, RewindEntry, display_msg_index_for_turn};
 
 use crossterm::event::KeyEvent;
 use maki_providers::Message;

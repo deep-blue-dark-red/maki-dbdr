@@ -1245,7 +1245,11 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 
 #[test]
 fn splash_logo_shows_fork_branch() {
-    assert_eq!(crate::splash::LOGO, "maki (mcp fork)", "logo should be 'maki (mcp fork)' on the maki-mcp branch");
+    assert_eq!(
+        crate::splash::LOGO,
+        "maki (mcp fork)",
+        "logo should be 'maki (mcp fork)' on the maki-mcp branch"
+    );
 }
 
 #[test]
@@ -2282,11 +2286,11 @@ fn rewind_to_middle_truncates_and_populates_input() {
     app.state.context_size = 100_000;
     let old_run_id = app.run_id;
     let entry = crate::components::rewind_picker::RewindEntry {
-            turn_index: 2,
-            segment_index: 0,
-            prompt_preview: "2: second".into(),
-            prompt_text: "second prompt".into(),
-        };
+        turn_index: 2,
+        segment_index: 0,
+        prompt_preview: "2: second".into(),
+        prompt_text: "second prompt".into(),
+    };
     let actions = app.rewind_to(entry);
 
     assert_eq!(app.state.session.messages().len(), 2);
@@ -2310,11 +2314,11 @@ fn rewind_to_first_turn_clears_everything() {
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
     let entry = crate::components::rewind_picker::RewindEntry {
-            turn_index: 0,
-            segment_index: 0,
-            prompt_preview: "1: first".into(),
-            prompt_text: "first prompt".into(),
-        };
+        turn_index: 0,
+        segment_index: 0,
+        prompt_preview: "1: first".into(),
+        prompt_text: "first prompt".into(),
+    };
     let actions = app.rewind_to(entry);
 
     assert!(app.state.session.messages().is_empty());
@@ -3908,8 +3912,6 @@ fn settings_picker_options() {
     assert!(picker.is_open());
 }
 
-
-
 // -- Every frame checkpoints: one way in for a history, one trigger to save --
 
 /// Long enough that a waiting change is still waiting when the assert runs, on
@@ -4315,8 +4317,14 @@ fn waiting_duration_advances_across_event_less_renders() {
     std::thread::sleep(std::time::Duration::from_millis(1200));
     let text2 = status_bar_text(&mut app);
 
-    assert_ne!(text1, text2, "event-less render should still show advanced time");
-    assert!(text2.contains("6s"), "expected duration to advance to 6s, got: {text2}");
+    assert_ne!(
+        text1, text2,
+        "event-less render should still show advanced time"
+    );
+    assert!(
+        text2.contains("6s"),
+        "expected duration to advance to 6s, got: {text2}"
+    );
 }
 
 /// Every path that sets `Status::Streaming` must also set `turn_start`, or
@@ -4358,7 +4366,11 @@ fn turn_start_survives_turn_complete_mid_turn() {
     app.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
     app.round_start = Some(std::time::Instant::now());
 
-    app.update(agent_msg(turn_complete(TokenUsage::default(), "test-model", None)));
+    app.update(agent_msg(turn_complete(
+        TokenUsage::default(),
+        "test-model",
+        None,
+    )));
 
     assert!(
         app.turn_start.is_some(),
@@ -4395,8 +4407,14 @@ fn tool_call_in_progress_shows_working_not_waiting() {
 
     let text = status_bar_text(&mut app);
     assert!(text.contains("Working"), "expected Working, got: {text}");
-    assert!(!text.contains("Waiting"), "expected no Waiting, got: {text}");
-    assert!(text.contains("42"), "expected carried-forward token count, got: {text}");
+    assert!(
+        !text.contains("Waiting"),
+        "expected no Waiting, got: {text}"
+    );
+    assert!(
+        text.contains("42"),
+        "expected carried-forward token count, got: {text}"
+    );
 }
 
 /// `chat.cost` stays `None` until the first priced turn completes, but a
@@ -4406,7 +4424,10 @@ fn tool_call_in_progress_shows_working_not_waiting() {
 fn cost_shows_zero_before_any_turn_completes_for_priced_model() {
     let mut app = test_app();
     let text = status_bar_text(&mut app);
-    assert!(text.contains("$0.000"), "expected $0.000 before any turn, got: {text}");
+    assert!(
+        text.contains("$0.000"),
+        "expected $0.000 before any turn, got: {text}"
+    );
 }
 
 fn turn_complete_full(usage: TokenUsage, turn_id: usize, cache_miss: bool) -> AgentEvent {
@@ -4481,7 +4502,11 @@ fn stats_records_a_row_per_turn_and_patches_tool_stats() {
 fn stats_command_toggles_modal_and_new_clears_history() {
     let mut app = test_app();
     app.run_id = 1;
-    app.update(agent_msg(turn_complete_full(TokenUsage::default(), 1, false)));
+    app.update(agent_msg(turn_complete_full(
+        TokenUsage::default(),
+        1,
+        false,
+    )));
     assert_eq!(app.turn_history.len(), 1);
 
     app.execute_command(cmd("/stats"));

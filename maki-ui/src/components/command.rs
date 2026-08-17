@@ -405,9 +405,11 @@ impl CommandPalette {
         self.tick();
 
         let input_cmd = format!("/{}", cmd_word);
-        if let Some(exact_idx) = self.filtered.iter().position(|m| {
-            self.item_name(m).eq_ignore_ascii_case(&input_cmd)
-        }) {
+        if let Some(exact_idx) = self
+            .filtered
+            .iter()
+            .position(|m| self.item_name(m).eq_ignore_ascii_case(&input_cmd))
+        {
             self.selected = exact_idx;
         }
     }

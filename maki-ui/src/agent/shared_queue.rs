@@ -177,7 +177,9 @@ impl QueueSender {
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
                 QueueItem::Message { text, .. } => Some(text.clone()),
-                QueueItem::Compact { .. } | QueueItem::Checkpoint { .. } | QueueItem::Rename { .. } => None,
+                QueueItem::Compact { .. }
+                | QueueItem::Checkpoint { .. }
+                | QueueItem::Rename { .. } => None,
             })
             .collect()
     }

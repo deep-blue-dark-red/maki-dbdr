@@ -31,8 +31,6 @@ use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
-use crate::components::plugins_modal::{PluginsModal, PluginsAction};
-use crate::components::skills_modal::{SkillsModal, SkillsAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
@@ -43,10 +41,12 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::plugins_modal::{PluginsAction, PluginsModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
+use crate::components::skills_modal::{SkillsAction, SkillsModal};
 use crate::components::stats_modal::{StatsModal, TurnSnapshot};
 use crate::components::status_bar::StatusBar;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
@@ -626,7 +626,6 @@ impl App {
         }
     }
 
-
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !is_ctrl(&key) {
             return None;
@@ -740,7 +739,8 @@ impl App {
             match self.export_picker.handle_key(key) {
                 ExportPickerAction::Select(entry) => {
                     let settings = UserSettings::load();
-                    let base_path = settings.resolved_export_path(std::path::Path::new(&self.state.session.cwd));
+                    let base_path = settings
+                        .resolved_export_path(std::path::Path::new(&self.state.session.cwd));
                     match entry.export_type {
                         ExportType::MarkdownClipboard => {
                             let text = self.export_session_to_markdown();
@@ -763,7 +763,8 @@ impl App {
                                 base_path.join(format!("session-{}.md", self.state.session.id))
                             };
                             match std::fs::write(&filepath, text) {
-                                Ok(_) => self.flash(format!("Saved transcript to {}", filepath.display())),
+                                Ok(_) => self
+                                    .flash(format!("Saved transcript to {}", filepath.display())),
                                 Err(e) => self.flash(format!("Failed to save transcript: {e}")),
                             }
                         }
@@ -788,7 +789,8 @@ impl App {
                                 base_path.join(format!("session-{}.json", self.state.session.id))
                             };
                             match std::fs::write(&filepath, text) {
-                                Ok(_) => self.flash(format!("Saved JSON session to {}", filepath.display())),
+                                Ok(_) => self
+                                    .flash(format!("Saved JSON session to {}", filepath.display())),
                                 Err(e) => self.flash(format!("Failed to save JSON session: {e}")),
                             }
                         }
@@ -1020,8 +1022,7 @@ impl App {
                 }
                 SettingsPickerAction::OpenSystemConfig => {
                     self.settings_picker.close();
-                    let path = maki_config::global_config_dir()
-                        .map(|d| d.join("init.lua"));
+                    let path = maki_config::global_config_dir().map(|d| d.join("init.lua"));
                     if let Some(p) = path {
                         vec![Action::OpenEditor(p)]
                     } else {
@@ -1311,7 +1312,8 @@ impl App {
             &title,
             self.state.session.created_at,
         );
-        self.status_bar.flash(format!("Session renamed to: {title}"));
+        self.status_bar
+            .flash(format!("Session renamed to: {title}"));
     }
 
     pub(crate) fn handle_submit(&mut self, sub: Submission) -> Vec<Action> {
@@ -1541,7 +1543,10 @@ impl App {
                     .unwrap_or(0.0);
                 let total = tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
                 let (pp_tps, tg_tps) = if round_elapsed > 0.0 {
-                    (total as f64 / round_elapsed, tc.usage.output as f64 / round_elapsed)
+                    (
+                        total as f64 / round_elapsed,
+                        tc.usage.output as f64 / round_elapsed,
+                    )
                 } else {
                     (0.0, 0.0)
                 };
@@ -1562,16 +1567,14 @@ impl App {
                     ..Default::default()
                 }
                 .cost(&self.state.model.pricing, self.state.fast);
-                self.last_turn_stats = Some(
-                    crate::components::status_bar::TurnStats {
-                        pp_tps,
-                        tg_tps,
-                        cache_rate,
-                        last_turn_cache_miss: tc.cache_miss,
-                        cache_hit_cost,
-                        cache_miss_cost,
-                    },
-                );
+                self.last_turn_stats = Some(crate::components::status_bar::TurnStats {
+                    pp_tps,
+                    tg_tps,
+                    cache_rate,
+                    last_turn_cache_miss: tc.cache_miss,
+                    cache_hit_cost,
+                    cache_miss_cost,
+                });
                 if tc.usage.output > 0 {
                     self.last_seen_output_tokens = tc.usage.output;
                 }
@@ -1628,7 +1631,8 @@ impl App {
             }
             self.last_turn_at = Some(Instant::now());
             self.update_cache_miss_warning();
-            *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
+            *maki_config::CURRENT_SESSION_NAME.lock().unwrap() =
+                Some(self.state.session.title.clone());
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
@@ -1644,7 +1648,11 @@ impl App {
                 tool_duration_ms,
                 tool_calls,
             } = &envelope.event
-            && let Some(turn) = self.turn_history.iter_mut().rev().find(|t| t.id == *turn_id)
+            && let Some(turn) = self
+                .turn_history
+                .iter_mut()
+                .rev()
+                .find(|t| t.id == *turn_id)
         {
             turn.tool_call_count = *tool_call_count;
             turn.tool_error_count = *tool_error_count;
@@ -1808,11 +1816,13 @@ impl App {
                 vec![]
             }
             "/skills" => {
-                self.skills_modal.open(std::path::PathBuf::from(&self.state.session.cwd));
+                self.skills_modal
+                    .open(std::path::PathBuf::from(&self.state.session.cwd));
                 vec![]
             }
             "/export" => {
-                self.export_picker.open(std::path::Path::new(&self.state.session.cwd));
+                self.export_picker
+                    .open(std::path::Path::new(&self.state.session.cwd));
                 vec![]
             }
             "/usage" => {

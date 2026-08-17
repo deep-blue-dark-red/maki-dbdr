@@ -63,7 +63,6 @@ pub(crate) struct ShutdownReport {
     pub focused: usize,
 }
 
-
 pub struct EventLoopParams {
     pub model: Model,
     pub needs_login: bool,
@@ -1088,21 +1087,23 @@ impl<'t> EventLoop<'t> {
             Action::RefreshModels => self.refresh_models(),
             Action::RefreshUsage => self.refresh_usage(),
             Action::Quit => {}
-            Action::EditSystemPrompt => {
-                match maki_storage::paths::config_dir() {
-                    Ok(config_dir) => {
-                        let path = config_dir.join("system.md");
-                        if !path.exists()
-                            && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
-                        {
-                            self.sessions[idx].app.flash(format!("Failed to create system.md: {e}"));
-                            return;
-                        }
-                        self.open_editor(idx, &path);
+            Action::EditSystemPrompt => match maki_storage::paths::config_dir() {
+                Ok(config_dir) => {
+                    let path = config_dir.join("system.md");
+                    if !path.exists()
+                        && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
+                    {
+                        self.sessions[idx]
+                            .app
+                            .flash(format!("Failed to create system.md: {e}"));
+                        return;
                     }
-                    Err(e) => self.sessions[idx].app.flash(format!("Failed to get config directory: {e}")),
+                    self.open_editor(idx, &path);
                 }
-            }
+                Err(e) => self.sessions[idx]
+                    .app
+                    .flash(format!("Failed to get config directory: {e}")),
+            },
             Action::RunLogsCommand => {
                 let settings = crate::components::settings_picker::UserSettings::load();
                 let log_path = self.sessions[idx].app.storage.path().join("maki.log");

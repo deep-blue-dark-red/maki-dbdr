@@ -477,8 +477,7 @@ mod tests {
 
     #[test]
     fn routing_survives_a_save_load_round_trip() {
-        let def: ProviderDef =
-            toml::from_str(r#"provider_only = ["deepseek"]"#).unwrap();
+        let def: ProviderDef = toml::from_str(r#"provider_only = ["deepseek"]"#).unwrap();
         let mut config = ProvidersConfig::default();
         config.upsert("openrouter".into(), def);
 

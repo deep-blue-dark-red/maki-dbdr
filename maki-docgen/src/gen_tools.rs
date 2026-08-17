@@ -253,7 +253,6 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     (registry, opt_in)
 }
 
-
 pub fn generate() -> String {
     let vars = Vars::new()
         .set("{cwd}", "<cwd>")

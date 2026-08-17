@@ -96,7 +96,8 @@ impl Turn {
     /// Time to the first streamed byte of the response, if the turn made
     /// a request and it hasn't errored out before streaming anything.
     pub fn ttfb(&self) -> Option<Duration> {
-        self.first_byte_at.map(|at| at.duration_since(self.started_at))
+        self.first_byte_at
+            .map(|at| at.duration_since(self.started_at))
     }
 }
 

@@ -850,14 +850,20 @@ pub struct UiConfig {
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
-
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
 
-    #[config(default = false, desc = "Show token statistics (tokens/sec, cache rate) in status bar")]
+    #[config(
+        default = false,
+        desc = "Show token statistics (tokens/sec, cache rate) in status bar"
+    )]
     pub show_token_stats: bool,
 
-    #[config(skip, default = "None", desc = "Context size (tokens) above which a >5min idle warns of a likely cache miss. Unset uses the model context window.")]
+    #[config(
+        skip,
+        default = "None",
+        desc = "Context size (tokens) above which a >5min idle warns of a likely cache miss. Unset uses the model context window."
+    )]
     pub cache_miss_warn_context: Option<u32>,
 }
 
@@ -2030,7 +2036,6 @@ mod tests {
         };
         assert_eq!(raw.into_config(false).unwrap().agent.task_max_concurrent, 3);
     }
-
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
     #[test_case(AlwaysThinking::Toggle(false), StoredThinking::Off ; "toggle_false")]

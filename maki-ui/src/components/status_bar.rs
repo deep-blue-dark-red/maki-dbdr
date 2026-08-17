@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
 
-
 use crate::theme;
 
 use maki_providers::{ModelPricing, TokenUsage, format_tokens};
@@ -210,10 +209,7 @@ impl StatusBar {
         }
 
         if ctx.restoring {
-            left_spans.push(Span::styled(
-                " ✻",
-                theme::current().status_notice,
-            ));
+            left_spans.push(Span::styled(" ✻", theme::current().status_notice));
         }
 
         if let Some(name) = ctx.chat_name {
@@ -284,7 +280,10 @@ impl StatusBar {
                 ));
             }
 
-            right_spans.push(Span::styled(format!("{}  ", ctx.mode_label), ctx.mode_style));
+            right_spans.push(Span::styled(
+                format!("{}  ", ctx.mode_label),
+                ctx.mode_style,
+            ));
 
             let context_style = Style::new().fg(theme::current().foreground);
             let context_text = format!(
@@ -310,7 +309,10 @@ impl StatusBar {
             // Model ID: always strip middle path components
             let model_short = shorten_model_id(ctx.model_id);
             let model_idx = right_spans.len();
-            right_spans.push(Span::styled(model_short.clone(), theme::current().status_dim));
+            right_spans.push(Span::styled(
+                model_short.clone(),
+                theme::current().status_dim,
+            ));
 
             // CWD at far right, same color as context usage
             right_spans.push(Span::raw("  "));
@@ -322,17 +324,24 @@ impl StatusBar {
             // Pass 1: abbreviate cwd path components.
             // Pass 2: truncate model with "...".
             // Pass 3: abbreviate left-side token stats to compact form.
-            let span_width = |spans: &[Span]| -> u16 {
-                spans.iter().map(|s| s.width() as u16).sum()
-            };
+            let span_width =
+                |spans: &[Span]| -> u16 { spans.iter().map(|s| s.width() as u16).sum() };
 
-            let mut left_w = left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1);
+            let mut left_w = left_spans
+                .iter()
+                .map(|s| s.width() as u16)
+                .sum::<u16>()
+                .max(1);
             if left_w + span_width(&right_spans) > area.width {
                 // Compact the left-side token stats first (drop PP/TG, keep
                 // CR + hit/miss marker + CH/CM), mirroring model-name compaction.
                 if let (Some(idx), Some(abbrev)) = (token_stats_idx, token_stats_abbrev) {
                     left_spans[idx] = Span::styled(abbrev.clone(), theme::current().status_dim);
-                    left_w = left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1);
+                    left_w = left_spans
+                        .iter()
+                        .map(|s| s.width() as u16)
+                        .sum::<u16>()
+                        .max(1);
                 }
 
                 if left_w + span_width(&right_spans) > area.width {
@@ -356,20 +365,20 @@ impl StatusBar {
                             theme::current().status_dim,
                         );
                     } else {
-                        right_spans[model_idx] =
-                            Span::styled("...", theme::current().status_dim);
+                        right_spans[model_idx] = Span::styled("...", theme::current().status_dim);
                     }
                 }
             }
         }
 
-        let left_width = left_spans.iter().map(|s| s.width() as u16).sum::<u16>().max(1);
+        let left_width = left_spans
+            .iter()
+            .map(|s| s.width() as u16)
+            .sum::<u16>()
+            .max(1);
 
-        let [left_area, right_area] = Layout::horizontal([
-            Constraint::Length(left_width),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Length(left_width), Constraint::Fill(1)]).areas(area);
 
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
         frame.render_widget(
@@ -386,11 +395,18 @@ impl StatusBar {
 /// omitted entirely when both are zero (e.g. the model has no known
 /// pricing) instead of showing a meaningless "CH $0.00 CM $0.00".
 fn format_token_stats(stats: &TurnStats) -> (String, String) {
-    let mark = if stats.last_turn_cache_miss { "𐄂" } else { "✓" };
+    let mark = if stats.last_turn_cache_miss {
+        "𐄂"
+    } else {
+        "✓"
+    };
     let cost_suffix = if stats.cache_hit_cost == 0.0 && stats.cache_miss_cost == 0.0 {
         String::new()
     } else {
-        format!(" CH ${:.2} CM ${:.2}", stats.cache_hit_cost, stats.cache_miss_cost)
+        format!(
+            " CH ${:.2} CM ${:.2}",
+            stats.cache_hit_cost, stats.cache_miss_cost
+        )
     };
     let abbrev = format!("  CR {:.1}% {mark}{cost_suffix}", stats.cache_rate * 100.0);
     let full = format!(

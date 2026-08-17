@@ -538,10 +538,8 @@ impl MessagesPanel {
         self.prompt_progress = None;
         if !self.streaming_text.is_empty() {
             let role = self.streaming_role.take().unwrap_or(DisplayRole::Assistant);
-            self.messages.push(DisplayMessage::new(
-                role,
-                self.streaming_text.take_all(),
-            ));
+            self.messages
+                .push(DisplayMessage::new(role, self.streaming_text.take_all()));
         }
     }
 
@@ -1200,7 +1198,11 @@ impl MessagesPanel {
         let elapsed = self.started_at.elapsed().as_millis();
         let spinner_span = Span::styled(
             active_spinner_str(elapsed),
-            animation::active_spinner_style(elapsed, theme::current().spinner, theme::current().tool_success),
+            animation::active_spinner_style(
+                elapsed,
+                theme::current().spinner,
+                theme::current().tool_success,
+            ),
         );
         for seg in self.cache.segments_mut() {
             seg.update_spinners(&spinner_span);

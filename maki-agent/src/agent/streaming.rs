@@ -185,4 +185,3 @@ pub(crate) fn estimate_input_tokens(messages: &[Message], system: &str, tools: &
     const CHARS_PER_TOKEN: usize = 4;
     (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
 }
-

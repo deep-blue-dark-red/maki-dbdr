@@ -600,7 +600,11 @@ fn snapshot_to_line(sline: &SnapshotLine) -> Line<'_> {
                         theme::style_by_name(n.strip_prefix(SPINNER_STYLE_PREFIX).unwrap_or(n));
                     Span::styled(
                         active_spinner_str(elapsed),
-                        animation::active_spinner_style(elapsed, base, theme::current().tool_success),
+                        animation::active_spinner_style(
+                            elapsed,
+                            base,
+                            theme::current().tool_success,
+                        ),
                     )
                 }
                 style => Span::styled(span.text.clone(), resolve_span_style(style)),

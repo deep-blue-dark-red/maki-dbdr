@@ -108,9 +108,10 @@ pub fn dot_spinner_color(elapsed_ms: u128, success: Color) -> Color {
 pub fn active_spinner_style(elapsed_ms: u128, base: Style, success: Style) -> Style {
     match spinner_config().style {
         SpinnerStyle::Braille => base,
-        SpinnerStyle::Dot => {
-            base.fg(dot_spinner_color(elapsed_ms, success.fg.unwrap_or(Color::Green)))
-        }
+        SpinnerStyle::Dot => base.fg(dot_spinner_color(
+            elapsed_ms,
+            success.fg.unwrap_or(Color::Green),
+        )),
     }
 }
 

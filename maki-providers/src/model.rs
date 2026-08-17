@@ -935,7 +935,10 @@ mod tests {
         let cost = usage.cost(&pricing, false);
         // 2M*0.5/1M + 1M*1.5/1M + 0.5M*0.1/1M + 4M*0.05/1M
         let expected = 1.0 + 1.5 + 0.05 + 0.2;
-        assert!((cost - expected).abs() < 1e-9, "got {cost}, expected {expected}");
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "got {cost}, expected {expected}"
+        );
     }
 
     #[test]

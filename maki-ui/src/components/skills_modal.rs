@@ -1,5 +1,6 @@
 use crate::components::Overlay;
 use crate::components::modal::Modal;
+use crate::components::settings_picker::UserSettings;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -7,7 +8,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use crate::components::settings_picker::UserSettings;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SkillsJson {
@@ -136,7 +136,9 @@ impl SkillsModal {
         self.folders = folders;
         self.skills_json = json;
 
-        self.selected_folder = self.selected_folder.min(self.folders.len().saturating_sub(1));
+        self.selected_folder = self
+            .selected_folder
+            .min(self.folders.len().saturating_sub(1));
         self.selected_skill = self.selected_skill.min(self.skills.len().saturating_sub(1));
     }
 
@@ -155,7 +157,10 @@ impl SkillsModal {
                     let path_str = self.input_buffer.value().trim().to_string();
                     if !path_str.is_empty() {
                         let path = std::path::Path::new(&path_str);
-                        if path_str.starts_with('~') || path_str.starts_with('/') || path.is_absolute() {
+                        if path_str.starts_with('~')
+                            || path_str.starts_with('/')
+                            || path.is_absolute()
+                        {
                             let mut settings = UserSettings::load();
                             let resolved = if let Some(stripped) = path_str.strip_prefix("~/") {
                                 if let Some(home) = maki_storage::paths::home() {
@@ -241,11 +246,22 @@ impl SkillsModal {
             KeyCode::Char(' ') | KeyCode::Enter => {
                 match self.focus {
                     Focus::Folders => {
-                        if let Some(folder) = self.folders.get(self.selected_folder).filter(|f| f.tag == FolderTag::Custom) {
-                            if let Some(pos) = self.skills_json.entries.iter().position(|e| e.path == folder.display_path) {
+                        if let Some(folder) = self
+                            .folders
+                            .get(self.selected_folder)
+                            .filter(|f| f.tag == FolderTag::Custom)
+                        {
+                            if let Some(pos) = self
+                                .skills_json
+                                .entries
+                                .iter()
+                                .position(|e| e.path == folder.display_path)
+                            {
                                 self.skills_json.entries.remove(pos);
                             } else {
-                                self.skills_json.entries.push(SkillEntry { path: folder.display_path.clone() });
+                                self.skills_json.entries.push(SkillEntry {
+                                    path: folder.display_path.clone(),
+                                });
                             }
                             let _ = save_skills_json(&self.cwd, &self.skills_json);
                             self.refresh();
@@ -254,7 +270,12 @@ impl SkillsModal {
                     Focus::Skills => {
                         if let Some(skill) = self.skills.get(self.selected_skill) {
                             let name_or_folder = &skill.folder_name;
-                            if let Some(pos) = self.skills_json.exclude.iter().position(|x| x == name_or_folder) {
+                            if let Some(pos) = self
+                                .skills_json
+                                .exclude
+                                .iter()
+                                .position(|x| x == name_or_folder)
+                            {
                                 self.skills_json.exclude.remove(pos);
                             } else {
                                 self.skills_json.exclude.push(name_or_folder.clone());
@@ -266,7 +287,9 @@ impl SkillsModal {
                 }
                 SkillsAction::None
             }
-            KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete if self.focus == Focus::Folders => {
+            KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete
+                if self.focus == Focus::Folders =>
+            {
                 if let Some(folder) = self.folders.get(self.selected_folder) {
                     let path_str = folder.path.to_string_lossy().into_owned();
                     let mut settings = UserSettings::load();
@@ -276,7 +299,12 @@ impl SkillsModal {
                         settings.save();
                         changed = true;
                     }
-                    if let Some(pos) = self.skills_json.entries.iter().position(|e| e.path == folder.display_path) {
+                    if let Some(pos) = self
+                        .skills_json
+                        .entries
+                        .iter()
+                        .position(|e| e.path == folder.display_path)
+                    {
                         self.skills_json.entries.remove(pos);
                         let _ = save_skills_json(&self.cwd, &self.skills_json);
                         changed = true;
@@ -314,26 +342,27 @@ impl SkillsModal {
                 }
                 SkillsAction::None
             }
-            KeyCode::Char('e') => {
-                match self.focus {
-                    Focus::Skills => {
-                        let path = self.skills.get(self.selected_skill).map(|s| s.path.clone());
-                        if let Some(p) = path {
-                            self.close();
-                            return SkillsAction::EditSkill(p);
-                        }
-                        SkillsAction::None
+            KeyCode::Char('e') => match self.focus {
+                Focus::Skills => {
+                    let path = self.skills.get(self.selected_skill).map(|s| s.path.clone());
+                    if let Some(p) = path {
+                        self.close();
+                        return SkillsAction::EditSkill(p);
                     }
-                    Focus::Folders => {
-                        let path = self.folders.get(self.selected_folder).map(|f| f.path.clone());
-                        if let Some(p) = path {
-                            self.close();
-                            return SkillsAction::EditSkillsJson(p);
-                        }
-                        SkillsAction::None
-                    }
+                    SkillsAction::None
                 }
-            }
+                Focus::Folders => {
+                    let path = self
+                        .folders
+                        .get(self.selected_folder)
+                        .map(|f| f.path.clone());
+                    if let Some(p) = path {
+                        self.close();
+                        return SkillsAction::EditSkillsJson(p);
+                    }
+                    SkillsAction::None
+                }
+            },
             _ => SkillsAction::None,
         }
     }
@@ -370,14 +399,23 @@ impl SkillsModal {
         let folders_block = Block::default()
             .borders(Borders::ALL)
             .title(" Folders ")
-            .border_style(if self.focus == Focus::Folders { t.accent } else { t.tool_dim });
+            .border_style(if self.focus == Focus::Folders {
+                t.accent
+            } else {
+                t.tool_dim
+            });
 
         let mut folder_lines = Vec::new();
         for (i, folder) in self.folders.iter().enumerate() {
             let is_selected = self.focus == Focus::Folders && i == self.selected_folder;
             let check = match folder.tag {
                 FolderTag::Custom => {
-                    if self.skills_json.entries.iter().any(|e| e.path == folder.display_path) {
+                    if self
+                        .skills_json
+                        .entries
+                        .iter()
+                        .any(|e| e.path == folder.display_path)
+                    {
                         "[x]"
                     } else {
                         "[ ]"
@@ -398,18 +436,34 @@ impl SkillsModal {
         let skills_block = Block::default()
             .borders(Borders::ALL)
             .title(" Skills ")
-            .border_style(if self.focus == Focus::Skills { t.accent } else { t.tool_dim });
+            .border_style(if self.focus == Focus::Skills {
+                t.accent
+            } else {
+                t.tool_dim
+            });
 
         let mut skill_lines = Vec::new();
         for (i, skill) in self.skills.iter().enumerate() {
             let is_selected = self.focus == Focus::Skills && i == self.selected_skill;
-            let is_excluded = self.skills_json.exclude.iter().any(|x| x == &skill.folder_name);
+            let is_excluded = self
+                .skills_json
+                .exclude
+                .iter()
+                .any(|x| x == &skill.folder_name);
             let check = if is_excluded { "[ ]" } else { "[x]" };
             let style = if is_selected { t.item_selected } else { t.item };
-            
-            let source_display = if skill.source_dir.to_string_lossy().contains(".agents/skills") {
+
+            let source_display = if skill
+                .source_dir
+                .to_string_lossy()
+                .contains(".agents/skills")
+            {
                 ".agents"
-            } else if skill.source_dir.to_string_lossy().contains(".gemini/config/skills") {
+            } else if skill
+                .source_dir
+                .to_string_lossy()
+                .contains(".gemini/config/skills")
+            {
                 "global"
             } else {
                 "custom"
@@ -433,15 +487,15 @@ impl SkillsModal {
         match self.focus {
             Focus::Folders => {
                 if self.input_mode {
-                    details_lines.push(Line::from(vec![
-                        Span::styled("Add Skills Folder Path: ", t.accent),
-                    ]));
+                    details_lines.push(Line::from(vec![Span::styled(
+                        "Add Skills Folder Path: ",
+                        t.accent,
+                    )]));
                     let value = self.input_buffer.value();
-                    let cursor_byte = crate::text_buffer::TextBuffer::char_to_byte(&value, self.input_buffer.x());
+                    let cursor_byte =
+                        crate::text_buffer::TextBuffer::char_to_byte(&value, self.input_buffer.x());
                     let (before, after) = value.split_at(cursor_byte);
-                    let mut spans = vec![
-                        Span::styled(before.to_string(), t.item),
-                    ];
+                    let mut spans = vec![Span::styled(before.to_string(), t.item)];
                     if let Some(c) = after.chars().next() {
                         spans.push(Span::styled(c.to_string(), t.item_selected));
                         spans.push(Span::styled(after[c.len_utf8()..].to_string(), t.item));
@@ -450,9 +504,10 @@ impl SkillsModal {
                     }
                     details_lines.push(Line::from(spans));
                     details_lines.push(Line::default());
-                    details_lines.push(Line::from(vec![
-                        Span::styled("Press Enter to add, Esc to cancel.", t.item_desc)
-                    ]));
+                    details_lines.push(Line::from(vec![Span::styled(
+                        "Press Enter to add, Esc to cancel.",
+                        t.item_desc,
+                    )]));
                 } else if let Some(folder) = self.folders.get(self.selected_folder) {
                     details_lines.push(Line::from(vec![
                         Span::styled("Path: ", t.tool_dim),
@@ -493,51 +548,58 @@ impl SkillsModal {
                         Span::styled(skill.source_dir.to_string_lossy().into_owned(), t.item),
                     ]));
                     details_lines.push(Line::default());
-                    details_lines.push(Line::from(vec![
-                        Span::styled("Description:", t.tool_dim)
-                    ]));
-                    details_lines.push(Line::from(vec![
-                        Span::styled(skill.description.clone(), t.item)
-                    ]));
+                    details_lines.push(Line::from(vec![Span::styled("Description:", t.tool_dim)]));
+                    details_lines.push(Line::from(vec![Span::styled(
+                        skill.description.clone(),
+                        t.item,
+                    )]));
                 } else {
-                    details_lines.push(Line::from(vec![
-                        Span::styled("No skills found. Press 'c' to create a new skill in .agents/skills.", t.item_desc)
-                    ]));
+                    details_lines.push(Line::from(vec![Span::styled(
+                        "No skills found. Press 'c' to create a new skill in .agents/skills.",
+                        t.item_desc,
+                    )]));
                 }
             }
         }
 
         details_lines.push(Line::default());
-        details_lines.push(Line::from(vec![
-            Span::styled("--- Keyboard Shortcuts ---", t.tool_dim)
-        ]));
+        details_lines.push(Line::from(vec![Span::styled(
+            "--- Keyboard Shortcuts ---",
+            t.tool_dim,
+        )]));
         details_lines.push(Line::from(vec![
             Span::styled("  Tab        ", t.accent),
-            Span::styled("Switch focus between Folders and Skills", t.item_desc)
+            Span::styled("Switch focus between Folders and Skills", t.item_desc),
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  Space/Enter", t.accent),
-            Span::styled("Toggle custom folder or exclude skill", t.item_desc)
+            Span::styled("Toggle custom folder or exclude skill", t.item_desc),
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  a          ", t.accent),
-            Span::styled("Add a new skills folder (global config / workspace)", t.item_desc)
+            Span::styled(
+                "Add a new skills folder (global config / workspace)",
+                t.item_desc,
+            ),
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  d/Backspace", t.accent),
-            Span::styled("Remove selected skills folder", t.item_desc)
+            Span::styled("Remove selected skills folder", t.item_desc),
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  c          ", t.accent),
-            Span::styled("Create a new skill in .agents/skills", t.item_desc)
+            Span::styled("Create a new skill in .agents/skills", t.item_desc),
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  e          ", t.accent),
-            Span::styled("Open the selected folder or skill in your editor", t.item_desc)
+            Span::styled(
+                "Open the selected folder or skill in your editor",
+                t.item_desc,
+            ),
         ]));
         details_lines.push(Line::from(vec![
             Span::styled("  Esc        ", t.accent),
-            Span::styled("Close menu", t.item_desc)
+            Span::styled("Close menu", t.item_desc),
         ]));
 
         let details_paragraph = Paragraph::new(details_lines)
@@ -593,7 +655,7 @@ fn find_project_ancestors(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 fn determine_folder_tag(path: &std::path::Path, cwd: &std::path::Path) -> FolderTag {
     let path_str = path.to_string_lossy();
-    
+
     // Find the project root (the first ancestor containing .git, or cwd if not found)
     let mut project_root = cwd.to_path_buf();
     let mut current = cwd;
@@ -728,7 +790,7 @@ pub fn discover_skills_and_folders(
                             .ok()
                             .and_then(|c| parse_skill_md(&c))
                             .unwrap_or_else(|| (folder_name.clone(), String::new()));
-                        
+
                         skills.push(SkillInfo {
                             name,
                             description,
@@ -751,7 +813,10 @@ pub fn discover_skills_and_folders(
     (unique_skills, folders, skills_json)
 }
 
-pub fn save_skills_json(cwd: &std::path::Path, skills_json: &SkillsJson) -> Result<(), std::io::Error> {
+pub fn save_skills_json(
+    cwd: &std::path::Path,
+    skills_json: &SkillsJson,
+) -> Result<(), std::io::Error> {
     let workspace_root = cwd.join(".agents");
     std::fs::create_dir_all(&workspace_root)?;
     let path = workspace_root.join("skills.json");

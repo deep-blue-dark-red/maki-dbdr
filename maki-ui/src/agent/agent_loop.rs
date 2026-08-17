@@ -176,7 +176,11 @@ impl AgentLoop {
         agent::checkpoint(&*provider, &model, &mut self.history, event_tx, None).await
     }
 
-    async fn do_rename(&mut self, event_tx: &EventSender, messages: Vec<Message>) -> Result<(), AgentError> {
+    async fn do_rename(
+        &mut self,
+        event_tx: &EventSender,
+        messages: Vec<Message>,
+    ) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
         let model = slot.model.clone();
         let provider = Arc::clone(&slot.provider);

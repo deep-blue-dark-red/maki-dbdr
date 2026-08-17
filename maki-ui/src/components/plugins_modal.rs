@@ -187,7 +187,11 @@ impl PluginsModal {
         let mut lines: Vec<Line> = Vec::new();
 
         if let Some(plugin) = self.plugins.get(self.selected) {
-            let status = if plugin.is_loaded { "enabled" } else { "disabled" };
+            let status = if plugin.is_loaded {
+                "enabled"
+            } else {
+                "disabled"
+            };
             let status_style = if plugin.is_loaded { t.item } else { t.tool_dim };
 
             lines.push(Line::from(vec![
@@ -202,7 +206,11 @@ impl PluginsModal {
             lines.push(Line::from(Span::styled("Source:", t.tool_dim)));
             let path_str = plugin.source_path.to_string_lossy().into_owned();
             // wrap long paths
-            for chunk in path_str.as_bytes().chunks(inner.width.saturating_sub(2) as usize).map(|b| std::str::from_utf8(b).unwrap_or("")) {
+            for chunk in path_str
+                .as_bytes()
+                .chunks(inner.width.saturating_sub(2) as usize)
+                .map(|b| std::str::from_utf8(b).unwrap_or(""))
+            {
                 lines.push(Line::from(Span::styled(chunk.to_string(), t.item_desc)));
             }
             lines.push(Line::from(""));
@@ -212,7 +220,10 @@ impl PluginsModal {
 
         // Key hints
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("── Keys ──────────────", t.tool_dim)));
+        lines.push(Line::from(Span::styled(
+            "── Keys ──────────────",
+            t.tool_dim,
+        )));
         for (key, desc) in &[
             ("Space/Enter", "toggle enable/disable"),
             ("e", "open source in editor"),

@@ -10,32 +10,84 @@ macro_rules! mod_key {
 }
 
 macro_rules! upper {
-    ('a') => { "A" };
-    ('b') => { "B" };
-    ('c') => { "C" };
-    ('d') => { "D" };
-    ('e') => { "E" };
-    ('f') => { "F" };
-    ('g') => { "G" };
-    ('h') => { "H" };
-    ('i') => { "I" };
-    ('j') => { "J" };
-    ('k') => { "K" };
-    ('l') => { "L" };
-    ('m') => { "M" };
-    ('n') => { "N" };
-    ('o') => { "O" };
-    ('p') => { "P" };
-    ('q') => { "Q" };
-    ('r') => { "R" };
-    ('s') => { "S" };
-    ('t') => { "T" };
-    ('u') => { "U" };
-    ('v') => { "V" };
-    ('w') => { "W" };
-    ('x') => { "X" };
-    ('y') => { "Y" };
-    ('z') => { "Z" };
+    ('a') => {
+        "A"
+    };
+    ('b') => {
+        "B"
+    };
+    ('c') => {
+        "C"
+    };
+    ('d') => {
+        "D"
+    };
+    ('e') => {
+        "E"
+    };
+    ('f') => {
+        "F"
+    };
+    ('g') => {
+        "G"
+    };
+    ('h') => {
+        "H"
+    };
+    ('i') => {
+        "I"
+    };
+    ('j') => {
+        "J"
+    };
+    ('k') => {
+        "K"
+    };
+    ('l') => {
+        "L"
+    };
+    ('m') => {
+        "M"
+    };
+    ('n') => {
+        "N"
+    };
+    ('o') => {
+        "O"
+    };
+    ('p') => {
+        "P"
+    };
+    ('q') => {
+        "Q"
+    };
+    ('r') => {
+        "R"
+    };
+    ('s') => {
+        "S"
+    };
+    ('t') => {
+        "T"
+    };
+    ('u') => {
+        "U"
+    };
+    ('v') => {
+        "V"
+    };
+    ('w') => {
+        "W"
+    };
+    ('x') => {
+        "X"
+    };
+    ('y') => {
+        "Y"
+    };
+    ('z') => {
+        "Z"
+    };
 }
 
 macro_rules! ctrl_bind {
@@ -162,7 +214,9 @@ impl Default for ConfiguredKeybindings {
             },
             edit_system_prompt: Bind {
                 code: KeyCode::Char('p'),
-                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+                modifiers: KeyModifiers::from_bits_truncate(
+                    KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits(),
+                ),
                 label: "Alt+Shift+P",
                 name: Some("edit_system_prompt"),
             },
@@ -187,25 +241,33 @@ impl Default for ConfiguredKeybindings {
             },
             shift_session_down: Bind {
                 code: KeyCode::Char('a'),
-                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+                modifiers: KeyModifiers::from_bits_truncate(
+                    KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits(),
+                ),
                 label: "Alt+Shift+A",
                 name: Some("shift_session_down"),
             },
             shift_session_up: Bind {
                 code: KeyCode::Char('s'),
-                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+                modifiers: KeyModifiers::from_bits_truncate(
+                    KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits(),
+                ),
                 label: "Alt+Shift+S",
                 name: Some("shift_session_up"),
             },
             delete_current_session: Bind {
                 code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+                modifiers: KeyModifiers::from_bits_truncate(
+                    KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits(),
+                ),
                 label: "Ctrl+Shift+D",
                 name: Some("delete_current_session"),
             },
             toggle_global_sessions: Bind {
                 code: KeyCode::Char('m'),
-                modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+                modifiers: KeyModifiers::from_bits_truncate(
+                    KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits(),
+                ),
                 label: "Ctrl+Shift+M",
                 name: Some("toggle_global_sessions"),
             },
@@ -213,10 +275,12 @@ impl Default for ConfiguredKeybindings {
     }
 }
 
-pub static CURRENT_BINDS: std::sync::OnceLock<std::sync::RwLock<ConfiguredKeybindings>> = std::sync::OnceLock::new();
+pub static CURRENT_BINDS: std::sync::OnceLock<std::sync::RwLock<ConfiguredKeybindings>> =
+    std::sync::OnceLock::new();
 
 pub fn get_configured_bind(name: &str) -> Option<Bind> {
-    let binds = CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
+    let binds =
+        CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
     let read = binds.read().unwrap();
     match name {
         "quit" => Some(read.quit),
@@ -265,7 +329,8 @@ pub fn get_bind<F, R>(f: F) -> R
 where
     F: FnOnce(&ConfiguredKeybindings) -> R,
 {
-    let binds = CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
+    let binds =
+        CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
     let read = binds.read().unwrap();
     f(&read)
 }
@@ -361,7 +426,8 @@ pub fn parse_keybind(s: &str) -> Option<Bind> {
 
 pub fn update_bind(action: &str, bind_str: &str) -> bool {
     if let Some(mut bind) = parse_keybind(bind_str) {
-        let binds = CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
+        let binds =
+            CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
         if let Ok(mut write) = binds.write() {
             bind.name = Some(Box::leak(action.to_string().into_boxed_str()));
             match action {
@@ -428,7 +494,9 @@ pub mod key {
     };
     pub const EDIT_SYSTEM_PROMPT: Bind = Bind {
         code: KeyCode::Char('p'),
-        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+        modifiers: KeyModifiers::from_bits_truncate(
+            KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits(),
+        ),
         label: "Alt+Shift+P",
         name: Some("edit_system_prompt"),
     };
@@ -454,25 +522,33 @@ pub mod key {
     };
     pub const SHIFT_SESSION_DOWN: Bind = Bind {
         code: KeyCode::Char('a'),
-        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+        modifiers: KeyModifiers::from_bits_truncate(
+            KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits(),
+        ),
         label: "Alt+Shift+A",
         name: Some("shift_session_down"),
     };
     pub const SHIFT_SESSION_UP: Bind = Bind {
         code: KeyCode::Char('s'),
-        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits()),
+        modifiers: KeyModifiers::from_bits_truncate(
+            KeyModifiers::ALT.bits() | KeyModifiers::SHIFT.bits(),
+        ),
         label: "Alt+Shift+S",
         name: Some("shift_session_up"),
     };
     pub const DELETE_CURRENT_SESSION: Bind = Bind {
         code: KeyCode::Char('d'),
-        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+        modifiers: KeyModifiers::from_bits_truncate(
+            KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits(),
+        ),
         label: "Ctrl+Shift+D",
         name: Some("delete_current_session"),
     };
     pub const TOGGLE_GLOBAL_SESSIONS: Bind = Bind {
         code: KeyCode::Char('m'),
-        modifiers: KeyModifiers::from_bits_truncate(KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits()),
+        modifiers: KeyModifiers::from_bits_truncate(
+            KeyModifiers::CONTROL.bits() | KeyModifiers::SHIFT.bits(),
+        ),
         label: "Ctrl+Shift+M",
         name: Some("toggle_global_sessions"),
     };
@@ -612,9 +688,7 @@ impl KeyLabel {
                     ResolvedLabel::Multi(normal.iter().map(|s| s.to_string()).collect())
                 }
             }
-            Self::Action(name) => {
-                ResolvedLabel::Single(get_bind_label(name))
-            }
+            Self::Action(name) => ResolvedLabel::Single(get_bind_label(name)),
             Self::ActionAlt(name1, name2) => {
                 ResolvedLabel::Alt(get_bind_label(name1), get_bind_label(name2))
             }
@@ -930,7 +1004,10 @@ pub(crate) fn key_event_to_string(key: &KeyEvent) -> String {
     if mods.contains(KeyModifiers::ALT) {
         s.push_str("alt+");
     }
-    if mods.contains(KeyModifiers::SHIFT) && (!is_char || mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)) {
+    if mods.contains(KeyModifiers::SHIFT)
+        && (!is_char
+            || mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER))
+    {
         s.push_str("shift+");
     }
     match key.code {

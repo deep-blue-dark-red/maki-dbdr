@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::{RewindEntry, display_msg_index_for_turn};
-use crate::components::{Action, LoadedSession};
 use crate::components::settings_picker::UserSettings;
+use crate::components::{Action, LoadedSession};
 use maki_agent::ToolOutput;
 use maki_providers::{ContentBlock, Message, Model, Role, TokenUsage};
 use maki_storage::id::MakiId;
@@ -371,10 +371,8 @@ impl App {
             if matches!(msg.role, Role::User) {
                 user_count += 1;
                 if user_count == turn_num {
-                    let display_idx = display_msg_index_for_turn(
-                        self.state.session.messages(),
-                        msg_idx,
-                    );
+                    let display_idx =
+                        display_msg_index_for_turn(self.state.session.messages(), msg_idx);
                     self.main_chat().scroll_to_segment(display_idx);
                     self.checkpoint_now();
                     return vec![];
@@ -427,13 +425,15 @@ impl App {
         let summaries = match summaries_res {
             Ok(list) => list,
             Err(e) => {
-                self.status_bar.flash(format!("Failed to list sessions: {e}"));
+                self.status_bar
+                    .flash(format!("Failed to list sessions: {e}"));
                 return vec![];
             }
         };
 
         if summaries.len() <= 1 {
-            self.status_bar.flash("No other sessions to switch to".into());
+            self.status_bar
+                .flash("No other sessions to switch to".into());
             return vec![];
         }
 
@@ -455,7 +455,8 @@ impl App {
         let target_title = &summaries[target_idx].title;
 
         let actions = self.load_session(target_id);
-        self.status_bar.flash(format!("Switched to session: {target_title}"));
+        self.status_bar
+            .flash(format!("Switched to session: {target_title}"));
         actions
     }
 
@@ -513,9 +514,10 @@ fn format_messages(
     for message in messages {
         match message.role {
             Role::User => {
-                let has_non_tool_result = message.content.iter().any(|block| {
-                    !matches!(block, ContentBlock::ToolResult { .. })
-                });
+                let has_non_tool_result = message
+                    .content
+                    .iter()
+                    .any(|block| !matches!(block, ContentBlock::ToolResult { .. }));
                 if !has_non_tool_result {
                     continue;
                 }
@@ -562,7 +564,9 @@ fn format_messages(
                                 );
                             }
                         }
-                        ContentBlock::ToolUse { id, name, input, .. } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             let _ = writeln!(out, "**Tool Call:** `{}`", name);
                             let input_pretty = serde_json::to_string_pretty(input)
                                 .unwrap_or_else(|_| input.to_string());
@@ -575,7 +579,8 @@ fn format_messages(
                                     if tool_output.is_markdown() {
                                         let _ = writeln!(out, "{}", output_text.trim_end());
                                     } else {
-                                        let _ = writeln!(out, "```\n{}\n```", output_text.trim_end());
+                                        let _ =
+                                            writeln!(out, "```\n{}\n```", output_text.trim_end());
                                     }
                                 }
                             } else {

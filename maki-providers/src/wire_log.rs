@@ -154,9 +154,7 @@ pub fn compute_patch(old: &[u8], new: &[u8]) -> (u32, u32, Vec<u8>) {
     }
     let max_suffix = min_len - prefix;
     let mut suffix = 0;
-    while suffix < max_suffix
-        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
-    {
+    while suffix < max_suffix && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix] {
         suffix += 1;
     }
     let diff = new[prefix..new.len() - suffix].to_vec();
@@ -217,7 +215,9 @@ pub fn log_request(
 
     let Ok(mut map) = SESSIONS.lock() else { return };
     let sess = map.entry(path.to_path_buf()).or_default();
-    let Ok(mut file) = open_append(path) else { return };
+    let Ok(mut file) = open_append(path) else {
+        return;
+    };
 
     let ok = match fragments {
         Some(frags) => write_refs(&mut file, ts_ms, uri, &frags, sess),
@@ -254,7 +254,12 @@ fn write_refs(
 }
 
 /// Return the id for `bytes`, emitting a `DEF` record first if it's novel.
-fn intern(file: &mut File, ts_ms: u64, bytes: &[u8], sess: &mut SessionLog) -> std::io::Result<u32> {
+fn intern(
+    file: &mut File,
+    ts_ms: u64,
+    bytes: &[u8],
+    sess: &mut SessionLog,
+) -> std::io::Result<u32> {
     if let Some(&id) = sess.blobs.get(bytes) {
         return Ok(id);
     }
@@ -299,7 +304,9 @@ fn write_diff(
 /// Log a response. Stores the exact received bytes.
 pub fn log_response(path: &Path, ts_ms: u64, status: u16, content_type: &str, raw_body: &[u8]) {
     let Ok(_guard) = SESSIONS.lock() else { return };
-    let Ok(mut file) = open_append(path) else { return };
+    let Ok(mut file) = open_append(path) else {
+        return;
+    };
     let mut payload = Vec::with_capacity(6 + content_type.len() + raw_body.len());
     payload.extend_from_slice(&status.to_le_bytes());
     put_bytes(&mut payload, content_type.as_bytes());
@@ -451,8 +458,8 @@ fn read_bytes(data: &[u8]) -> Option<Vec<Record>> {
 /// non-SSE bodies are returned parsed as-is. Byte-exact recovery still lives in
 /// the record itself.
 pub fn clean_response_body(body_str: &str, content_type: Option<&str>) -> Value {
-    let is_sse = content_type.is_some_and(|ct| ct.contains("event-stream"))
-        || body_str.contains("data: ");
+    let is_sse =
+        content_type.is_some_and(|ct| ct.contains("event-stream")) || body_str.contains("data: ");
     if !is_sse {
         return serde_json::from_str(body_str)
             .unwrap_or_else(|_| Value::String(body_str.to_string()));

@@ -226,7 +226,9 @@ pub(crate) fn paint_semantic(
         lines.push(prefix_line(last_frag, prefix_style));
     } else if shares_line_with_prefix(&semantic[0].kind) {
         if !last_frag.is_empty() {
-            lines[0].spans.insert(0, prefix_span(last_frag, prefix_style));
+            lines[0]
+                .spans
+                .insert(0, prefix_span(last_frag, prefix_style));
         }
     } else if !last_frag.is_empty() {
         lines.insert(0, prefix_line(last_frag, prefix_style));
@@ -422,7 +424,11 @@ mod tests {
         let texts = lines_text(&lines);
         assert_eq!(
             texts,
-            vec!["---".to_string(), "p> hello".to_string(), "world".to_string()]
+            vec![
+                "---".to_string(),
+                "p> hello".to_string(),
+                "world".to_string()
+            ]
         );
     }
 
