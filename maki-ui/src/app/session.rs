@@ -71,13 +71,7 @@ impl App {
             meta,
             self.state.token_usage,
         );
-        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(self.state.session.title.clone());
-        maki_providers::update_api_log_symlink(
-            &self.state.session.id.to_string(),
-            None,
-            &self.state.session.title,
-            self.state.session.created_at,
-        );
+        self.publish_session_name();
         if !self.has_content() {
             // A draft typed and then deleted is already on disk, and a file with
             // nothing in it is a session the picker still offers to resume. Idle
@@ -114,6 +108,36 @@ impl App {
 
         self.storage_writer.send(Arc::clone(&self.state.session));
         self.last_sent = Some(sent);
+    }
+
+    /// Mirrors the session's name outwards: to the config global the status
+    /// line reads, and to the friendly symlink beside the API log.
+    ///
+    /// Both are pure functions of the session id and title, and a checkpoint
+    /// runs every frame, so they are gated on the name actually moving. The
+    /// symlink side in particular reaches the filesystem — a `create_dir_all`
+    /// and a `stat` at minimum, an unlink and a `symlink` once a log exists —
+    /// and none of that belongs on a 16ms tick that usually has nothing to say.
+    fn publish_session_name(&mut self) {
+        let session = &self.state.session;
+        if self
+            .published_name
+            .as_ref()
+            .is_some_and(|(id, title)| *id == session.id && title == &session.title)
+        {
+            return;
+        }
+        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(session.title.clone());
+        maki_providers::update_api_log_symlink(
+            &session.id.to_string(),
+            self.published_name
+                .as_ref()
+                .filter(|(id, _)| *id == session.id)
+                .map(|(_, title)| title.as_str()),
+            &session.title,
+            session.created_at,
+        );
+        self.published_name = Some((session.id, session.title.clone()));
     }
 
     /// Everything the session mirrors from live state, built field by field so

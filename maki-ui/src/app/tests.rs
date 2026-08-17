@@ -4517,3 +4517,26 @@ fn stats_command_toggles_modal_and_new_clears_history() {
     app.reset_session();
     assert!(app.turn_history.is_empty());
 }
+
+/// A checkpoint runs every frame, so the outward-facing name publish has to
+/// stay quiet when nothing moved: it writes a global and, on the symlink
+/// side, reaches the filesystem.
+#[test]
+fn session_name_is_published_only_when_it_changes() {
+    let mut app = test_app();
+    app.checkpoint();
+    let first = app.published_name.clone();
+    assert_eq!(
+        first.as_ref().map(|(id, _)| *id),
+        Some(app.state.session.id)
+    );
+
+    app.checkpoint();
+    assert_eq!(app.published_name, first, "republished an unchanged name");
+
+    app.apply_rename("renamed".into());
+    assert_eq!(
+        app.published_name.as_ref().map(|(_, t)| t.as_str()),
+        Some("renamed")
+    );
+}

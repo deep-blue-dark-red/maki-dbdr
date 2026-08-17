@@ -67,6 +67,7 @@ use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
 use maki_providers::{Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
+use maki_storage::id::MakiId;
 use maki_storage::input_history::InputHistory;
 use maki_storage::model::persist_model;
 
@@ -228,6 +229,7 @@ pub struct App {
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     storage_writer: Arc<StorageWriter>,
     last_sent: Option<Sent>,
+    published_name: Option<(MakiId, String)>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(super) show_token_stats: bool,
@@ -336,6 +338,7 @@ impl App {
             image_paste_rx: vec![],
             storage_writer,
             last_sent: None,
+            published_name: None,
             shell: shell::ShellState::default(),
             ui_config,
             show_token_stats: UserSettings::load().show_token_stats,
@@ -1301,17 +1304,11 @@ impl App {
     }
 
     pub(crate) fn apply_rename(&mut self, title: String) {
-        let old_name = self.state.session.title.clone();
-        let session_id = self.state.session.id;
         self.state.session_mut().set_title(title.clone());
-        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(title.clone());
+        // The checkpoint publishes the new name and retires the symlink the
+        // old one left behind; it knows the previous title, so a rename needs
+        // nothing here beyond setting the new one.
         self.checkpoint_now();
-        maki_providers::update_api_log_symlink(
-            &session_id.to_string(),
-            Some(&old_name),
-            &title,
-            self.state.session.created_at,
-        );
         self.status_bar
             .flash(format!("Session renamed to: {title}"));
     }
