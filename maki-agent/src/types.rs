@@ -499,19 +499,50 @@ impl ToolDoneEvent {
     }
 }
 
-pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
-    let mut content = Vec::with_capacity(results.len());
-    let mut images = Vec::new();
-    for r in results {
-        content.push(ContentBlock::ToolResult {
-            tool_use_id: r.id,
-            content: r.output.as_text(),
+/// Everything the history message and the turn record need from a finished
+/// tool call.
+///
+/// A `ToolDoneEvent` carries the tool's full structured output, which for a
+/// file read is every line of the file. Both the UI and the history want
+/// something from a finished call; taking these four fields first lets the
+/// event itself go to the UI by move instead of being copied whole.
+pub struct ToolResultParts {
+    pub id: String,
+    pub text: String,
+    pub is_error: bool,
+    /// Pixels ride as their own content block; `text` holds the caption.
+    pub image: Option<maki_providers::ImageSource>,
+}
+
+impl ToolResultParts {
+    pub fn from_event(r: &ToolDoneEvent) -> Self {
+        Self {
+            id: r.id.clone(),
+            text: r.output.as_text(),
             is_error: r.is_error,
+            image: match &r.output {
+                ToolOutput::Image { source, .. } => Some(source.clone()),
+                _ => None,
+            },
+        }
+    }
+}
+
+pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
+    tool_results_from_parts(results.iter().map(ToolResultParts::from_event).collect())
+}
+
+pub fn tool_results_from_parts(parts: Vec<ToolResultParts>) -> Message {
+    let mut content = Vec::with_capacity(parts.len());
+    let mut images = Vec::new();
+    for p in parts {
+        content.push(ContentBlock::ToolResult {
+            tool_use_id: p.id,
+            content: p.text,
+            is_error: p.is_error,
         });
-        if let ToolOutput::Image { source, .. } = &r.output {
-            images.push(ContentBlock::Image {
-                source: source.clone(),
-            });
+        if let Some(source) = p.image {
+            images.push(ContentBlock::Image { source });
         }
     }
     // Anthropic wants every tool_result before other content in the user

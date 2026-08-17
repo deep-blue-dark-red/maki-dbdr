@@ -11,6 +11,7 @@ use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
 use crate::tools::{LocalToolFn, ToolContext};
+use crate::types::ToolResultParts;
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
 
@@ -412,7 +413,7 @@ pub(super) async fn process_tool_calls(
 
     history.push(response.message);
 
-    let mut immediate_errors: Vec<ToolDoneEvent> = Vec::new();
+    let mut immediate_parts: Vec<ToolResultParts> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
     let mut records: Vec<super::turn_state::ToolCallRecord> = Vec::new();
@@ -423,26 +424,28 @@ pub(super) async fn process_tool_calls(
             input_preview = %crate::tools::schema::preview(&input.to_string()),
             "parsing tool call"
         );
-        if recent_calls.is_doom_loop(&name, &input) {
+        // Decided before recording, so the call being judged is not already
+        // in the window it is judged against. Recording here rather than
+        // after lets `input` move into whichever branch takes it.
+        let doom_loop = recent_calls.is_doom_loop(&name, &input);
+        recent_calls.record(name.clone(), &input);
+        if doom_loop {
             warn!(tool = %name, "doom loop detected, skipping execution");
-            immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
+            let err = ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE);
+            immediate_parts.push(ToolResultParts::from_event(&err));
+            event_tx.try_send(AgentEvent::ToolDone(Box::new(err)));
             // Doom-loop-skipped calls never actually ran, but they're still a
             // tool call that resulted in an error, so they're worth counting.
             records.push(super::turn_state::ToolCallRecord {
                 id,
-                tool: name.clone(),
-                args: input.clone(),
+                tool: name,
+                args: input,
                 duration_ms: 0,
                 is_error: true,
             });
         } else {
-            runnable.push((id, name.clone(), input.clone()));
+            runnable.push((id, name, input));
         }
-        recent_calls.record(name, &input);
-    }
-
-    for err in &immediate_errors {
-        event_tx.try_send(AgentEvent::ToolDone(Box::new(err.clone())));
     }
 
     let mut set = TaskSet::new();
@@ -456,7 +459,6 @@ pub(super) async fn process_tool_calls(
             tool_use_id: Some(id.clone()),
             ..ctx.clone()
         };
-        let args = input.clone();
         let mcp_owned = mcp.cloned();
         set.spawn(async move {
             let started = Instant::now();
@@ -471,12 +473,16 @@ pub(super) async fn process_tool_calls(
             )
             .await;
             let duration = started.elapsed();
-            event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done.clone())));
-            (done, duration, args)
+            // Take what history needs first, then hand the event to the UI by
+            // move: cloning it duplicated the whole tool output, which for a
+            // file read is every line of the file.
+            let parts = ToolResultParts::from_event(&done);
+            event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done)));
+            (parts, duration, input)
         });
     }
 
-    let mut results: Vec<ToolDoneEvent> = Vec::new();
+    let mut results: Vec<ToolResultParts> = Vec::new();
     for ((r, id), name) in set
         .join_all()
         .await
@@ -484,30 +490,31 @@ pub(super) async fn process_tool_calls(
         .zip(spawned_ids)
         .zip(spawned_names)
     {
-        let (out, duration, args) = match r {
-            Ok((out, duration, args)) => (out, duration, args),
+        let (parts, duration, args) = match r {
+            Ok((parts, duration, args)) => (parts, duration, args),
             Err(e) => {
                 error!(error = %e, "tool task panicked");
+                let err = ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}"));
                 (
-                    ToolDoneEvent::error(id, format!("internal error: tool panicked: {e}")),
+                    ToolResultParts::from_event(&err),
                     std::time::Duration::ZERO,
                     serde_json::Value::Null,
                 )
             }
         };
         records.push(super::turn_state::ToolCallRecord {
-            id: out.id.clone(),
+            id: parts.id.clone(),
             tool: name,
             args,
             duration_ms: duration.as_millis() as u64,
-            is_error: out.is_error,
+            is_error: parts.is_error,
         });
-        results.push(out);
+        results.push(parts);
     }
 
     let mut all_results = results;
-    all_results.extend(immediate_errors);
-    let tool_msg = crate::types::tool_results(all_results);
+    all_results.extend(immediate_parts);
+    let tool_msg = crate::types::tool_results_from_parts(all_results);
     event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
     })?;
