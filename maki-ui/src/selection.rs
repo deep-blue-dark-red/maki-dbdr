@@ -28,6 +28,7 @@
 //! `append_rows` calls `needs_space()` to decide.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 use std::time::Instant;
 
 use ratatui::buffer::Buffer;
@@ -526,25 +527,33 @@ pub(crate) fn strip_code_bar_prefix(
 
 /// Trailing whitespace is trimmed per line. Consecutive blank lines are
 /// collapsed so we don't emit a wall of empty newlines.
+///
+/// `breaks_origin` is the buffer row that `breaks` bit 0 describes. That is
+/// `area.y` when the breaks were indexed over exactly the rows the buffer
+/// holds, but a caller painting a window of a larger block can only index
+/// whole source lines, so its breaks begin at the row the window's first
+/// line began on — which may be above `area.y`. Get this wrong and the
+/// buffer is still right while the copied text puts its newlines and its
+/// re-inserted wrap spaces in the wrong places.
 pub(crate) fn append_rows(
     buf: &Buffer,
     area: Rect,
     ss: &ScreenSelection,
-    from: u16,
-    to: u16,
+    rows: Range<u16>,
     out: &mut String,
     breaks: &LineBreaks,
+    breaks_origin: u16,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let right = area.x + area.width.saturating_sub(1);
-    let row_start = from.max(area.y);
-    let row_end = to.min(area.bottom());
+    let row_start = rows.start.max(area.y);
+    let row_end = rows.end.min(area.bottom());
     let mut pending_newlines = 0u16;
     let anchor = out.len();
     for row in row_start..row_end {
-        let rel_row = row - area.y;
+        let rel_row = row.saturating_sub(breaks_origin);
         let is_new_line = breaks.is_line_start(rel_row);
 
         let (col_start, col_end) = col_range(ss, area.x, right, row);
@@ -627,10 +636,10 @@ pub fn extract_selected_text(
                 buf,
                 region.area,
                 ss,
-                row,
-                chunk_end,
+                row..chunk_end,
                 &mut out,
                 &region.line_breaks,
+                region.area.y,
             );
         }
         row = region_end;
@@ -1227,7 +1236,15 @@ mod tests {
     ) {
         let buf = Buffer::empty(buf_area);
         let mut out = String::new();
-        append_rows(&buf, area, &sel, from, to, &mut out, &LineBreaks::EveryRow);
+        append_rows(
+            &buf,
+            area,
+            &sel,
+            from..to,
+            &mut out,
+            &LineBreaks::EveryRow,
+            area.y,
+        );
         assert!(out.is_empty());
     }
 
@@ -1300,10 +1317,10 @@ mod tests {
             &buf,
             area,
             &ss(0, 1, 0, 3),
-            0,
-            1,
+            0..1,
             &mut out,
             &LineBreaks::EveryRow,
+            area.y,
         );
         assert_eq!(out, "好");
     }
