@@ -12,16 +12,16 @@ pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
 
 pub struct History {
-    /// The value the mirror publishes, held whole so the two can never
-    /// disagree and so a new run can never inherit the last one's epoch.
-    snapshot: HistorySnapshot,
+    messages: Vec<Message>,
+    epoch: u64,
     mirror: Option<SharedMessages>,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
-            snapshot: HistorySnapshot::new(messages),
+            messages,
+            epoch: next_epoch(),
             mirror: None,
         }
     }
@@ -38,19 +38,20 @@ impl History {
     }
 
     pub fn as_slice(&self) -> &[Message] {
-        &self.snapshot.messages
+        &self.messages
     }
 
     pub fn push(&mut self, msg: Message) {
-        self.edit(|msgs| msgs.push(msg));
+        self.messages.push(msg);
+        self.publish();
     }
 
     pub fn len(&self) -> usize {
-        self.snapshot.messages.len()
+        self.messages.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.snapshot.messages.is_empty()
+        self.messages.is_empty()
     }
 
     pub fn has_recent_tool_results(&self, depth: usize) -> bool {
@@ -72,19 +73,20 @@ impl History {
     }
 
     pub fn into_vec(self) -> Vec<Message> {
-        Arc::unwrap_or_clone(self.snapshot.messages)
+        self.messages
     }
 
     /// An append: whatever a consumer already holds of the list stays good.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        f(Arc::make_mut(&mut self.snapshot.messages));
+        f(&mut self.messages);
         self.publish();
     }
 
     /// Any other change, so a consumer has to start the list over.
     fn rewrite(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
-        self.snapshot.epoch = next_epoch();
-        self.edit(f);
+        self.epoch = next_epoch();
+        f(&mut self.messages);
+        self.publish();
     }
 
     /// The mirror gets the messages as they are. Closing dangling tool calls
@@ -93,7 +95,10 @@ impl History {
     /// close the dangling calls on their own copy.
     fn publish(&self) {
         let Some(mirror) = &self.mirror else { return };
-        mirror.store(Arc::new(self.snapshot.clone()));
+        mirror.store(Arc::new(HistorySnapshot {
+            messages: Arc::new(self.messages.clone()),
+            epoch: self.epoch,
+        }));
     }
 }
 
@@ -606,10 +611,7 @@ mod tests {
 
         let snap = mirror.load();
         assert_ne!(snap.epoch, seed_epoch);
-        assert!(
-            Arc::ptr_eq(&snap.messages, &history.snapshot.messages),
-            "mirror shares the sanitized buffer verbatim"
-        );
+        assert_eq!(snap.messages.len(), history.len());
         assert_eq!(snap.messages.len(), 3);
         assert_eq!(extract_error_ids(&snap.messages[2]), ["t1"]);
     }

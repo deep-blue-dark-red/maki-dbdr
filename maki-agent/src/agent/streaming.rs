@@ -134,10 +134,31 @@ pub(crate) async fn stream_with_retry(
     }
 }
 
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn json_byte_len(val: &Value) -> usize {
+    let mut counter = ByteCounter(0);
+    let _ = serde_json::to_writer(&mut counter, val);
+    counter.0
+}
+
 pub(crate) fn estimate_input_tokens(messages: &[Message], system: &str, tools: &Value) -> u32 {
     let mut total_bytes = system.len();
     if !tools.is_null() {
-        total_bytes += tools.to_string().len();
+        total_bytes += json_byte_len(tools);
     }
     for m in messages {
         for b in &m.content {
@@ -149,7 +170,7 @@ pub(crate) fn estimate_input_tokens(messages: &[Message], system: &str, tools: &
                     total_bytes += content.len();
                 }
                 maki_providers::ContentBlock::ToolUse { input, .. } => {
-                    total_bytes += input.to_string().len();
+                    total_bytes += json_byte_len(input);
                 }
                 maki_providers::ContentBlock::Thinking { thinking, .. } => {
                     total_bytes += thinking.len();

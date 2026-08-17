@@ -378,11 +378,16 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     content,
                     is_error,
                 } => {
-                    let parsed = serde_json::from_str::<Value>(content);
-                    let mut response_val = match parsed {
-                        Ok(Value::Object(map)) => Value::Object(map),
-                        Ok(other) => json!({"result": other}),
-                        Err(_) => json!({"result": content}),
+                    let trimmed = content.trim_start();
+                    let mut response_val = if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                        && let Ok(val) = serde_json::from_str::<Value>(content)
+                    {
+                        match val {
+                            Value::Object(map) => Value::Object(map),
+                            other => json!({"result": other}),
+                        }
+                    } else {
+                        json!({"result": content})
                     };
                     if *is_error {
                         response_val = json!({"error": response_val});

@@ -12,7 +12,7 @@ use maki_providers::{
 use super::compaction::{self, CONTINUE_AFTER_COMPACT};
 use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
-use super::streaming::{estimate_input_tokens, stream_with_retry};
+use super::streaming::{estimate_input_tokens, json_byte_len, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
@@ -673,7 +673,7 @@ pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
         .filter_map(|b| match b {
             ContentBlock::Text { text } => Some(text.len()),
             ContentBlock::ToolResult { content, .. } => Some(content.len()),
-            ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
+            ContentBlock::ToolUse { input, .. } => Some(json_byte_len(input)),
             _ => None,
         })
         .sum();

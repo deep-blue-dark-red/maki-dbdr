@@ -346,7 +346,7 @@ pub(super) fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
-    Paragraph::new(lines.to_vec())
+    Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .line_count(width) as u16
 }

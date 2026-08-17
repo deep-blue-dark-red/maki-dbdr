@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,6 +25,21 @@ const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 
 const MCP_BLOCKED_IN_PLAN: &str = "MCP tools are not available in plan mode";
 const UNKNOWN_TOOL_PREFIX: &str = "unknown tool";
 
+struct HashWriter<'a, H: Hasher>(&'a mut H);
+
+impl<H: Hasher> std::io::Write for HashWriter<'_, H> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(super) struct RecentCalls(VecDeque<(String, u64)>);
 
 impl RecentCalls {
@@ -34,7 +49,7 @@ impl RecentCalls {
 
     fn hash_input(input: &Value) -> u64 {
         let mut h = DefaultHasher::new();
-        input.to_string().hash(&mut h);
+        let _ = serde_json::to_writer(HashWriter(&mut h), input);
         h.finish()
     }
 
