@@ -1806,3 +1806,41 @@ fn stream_reset_clears_thinking_expand_state() {
         "new stream must stay hidden; got: {text}"
     );
 }
+
+/// Turn numbers are carried forward across a rebuild instead of rescanned,
+/// so they have to survive both an incremental append and the full rebuild a
+/// width change forces — and keep counting user messages the renderer gives
+/// no numbered prefix, like the one carrying a plan.
+#[test]
+fn user_turn_numbers_count_every_user_message() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let numbered = |panel: &MessagesPanel| -> Vec<String> {
+        panel
+            .cache
+            .segments()
+            .iter()
+            .flat_map(|s| s.lines())
+            .filter_map(|l| l.spans.first())
+            .map(|s| s.content.to_string())
+            .filter(|c| c.contains("‧ you ∙"))
+            .collect()
+    };
+
+    panel.push(DisplayMessage::new(DisplayRole::User, "first".into()));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+    rebuild(&mut panel);
+    assert_eq!(numbered(&panel), ["1‧ you ∙ "]);
+
+    // Appended after the first two are already cached: the count has to come
+    // from what was built, not from a rescan of the new messages alone.
+    let mut plan = DisplayMessage::new(DisplayRole::User, "with plan".into());
+    plan.plan_path = Some("/tmp/plan.md".into());
+    panel.push(plan);
+    panel.push(DisplayMessage::new(DisplayRole::User, "third".into()));
+    rebuild(&mut panel);
+    assert_eq!(numbered(&panel), ["1‧ you ∙ ", "3‧ you ∙ "]);
+
+    // A width change drops the whole cache and rebuilds from zero.
+    render(&mut panel, 60, 24);
+    assert_eq!(numbered(&panel), ["1‧ you ∙ ", "3‧ you ∙ "]);
+}

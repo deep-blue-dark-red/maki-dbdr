@@ -471,12 +471,16 @@ pub fn history_to_display(
                             // view.
                             let rust_rendered =
                                 stored.is_some_and(|o| o.structured_display_text().is_some());
+                            // One copy of the input per tool call, shared by the
+                            // display message and the restore item. Loading a
+                            // long session used to deep-copy every one twice.
+                            let raw_input = Arc::new(input.clone());
                             if !rust_rendered {
                                 restore_items.push(maki_lua::RestoreItem {
                                     tool: Arc::from(static_name),
                                     tool_use_id: id.clone(),
                                     output,
-                                    input: input.clone(),
+                                    input: Arc::clone(&raw_input),
                                     is_error: status == ToolStatus::Error,
                                     tool_output_lines: *tool_output_lines,
                                     theme_gen: None,
@@ -492,7 +496,7 @@ pub fn history_to_display(
                                 })),
                                 text,
                                 tool_input: None,
-                                tool_raw_input: Some(Arc::new(input.clone())),
+                                tool_raw_input: Some(raw_input),
                                 tool_output,
                                 live_output: None,
                                 annotation,
@@ -525,7 +529,7 @@ pub(crate) fn restore_item_for(
     let DisplayRole::Tool(role) = &msg.role else {
         return None;
     };
-    let input = msg.tool_raw_input.as_deref()?;
+    let input = msg.tool_raw_input.clone()?;
     let stored = msg.tool_output.as_deref()?;
     if stored.structured_display_text().is_some() {
         return None;
@@ -536,7 +540,7 @@ pub(crate) fn restore_item_for(
         tool: role.name.clone(),
         tool_use_id: role.id.clone(),
         output,
-        input: input.clone(),
+        input,
         is_error: role.status == ToolStatus::Error,
         tool_output_lines,
         theme_gen: Some(theme_gen),
@@ -999,7 +1003,7 @@ mod tests {
         assert!(!item.is_error);
         assert_eq!(item.output, RESTORE_OUTPUT);
         assert_eq!(item.theme_gen, Some(RESTORE_THEME_GEN));
-        assert_eq!(item.input, serde_json::json!({ "q": "bash" }));
+        assert_eq!(*item.input, serde_json::json!({ "q": "bash" }));
     }
 
     #[test]

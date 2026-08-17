@@ -604,7 +604,7 @@ fn restore_snapshot_lines_opts(
             tool: Arc::from(BATCH_TOOL),
             tool_use_id: BATCH_ID.to_owned(),
             output: output.to_owned(),
-            input,
+            input: std::sync::Arc::new(input),
             is_error: false,
             tool_output_lines: ToolOutputLines::default(),
             theme_gen: None,

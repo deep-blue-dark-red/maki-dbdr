@@ -1106,7 +1106,9 @@ impl<'t> EventLoop<'t> {
             },
             Action::RunLogsCommand => {
                 let settings = crate::components::settings_picker::UserSettings::load();
-                let log_path = self.sessions[idx].app.storage.path().join("maki.log");
+                let log_path = maki_storage::paths::logs_dir()
+                    .unwrap_or_else(|_| self.sessions[idx].app.storage.path().to_path_buf())
+                    .join("maki.log");
                 let log_path_str = log_path.to_string_lossy();
                 let cmd_string = match &settings.log_command {
                     Some(cmd) if !cmd.trim().is_empty() => cmd.clone(),

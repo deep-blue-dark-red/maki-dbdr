@@ -222,7 +222,9 @@ pub struct RestoreItem {
     pub tool: Arc<str>,
     pub tool_use_id: String,
     pub output: String,
-    pub input: Value,
+    /// Shared with the display message the UI builds from the same tool call,
+    /// so restoring a loaded session does not deep-copy every tool input twice.
+    pub input: Arc<Value>,
     pub is_error: bool,
     pub tool_output_lines: maki_config::ToolOutputLines,
     /// Lets the UI discard snapshots from a stale theme.
@@ -1942,7 +1944,7 @@ async fn compute_header(
     plugins: &PluginMap,
     plugin: &str,
     tool: &str,
-    input: Value,
+    input: &Value,
 ) -> HeaderResult {
     let Some((func, input_lua)) = plugin_fn(
         lua,
@@ -1951,7 +1953,7 @@ async fn compute_header(
         tool,
         "header",
         |tk| tk.header.as_ref(),
-        &input,
+        input,
     ) else {
         return HeaderResult::plain(tool.to_string());
     };
@@ -2038,7 +2040,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
     let mut reply = extract_restore_reply(&ret)?;
     if reply.header.is_none() {
         reply.header = Some(
-            compute_header(lua, plugins, &plugin_name, &item.tool, item.input)
+            compute_header(lua, plugins, &plugin_name, &item.tool, &item.input)
                 .await
                 .into_snapshot(),
         );
@@ -2741,7 +2743,7 @@ pub fn spawn(
                             reply,
                         } => {
                             let res =
-                                compute_header(&rt.lua, &rt.plugins, &plugin, &tool, input).await;
+                                compute_header(&rt.lua, &rt.plugins, &plugin, &tool, &input).await;
                             let _ = reply.send(res);
                         }
                         Request::ComputePermissionScopes {

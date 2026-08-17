@@ -76,7 +76,7 @@ fn restore(
             tool: Arc::from(tool),
             tool_use_id: "restore_id".to_owned(),
             output: output.to_owned(),
-            input,
+            input: std::sync::Arc::new(input),
             is_error: false,
             tool_output_lines: view_lines(),
             theme_gen: None,

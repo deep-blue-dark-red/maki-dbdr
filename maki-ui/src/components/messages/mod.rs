@@ -1297,8 +1297,24 @@ impl MessagesPanel {
         if !self.cache.needs_rebuild(self.messages.len()) {
             return;
         }
-        for i in self.cache.msg_count()..self.messages.len() {
+        let start = self.cache.msg_count();
+        // Turn numbers count user messages from the top. Counting the ones
+        // already built once, then carrying the number forward, replaces a
+        // prefix rescan per user message — which a width change, rebuilding
+        // every message, paid in full.
+        let mut user_turns = self.messages[..start]
+            .iter()
+            .filter(|m| m.role == DisplayRole::User)
+            .count();
+        // `UserSettings::load` clones the whole settings struct, so it is read
+        // once per rebuild rather than once per user message, and only if a
+        // user message actually turns up.
+        let mut prefix_template: Option<String> = None;
+        for i in start..self.messages.len() {
             let msg = &self.messages[i];
+            if msg.role == DisplayRole::User {
+                user_turns += 1;
+            }
 
             if let DisplayRole::Tool(t) = &msg.role {
                 let exp = self.expanded_tools.get(&t.id).copied().unwrap_or_default();
@@ -1343,13 +1359,11 @@ impl MessagesPanel {
                 let prefix = if msg.plan_path.is_some() {
                     ""
                 } else if msg.role == DisplayRole::User {
-                    let turn_num = self.messages[..=i]
-                        .iter()
-                        .filter(|m| m.role == DisplayRole::User)
-                        .count();
-                    let template = crate::components::settings_picker::UserSettings::load()
-                        .user_prompt_prefix_template();
-                    dynamic_prefix = template.replace("{n}", &turn_num.to_string());
+                    let template = prefix_template.get_or_insert_with(|| {
+                        crate::components::settings_picker::UserSettings::load()
+                            .user_prompt_prefix_template()
+                    });
+                    dynamic_prefix = template.replace("{n}", &user_turns.to_string());
                     &dynamic_prefix
                 } else {
                     style.prefix
