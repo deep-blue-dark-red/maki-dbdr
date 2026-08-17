@@ -501,6 +501,7 @@ impl<'h> Agent<'h> {
                 cost,
                 context_size: Some(response.usage.context_tokens()),
                 cache_miss: turn.is_cache_miss,
+                upstream: response.upstream.clone(),
                 turn_id: turn.id,
                 duration_ms: turn.duration.map(|d| d.as_millis() as u64),
                 ttfb_ms: turn.ttfb().map(|d| d.as_millis() as u64),
@@ -769,6 +770,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            upstream: None,
         }
     }
 
@@ -781,6 +783,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::EndTurn),
+            upstream: None,
         }
     }
 
@@ -961,6 +964,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
+            upstream: None,
         }
     }
 
@@ -973,6 +977,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(StopReason::ToolUse),
+            upstream: None,
         }
     }
 

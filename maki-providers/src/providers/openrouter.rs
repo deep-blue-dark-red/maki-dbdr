@@ -43,6 +43,14 @@ pub struct OpenRouter {
     auth: Arc<Mutex<ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
+    /// `providers.toml` upstream routing, resolved once at construction.
+    routing: Option<Value>,
+}
+
+/// Read `[openrouter]` routing preferences from `providers.toml`.
+fn configured_routing() -> Option<Value> {
+    let providers = maki_config::providers::ProvidersConfig::load();
+    maki_config::providers::configured_routing(providers.get(CONFIG.slug))
 }
 
 impl OpenRouter {
@@ -53,6 +61,7 @@ impl OpenRouter {
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
             key_pool: Some(pool),
             system_prefix: None,
+            routing: configured_routing(),
         })
     }
 
@@ -62,6 +71,7 @@ impl OpenRouter {
             auth,
             key_pool: None,
             system_prefix: None,
+            routing: configured_routing(),
         }
     }
 
@@ -184,6 +194,14 @@ impl Provider for OpenRouter {
             let mut body = self.compat.build_body(model, messages, system, tools);
 
             body["cache_control"] = json!({"type": "ephemeral"});
+
+            // Without this, OpenRouter load balances across every upstream
+            // serving the model and each keeps a separate prompt cache, so
+            // consecutive turns of one conversation land on caches holding
+            // different prefixes. `session_id` below does not pin routing.
+            if let Some(routing) = &self.routing {
+                body["provider"] = routing.clone();
+            }
 
             let reasoning_info: Option<Arc<OpenRouterModelInfo>> = {
                 let guard = crate::model_registry::model_registry().read().unwrap();

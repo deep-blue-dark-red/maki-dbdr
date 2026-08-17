@@ -670,6 +670,7 @@ async fn parse_sse(
         },
         usage,
         stop_reason,
+        upstream: None,
     })
 }
 

@@ -676,11 +676,35 @@ impl RequestOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StreamResponse {
     pub message: Message,
     pub usage: TokenUsage,
     pub stop_reason: Option<StopReason>,
+    /// Which upstream actually served the request, when the aggregator
+    /// reports one (OpenRouter's `provider`). Aggregators load balance across
+    /// upstreams that each hold a separate prompt cache, so this is the only
+    /// way to attribute a cache miss to a routing change rather than to a
+    /// changed prompt prefix.
+    pub upstream: Option<Upstream>,
+}
+
+/// The upstream that served one request, as reported by an aggregator.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Upstream {
+    /// Upstream provider name, e.g. `"DeepInfra"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Aggregator-side generation id (`gen-...`), for after-the-fact lookup
+    /// against OpenRouter's `/api/v1/generation` endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+}
+
+impl Upstream {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.generation_id.is_none()
+    }
 }
 
 /// Provider-reported usage quota, independent of local token accounting. Not every

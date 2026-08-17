@@ -1615,6 +1615,7 @@ impl App {
                     cache_creation: tc.usage.cache_creation,
                     output: tc.usage.output,
                     cache_miss: tc.cache_miss,
+                    upstream: tc.upstream.clone(),
                     cost: tc.cost,
                     api_duration_ms: tc.duration_ms,
                     ttfb_ms: tc.ttfb_ms,

@@ -471,6 +471,11 @@ struct SseChunk {
     #[serde(default)]
     choices: Vec<ChunkChoice>,
     usage: Option<ChunkUsage>,
+    /// OpenRouter reports the upstream that served the request here.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 struct ToolAccumulator {
@@ -491,6 +496,7 @@ pub async fn parse_sse(
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
+    let mut upstream = crate::Upstream::default();
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
 
@@ -518,6 +524,14 @@ pub async fn parse_sse(
                 continue;
             }
         };
+
+        // Every chunk repeats these; keep the first non-empty sighting.
+        if upstream.name.is_none() {
+            upstream.name = chunk.provider.filter(|p| !p.is_empty());
+        }
+        if upstream.generation_id.is_none() {
+            upstream.generation_id = chunk.id.filter(|i| !i.is_empty());
+        }
 
         if let Some(u) = chunk.usage {
             let cached = u
@@ -693,6 +707,7 @@ pub async fn parse_sse(
         },
         usage,
         stop_reason,
+        upstream: (!upstream.is_empty()).then_some(upstream),
     })
 }
 

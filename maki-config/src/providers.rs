@@ -153,8 +153,76 @@ pub struct ProviderDef {
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_free_models: Option<bool>,
+    /// OpenRouter-only: upstream routing preferences. See [`ProviderRouting`].
+    #[serde(flatten)]
+    pub routing: ProviderRouting,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDef>,
+}
+
+/// OpenRouter upstream-provider routing (`provider` in the request body).
+///
+/// OpenRouter's default is to load balance each request across every upstream
+/// serving the model. Prompt caches are per-upstream, so an unpinned session
+/// bounces between caches that each hold the conversation as of a different
+/// turn - the observable symptom is `cache_read` collapsing to zero, or to the
+/// size of a request several turns old. Setting `order`, `only`, or `sort`
+/// disables load balancing and keeps one cache warm.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProviderRouting {
+    /// Try these upstream slugs (e.g. `["deepinfra", "fireworks"]`) in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_order: Vec<String>,
+    /// Restrict routing to these upstream slugs entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_only: Vec<String>,
+    /// `"price"`, `"throughput"`, or `"latency"`. Also disables load balancing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_sort: Option<String>,
+    /// Whether to fall back past `provider_order` when those upstreams fail.
+    /// Defaults to OpenRouter's own default (`true`) when unset.
+    ///
+    /// Prefer leaving this true. Routing applies to every model on the
+    /// provider, but an upstream list is necessarily chosen for one model, so
+    /// `false` turns any model the list doesn't serve into a hard
+    /// "No endpoints found" failure. Setting `provider_order` already
+    /// disables load balancing by itself, so `false` buys no extra cache
+    /// stickiness - it only removes the escape hatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+}
+
+impl ProviderRouting {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// The `provider` request-body object, or `None` when nothing is
+    /// configured (leaving OpenRouter's load-balancing default in place).
+    pub fn to_body(&self) -> Option<serde_json::Value> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut out = serde_json::Map::new();
+        if !self.provider_order.is_empty() {
+            out.insert("order".into(), self.provider_order.as_slice().into());
+        }
+        if !self.provider_only.is_empty() {
+            out.insert("only".into(), self.provider_only.as_slice().into());
+        }
+        if let Some(sort) = &self.provider_sort {
+            out.insert("sort".into(), sort.as_str().into());
+        }
+        if let Some(allow) = self.allow_fallbacks {
+            out.insert("allow_fallbacks".into(), allow.into());
+        }
+        Some(serde_json::Value::Object(out))
+    }
+}
+
+/// Routing for `slug` from `providers.toml`, or `None` when unconfigured.
+pub fn configured_routing(def: Option<&ProviderDef>) -> Option<serde_json::Value> {
+    def?.routing.to_body()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -366,6 +434,62 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    /// An unconfigured provider must send no `provider` block at all, leaving
+    /// OpenRouter's own default in place rather than pinning to nothing.
+    #[test]
+    fn routing_absent_when_unconfigured() {
+        let def: ProviderDef = toml::from_str("discover_models = true").unwrap();
+        assert!(def.routing.is_empty());
+        assert_eq!(configured_routing(Some(&def)), None);
+        assert_eq!(configured_routing(None), None);
+    }
+
+    #[test]
+    fn routing_parses_from_provider_table() {
+        let def: ProviderDef = toml::from_str(
+            r#"
+            provider_order = ["deepinfra", "gmicloud"]
+            allow_fallbacks = false
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            configured_routing(Some(&def)),
+            Some(serde_json::json!({
+                "order": ["deepinfra", "gmicloud"],
+                "allow_fallbacks": false,
+            }))
+        );
+    }
+
+    #[test]
+    fn routing_emits_only_the_configured_keys() {
+        let def: ProviderDef = toml::from_str(r#"provider_sort = "throughput""#).unwrap();
+        // `order`/`only`/`allow_fallbacks` must stay absent: sending `order: []`
+        // would be a different request than sending nothing.
+        assert_eq!(
+            configured_routing(Some(&def)),
+            Some(serde_json::json!({"sort": "throughput"}))
+        );
+    }
+
+    #[test]
+    fn routing_survives_a_save_load_round_trip() {
+        let def: ProviderDef =
+            toml::from_str(r#"provider_only = ["deepseek"]"#).unwrap();
+        let mut config = ProvidersConfig::default();
+        config.upsert("openrouter".into(), def);
+
+        let reparsed: ProvidersConfig =
+            toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        assert_eq!(
+            configured_routing(reparsed.get("openrouter")),
+            Some(serde_json::json!({"only": ["deepseek"]}))
+        );
+    }
 
     #[test]
     fn provider_def_roundtrip() {

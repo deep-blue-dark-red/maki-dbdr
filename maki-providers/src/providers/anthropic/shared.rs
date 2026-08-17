@@ -375,6 +375,7 @@ impl EventParser {
             },
             usage: self.usage,
             stop_reason: self.stop_reason,
+            upstream: None,
         }
     }
 }

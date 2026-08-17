@@ -848,6 +848,11 @@ pub struct TurnCompleteEvent {
     /// the first real turn of every run — there's nothing to have cached
     /// yet at that point, so it isn't a meaningful miss.
     pub cache_miss: bool,
+    /// Upstream that served this turn, when the provider is an aggregator.
+    /// A `cache_miss` whose `upstream` differs from the previous turn's is a
+    /// routing change, not a changed prompt prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<maki_providers::Upstream>,
     /// 1-based turn index, matching `Agent::num_turns` at completion. Ties
     /// this event to a later `TurnToolsDone { turn_id, .. }`, if any.
     pub turn_id: usize,

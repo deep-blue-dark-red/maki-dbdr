@@ -134,6 +134,7 @@ fn finish_compact(
         // cache-miss deviance check (it's a one-off summarization call,
         // not part of the regular turn sequence).
         cache_miss: false,
+        upstream: response.upstream.clone(),
         turn_id: 0,
         duration_ms: Some(compact_start.elapsed().as_millis() as u64),
         ttfb_ms: None,
@@ -434,6 +435,7 @@ mod tests {
             },
             usage: TokenUsage::default(),
             stop_reason: Some(stop_reason),
+            upstream: None,
         }
     }
 

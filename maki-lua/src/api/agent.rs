@@ -926,6 +926,7 @@ mod tests {
             cost: Some(cost),
             context_size: None,
             cache_miss: false,
+            upstream: None,
             turn_id: 0,
             duration_ms: None,
             ttfb_ms: None,

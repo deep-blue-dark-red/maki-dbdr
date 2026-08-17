@@ -54,6 +54,10 @@ pub struct TurnSnapshot {
     pub cache_creation: u32,
     pub output: u32,
     pub cache_miss: bool,
+    /// Upstream that served this turn (aggregators only). When consecutive
+    /// turns report different upstreams, a `cache_miss` between them is a
+    /// routing change rather than a changed prompt prefix.
+    pub upstream: Option<maki_providers::Upstream>,
     pub cost: Option<f64>,
     /// Time from dispatching the request to the response arriving.
     pub api_duration_ms: Option<u64>,
@@ -86,6 +90,8 @@ pub struct PersistedTurn {
     pub output: u32,
     pub cache_miss: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<maki_providers::Upstream>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
     pub api_duration_ms: Option<u64>,
     pub ttfb_ms: Option<u64>,
@@ -109,6 +115,7 @@ impl From<&TurnSnapshot> for PersistedTurn {
             cache_creation: t.cache_creation,
             output: t.output,
             cache_miss: t.cache_miss,
+            upstream: t.upstream.clone(),
             cost: t.cost,
             api_duration_ms: t.api_duration_ms,
             ttfb_ms: t.ttfb_ms,
@@ -159,6 +166,7 @@ pub enum SortColumn {
     ToolErr,
     ApiErr,
     Cost,
+    Upstream,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +200,8 @@ impl SortState {
             SortColumn::Api => SortColumn::ToolErr,
             SortColumn::ToolErr => SortColumn::ApiErr,
             SortColumn::ApiErr => SortColumn::Cost,
-            SortColumn::Cost => SortColumn::Turn,
+            SortColumn::Cost => SortColumn::Upstream,
+            SortColumn::Upstream => SortColumn::Turn,
         };
         self.active = true;
         self
@@ -200,7 +209,7 @@ impl SortState {
 
     fn prev_column(mut self) -> Self {
         self.column = match self.column {
-            SortColumn::Turn => SortColumn::Cost,
+            SortColumn::Turn => SortColumn::Upstream,
             SortColumn::Time => SortColumn::Turn,
             SortColumn::Input => SortColumn::Time,
             SortColumn::Cache => SortColumn::Input,
@@ -212,6 +221,7 @@ impl SortState {
             SortColumn::ToolErr => SortColumn::Api,
             SortColumn::ApiErr => SortColumn::ToolErr,
             SortColumn::Cost => SortColumn::ApiErr,
+            SortColumn::Upstream => SortColumn::Cost,
         };
         self.active = true;
         self
@@ -252,6 +262,7 @@ impl SortState {
                     (None, Some(_)) => Ordering::Greater,
                     (None, None) => Ordering::Equal,
                 },
+                SortColumn::Upstream => upstream_name(b).cmp(upstream_name(a)),
             }
         } else {
             match self.column {
@@ -272,6 +283,7 @@ impl SortState {
                     (None, Some(_)) => Ordering::Greater,
                     (None, None) => Ordering::Equal,
                 },
+                SortColumn::Upstream => upstream_name(a).cmp(upstream_name(b)),
             }
         }
     }
@@ -569,6 +581,9 @@ const COL_MARK: usize = 1;
 const COL_DURATION: usize = 7;
 const COL_ERR: usize = 4;
 const COL_COST: usize = 8;
+/// Upstream provider name for aggregators (OpenRouter). Blank for direct
+/// providers, which serve every request from the same place.
+const COL_UPSTREAM: usize = 12;
 
 /// Seconds with 2 decimal places, e.g. "15.10s" — pre-rendered (suffix
 /// included) so the caller right-aligns the *whole* string to
@@ -577,19 +592,37 @@ fn duration_secs(ms: u64) -> String {
     format!("{:.2}s", ms as f64 / 1000.0)
 }
 
+/// Upstream provider name, or `""` for direct providers. Sorting on it groups
+/// every turn served by the same upstream together, which is what makes an
+/// aggregator's routing churn visible.
+fn upstream_name(t: &TurnSnapshot) -> &str {
+    t.upstream
+        .as_ref()
+        .and_then(|u| u.name.as_deref())
+        .unwrap_or("")
+}
+
+/// Clip to `width` on a char boundary so a long upstream name can't push the
+/// row past its column and break the alignment every other cell relies on.
+fn truncate_cell(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    s.chars().take(width.saturating_sub(1)).chain(['…']).collect()
+}
+
 fn header_row(theme: &crate::theme::Theme) -> Line<'static> {
     Line::from(Span::styled(
         format!(
-            "{PREFIX}{:<COL_TURN$} {:<COL_TIME$} {:>COL_TOKENS$} {:>COL_TOKENS$} {:>COL_PCT$}% {:>COL_MARK$} {:>COL_TOKENS$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_ERR$} {:>COL_ERR$} {:>COL_COST$}",
-            "turn", "time", "in", "cache", "cch", "", "out", "total", "tool", "api", "tE", "aE", "cost",
+            "{PREFIX}{:<COL_TURN$} {:<COL_TIME$} {:>COL_TOKENS$} {:>COL_TOKENS$} {:>COL_PCT$}% {:>COL_MARK$} {:>COL_TOKENS$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_ERR$} {:>COL_ERR$} {:>COL_COST$} {:<COL_UPSTREAM$}",
+            "turn", "time", "in", "cache", "cch", "", "out", "total", "tool", "api", "tE", "aE", "cost", "upstream",
         ),
         theme.status_dim,
     ))
 }
 
 fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
-    let fg = Style::new().fg(theme.foreground);
-    let time = t
+    let fg = Style::new().fg(theme.foreground);    let time = t
         .received_at
         .to_zoned(TimeZone::system())
         .strftime("%Y-%m-%d %H:%M:%S")
@@ -611,6 +644,11 @@ fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
     // `user_turn.round` label. `human_turn` marks real user turns (the rest
     // are internal continuation rounds auto-triggered by tool calls).
     let turn_label = format!("{}", t.event_id);
+    let upstream = t
+        .upstream
+        .as_ref()
+        .and_then(|u| u.name.as_deref())
+        .map_or_else(String::new, |n| truncate_cell(n, COL_UPSTREAM));
     Line::from(vec![
         Span::raw(PREFIX),
         Span::styled(format!("{turn_label:<COL_TURN$} "), fg),
@@ -628,7 +666,29 @@ fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
         Span::styled(format!("{api:>COL_DURATION$} "), fg),
         Span::styled(format!("{:>COL_ERR$} ", t.tool_error_count), fg),
         Span::styled(format!("{:>COL_ERR$} ", t.api_error_count), fg),
-        Span::styled(cost, fg),
+        Span::styled(format!("{cost} "), fg),
+        Span::styled(format!("{upstream:<COL_UPSTREAM$}"), fg),
+    ])
+}
+
+/// Detail line under a turn row for one tool call: name, duration, and an
+/// error marker. Indented under its turn so the per-call breakdown reads as
+/// a child list of the aggregate row above.
+fn tool_call_line(rec: &maki_agent::agent::turn_state::ToolCallRecord, theme: &crate::theme::Theme) -> Line<'static> {
+    const PAD: &str = "    ";
+    let fg = Style::new().fg(theme.foreground);
+    let mark_style = if rec.is_error {
+        theme.tool_error
+    } else {
+        fg
+    };
+    let mark = if rec.is_error { "✗" } else { "✓" };
+    Line::from(vec![
+        Span::raw(PAD),
+        Span::raw("└ "),
+        Span::styled(format!("{:<16}", rec.tool), fg),
+        Span::styled(duration_secs(rec.duration_ms), theme.tool_dim),
+        Span::styled(format!("  {mark}"), mark_style),
     ])
 }
 
@@ -666,7 +726,7 @@ fn build_lines(turns: &[TurnSnapshot], theme: &crate::theme::Theme) -> Vec<Line<
 /// mark (cache-miss ✓/𐄂) column has no label and is not sortable. Widths are
 /// kept in lockstep with the `COL_*` consts so the header, rows, and mouse
 /// hit-testing can never drift apart.
-fn column_defs() -> [(Option<SortColumn>, &'static str, usize); 13] {
+fn column_defs() -> [(Option<SortColumn>, &'static str, usize); 14] {
     [
         (Some(SortColumn::Turn), "turn", COL_TURN),
         (Some(SortColumn::Time), "time", COL_TIME),
@@ -681,6 +741,7 @@ fn column_defs() -> [(Option<SortColumn>, &'static str, usize); 13] {
         (Some(SortColumn::ToolErr), "tE", COL_ERR),
         (Some(SortColumn::ApiErr), "aE", COL_ERR),
         (Some(SortColumn::Cost), "cost", COL_COST),
+        (Some(SortColumn::Upstream), "upstream", COL_UPSTREAM),
     ]
 }
 
@@ -813,6 +874,7 @@ mod tests {
             cache_creation: 0,
             output: 340,
             cache_miss: false,
+            upstream: None,
             cost: Some(0.0123),
             api_duration_ms: Some(1400),
             ttfb_ms: Some(300),
@@ -1069,8 +1131,12 @@ mod tests {
 
     #[test]
     fn sort_cycling_returns_to_start_after_all_columns() {
+        // Derived from `column_defs` so adding a column can't silently leave
+        // the cycle short — the two used to drift independently. Only the
+        // sortable columns are in the cycle; the mark column has no key.
+        let n = column_defs().iter().filter(|(c, _, _)| c.is_some()).count();
         let mut col = SortColumn::Cost;
-        for _ in 0..12 {
+        for _ in 0..n {
             let st = SortState {
                 column: col,
                 desc: false,
@@ -1078,6 +1144,6 @@ mod tests {
             };
             col = st.next_column().column;
         }
-        assert_eq!(col, SortColumn::Cost, "cycling 12 columns returns to start");
+        assert_eq!(col, SortColumn::Cost, "cycling {n} columns returns to start");
     }
 }
