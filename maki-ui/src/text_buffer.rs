@@ -41,6 +41,20 @@ impl TextBuffer {
         self.revision
     }
 
+    /// Replace the contents in place, moving the revision on.
+    ///
+    /// Assigning a freshly built `TextBuffer` instead would restart the
+    /// revision at zero, and anything memoizing against it — the input
+    /// render cache, the session draft — would go on showing what the old
+    /// buffer held. Two history entries of the same length landed on the
+    /// same cache key exactly this way.
+    pub fn set_value(&mut self, input: String) {
+        self.lines = input.split('\n').map(str::to_string).collect();
+        self.raw_x = 0;
+        self.cursor_y = 0;
+        self.bump();
+    }
+
     fn bump(&mut self) {
         self.revision = self.revision.wrapping_add(1);
     }

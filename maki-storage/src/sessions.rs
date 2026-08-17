@@ -118,8 +118,11 @@ pub struct SessionMeta {
     pub session_rules: Vec<StoredRule>,
     #[serde(default)]
     pub context_size: u32,
+    /// Shared rather than owned so the UI can hand the same draft back every
+    /// frame without rebuilding it, and so comparing two metas that carry the
+    /// same draft settles on a pointer check instead of the whole string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_draft: Option<String>,
+    pub input_draft: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2692,7 +2695,7 @@ mod tests {
         let mut log = SessionLog::rewrite(dir, &session).unwrap();
 
         session.title = "big-meta".into();
-        session.meta.input_draft = Some("x".repeat(TAIL_BUF as usize * 2));
+        session.meta.input_draft = Some("x".repeat(TAIL_BUF as usize * 2).into());
         session.push_message(assistant_message("reply"));
         log.append(&session).unwrap();
 
@@ -2785,7 +2788,7 @@ mod tests {
             _ => {
                 session.set_title(format!("title-{step}"));
                 session.set_meta(SessionMeta {
-                    input_draft: Some(format!("draft-{step}")),
+                    input_draft: Some(format!("draft-{step}").into()),
                     ..session.meta.clone()
                 });
             }
@@ -3018,5 +3021,30 @@ mod tests {
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_same_session(&loaded, &session);
+    }
+
+    /// `input_draft` is a persisted field, so sharing it must not change the
+    /// bytes. serde's `rc` support writes `Arc<str>` as a plain string, which
+    /// keeps sessions written before the change readable and sessions written
+    /// after readable by anything expecting the old shape.
+    #[test]
+    fn input_draft_round_trips_as_a_plain_json_string() {
+        let stored = r#"{"input_draft":"typed but not sent"}"#;
+        let meta: SessionMeta = serde_json::from_str(stored).unwrap();
+        assert_eq!(meta.input_draft.as_deref(), Some("typed but not sent"));
+        assert_eq!(
+            serde_json::to_value(&meta).unwrap()["input_draft"],
+            serde_json::json!("typed but not sent")
+        );
+
+        let absent: SessionMeta = serde_json::from_str("{}").unwrap();
+        assert!(absent.input_draft.is_none());
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("input_draft")
+                .is_none(),
+            "an empty draft must stay off the wire"
+        );
     }
 }

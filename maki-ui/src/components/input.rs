@@ -271,7 +271,7 @@ impl InputBox {
     }
 
     pub fn set_input(&mut self, s: String) {
-        self.buffer = TextBuffer::new(s);
+        self.buffer.set_value(s);
     }
 
     pub fn history_up(&mut self) {
@@ -1097,5 +1097,57 @@ mod tests {
         type_text(&mut input, "read");
         input.handle_paste_with_spaces("file.rs");
         assert_eq!(input.buffer.value(), "read file.rs");
+    }
+
+    fn rendered_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The render cache keys on the buffer revision, so replacing the buffer
+    /// must move that revision on. Rebuilding it restarted the count at zero,
+    /// and two history entries of the same length then shared a cache key —
+    /// recalling the second showed the first.
+    #[test]
+    fn recalling_a_same_length_history_entry_renders_the_new_one() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "hello");
+        submit_text(&mut input, "world");
+
+        input.history_up();
+        let first = rendered_text(&render_input(&mut input, 40, 5));
+        assert!(first.contains("world"), "got: {first}");
+
+        input.history_up();
+        let second = rendered_text(&render_input(&mut input, 40, 5));
+        assert!(second.contains("hello"), "stale render, got: {second}");
+    }
+
+    /// The same collision on the way back down. `history_down` leaves the
+    /// cursor at the origin, so every entry it restores shared a key with the
+    /// saved draft it eventually returns to.
+    #[test]
+    fn returning_to_a_saved_draft_renders_the_draft() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "hello");
+        submit_text(&mut input, "world");
+        type_text(&mut input, "draft!");
+
+        input.history_up();
+        input.history_up();
+        input.history_down();
+        let recalled = rendered_text(&render_input(&mut input, 40, 5));
+        assert!(recalled.contains("world"), "got: {recalled}");
+
+        input.history_down();
+        let back = rendered_text(&render_input(&mut input, 40, 5));
+        assert!(back.contains("draft!"), "stale render, got: {back}");
     }
 }

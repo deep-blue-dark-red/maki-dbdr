@@ -140,20 +140,41 @@ impl App {
         self.published_name = Some((session.id, session.title.clone()));
     }
 
+    /// The draft as `SessionMeta` wants it, rebuilt only when the buffer moves.
+    ///
+    /// `TextBuffer::value` joins every line into a fresh `String`, and a
+    /// checkpoint runs every frame, so a long pasted prompt was re-joined and
+    /// then compared against the stored one 60 times a second while the agent
+    /// streamed — only to be thrown away, since nothing had changed. Handing
+    /// back the same `Arc` reduces that to a refcount bump, and lets the meta
+    /// comparison downstream settle on a pointer check.
+    fn draft(&mut self) -> Option<Arc<str>> {
+        let revision = self.input_box.buffer.revision();
+        if let Some((built_at, draft)) = &self.draft_mirror
+            && *built_at == revision
+        {
+            return draft.clone();
+        }
+        let value = self.input_box.buffer.value();
+        let draft = (!value.is_empty()).then(|| Arc::from(value));
+        self.draft_mirror = Some((revision, draft.clone()));
+        draft
+    }
+
     /// Everything the session mirrors from live state, built field by field so
     /// a new `SessionMeta` field forces a decision here. Every frame calls it,
     /// so it stays cheap: an idle UI has an empty draft, queue and rule list,
     /// and an empty `Vec` does not allocate.
-    fn build_meta(&self) -> SessionMeta {
+    fn build_meta(&mut self) -> SessionMeta {
+        let input_draft = self.draft();
         let state = &self.state;
-        let draft = self.input_box.buffer.value();
         SessionMeta {
             mode: Some(state.mode.into()),
             plan_path: state.plan.path().map(|p| p.to_string_lossy().into_owned()),
             plan_written: state.plan.is_ready(),
             session_rules: rules_to_stored(&self.permissions.session_rules_snapshot()),
             context_size: state.context_size,
-            input_draft: (!draft.is_empty()).then_some(draft),
+            input_draft,
             queued_messages: if self.recoverable_queue.is_empty() {
                 self.queue.text_messages()
             } else {
@@ -235,7 +256,7 @@ impl App {
         main.cost = cost;
         main.context_size = context_size;
         if let Some(draft) = self.state.session.meta.input_draft.clone() {
-            self.input_box.set_input(draft);
+            self.input_box.set_input(draft.to_string());
             self.input_box.buffer.move_to_end();
         }
 
