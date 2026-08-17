@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
@@ -15,11 +15,39 @@ pub const TAB_SPACES: &str = "  ";
 type Rgb = (u8, u8, u8);
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static THEME: OnceLock<RwLock<Arc<Theme>>> = OnceLock::new();
+static THEME: OnceLock<RwLock<ThemeState>> = OnceLock::new();
 static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
 
-fn theme_lock() -> &'static RwLock<Arc<Theme>> {
-    THEME.get_or_init(|| RwLock::new(Arc::new(Theme::default())))
+/// The active theme plus its derived syntect highlighter.
+///
+/// `SynHighlighter::new` walks every scope rule in the theme, allocates two
+/// selector vectors and sorts one of them, so it is far too expensive to build
+/// per highlighted line. Both halves are leaked to `'static` so the highlighter
+/// can borrow the theme without a self-referential struct; `set_theme` skips the
+/// work (and the leak) when the theme is unchanged, so this only ever allocates
+/// once per distinct theme the user actually switches to.
+#[derive(Clone, Copy)]
+struct ThemeState {
+    theme: &'static Theme,
+    syn: &'static SynHighlighter<'static>,
+}
+
+impl ThemeState {
+    fn new(theme: Theme) -> Self {
+        let theme: &'static Theme = Box::leak(Box::new(theme));
+        Self {
+            theme,
+            syn: Box::leak(Box::new(SynHighlighter::new(theme))),
+        }
+    }
+}
+
+fn theme_lock() -> &'static RwLock<ThemeState> {
+    THEME.get_or_init(|| RwLock::new(ThemeState::new(Theme::default())))
+}
+
+fn theme_state() -> ThemeState {
+    *theme_lock().read().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn warmup() {
@@ -34,14 +62,15 @@ pub fn is_ready() -> bool {
 }
 
 pub fn set_theme(theme: Theme) {
-    *theme_lock().write().unwrap_or_else(|e| e.into_inner()) = Arc::new(theme);
+    let mut state = theme_lock().write().unwrap_or_else(|e| e.into_inner());
+    if *state.theme == theme {
+        return;
+    }
+    *state = ThemeState::new(theme);
 }
 
-pub fn theme() -> Arc<Theme> {
-    theme_lock()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+pub fn theme() -> &'static Theme {
+    theme_state().theme
 }
 
 fn ui_colors_lock() -> &'static RwLock<HashMap<String, Rgb>> {
@@ -60,15 +89,40 @@ pub fn theme_color(name: &str) -> Option<Rgb> {
     {
         return Some(c);
     }
-    let settings = &theme().settings;
-    let map = serde_json::to_value(settings).ok()?;
-    let obj = map.as_object()?;
-    let val = obj.get(name)?;
-    let obj = val.as_object()?;
-    let r = obj.get("r")?.as_u64()? as u8;
-    let g = obj.get("g")?.as_u64()? as u8;
-    let b = obj.get("b")?.as_u64()? as u8;
-    Some((r, g, b))
+    let s = &theme().settings;
+    // Field names match `ThemeSettings`' serde representation, which is what
+    // this used to go through `serde_json::to_value` to reach. Non-colour
+    // settings (the `*_css` strings and `*_options` enums) resolve to `None`,
+    // exactly as they did when the JSON lookup failed `as_object`.
+    let color = match name {
+        "foreground" => s.foreground,
+        "background" => s.background,
+        "caret" => s.caret,
+        "line_highlight" => s.line_highlight,
+        "misspelling" => s.misspelling,
+        "minimap_border" => s.minimap_border,
+        "accent" => s.accent,
+        "bracket_contents_foreground" => s.bracket_contents_foreground,
+        "brackets_foreground" => s.brackets_foreground,
+        "brackets_background" => s.brackets_background,
+        "tags_foreground" => s.tags_foreground,
+        "highlight" => s.highlight,
+        "find_highlight" => s.find_highlight,
+        "find_highlight_foreground" => s.find_highlight_foreground,
+        "gutter" => s.gutter,
+        "gutter_foreground" => s.gutter_foreground,
+        "selection" => s.selection,
+        "selection_foreground" => s.selection_foreground,
+        "selection_border" => s.selection_border,
+        "inactive_selection" => s.inactive_selection,
+        "inactive_selection_foreground" => s.inactive_selection_foreground,
+        "guide" => s.guide,
+        "active_guide" => s.active_guide,
+        "stack_guide" => s.stack_guide,
+        "shadow" => s.shadow,
+        _ => None,
+    }?;
+    Some((color.r, color.g, color.b))
 }
 
 pub fn syntax_set() -> &'static SyntaxSet {
@@ -103,43 +157,42 @@ pub fn syntax_for_token(lang: &str) -> &'static SyntaxReference {
 }
 
 pub struct Highlighter {
-    theme: Arc<Theme>,
+    syn: &'static SynHighlighter<'static>,
     parse_state: ParseState,
     highlight_state: HighlightState,
 }
 
 impl Highlighter {
-    fn new(syntax: &SyntaxReference, theme: Arc<Theme>) -> Self {
-        let syn_hl = SynHighlighter::new(&theme);
+    fn new(syntax: &SyntaxReference, syn: &'static SynHighlighter<'static>) -> Self {
         Self {
-            highlight_state: HighlightState::new(&syn_hl, ScopeStack::new()),
+            highlight_state: HighlightState::new(syn, ScopeStack::new()),
             parse_state: ParseState::new(syntax),
-            theme,
+            syn,
         }
     }
 
     fn from_state(
-        theme: Arc<Theme>,
+        syn: &'static SynHighlighter<'static>,
         highlight_state: HighlightState,
         parse_state: ParseState,
     ) -> Self {
         Self {
-            theme,
+            syn,
             highlight_state,
             parse_state,
         }
     }
 
     pub fn for_path(path: &str) -> Self {
-        Self::new(syntax_for_path(path), theme())
+        Self::new(syntax_for_path(path), theme_state().syn)
     }
 
     pub fn for_syntax(syntax: &'static SyntaxReference) -> Self {
-        Self::new(syntax, theme())
+        Self::new(syntax, theme_state().syn)
     }
 
     pub fn for_token(lang: &str) -> Self {
-        Self::new(syntax_for_token(lang), theme())
+        Self::new(syntax_for_token(lang), theme_state().syn)
     }
 
     fn raw_highlight_line<'a>(
@@ -147,8 +200,7 @@ impl Highlighter {
         text: &'a str,
     ) -> Result<Vec<(SynStyle, &'a str)>, syntect::Error> {
         let ops = self.parse_state.parse_line(text, syntax_set())?;
-        let syn_hl = SynHighlighter::new(&self.theme);
-        let iter = HighlightIterator::new(&mut self.highlight_state, &ops, text, &syn_hl);
+        let iter = HighlightIterator::new(&mut self.highlight_state, &ops, text, self.syn);
         Ok(iter.collect())
     }
 
@@ -251,11 +303,9 @@ pub struct CodeHighlighter {
 impl CodeHighlighter {
     pub fn new(lang: &str) -> Self {
         let syntax = syntax_for_token(lang);
-        let t = theme();
-        let highlighter = SynHighlighter::new(&t);
         Self {
             checkpoint_parse: ParseState::new(syntax),
-            checkpoint_highlight: HighlightState::new(&highlighter, ScopeStack::new()),
+            checkpoint_highlight: HighlightState::new(theme_state().syn, ScopeStack::new()),
             completed_lines: 0,
             cached_segments: Vec::new(),
         }
@@ -286,7 +336,7 @@ impl CodeHighlighter {
 
         if new_completed > self.completed_lines {
             let mut hl = Highlighter::from_state(
-                theme(),
+                theme_state().syn,
                 self.checkpoint_highlight.clone(),
                 self.checkpoint_parse.clone(),
             );
@@ -306,7 +356,7 @@ impl CodeHighlighter {
 
         if new_completed < total {
             let mut hl = Highlighter::from_state(
-                theme(),
+                theme_state().syn,
                 self.checkpoint_highlight.clone(),
                 self.checkpoint_parse.clone(),
             );
@@ -467,7 +517,7 @@ mod tests {
         hl.advance("fn main() {\n");
         let (hs, ps) = hl.state();
 
-        let mut from_state = Highlighter::from_state(theme(), hs, ps);
+        let mut from_state = Highlighter::from_state(theme_state().syn, hs, ps);
         let seg_from_state = from_state.highlight_line("    let x = 1;\n");
 
         let mut fresh = Highlighter::for_token("rust");
