@@ -325,6 +325,36 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
 
+/// Keeps tests that swap the global theme away from tests that depend on
+/// which theme is installed.
+///
+/// The theme lives in a process global and `cargo test` runs a binary's tests
+/// concurrently, so a test calling `set()` changes the palette underneath
+/// every other test in the binary. That breaks two kinds of reader: one that
+/// asserts against `current()` directly, and — less obviously — one that
+/// bakes a theme colour into rendered output and then compares it against a
+/// second read, where a swap in between is enough to fail the assert.
+///
+/// A reader must hold [`test_read_lock`] across *both* the render and the
+/// assert, not just the assert.
+#[cfg(test)]
+static TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Take this in any test that calls [`set`] or [`set_current_name`].
+#[cfg(test)]
+pub(crate) fn test_write_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+    // A test that fails while holding the lock poisons it; the rest should
+    // still run serialised rather than all fail behind it.
+    TEST_LOCK.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Take this in any test whose assertions depend on the installed theme.
+/// Readers do not exclude each other, only the tests that swap the theme.
+#[cfg(test)]
+pub(crate) fn test_read_lock() -> std::sync::RwLockReadGuard<'static, ()> {
+    TEST_LOCK.read().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
     BUNDLED_THEMES
         .iter()
@@ -1065,6 +1095,7 @@ mod tests {
 
     #[test]
     fn current_theme_name_prefers_in_memory_name() {
+        let _guard = test_write_lock();
         set_current_name("zenburn");
         assert_eq!(current_theme_name(), "zenburn");
     }
@@ -1150,6 +1181,7 @@ mode_build = "#112233"
 
     #[test]
     fn style_by_name_resolves() {
+        let _guard = test_write_lock();
         set(dracula());
         let t = current();
         assert_eq!(style_by_name("dim"), t.tool_dim);
@@ -1202,6 +1234,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_advances_generation() {
+        let _guard = test_write_lock();
         let before = generation();
         set(dracula());
         assert!(generation() > before);
@@ -1209,6 +1242,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_installs_theme_before_generation_observed() {
+        let _guard = test_write_lock();
         let theme = tokyonight();
         let expected_syntax_bg = theme.syntax.settings.background;
         let before = generation();
@@ -1227,6 +1261,7 @@ mode_build = "#112233"
 
     #[test]
     fn set_generation_is_monotonic_across_switches() {
+        let _guard = test_write_lock();
         let g0 = generation();
         set(dracula());
         let g1 = generation();

@@ -339,6 +339,7 @@ mod tests {
 
     #[test]
     fn heading_uses_theme_heading_style() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("# hello", "", style, style, TEST_WIDTH);
         assert_eq!(lines.len(), 1);
@@ -348,6 +349,7 @@ mod tests {
 
     #[test]
     fn code_block_emits_code_bar_with_theme_color() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("```\nhello\n```", "", style, style, TEST_WIDTH);
         let bar = lines
@@ -360,6 +362,7 @@ mod tests {
 
     #[test]
     fn bold_uses_theme_bold_fg_and_modifier() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("**bold**", "", style, style, TEST_WIDTH);
         let bold = find_span(&lines, "bold");
@@ -369,6 +372,7 @@ mod tests {
 
     #[test]
     fn heading_emphasis_preserves_heading_color() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("## ***hi***", "", style, style, TEST_WIDTH);
         let hi = find_span(&lines, "hi");
@@ -382,6 +386,7 @@ mod tests {
 
     #[test]
     fn heading_inline_code_recolors_to_code_fg() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("## foo `bar`", "", style, style, TEST_WIDTH);
         let bar = find_span(&lines, "bar");
@@ -390,6 +395,7 @@ mod tests {
 
     #[test]
     fn list_marker_uses_list_marker_style() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("- item", "", style, style, TEST_WIDTH);
         let marker = lines[0]
@@ -504,6 +510,7 @@ mod tests {
 
     #[test]
     fn strikethrough_uses_theme_strikethrough_style() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("~~struck~~", "", style, style, TEST_WIDTH);
         let struck = find_span(&lines, "struck");
@@ -521,6 +528,7 @@ mod tests {
 
     #[test]
     fn table_border_uses_theme_table_border_style() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let input = "| a | b |\n| --- | --- |\n| 1 | 2 |";
         let lines = text_to_lines(input, "", style, style, TEST_WIDTH);
@@ -537,6 +545,7 @@ mod tests {
 
     #[test]
     fn horizontal_rule_uses_theme_style_and_fill_char() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("---", "", style, style, TEST_WIDTH);
         assert_eq!(lines.len(), 1);
@@ -562,6 +571,7 @@ mod tests {
 
     #[test]
     fn code_block_highlight_spans_have_rgb_color() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("```rust\nfn x() {}\n```", "", style, style, TEST_WIDTH);
         let code_spans: Vec<_> = lines
@@ -586,6 +596,7 @@ mod tests {
 
     #[test]
     fn inline_code_inside_bold_gets_overlay() {
+        let _guard = theme::test_read_lock();
         let style = Style::default();
         let lines = text_to_lines("**a `code` b**", "", style, style, TEST_WIDTH);
         let code = find_span(&lines, "code");

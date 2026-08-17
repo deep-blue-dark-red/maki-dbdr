@@ -898,6 +898,7 @@ mod tests {
     #[test_case(80, true  ; "shown_when_width_sufficient")]
     #[test_case(10, false ; "hidden_when_too_narrow")]
     fn append_right_info_timestamp_visibility(width: u16, expect_timestamp: bool) {
+        let _guard = theme::test_read_lock();
         let msg = tool_msg();
         let mut tl = build_tool_lines(
             &msg,
@@ -997,6 +998,7 @@ mod tests {
 
     #[test]
     fn task_output_truncated_and_styled() {
+        let _guard = theme::test_read_lock();
         let task_max = TOL.task;
         let tl = task_truncation_tl(n_lines(200));
         let body_lines = tl.lines.len() - 1;
@@ -1276,6 +1278,7 @@ mod tests {
 
     #[test]
     fn snapshot_renders_styled_spans() {
+        let _guard = theme::test_read_lock();
         let snapshot = make_snapshot(vec![vec![
             SnapshotSpan {
                 text: "pub".into(),
@@ -1703,6 +1706,7 @@ mod tests {
 
     #[test]
     fn default_span_resolves_to_theme_tool() {
+        let _guard = theme::test_write_lock();
         theme::set(theme::load_by_name("dracula").expect("dracula theme"));
         assert_eq!(
             resolve_span_style(&SpanStyle::Default),

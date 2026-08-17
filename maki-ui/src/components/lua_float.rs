@@ -695,6 +695,7 @@ mod tests {
     #[test_case("spinner", "spinner" ; "bare_name_takes_spinner_style")]
     #[test_case("spinner:match_selected", "match_selected" ; "prefixed_name_takes_suffix_style")]
     fn spinner_span_bakes_to_live_glyph(span_style: &str, expected_style: &str) {
+        let _guard = theme::test_read_lock();
         let placeholder = "· ";
         let line = SnapshotLine {
             spans: vec![SnapshotSpan {

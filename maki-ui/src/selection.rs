@@ -879,6 +879,7 @@ mod tests {
 
     #[test]
     fn strips_code_bar_prefix_from_partial_selection() {
+        let _guard = theme::test_read_lock();
         let (buf, area) = code_bar_buffer();
         let region = ContentRegion {
             area,
@@ -890,6 +891,7 @@ mod tests {
 
     #[test]
     fn does_not_strip_table_border_prefix() {
+        let _guard = theme::test_read_lock();
         let area = Rect::new(0, 0, 20, 1);
         let mut buf = Buffer::empty(area);
         let table_style = theme::current().table_border;
@@ -905,6 +907,7 @@ mod tests {
 
     #[test]
     fn no_strip_when_selection_starts_mid_line() {
+        let _guard = theme::test_read_lock();
         let (buf, area) = code_bar_buffer();
         let region = ContentRegion {
             area,
@@ -916,6 +919,7 @@ mod tests {
 
     #[test]
     fn strips_code_bar_wrap_prefix() {
+        let _guard = theme::test_read_lock();
         let area = Rect::new(0, 0, 12, 1);
         let mut buf = Buffer::empty(area);
         let code_bar_style = theme::current().code_gutter;
@@ -1008,6 +1012,7 @@ mod tests {
 
     #[test]
     fn code_wrap_continuation_no_space() {
+        let _guard = theme::test_read_lock();
         let area = Rect::new(0, 0, 20, 2);
         let mut buf = Buffer::empty(area);
         let code_style = theme::current().code_gutter;

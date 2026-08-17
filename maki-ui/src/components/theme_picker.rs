@@ -130,6 +130,9 @@ mod tests {
 
     #[test]
     fn enter_closes() {
+        // Selecting persists the theme name; previewing and cancelling below
+        // installs themes outright.
+        let _guard = theme::test_write_lock();
         let mut p = ThemePicker::new();
         p.open();
         let action = p.handle_key(key(KeyCode::Enter));
@@ -140,6 +143,7 @@ mod tests {
     #[test_case(key(KeyCode::Esc) ; "escape_restores_and_closes")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_restores_and_closes")]
     fn cancel_restores(cancel_key: crossterm::event::KeyEvent) {
+        let _guard = theme::test_write_lock();
         let mut p = ThemePicker::new();
         p.open();
         p.handle_key(key(KeyCode::Down));

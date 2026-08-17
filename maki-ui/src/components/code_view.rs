@@ -640,6 +640,7 @@ mod tests {
     /// state, not a fresh one from the hunk start.
     #[test]
     fn diff_context_line_inside_block_comment_matches_full_file_state() {
+        let _guard = theme::test_read_lock();
         let before = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nOLD\ngolf\n*/\n";
         let after = "/*\nalpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\nNEW\ngolf\n*/\n";
 
@@ -657,6 +658,7 @@ mod tests {
     /// Unchanged context lines must use the AFTER parser state.
     #[test]
     fn diff_unchanged_line_uses_after_state_when_close_tag_removed() {
+        let _guard = theme::test_read_lock();
         let before = "/*\ndoc\n*/\nfn x() {}\n";
         let after = "/*\ndoc\nfn x() {}\n";
 
