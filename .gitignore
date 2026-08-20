@@ -9,3 +9,4 @@ bench/results/
 .DS_Store
 /repository_context.txt
 /session-*.md
+/.claude/
