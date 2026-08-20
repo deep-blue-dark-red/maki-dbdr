@@ -7,8 +7,9 @@ use crossterm::Command;
 use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
@@ -58,6 +59,7 @@ impl TerminalGuard {
         let terminal = ratatui::init();
         stdout().execute(EnableBracketedPaste)?;
         stdout().execute(EnableMouseCapture)?;
+        stdout().execute(EnableFocusChange)?;
         push_keyboard_enhancement();
         Ok((Self, terminal))
     }
@@ -89,6 +91,7 @@ fn teardown() {
 fn pop_terminal_modes() {
     stdout().execute(crossterm::cursor::Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
+    stdout().execute(DisableFocusChange).ok();
     stdout().execute(DisableMouseCapture).ok();
     stdout().execute(DisableBracketedPaste).ok();
 }
@@ -97,6 +100,7 @@ fn resume(terminal: &mut ratatui::DefaultTerminal) {
     stdout().execute(EnterAlternateScreen).ok();
     stdout().execute(EnableBracketedPaste).ok();
     stdout().execute(EnableMouseCapture).ok();
+    stdout().execute(EnableFocusChange).ok();
     terminal::enable_raw_mode().ok();
     push_keyboard_enhancement();
     let _ = terminal.clear();

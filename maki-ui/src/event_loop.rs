@@ -49,6 +49,11 @@ use crate::terminal;
 
 const ANIMATION_INTERVAL_MS: u64 = 16;
 const IDLE_POLL_INTERVAL_MS: u64 = 100;
+/// Decorative animation (the idle splash, spinners) is worth 60 FPS only
+/// while someone is looking. Unfocused, the loop still wakes instantly on
+/// any agent/input/plugin event, so streamed output stays live; only
+/// time-driven repaints slow down.
+const BACKGROUND_POLL_INTERVAL_MS: u64 = 500;
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -225,6 +230,9 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
+    /// Terminals that do not report focus never send `FocusLost`, so this
+    /// stays true and they keep the foreground frame rate.
+    terminal_focused: bool,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -417,6 +425,7 @@ impl<'t> EventLoop<'t> {
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             ui_action_rx,
+            terminal_focused: true,
             _model_fetch_task: bg.task,
         })
     }
@@ -459,11 +468,7 @@ impl<'t> EventLoop<'t> {
                 break Ok(());
             }
 
-            let timeout = if self.sessions[self.focused].app.is_animating() {
-                Duration::from_millis(ANIMATION_INTERVAL_MS)
-            } else {
-                Duration::from_millis(IDLE_POLL_INTERVAL_MS)
-            };
+            let timeout = Duration::from_millis(self.poll_interval_ms());
             if let Some(wake) = self.next_wake(timeout)
                 && let Err(e) = self.handle_wake(wake)
             {
@@ -499,6 +504,13 @@ impl<'t> EventLoop<'t> {
             });
         }
         sel.wait_timeout(timeout).ok().flatten()
+    }
+
+    fn poll_interval_ms(&self) -> u64 {
+        poll_interval_ms(
+            self.terminal_focused,
+            self.sessions[self.focused].app.is_animating(),
+        )
     }
 
     fn handle_wake(&mut self, wake: Wake) -> Result<()> {
@@ -878,6 +890,12 @@ impl<'t> EventLoop<'t> {
             Event::Key(_) => (None, None),
             Event::Paste(text) => (Some(Msg::Paste(text)), None),
             Event::Mouse(mouse) => self.translate_mouse(mouse),
+            // Reported only by terminals that answer DECSET 1004; the frame
+            // rate falls back to the foreground one everywhere else.
+            Event::FocusGained | Event::FocusLost => {
+                self.terminal_focused = raw == Event::FocusGained;
+                (None, None)
+            }
             _ => (None, None),
         }
     }
@@ -1251,6 +1269,17 @@ impl<'t> EventLoop<'t> {
     }
 }
 
+/// Backgrounded terminals drop to the slow tick whether or not anything is
+/// animating: a repaint nobody can see is worth no CPU, and real events still
+/// wake the loop immediately.
+fn poll_interval_ms(focused: bool, animating: bool) -> u64 {
+    match (focused, animating) {
+        (false, _) => BACKGROUND_POLL_INTERVAL_MS,
+        (true, true) => ANIMATION_INTERVAL_MS,
+        (true, false) => IDLE_POLL_INTERVAL_MS,
+    }
+}
+
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     if kind == MouseEventKind::ScrollUp {
         lines as i32
@@ -1263,10 +1292,20 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 mod tests {
     use std::cell::Cell;
 
+    use test_case::test_case;
+
     use super::*;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
+
+    #[test_case(true, true => ANIMATION_INTERVAL_MS ; "focused and animating runs at full rate")]
+    #[test_case(true, false => IDLE_POLL_INTERVAL_MS ; "focused and settled idles")]
+    #[test_case(false, true => BACKGROUND_POLL_INTERVAL_MS ; "animation does not raise the rate in the background")]
+    #[test_case(false, false => BACKGROUND_POLL_INTERVAL_MS ; "backgrounded and settled idles slowest")]
+    fn poll_interval_by_focus(focused: bool, animating: bool) -> u64 {
+        poll_interval_ms(focused, animating)
+    }
 
     #[test]
     fn idle_wake_claims_a_non_empty_preamble() {
