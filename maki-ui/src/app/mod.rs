@@ -57,7 +57,7 @@ use crate::components::{
 use crate::image;
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
@@ -1197,6 +1197,13 @@ impl App {
                 return vec![];
             }
             CommandAction::Passthrough => {}
+        }
+
+        if key.code == KeyCode::Char('@')
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.file_picker.open(&self.state.session.cwd);
+            return vec![];
         }
 
         let streaming = self.status == Status::Streaming;

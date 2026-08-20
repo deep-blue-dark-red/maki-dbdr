@@ -28,8 +28,8 @@ use crate::theme;
 
 const TITLE: &str = " Files ";
 const TITLE_WALKING: &str = " Files (scanning…) ";
-const WIDTH_PERCENT: u16 = 60;
-const MAX_HEIGHT_PERCENT: u16 = 80;
+const WIDTH_PERCENT: u16 = 50;
+const MAX_HEIGHT_PERCENT: u16 = 60;
 const SEARCH_ROW: u16 = 1;
 const NO_MATCHES: &str = "  No matches";
 const LABEL_INDENT: &str = "  ";
@@ -825,5 +825,44 @@ mod tests {
     fn contains_returns_false_when_not_visible() {
         let (picker, _done_tx) = pending_picker();
         assert!(!picker.contains(Position::new(0, 0)));
+    }
+
+    fn render_popup_rect(picker: &mut FilePickerModal, area: Rect) -> Rect {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| {
+                popup = picker.view(frame, area);
+            })
+            .unwrap();
+        popup
+    }
+
+    #[test]
+    fn view_popup_resizes_with_match_count() {
+        let area = Rect::new(0, 0, 60, 20);
+        let empty = render_popup_rect(&mut picker_with_matches(0), area);
+        let few = render_popup_rect(&mut picker_with_matches(3), area);
+        let many = render_popup_rect(&mut picker_with_matches(50), area);
+        assert!(few.height > empty.height);
+        assert!(many.height > few.height);
+    }
+
+    #[test]
+    fn view_popup_stays_within_messages_area() {
+        let area = Rect::new(0, 0, 60, 12);
+        let popup = render_popup_rect(&mut picker_with_matches(500), area);
+        assert!(popup.height <= area.height);
+        assert!(popup.width <= area.width);
+        assert!(popup.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn view_popup_caps_height_by_area_percent() {
+        let area = Rect::new(0, 0, 80, 40);
+        let popup = render_popup_rect(&mut picker_with_matches(1000), area);
+        let cap = area.height * MAX_HEIGHT_PERCENT / 100;
+        assert!(popup.height <= cap);
     }
 }

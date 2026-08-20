@@ -233,7 +233,7 @@ impl App {
             if let Some(flash) = self.file_picker.tick() {
                 self.status_bar.flash(flash);
             }
-            overlay_rect = self.file_picker.view(frame, full);
+            overlay_rect = self.file_picker.view(frame, layout.msg_area);
         }
 
         macro_rules! render_if_open {

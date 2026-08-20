@@ -2530,6 +2530,23 @@ fn search_escape_restores_scroll(scroll_top: u16, auto_scroll: bool) {
 }
 
 #[test]
+fn at_opens_file_picker() {
+    let mut app = test_app();
+    assert!(!app.file_picker.is_open());
+    app.update(Msg::Key(key(KeyCode::Char('@'))));
+    assert!(app.file_picker.is_open());
+    assert!(app.input_box.buffer.value().is_empty());
+}
+
+#[test_case(KeyModifiers::CONTROL ; "ctrl_at_does_not_open")]
+#[test_case(KeyModifiers::ALT      ; "alt_at_does_not_open")]
+fn at_with_shortcut_modifier_does_not_open_picker(mods: KeyModifiers) {
+    let mut app = test_app();
+    app.update(Msg::Key(KeyEvent::new(KeyCode::Char('@'), mods)));
+    assert!(!app.file_picker.is_open());
+}
+
+#[test]
 fn mcp_command_opens_picker() {
     let mut app = test_app();
     app.execute_command(cmd("/mcp"));
