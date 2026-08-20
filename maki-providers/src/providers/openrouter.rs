@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use flume::Sender;
 use maki_storage::id::SessionRef;
@@ -8,7 +10,7 @@ use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
-    dialect,
+    Upstream, dialect,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -51,6 +53,138 @@ pub struct OpenRouter {
 fn configured_routing() -> Option<Value> {
     let providers = maki_config::providers::ProvidersConfig::load();
     maki_config::providers::configured_routing(providers.get(CONFIG.slug))
+}
+
+/// Where the pin table lives between runs, under the state dir.
+const PINS_FILE: &str = "openrouter-pins.json";
+
+/// Enough pins for any plausible model list; past it the table is dropped
+/// rather than evicted one entry at a time, costing one uncached request per
+/// model still in use.
+const MAX_PINS: usize = 512;
+
+/// The upstream each model last talked to.
+///
+/// OpenRouter load balances every request across the upstreams serving a
+/// model, and each upstream holds a separate prompt cache, so consecutive
+/// turns of one conversation land on caches holding different prefixes - the
+/// observable symptom is `cache_read` collapsing to zero or to the size of a
+/// request several turns old. Every response names the upstream that served
+/// it, so asking for that same upstream next turn keeps one cache warm.
+///
+/// Keyed by model alone, not by session: one model's cached prefix is its
+/// system prompt and tool definitions, which every session using that model
+/// shares. Sending them all to one upstream is what lets a *new* session open
+/// against an already-warm cache instead of paying to build its own.
+///
+/// The table outlives any one provider instance, and the process itself, for
+/// the same reason. maki rebuilds the OpenRouter provider whenever the model
+/// catalog resolves or the model changes, so a pin held in the provider is
+/// dropped mid-conversation - putting the session back on load balancing,
+/// which is the exact behaviour this exists to prevent.
+///
+/// The pin follows whoever actually served the last request rather than
+/// sticking to the first: `allow_fallbacks` is left at OpenRouter's default,
+/// so when a pinned upstream goes down the request still succeeds elsewhere,
+/// and the pin moves to the cache that is now the warm one.
+#[derive(Debug, Default)]
+struct UpstreamPins {
+    /// Model id -> upstream display name.
+    pins: Mutex<HashMap<String, String>>,
+    /// Where to persist; `None` disables persistence (tests, and any run
+    /// whose state dir cannot be resolved).
+    path: Option<PathBuf>,
+}
+
+/// The pins for this process, shared by every OpenRouter provider it builds.
+static PINS: LazyLock<UpstreamPins> = LazyLock::new(UpstreamPins::load);
+
+impl UpstreamPins {
+    /// Read the persisted table. A missing, unreadable, or malformed file is
+    /// not worth reporting: the cost is one unpinned request per model, and
+    /// the next response rewrites the file anyway.
+    fn load() -> Self {
+        let path = maki_storage::paths::state_dir()
+            .ok()
+            .map(|d| d.join(PINS_FILE));
+        let pins = path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|raw| serde_json::from_slice::<HashMap<String, String>>(&raw).ok())
+            .unwrap_or_default();
+        Self {
+            pins: Mutex::new(pins),
+            path,
+        }
+    }
+
+    fn get(&self, model: &str) -> Option<String> {
+        self.pins.lock().unwrap().get(model).cloned()
+    }
+
+    /// Record the upstream that served a response. A response that names none
+    /// (an aggregator that did not report one) leaves the existing pin alone
+    /// rather than unpinning the model.
+    fn record(&self, model: &str, upstream: Option<&Upstream>) {
+        let Some(name) = upstream.and_then(|u| u.name.clone()) else {
+            return;
+        };
+        let mut pins = self.pins.lock().unwrap();
+        match pins.get(model) {
+            Some(current) if *current == name => return,
+            // The request asked for one upstream and another answered, so
+            // OpenRouter fell back — the pinned upstream was unreachable or
+            // out of capacity. Worth a line: it is the difference between a
+            // pin that isn't working and a pin that was overridden, which
+            // look identical in the `upstream` column of `/stats`.
+            Some(current) => tracing::info!(
+                model,
+                pinned = %current,
+                served = %name,
+                "openrouter fell back off the pinned upstream; re-pinning to the warm cache"
+            ),
+            None => tracing::debug!(model, upstream = %name, "pinned openrouter upstream"),
+        }
+        if pins.len() >= MAX_PINS && !pins.contains_key(model) {
+            pins.clear();
+        }
+        pins.insert(model.to_string(), name);
+        // Only on a change, so a stable session writes nothing after its
+        // first turn.
+        if let Some(path) = &self.path
+            && let Ok(raw) = serde_json::to_vec(&*pins)
+            && let Err(e) = std::fs::write(path, raw)
+        {
+            tracing::debug!(path = %path.display(), error = %e, "cannot persist upstream pins");
+        }
+    }
+}
+
+/// The `provider` request-body object.
+///
+/// Routing configured in `providers.toml` wins whenever it selects upstreams
+/// itself (`order`, `only`, or `sort`) - an explicit preference is not
+/// something to silently override with a learned one. Otherwise the session's
+/// pin becomes the `order`, merged into whatever else was configured (an
+/// `allow_fallbacks` on its own, say).
+///
+/// OpenRouter resolves both the slug (`streamlake`) and the display name
+/// (`StreamLake`) here, and responses report the display name, so the name
+/// goes back as-is. A name it does not recognise in `order` is silently
+/// dropped, putting that request back on load balancing — which is why the
+/// pin is only ever a name OpenRouter itself reported, never one derived by
+/// guessing at a slug.
+fn routing_body(configured: Option<&Value>, pin: Option<&str>) -> Option<Value> {
+    let selects_upstream = |v: &Value| ["order", "only", "sort"].iter().any(|k| v.get(k).is_some());
+    match (configured, pin) {
+        (Some(cfg), _) if selects_upstream(cfg) => Some(cfg.clone()),
+        (cfg, Some(pin)) => {
+            let mut out = cfg.cloned().unwrap_or_else(|| json!({}));
+            out["order"] = json!([pin]);
+            Some(out)
+        }
+        (cfg, None) => cfg.cloned(),
+    }
 }
 
 impl OpenRouter {
@@ -199,8 +333,10 @@ impl Provider for OpenRouter {
             // serving the model and each keeps a separate prompt cache, so
             // consecutive turns of one conversation land on caches holding
             // different prefixes. `session_id` below does not pin routing.
-            if let Some(routing) = &self.routing {
-                body["provider"] = routing.clone();
+            if let Some(routing) =
+                routing_body(self.routing.as_ref(), PINS.get(&model.id).as_deref())
+            {
+                body["provider"] = routing;
             }
 
             let reasoning_info: Option<Arc<OpenRouterModelInfo>> = {
@@ -227,9 +363,16 @@ impl Provider for OpenRouter {
             }
 
             let extra_headers = [("HTTP-Referer", REFERER), ("X-OpenRouter-Title", APP_TITLE)];
-            self.compat
+            let response = self
+                .compat
                 .do_stream(model, &extra_headers, &body, event_tx, &auth)
-                .await
+                .await?;
+
+            // Pin to whoever holds the cache now, which is whoever just
+            // answered - the pinned upstream normally, a fallback when it was
+            // unreachable.
+            PINS.record(&model.id, response.upstream.as_ref());
+            Ok(response)
         })
     }
 
@@ -382,6 +525,148 @@ mod tests {
         };
         let (dialect, model) = openrouter_model(Some(&info));
         assert_eq!(ThinkingConfig::Off.effort_str(&dialect, &model), expected);
+    }
+
+    const MODEL: &str = "moonshotai/kimi-k2";
+
+    fn upstream(name: &str) -> Upstream {
+        Upstream {
+            name: Some(name.to_string()),
+            generation_id: None,
+        }
+    }
+
+    /// Pins with persistence disabled: unit tests must not write to the
+    /// real state dir, and none of this logic depends on the file.
+    fn pins() -> UpstreamPins {
+        UpstreamPins::default()
+    }
+
+    #[test]
+    fn unpinned_unconfigured_session_sends_no_routing() {
+        assert_eq!(routing_body(None, None), None);
+    }
+
+    #[test]
+    fn a_pin_becomes_the_order() {
+        assert_eq!(
+            routing_body(None, Some("StreamLake")),
+            Some(json!({"order": ["StreamLake"]}))
+        );
+    }
+
+    #[test_case(json!({"order": ["deepinfra"]})            ; "order")]
+    #[test_case(json!({"only": ["deepinfra"]})             ; "only")]
+    #[test_case(json!({"sort": "price"})                   ; "sort")]
+    fn configured_upstream_selection_outranks_the_pin(configured: Value) {
+        assert_eq!(
+            routing_body(Some(&configured), Some("StreamLake")),
+            Some(configured.clone())
+        );
+    }
+
+    /// `allow_fallbacks` alone selects no upstream, so it has nothing to say
+    /// about which one to pin - keep it and add the pin.
+    #[test]
+    fn pin_merges_into_configuration_that_selects_nothing() {
+        assert_eq!(
+            routing_body(Some(&json!({"allow_fallbacks": true})), Some("Baidu")),
+            Some(json!({"allow_fallbacks": true, "order": ["Baidu"]}))
+        );
+    }
+
+    #[test]
+    fn pin_follows_the_upstream_that_actually_answered() {
+        let pins = pins();
+        pins.record(MODEL, Some(&upstream("StreamLake")));
+        assert_eq!(pins.get(MODEL).as_deref(), Some("StreamLake"));
+
+        // The pinned upstream was down and a fallback served the turn, so the
+        // warm cache is the fallback's from here on.
+        pins.record(MODEL, Some(&upstream("Baidu")));
+        assert_eq!(pins.get(MODEL).as_deref(), Some("Baidu"));
+    }
+
+    #[test]
+    fn a_response_naming_no_upstream_leaves_the_pin_alone() {
+        let pins = pins();
+        pins.record(MODEL, Some(&upstream("StreamLake")));
+        pins.record(MODEL, None);
+        pins.record(MODEL, Some(&Upstream::default()));
+
+        assert_eq!(pins.get(MODEL).as_deref(), Some("StreamLake"));
+    }
+
+    /// Each model has its own cache, so one model's pin says nothing about
+    /// where another should go.
+    #[test]
+    fn pins_do_not_leak_across_models() {
+        let pins = pins();
+        pins.record(MODEL, Some(&upstream("StreamLake")));
+
+        assert_eq!(pins.get("deepseek/deepseek-v4-flash"), None);
+    }
+
+    /// Sessions deliberately share: the cached prefix is the system prompt
+    /// and tools, which every session on the model has in common, so a new
+    /// session should open against the warm cache rather than build its own.
+    /// This is why the table is keyed by model and lives outside the provider
+    /// instance, which maki rebuilds on every model switch.
+    #[test]
+    fn a_pin_survives_the_provider_being_rebuilt() {
+        let pins = pins();
+        pins.record(MODEL, Some(&upstream("Baidu")));
+
+        // A rebuilt provider consults the same table, so the pin is still there.
+        assert_eq!(pins.get(MODEL).as_deref(), Some("Baidu"));
+        assert_eq!(
+            routing_body(None, pins.get(MODEL).as_deref()),
+            Some(json!({"order": ["Baidu"]}))
+        );
+    }
+
+    #[test]
+    fn a_persisted_table_is_read_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PINS_FILE);
+        let written = UpstreamPins {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        written.record(MODEL, Some(&upstream("Baidu")));
+
+        let reloaded: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).expect("pins file")).expect("valid json");
+        assert_eq!(reloaded.get(MODEL).map(String::as_str), Some("Baidu"));
+    }
+
+    /// A truncated or hand-edited file costs one unpinned request, not a
+    /// crash on startup.
+    #[test]
+    fn a_corrupt_pins_file_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(PINS_FILE);
+        std::fs::write(&path, b"{not json").expect("write");
+
+        let pins: HashMap<String, String> = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok())
+            .unwrap_or_default();
+        assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn pin_table_stays_bounded() {
+        let pins = pins();
+        for i in 0..=MAX_PINS {
+            pins.record(&format!("model-{i}"), Some(&upstream("X")));
+        }
+
+        let len = pins.pins.lock().unwrap().len();
+        assert!(len <= MAX_PINS, "{len} pins retained");
+        // The model that triggered the drop is still pinned; the run in
+        // progress keeps its cache.
+        assert_eq!(pins.get(&format!("model-{MAX_PINS}")).as_deref(), Some("X"));
     }
 
     #[test_case(json!(["image"]), json!(["image"]); "image_only")]

@@ -168,6 +168,12 @@ pub struct ProviderDef {
 /// turn - the observable symptom is `cache_read` collapsing to zero, or to the
 /// size of a request several turns old. Setting `order`, `only`, or `sort`
 /// disables load balancing and keeps one cache warm.
+///
+/// Configuring this is optional: the OpenRouter provider already pins each
+/// session to whichever upstream served its last turn, so caches stay warm
+/// without any of these set. Any of `order`, `only`, or `sort` overrides that,
+/// for choosing upstreams on grounds other than cache stickiness - price, or
+/// keeping traffic away from a particular host.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ProviderRouting {
     /// Try these upstream slugs (e.g. `["deepinfra", "fireworks"]`) in order.
