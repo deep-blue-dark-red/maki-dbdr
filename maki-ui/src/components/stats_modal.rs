@@ -149,6 +149,45 @@ impl TurnSnapshot {
     pub fn total_duration_ms(&self) -> u64 {
         self.api_duration_ms.unwrap_or(0) + self.tool_duration_ms
     }
+
+    /// Prompt processing, in tokens per second: the tokens the server
+    /// actually had to read, over the wait before the first byte came back.
+    ///
+    /// A cache hit is not processing — the prefix was already resolved — so
+    /// the numerator is the delta this request added on top of the cache:
+    /// fresh input, plus anything written into the cache for later turns to
+    /// read. Counting `cache_read` here would report a prefill speed the
+    /// server never achieved, rising with cache size rather than with work
+    /// done.
+    ///
+    /// The divisor is wall-clock time to the first byte, which also contains
+    /// queueing and network latency, so this reads as a floor on the server's
+    /// real prefill speed rather than a measurement of it.
+    ///
+    /// `None` when the turn has no time-to-first-byte to divide by, or added
+    /// nothing to the cached prefix.
+    pub fn prompt_rate(&self) -> Option<f64> {
+        let ttfb = self.ttfb_ms.filter(|&ms| ms > 0)?;
+        let fresh = self.input + self.cache_creation;
+        (fresh > 0).then(|| fresh as f64 * 1000.0 / ttfb as f64)
+    }
+
+    /// Token generation, in tokens per second: output over the streaming
+    /// window, which is everything after the first byte. Prefill is charged
+    /// to [`prompt_rate`](Self::prompt_rate) instead, so a long prompt does
+    /// not drag this figure down with it.
+    ///
+    /// A turn with no time-to-first-byte has no streaming window to divide
+    /// by, and reports nothing rather than dividing by the whole API wait —
+    /// that figure is prefill and generation mixed together, which is not
+    /// what this column claims to be.
+    pub fn gen_rate(&self) -> Option<f64> {
+        let streaming = self
+            .api_duration_ms?
+            .checked_sub(self.ttfb_ms?)
+            .filter(|&ms| ms > 0)?;
+        (self.output > 0).then(|| self.output as f64 * 1000.0 / streaming as f64)
+    }
 }
 
 /// Which column the table is currently sorted by, and the direction.
@@ -163,6 +202,8 @@ pub enum SortColumn {
     Total,
     Tool,
     Api,
+    Pp,
+    Tg,
     ToolErr,
     ApiErr,
     Cost,
@@ -197,7 +238,9 @@ impl SortState {
             SortColumn::Out => SortColumn::Total,
             SortColumn::Total => SortColumn::Tool,
             SortColumn::Tool => SortColumn::Api,
-            SortColumn::Api => SortColumn::ToolErr,
+            SortColumn::Api => SortColumn::Pp,
+            SortColumn::Pp => SortColumn::Tg,
+            SortColumn::Tg => SortColumn::ToolErr,
             SortColumn::ToolErr => SortColumn::ApiErr,
             SortColumn::ApiErr => SortColumn::Cost,
             SortColumn::Cost => SortColumn::Upstream,
@@ -218,7 +261,9 @@ impl SortState {
             SortColumn::Total => SortColumn::Out,
             SortColumn::Tool => SortColumn::Total,
             SortColumn::Api => SortColumn::Tool,
-            SortColumn::ToolErr => SortColumn::Api,
+            SortColumn::Pp => SortColumn::Api,
+            SortColumn::Tg => SortColumn::Pp,
+            SortColumn::ToolErr => SortColumn::Tg,
             SortColumn::ApiErr => SortColumn::ToolErr,
             SortColumn::Cost => SortColumn::ApiErr,
             SortColumn::Upstream => SortColumn::Cost,
@@ -259,6 +304,18 @@ impl SortState {
                     .api_duration_ms
                     .unwrap_or(0)
                     .cmp(&a.api_duration_ms.unwrap_or(0)),
+                // A turn with no rate to show sorts as the slowest either
+                // way, keeping the rows that do carry a figure together.
+                SortColumn::Pp => num(
+                    a.prompt_rate().unwrap_or(0.0),
+                    b.prompt_rate().unwrap_or(0.0),
+                    true,
+                ),
+                SortColumn::Tg => num(
+                    a.gen_rate().unwrap_or(0.0),
+                    b.gen_rate().unwrap_or(0.0),
+                    true,
+                ),
                 SortColumn::ToolErr => b.tool_error_count.cmp(&a.tool_error_count),
                 SortColumn::ApiErr => b.api_error_count.cmp(&a.api_error_count),
                 SortColumn::Cost => match (a.cost, b.cost) {
@@ -285,6 +342,16 @@ impl SortState {
                     .api_duration_ms
                     .unwrap_or(0)
                     .cmp(&b.api_duration_ms.unwrap_or(0)),
+                SortColumn::Pp => num(
+                    a.prompt_rate().unwrap_or(0.0),
+                    b.prompt_rate().unwrap_or(0.0),
+                    false,
+                ),
+                SortColumn::Tg => num(
+                    a.gen_rate().unwrap_or(0.0),
+                    b.gen_rate().unwrap_or(0.0),
+                    false,
+                ),
                 SortColumn::ToolErr => a.tool_error_count.cmp(&b.tool_error_count),
                 SortColumn::ApiErr => a.api_error_count.cmp(&b.api_error_count),
                 SortColumn::Cost => match (a.cost, b.cost) {
@@ -494,19 +561,12 @@ impl StatsModal {
             ))];
         }
 
-        let total_cost: f64 = turns.iter().filter_map(|t| t.cost).sum::<f64>() + 0.0;
-        let user_turns: std::collections::HashSet<usize> =
-            turns.iter().map(|t| t.user_turn).collect();
         let mut lines = Vec::new();
         if self.searching {
             lines.push(self.search_line(theme));
         }
         lines.push(Line::from(Span::styled(
-            format!(
-                "{PREFIX}{} turns · {} requests · ${total_cost:.4} total",
-                user_turns.len(),
-                turns.len(),
-            ),
+            summary_text(turns),
             theme.keybind_section,
         )));
         lines.push(Line::default());
@@ -594,6 +654,8 @@ const COL_TOKENS: usize = 6;
 const COL_PCT: usize = 4;
 const COL_MARK: usize = 1;
 const COL_DURATION: usize = 7;
+/// Tokens per second, wide enough for the "12.3k" form.
+const COL_RATE: usize = 6;
 const COL_ERR: usize = 4;
 const COL_COST: usize = 8;
 /// Upstream provider name for aggregators (OpenRouter). Blank for direct
@@ -605,6 +667,51 @@ const COL_UPSTREAM: usize = 12;
 /// `COL_DURATION`, not just the number with the suffix tacked on after.
 fn duration_secs(ms: u64) -> String {
     format!("{:.2}s", ms as f64 / 1000.0)
+}
+
+/// Tokens per second, at three significant figures throughout the range these
+/// rates span: "12.3k" for a cached prefill, "184" for generation, "9.4" for
+/// a turn that barely streamed. `—` when the turn lacks the timings to
+/// compute one.
+fn rate_cell(rate: Option<f64>) -> String {
+    match rate {
+        Some(r) if r >= 1000.0 => format!("{:.1}k", r / 1000.0),
+        Some(r) if r >= 100.0 => format!("{r:.0}"),
+        Some(r) => format!("{r:.1}"),
+        None => "—".to_string(),
+    }
+}
+
+/// The upstream the next request will be pinned to: maki asks OpenRouter for
+/// whichever upstream answered last, so it is the most recent turn that named
+/// one. `None` for direct providers, which serve every request from the same
+/// place and report no upstream.
+///
+/// Explicit `provider_order`/`only`/`sort` in `providers.toml` outranks that
+/// pin, and then this reads as "who served last" rather than "who is pinned"
+/// — the two only diverge when the configured routing itself moves.
+fn pinned_upstream(turns: &[TurnSnapshot]) -> Option<&str> {
+    turns
+        .iter()
+        .rev()
+        .find_map(|t| t.upstream.as_ref().and_then(|u| u.name.as_deref()))
+}
+
+/// Summary line above the table: turn and request counts, spend, and the
+/// upstream the session is pinned to.
+fn summary_text(turns: &[TurnSnapshot]) -> String {
+    // `Sum for f64` folds from `-0.0` (the true IEEE-754 additive identity),
+    // so summing zero costs (e.g. every turn used an unpriced/local model)
+    // yields `-0.0`, which formats as "-0.0000" instead of "0.0000". `+ 0.0`
+    // normalizes the sign back to positive.
+    let total_cost: f64 = turns.iter().filter_map(|t| t.cost).sum::<f64>() + 0.0;
+    let user_turns: std::collections::HashSet<usize> = turns.iter().map(|t| t.user_turn).collect();
+    let pinned = pinned_upstream(turns).map_or_else(String::new, |u| format!(" · pinned {u}"));
+    format!(
+        "{PREFIX}{} turns · {} requests · ${total_cost:.4} total{pinned}",
+        user_turns.len(),
+        turns.len(),
+    )
 }
 
 /// Upstream provider name, or `""` for direct providers. Sorting on it groups
@@ -632,7 +739,7 @@ fn truncate_cell(s: &str, width: usize) -> String {
 fn header_row(theme: &crate::theme::Theme) -> Line<'static> {
     Line::from(Span::styled(
         format!(
-            "{PREFIX}{:<COL_TURN$} {:<COL_TIME$} {:>COL_TOKENS$} {:>COL_TOKENS$} {:>COL_PCT$}% {:>COL_MARK$} {:>COL_TOKENS$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_ERR$} {:>COL_ERR$} {:>COL_COST$} {:<COL_UPSTREAM$}",
+            "{PREFIX}{:<COL_TURN$} {:<COL_TIME$} {:>COL_TOKENS$} {:>COL_TOKENS$} {:>COL_PCT$}% {:>COL_MARK$} {:>COL_TOKENS$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_DURATION$} {:>COL_RATE$} {:>COL_RATE$} {:>COL_ERR$} {:>COL_ERR$} {:>COL_COST$} {:<COL_UPSTREAM$}",
             "turn",
             "time",
             "in",
@@ -643,6 +750,8 @@ fn header_row(theme: &crate::theme::Theme) -> Line<'static> {
             "total",
             "tool",
             "api",
+            "pp/s",
+            "tg/s",
             "tE",
             "aE",
             "cost",
@@ -695,6 +804,8 @@ fn turn_row(t: &TurnSnapshot, theme: &crate::theme::Theme) -> Line<'static> {
         Span::styled(format!("{total:>COL_DURATION$} "), fg),
         Span::styled(format!("{tool:>COL_DURATION$} "), fg),
         Span::styled(format!("{api:>COL_DURATION$} "), fg),
+        Span::styled(format!("{:>COL_RATE$} ", rate_cell(t.prompt_rate())), fg),
+        Span::styled(format!("{:>COL_RATE$} ", rate_cell(t.gen_rate())), fg),
         Span::styled(format!("{:>COL_ERR$} ", t.tool_error_count), fg),
         Span::styled(format!("{:>COL_ERR$} ", t.api_error_count), fg),
         Span::styled(format!("{cost} "), fg),
@@ -751,21 +862,8 @@ fn build_lines(turns: &[TurnSnapshot], theme: &crate::theme::Theme) -> Vec<Line<
         ))];
     }
 
-    // `Sum for f64` folds from `-0.0` (the true IEEE-754 additive identity),
-    // so summing zero costs (e.g. every turn used an unpriced/local model)
-    // yields `-0.0`, which formats as "-0.0000" instead of "0.0000". `+
-    // 0.0` normalizes the sign back to positive.
-    let total_cost: f64 = turns.iter().filter_map(|t| t.cost).sum::<f64>() + 0.0;
-    let user_turns: std::collections::HashSet<usize> = turns.iter().map(|t| t.user_turn).collect();
     let mut lines = vec![
-        Line::from(Span::styled(
-            format!(
-                "{PREFIX}{} turns · {} requests · ${total_cost:.4} total",
-                user_turns.len(),
-                turns.len(),
-            ),
-            theme.keybind_section,
-        )),
+        Line::from(Span::styled(summary_text(turns), theme.keybind_section)),
         Line::default(),
         header_row(theme),
     ];
@@ -777,7 +875,7 @@ fn build_lines(turns: &[TurnSnapshot], theme: &crate::theme::Theme) -> Vec<Line<
 /// mark (cache-miss ✓/𐄂) column has no label and is not sortable. Widths are
 /// kept in lockstep with the `COL_*` consts so the header, rows, and mouse
 /// hit-testing can never drift apart.
-fn column_defs() -> [(Option<SortColumn>, &'static str, usize); 14] {
+fn column_defs() -> [(Option<SortColumn>, &'static str, usize); 16] {
     [
         (Some(SortColumn::Turn), "turn", COL_TURN),
         (Some(SortColumn::Time), "time", COL_TIME),
@@ -789,6 +887,8 @@ fn column_defs() -> [(Option<SortColumn>, &'static str, usize); 14] {
         (Some(SortColumn::Total), "total", COL_DURATION),
         (Some(SortColumn::Tool), "tool", COL_DURATION),
         (Some(SortColumn::Api), "api", COL_DURATION),
+        (Some(SortColumn::Pp), "pp/s", COL_RATE),
+        (Some(SortColumn::Tg), "tg/s", COL_RATE),
         (Some(SortColumn::ToolErr), "tE", COL_ERR),
         (Some(SortColumn::ApiErr), "aE", COL_ERR),
         (Some(SortColumn::Cost), "cost", COL_COST),
@@ -847,7 +947,7 @@ fn row_search_text(t: &TurnSnapshot) -> String {
         .strftime("%Y-%m-%d %H:%M:%S")
         .to_string();
     format!(
-        "{} {time} {} {} {} {} {:.2} {} {} {} {} {:.4} {} {}",
+        "{} {time} {} {} {} {} {:.2} {} {} {} {} {} {} {:.4} {} {}",
         t.event_id,
         t.input,
         t.cache_read + t.cache_creation,
@@ -856,6 +956,8 @@ fn row_search_text(t: &TurnSnapshot) -> String {
         t.total_duration_ms() as f64 / 1000.0,
         t.tool_duration_ms as f64 / 1000.0,
         t.api_duration_ms.unwrap_or(0) as f64 / 1000.0,
+        rate_cell(t.prompt_rate()),
+        rate_cell(t.gen_rate()),
         t.tool_error_count,
         t.api_error_count,
         t.cost.unwrap_or(0.0),
@@ -929,6 +1031,7 @@ fn highlight_query(line: &mut Line<'static>, query: &str, matcher: &mut Matcher)
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use test_case::test_case;
 
     fn key_event(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1245,6 +1348,137 @@ mod tests {
         let summary: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(summary.contains("2 turns"), "got: {summary:?}");
         assert!(summary.contains("3 requests"), "got: {summary:?}");
+    }
+
+    /// Cache reads are not prompt processing, so the prefill rate is the
+    /// delta over the cache — fresh input plus what this turn wrote into it —
+    /// over time-to-first-byte. Counting the 800 cached tokens here would
+    /// report a prefill speed the server never achieved.
+    #[test]
+    fn prompt_rate_measures_the_delta_over_the_cache_not_the_whole_prompt() {
+        let mut t = sample_turn(1);
+        t.input = 1200;
+        t.cache_read = 800;
+        t.cache_creation = 0;
+        t.ttfb_ms = Some(300);
+        assert_eq!(t.prompt_rate(), Some(4000.0));
+
+        // A cache write is work the server did do, so it counts.
+        t.cache_creation = 300;
+        assert_eq!(t.prompt_rate(), Some(5000.0));
+    }
+
+    /// Generation is measured over the streaming window alone. Dividing the
+    /// output by the whole API duration would charge prefill to the
+    /// generation rate, making a long prompt look like a slow decoder.
+    #[test]
+    fn gen_rate_excludes_the_prefill_wait() {
+        let mut t = sample_turn(1);
+        t.output = 340;
+        t.ttfb_ms = Some(300);
+        t.api_duration_ms = Some(1400);
+        // 340 tokens over the 1.1s that streamed, not the full 1.4s.
+        assert_eq!(t.gen_rate(), Some(340.0 * 1000.0 / 1100.0));
+    }
+
+    #[test_case(None,       Some(1400), 340 ; "no ttfb")]
+    #[test_case(Some(300),  None,       340 ; "no api duration")]
+    #[test_case(Some(1400), Some(1400), 340 ; "nothing streamed after the first byte")]
+    #[test_case(Some(300),  Some(1400), 0   ; "no output")]
+    fn gen_rate_is_absent_when_it_cannot_be_measured(
+        ttfb_ms: Option<u64>,
+        api_duration_ms: Option<u64>,
+        output: u32,
+    ) {
+        let mut t = sample_turn(1);
+        t.ttfb_ms = ttfb_ms;
+        t.api_duration_ms = api_duration_ms;
+        t.output = output;
+        assert_eq!(t.gen_rate(), None);
+    }
+
+    #[test]
+    fn prompt_rate_is_absent_without_a_ttfb_or_fresh_tokens() {
+        let mut t = sample_turn(1);
+        t.ttfb_ms = None;
+        assert_eq!(t.prompt_rate(), None);
+
+        let mut t = sample_turn(1);
+        t.ttfb_ms = Some(0);
+        assert_eq!(t.prompt_rate(), None, "a zero wait is not a rate");
+
+        let mut t = sample_turn(1);
+        t.input = 0;
+        t.cache_creation = 0;
+        assert_eq!(
+            t.prompt_rate(),
+            None,
+            "a fully cached prompt processed nothing"
+        );
+    }
+
+    /// Three significant figures across the whole range these rates span, so
+    /// a 12k/s prefill and a 9.4/s trickle both stay inside the column.
+    #[test_case(Some(12_345.0), "12.3k" ; "thousands")]
+    #[test_case(Some(184.2),    "184"   ; "hundreds")]
+    #[test_case(Some(9.42),     "9.4"   ; "single digits")]
+    #[test_case(None,           "—"     ; "unmeasurable")]
+    fn rates_render_at_three_significant_figures(rate: Option<f64>, expected: &str) {
+        assert_eq!(rate_cell(rate), expected);
+        assert!(rate_cell(rate).chars().count() <= COL_RATE);
+    }
+
+    #[test]
+    fn turn_row_shows_both_rates() {
+        let theme = theme::current();
+        // input 1200, cache_creation 0, ttfb 300ms -> 4.0k/s prefill.
+        // output 340 over (1400 - 300)ms -> 309/s generation.
+        let text: String = turn_row(&sample_turn(1), &theme)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("4.0k"), "got: {text:?}");
+        assert!(text.contains("309"), "got: {text:?}");
+    }
+
+    /// maki pins each model to whichever upstream answered last, so the
+    /// summary reports the most recent one — that is where the next request
+    /// goes.
+    #[test]
+    fn summary_names_the_pinned_upstream() {
+        let named = |name: &str| {
+            Some(maki_providers::Upstream {
+                name: Some(name.into()),
+                generation_id: None,
+            })
+        };
+        let mut t1 = sample_turn(1);
+        t1.upstream = named("StreamLake");
+        let mut t2 = sample_turn(2);
+        t2.upstream = named("Baidu");
+
+        assert!(
+            summary_text(&[t1.clone(), t2.clone()]).ends_with("· pinned Baidu"),
+            "got: {:?}",
+            summary_text(&[t1.clone(), t2.clone()])
+        );
+
+        // A turn that reports no upstream doesn't unpin the session; the last
+        // one that named an upstream is still where requests land.
+        let t3 = sample_turn(3);
+        assert!(
+            summary_text(&[t1, t2, t3]).ends_with("· pinned Baidu"),
+            "a nameless turn cleared the pin"
+        );
+    }
+
+    /// Direct providers serve every request from the same place and report no
+    /// upstream, so there is no pin to speak of.
+    #[test]
+    fn summary_omits_the_pin_for_direct_providers() {
+        let summary = summary_text(&[sample_turn(1)]);
+        assert!(!summary.contains("pinned"), "got: {summary:?}");
     }
 
     #[test]
