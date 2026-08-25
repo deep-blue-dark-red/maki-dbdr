@@ -1,20 +1,25 @@
 use super::*;
 use crate::agent::shared_queue;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
+use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
+use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
-use crate::components::{ExitRequest, key, test_model};
+use crate::components::rewind_picker::RewindEntry;
+use crate::components::{ExitRequest, buffer_text, key, test_model};
+use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
+    DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
     McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{PermissionsConfig, UiConfig};
-use maki_lua::{HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
-use maki_providers::{ContentBlock, Effort, Message, Role, TokenUsage};
+use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
+use maki_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
+use maki_providers::{ContentBlock, Effort, Message, Role, THINKING_USAGE, TokenUsage};
 use maki_storage::sessions::{StoredMode, StoredThinking};
 use ratatui::layout::Rect;
 use std::env;
@@ -25,6 +30,24 @@ use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_ID: &str = "task1";
+const SUB_TOOL_ID: &str = "sub_t1";
+const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
+const LATE_MODEL_SPEC: &str = "zai/glm-5";
+const HINT_PLUGIN: &str = "statusline";
+const HINT_TEXT: &str = "2/4 staged";
+const HINT_STYLE: &str = "fg";
+const RETRY_MESSAGE: &str = "overloaded";
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+const MISSING_DIR: &str = "gone";
+const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
+const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
+const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
+const WALK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Stands in for a size the provider measured, baseline included.
+const MEASURED_CONTEXT: u32 = 100_000;
+/// The rewind fixture holds a few dozen bytes of chat, far below this, so it
+/// doubles as the window the gauge is allowed to land in.
+const SMALL_HISTORY: u32 = 1_000;
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -59,9 +82,11 @@ fn build_app_with_lua(
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
+            Arc::default(),
         )),
         Arc::from([]),
         maki_lua::EventHandle::disconnected_for_test(),
+        Arc::new(maki_config::ModelPolicy::default()),
     )
 }
 
@@ -75,6 +100,38 @@ pub(crate) fn test_app() -> App {
     let (shared_queue, _rx) = shared_queue::queue();
     app.queue.set_shared(shared_queue);
     app
+}
+
+/// A `test_app` past its idle splash, whose drifting starfield would mask
+/// every other cadence.
+fn app_without_splash() -> App {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::TextDelta { text: "hi".into() }));
+    app.update(done_event());
+    app
+}
+
+/// Hands back the slot providers publish their model lists into, since the app
+/// keeps no handle to it once the picker owns it.
+fn app_with_model_slot() -> (App, Arc<ArcSwapOption<Vec<String>>>) {
+    let models = Arc::new(ArcSwapOption::empty());
+    let mut app = test_app();
+    app.model_picker = ModelPicker::new(Arc::clone(&models));
+    (app, models)
+}
+
+/// Hands back the end a plugin publishes hints through. That is the Lua thread
+/// in production, and this test here. Seeding the watch from the new reader is
+/// what `App::new` does, and skipping it would make the first poll report the
+/// swap itself.
+fn app_with_hints() -> (App, HintWriterHandle) {
+    let (writer, reader) = hint_writer_pair();
+    let mut app = test_app();
+    app.hints = Watch::seeded(reader.load_full());
+    app.hint_reader = reader;
+    (app, writer)
 }
 
 fn tempdir_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
@@ -104,6 +161,18 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
         subagent: None,
         run_id,
     }))
+}
+
+fn done() -> AgentEvent {
+    AgentEvent::Done {
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }
+}
+
+fn done_event() -> Msg {
+    agent_msg(done())
 }
 
 fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
@@ -192,6 +261,7 @@ fn turn_complete(usage: TokenUsage, model: &str, cost: Option<f64>) -> AgentEven
         duration_ms: None,
         ttfb_ms: None,
         api_error_count: 0,
+        context_window: 0,
     }))
 }
 
@@ -262,18 +332,36 @@ fn ctrl_c_quits_when_input_empty() {
     app.status = Status::Idle;
     let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
     assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(actions.is_empty());
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
 }
 
-#[test_case(AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None }, ExitRequest::Success ; "done_exits_success")]
+#[test_case(done(), ExitRequest::Success ; "done_exits_success")]
 #[test_case(AgentEvent::Error { message: "boom".into() }, ExitRequest::Error ; "error_exits_error")]
 fn exit_on_done_flag_triggers_exit(event: AgentEvent, expected: ExitRequest) {
     let mut app = test_app();
     app.exit_on_done = true;
     app.status = Status::Streaming;
     app.run_id = 1;
-    app.update(agent_msg(event));
+    let actions = app.update(agent_msg(event));
     assert_eq!(app.exit_request, expected);
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn reset_session_clears_exit_request_source() {
+    let mut app = test_app();
+    app.exit_on_done = true;
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::Done {
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason: DoneReason::EndTurn,
+    }));
+
+    app.reset_session();
+
+    assert_eq!(app.exit_request, ExitRequest::None);
 }
 
 #[test]
@@ -697,7 +785,7 @@ fn tab_in_palette_completes_command() {
 }
 
 #[test]
-fn ctrl_p_n_navigation() {
+fn chat_navigation_actions() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -709,16 +797,16 @@ fn ctrl_p_n_navigation() {
     assert_eq!(app.chats.len(), 2);
     assert_eq!(app.active_chat, 0);
 
-    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
 
-    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
 
-    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::PrevChat);
     assert_eq!(app.active_chat, 0);
 
-    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::PrevChat);
     assert_eq!(app.active_chat, 0);
 }
 
@@ -809,6 +897,11 @@ const MAIN_TOKENS: TokenUsage = TokenUsage {
     cache_read: 0,
 };
 const MAIN_COST: Option<f64> = Some(0.002);
+const MAIN_MODEL: &str = "main-model";
+
+fn main_turn() -> Msg {
+    agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, MAIN_COST))
+}
 
 fn sub_turn_complete() -> Msg {
     subagent_msg(
@@ -822,6 +915,109 @@ fn sub_turn_complete() -> Msg {
 /// usage, not how it is spelled (maki-providers covers the spelling).
 fn sub_usage_text() -> String {
     SUB_TOKENS.format_sum_cost(SUB_COST)
+}
+
+/// Each turn bills at the rates of the model that ran it, subagent tiers
+/// included, so the session total is the sum of what the turns recorded.
+#[test]
+fn session_cost_sums_what_each_model_recorded() {
+    let mut app = streaming_app();
+    app.update(main_turn());
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(sub_turn_complete());
+
+    let expected = MAIN_COST.unwrap() + SUB_COST.unwrap();
+    assert_eq!(app.state.cost, Some(expected));
+    let stored: f64 = app
+        .state
+        .session
+        .usage_by_model()
+        .values()
+        .filter_map(|u| u.cost)
+        .sum();
+    assert_eq!(stored, expected);
+}
+
+const RESTORED_COST: f64 = 0.42;
+/// Counters big enough that re-pricing them could never land on
+/// [`RESTORED_COST`], so a total derived from them stands out.
+const RESTORED_TOKENS: TokenUsage = TokenUsage {
+    input: 1_000_000,
+    output: 0,
+    cache_creation: 0,
+    cache_read: 0,
+};
+const RESTORED_MODEL: &str = "model-that-ran-before";
+const SIGMA_MISSING: &str = "the status bar must draw the session total";
+const COST_WAS_NOT_BILLED: &str = "the turn must bill something for the reset to prove anything";
+
+/// A new session opens on a clean bill. The total is never re-derived from the
+/// counters, so anything left behind here follows the user forever.
+#[test]
+fn reset_session_clears_the_bill_and_the_model_breakdown() {
+    let mut app = streaming_app();
+    app.update(main_turn());
+    assert_eq!(app.state.cost, MAIN_COST, "{COST_WAS_NOT_BILLED}");
+
+    app.reset_session();
+
+    assert_eq!(app.state.cost, None);
+    assert!(app.state.session.usage_by_model().is_empty());
+}
+
+/// `None` is what hides the cost, so an unpriced turn must leave the total
+/// alone. `Some(0.0)` would advertise a free session.
+#[test_case(None, None ; "unpriced_turns_only")]
+#[test_case(MAIN_COST, MAIN_COST ; "priced_turn_after_an_unpriced_one")]
+fn session_cost_counts_only_priced_turns(second: Option<f64>, expected: Option<f64>) {
+    let mut app = streaming_app();
+    // How an unpriced session opens; `session_state` covers the seeding.
+    app.state.cost = None;
+    app.update(agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, None)));
+
+    app.update(agent_msg(turn_complete(MAIN_TOKENS, MAIN_MODEL, second)));
+
+    assert_eq!(app.state.cost, expected);
+}
+
+/// The restored bill is a running total later turns add to, so a resumed
+/// session shows what it paid back then plus what it pays now, never its
+/// counters re-priced at today's rates.
+#[test]
+fn resumed_session_keeps_adding_to_the_restored_bill() {
+    let mut app = test_app();
+    let mut stored = AppSession::new("test-model", "/tmp");
+    stored.token_usage = RESTORED_TOKENS;
+    stored.add_model_usage(RESTORED_MODEL, RESTORED_TOKENS.billed(Some(RESTORED_COST)));
+
+    app.apply_loaded_session(stored, &test_model());
+    assert_eq!(app.state.cost, Some(RESTORED_COST));
+    assert_eq!(app.chats[0].cost, Some(RESTORED_COST));
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(main_turn());
+
+    assert_eq!(app.state.cost, Some(RESTORED_COST + MAIN_COST.unwrap()));
+}
+
+/// The sigma the status bar draws once subagents split the bill is the session
+/// total itself, so it cannot drift from what `/usage` sums.
+#[test]
+fn status_bar_sigma_draws_the_session_cost() {
+    let mut app = app_with_subagent();
+    app.update(main_turn());
+    app.update(sub_turn_complete());
+
+    let total = app.state.cost.expect("both turns were priced");
+    let sigma = format!("\u{03a3}${total:.3}");
+    // Rendered wide on purpose: this bar carries live token stats and a
+    // duration too, and at 80 columns the adaptive shortening is what decides
+    // the sigma's fate. What is under test is the number, not the squeeze.
+    assert!(
+        status_bar_text(&mut app).contains(&sigma),
+        "{SIGMA_MISSING}: {sigma}"
+    );
 }
 
 #[test]
@@ -854,11 +1050,7 @@ fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
 #[test_case(true  ; "subagent_stamp_is_not_overwritten")]
 fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
     let mut app = streaming_app();
-    app.update(agent_msg(turn_complete(
-        MAIN_TOKENS,
-        "main-model",
-        MAIN_COST,
-    )));
+    app.update(main_turn());
     app.update(agent_msg(tool_start(TASK_ID, "task")));
     if subagent_ran {
         app.update(sub_turn_complete());
@@ -975,7 +1167,7 @@ fn cancel_resets_all_chats_and_indices() {
     assert_eq!(app.chats[1].in_progress_count(), 0);
     assert!(app.chats[1].is_finished());
     assert!(app.chat_index.is_empty());
-    assert!(!app.is_animating());
+    assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
 fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
@@ -1196,8 +1388,6 @@ fn picker_enter_stays_at_navigated() {
 }
 
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
-    kb::NEXT_CHAT.to_key_event(),
-    kb::PREV_CHAT.to_key_event(),
     kb::SCROLL_HALF_UP.to_key_event(),
     kb::SCROLL_HALF_DOWN.to_key_event(),
     kb::HELP.to_key_event(),
@@ -1255,7 +1445,7 @@ fn splash_logo_shows_fork_branch() {
 #[test]
 fn compact_command_sets_streaming() {
     let mut app = test_app();
-    let actions = app.execute_command(cmd("/compact"));
+    let actions = app.execute_command(cmd("/compact"), 0);
     assert!(matches!(&actions[0], Action::Compact));
     assert_eq!(app.status, Status::Streaming);
 }
@@ -1266,7 +1456,7 @@ fn compact_during_streaming_queues_item() {
     app.status = Status::Streaming;
     app.run_id = 1;
 
-    let actions = app.execute_command(cmd("/compact"));
+    let actions = app.execute_command(cmd("/compact"), 0);
     assert!(actions.is_empty());
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.queue.panel_entries()[0].text, "/compact");
@@ -1464,24 +1654,211 @@ fn ctrl_c_while_streaming_cancels_instead_of_quitting() {
     assert_ne!(app.exit_request, ExitRequest::Success);
 }
 
+/// The whole point of issue 778: a settled session paints nothing at all. Any
+/// poller that starts reporting a change on every tick trips this.
+#[test]
+fn settled_app_owes_no_frame_and_does_not_animate() {
+    let mut app = app_without_splash();
+
+    assert_eq!(app.cadence(), Cadence::IDLE);
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+}
+
+/// Nothing wakes the loop when a background thread drops an answer into a
+/// shared slot, so `tick` has to go and look. The tick that first sees it is
+/// also the only one allowed to claim a frame: `tick` runs on every turn of the
+/// loop, so a poller that keeps saying yes never lets it sleep again.
+#[track_caller]
+fn assert_owes_one_frame(app: &mut App, arrival: impl FnOnce()) {
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+    arrival();
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+}
+
+/// `/usage` spawns a detached fetch that stores its answer with nothing
+/// listening, so an unpolled modal sits on `Loading` until the user presses
+/// some unrelated key.
+#[test]
+fn usage_quota_arriving_in_the_background_owes_a_frame() {
+    let mut app = test_app();
+    app.execute_command(cmd("/usage"), 0);
+    let slot = Arc::clone(&app.usage_slot);
+
+    assert_owes_one_frame(&mut app, || {
+        slot.store(Some(Arc::new(UsageFetchState::Loading)));
+    });
+}
+
+/// Providers publish their model list into a shared slot that wakes nothing,
+/// so an open picker keeps showing the stale list until the user happens to
+/// press a key.
+#[test]
+fn model_list_arriving_in_the_background_owes_a_frame() {
+    let (mut app, models) = app_with_model_slot();
+    app.execute_command(cmd("/model"), 0);
+    assert!(app.model_picker.is_open());
+
+    assert_owes_one_frame(&mut app, || {
+        models.store(Some(Arc::new(vec![LATE_MODEL_SPEC.into()])));
+    });
+}
+
+/// Tool output streams into a subagent's chat while the parent chat is the one
+/// on screen. Draining only the active chat would lose it, and the task picker
+/// and a later switch would show nothing.
+#[test]
+fn tick_drains_live_bufs_of_background_chats() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(subagent_msg(tool_start(SUB_TOOL_ID, "bash"), TASK_ID, None));
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    app.update(subagent_msg(
+        AgentEvent::LiveToolBuf {
+            id: SUB_TOOL_ID.into(),
+            body: Arc::clone(&buf),
+        },
+        TASK_ID,
+        None,
+    ));
+    assert_eq!(app.active_chat, 0, "the subagent's chat is the hidden one");
+
+    assert_owes_one_frame(&mut app, || {
+        buf.append(maki_agent::SnapshotLine::plain(TOOL_OUTPUT_LINE.into()));
+    });
+}
+
+/// A plugin publishes hints from the Lua thread, and the loop never hears back
+/// from that thread. The footer they draw in is on screen the whole time, so a
+/// publish nobody polled for shows up on some later, unrelated keypress, or
+/// never.
+#[test]
+fn status_hints_published_by_a_plugin_reach_the_screen() {
+    let (mut app, plugin) = app_with_hints();
+    plugin.publish(vec![(
+        Arc::from(HINT_PLUGIN),
+        vec![(HINT_TEXT.into(), HINT_STYLE.into())],
+    )]);
+
+    assert!(
+        !rendered(&mut app).contains(HINT_TEXT),
+        "a hint no poller has seen must not be on screen"
+    );
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    assert!(rendered(&mut app).contains(HINT_TEXT));
+
+    plugin.publish(vec![]);
+    assert_eq!(app.tick(), Dirty::YES, "{OWED}");
+    assert!(!rendered(&mut app).contains(HINT_TEXT));
+}
+
+fn rendered(app: &mut App) -> String {
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.view(frame)).unwrap();
+    buffer_text(terminal.backend().buffer())
+}
+
+/// When the picker gives up on a directory it cannot list, the flash is the
+/// only trace the user gets. Forwarding it moved from `view` into `tick`, and
+/// dropping that hop closes the picker with no explanation at all. The loop
+/// ends the moment the walker thread answers; the deadline only turns a
+/// missing hop into a failure instead of a hang.
+#[test]
+fn tick_forwards_the_file_picker_flash_to_the_status_bar() {
+    let tmp = TempDir::new().unwrap();
+    let mut app = test_app();
+    app.file_picker
+        .open(&tmp.path().join(MISSING_DIR).to_string_lossy());
+
+    let deadline = Instant::now() + WALK_TIMEOUT;
+    while app.status_bar.flash_text().is_none() {
+        assert!(Instant::now() < deadline, "the picker never flashed");
+        let _ = app.tick();
+        std::thread::yield_now();
+    }
+
+    assert_eq!(app.status_bar.flash_text(), Some(UNREADABLE_DIR_MSG));
+    assert!(!app.file_picker.is_open());
+}
+
+/// A waiting tool draws a spinner, which changes once per `SPINNER_FRAME`.
+/// Claiming `SMOOTH` here paints five identical frames for every visible one,
+/// for as long as the tool runs.
+#[test]
+fn waiting_tool_animates_at_the_spinner_rate() {
+    let mut app = app_without_splash();
+    app.update(agent_msg(tool_start("t1", "bash")));
+
+    assert_eq!(app.cadence(), Cadence::SPINNER);
+}
+
+/// The bar spins for a whole streaming turn, again while a restore is in
+/// flight, and once more for a retry countdown. The old `is_animating` only
+/// knew about the restore, so the other two froze mid turn.
+#[test_case(Status::Streaming, false, false => Cadence::SPINNER ; "streaming_turn")]
+#[test_case(Status::Idle, true, false => Cadence::SPINNER ; "restoring_session")]
+#[test_case(Status::Idle, false, true => Cadence::SPINNER ; "retry_countdown")]
+#[test_case(Status::Idle, false, false => Cadence::IDLE ; "nothing_in_flight")]
+fn status_bar_motion_reaches_app_cadence(
+    status: Status,
+    restoring: bool,
+    retrying: bool,
+) -> Cadence {
+    let mut app = app_without_splash();
+    app.status = status;
+    app.restoring.store(restoring, Ordering::Relaxed);
+    if retrying {
+        app.retry_info = Some(RetryInfo {
+            attempt: 1,
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + RETRY_DELAY,
+        });
+    }
+    app.cadence()
+}
+
+/// `App::cadence` asks `overlays()` as a group, so a moving overlay only
+/// reaches the loop through that fold.
+#[test]
+fn open_overlay_motion_reaches_app_cadence() {
+    let mut app = app_without_splash();
+    assert_eq!(app.cadence(), Cadence::IDLE);
+
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr.open(
+        Arc::new(maki_agent::SharedBuf::new()),
+        maki_lua::FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+    assert_eq!(
+        app.cadence(),
+        Cadence::SPINNER,
+        "an open float's spinners only turn if the app keeps painting"
+    );
+
+    app.close_all_overlays();
+    assert_eq!(app.cadence(), Cadence::IDLE);
+}
+
 #[test]
 fn edge_scroll_makes_app_animating() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
-    app.update(agent_msg(AgentEvent::Done {
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        stop_reason: None,
-    }));
-    assert!(!app.is_animating());
+    let mut app = app_without_splash();
+    assert_eq!(app.cadence(), Cadence::IDLE);
     let zone = Rect::new(0, 2, 80, 20);
     set_zone(&mut app, SelectionZone::Messages, zone);
     app.active_chat().scroll_to_top();
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 10));
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 10, 1));
-    assert!(app.is_animating());
+    assert_eq!(
+        app.cadence(),
+        Cadence::SMOOTH,
+        "an edge-scrolling drag advances on a timer, with no events to wake us"
+    );
 }
 
 #[test]
@@ -1650,23 +2027,15 @@ fn pending_copy_ignores_drag_and_tick() {
     app.update(mouse_event(MouseEventKind::Drag(MouseButton::Left), 50, 50));
     assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
 
-    app.tick_edge_scroll();
+    let _ = app.tick_edge_scroll();
     assert!(app.selection_state.as_ref().unwrap().is_pending_copy());
 }
 
 #[test]
 fn pending_copy_not_animating() {
-    let mut app = test_app();
-    app.status = Status::Streaming;
-    app.run_id = 1;
-    app.update(agent_msg(AgentEvent::TextDelta { text: "x".into() }));
-    app.update(agent_msg(AgentEvent::Done {
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        stop_reason: None,
-    }));
+    let mut app = app_without_splash();
     make_pending_copy(&mut app);
-    assert!(!app.is_animating());
+    assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
 #[test]
@@ -1737,7 +2106,7 @@ fn queue_command_sets_focus(has_queue: bool) {
     } else {
         test_app()
     };
-    app.execute_command(cmd("/queue"));
+    app.execute_command(cmd("/queue"), 0);
     assert_eq!(app.queue.focus().is_some(), has_queue);
 }
 
@@ -1852,14 +2221,7 @@ fn stale_done_does_not_drain_queue() {
     cancel_app(&mut app);
     app.queue_and_notify(queued_msg("next"));
 
-    app.update(agent_msg_with_run_id(
-        AgentEvent::Done {
-            usage: TokenUsage::default(),
-            num_turns: 1,
-            stop_reason: None,
-        },
-        1,
-    ));
+    app.update(agent_msg_with_run_id(done(), 1));
     assert_eq!(app.queue.len(), 1);
     assert_eq!(app.status, Status::Idle);
 }
@@ -1913,7 +2275,7 @@ fn help_toggles_modal() {
     assert!(!app.help_modal.is_open());
     app.update(Msg::Key(kb::HELP.to_key_event()));
     assert!(app.help_modal.is_open());
-    app.execute_command(cmd("/help"));
+    app.execute_command(cmd("/help"), 0);
     assert!(!app.help_modal.is_open());
 }
 
@@ -1989,7 +2351,7 @@ fn submit_exit_quits() {
         images: vec![],
     });
     assert_eq!(app.exit_request, ExitRequest::Success);
-    assert!(actions.is_empty());
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
 }
 
 #[test]
@@ -2082,9 +2444,9 @@ fn reload_persists_session_with_content_to_disk() {
     app.state
         .session_mut()
         .push_message(Message::user("hello".into()));
-    let actions = app.execute_command(cmd("/reload"));
+    let actions = app.execute_command(cmd("/reload"), 0);
     assert_eq!(app.exit_request, ExitRequest::Reload);
-    assert!(actions.is_empty());
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
     app.checkpoint();
     let id = app.state.session.id;
     drain_writer(app, writer);
@@ -2095,7 +2457,7 @@ fn reload_persists_session_with_content_to_disk() {
 #[test]
 fn reload_leaves_empty_session_unpersisted_on_disk() {
     let (tmp, _dir, writer, mut app) = tempdir_app();
-    app.execute_command(cmd("/reload"));
+    app.execute_command(cmd("/reload"), 0);
     drain_writer(app, writer);
 
     let sessions_dir = tmp.path().join(maki_storage::sessions::SESSIONS_DIR);
@@ -2135,11 +2497,11 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
 fn yolo_toggle() {
     let mut app = test_app();
     assert!(!app.permissions.is_yolo());
-    app.execute_command(cmd("/yolo"));
+    app.execute_command(cmd("/yolo"), 0);
     assert!(app.permissions.is_yolo());
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.contains("enabled"), "flash={flash:?}");
-    app.execute_command(cmd("/yolo"));
+    app.execute_command(cmd("/yolo"), 0);
     assert!(!app.permissions.is_yolo());
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.contains("disabled"), "flash={flash:?}");
@@ -2149,7 +2511,7 @@ fn yolo_toggle() {
 fn usage_command_toggles_modal() {
     let mut app = test_app();
     assert!(!app.usage_modal.is_open());
-    let open_actions = app.execute_command(cmd("/usage"));
+    let open_actions = app.execute_command(cmd("/usage"), 0);
     assert!(app.usage_modal.is_open());
     assert!(
         open_actions
@@ -2157,7 +2519,7 @@ fn usage_command_toggles_modal() {
             .any(|a| matches!(a, Action::RefreshUsage)),
         "opening should request a quota refresh"
     );
-    let close_actions = app.execute_command(cmd("/usage"));
+    let close_actions = app.execute_command(cmd("/usage"), 0);
     assert!(!app.usage_modal.is_open());
     assert!(
         !close_actions
@@ -2170,7 +2532,7 @@ fn usage_command_toggles_modal() {
 #[test]
 fn ctrl_r_refreshes_usage_while_modal_open() {
     let mut app = test_app();
-    app.execute_command(cmd("/usage"));
+    app.execute_command(cmd("/usage"), 0);
     assert!(app.usage_modal.is_open());
 
     let actions = app.update(Msg::Key(kb::REFRESH.to_key_event()));
@@ -2184,10 +2546,13 @@ fn ctrl_r_refreshes_usage_while_modal_open() {
 #[test]
 fn cd_command_behavior() {
     let mut app = test_app();
-    app.execute_command(ParsedCommand {
-        name: "/cd".into(),
-        args: "/tmp".into(),
-    });
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/tmp".into(),
+        },
+        0,
+    );
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.starts_with("cd /tmp"), "flash={flash:?}");
     // Use `canonicalize_clean` (resolves symlinks like the OS does) rather
@@ -2197,10 +2562,13 @@ fn cd_command_behavior() {
     let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
     assert_eq!(app.state.session.cwd, resolved.to_string_lossy());
 
-    app.execute_command(ParsedCommand {
-        name: "/cd".into(),
-        args: "/nonexistent_path_12345".into(),
-    });
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/nonexistent_path_12345".into(),
+        },
+        0,
+    );
     let flash = app.status_bar.flash_text().unwrap();
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
 }
@@ -2239,6 +2607,98 @@ fn typed_lua_command_with_args_executes() {
 
     assert!(actions.is_empty(), "{LUA_COMMAND_NOT_SENT}");
     assert!(probe.try_recv().is_some(), "{LUA_COMMAND_RAN}");
+}
+
+const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
+
+#[test_case("/new" ; "plain")]
+#[test_case("/NEW" ; "uppercase")]
+#[test_case("  /new  " ; "surrounding_whitespace")]
+#[test_case("new" ; "missing_slash")]
+fn run_cmdline_executes_builtin(cmdline: &str) {
+    let mut app = test_app();
+
+    let actions = app.run_cmdline(cmdline, 0).unwrap();
+
+    assert!(matches!(&actions[..], [Action::NewSession]));
+}
+
+#[test]
+fn run_cmdline_splits_args_off_the_name() {
+    let mut app = test_app();
+
+    let actions = app.run_cmdline("/btw what is rust?", 0).unwrap();
+
+    assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
+}
+
+/// Only the typed path clears the input, so a keybind or autocmd reaching for
+/// `run_command` cannot eat a half-written message.
+#[test]
+fn run_cmdline_keeps_typed_input() {
+    let mut app = test_app();
+    app.input_box.set_input("half written".into());
+
+    app.run_cmdline("/usage", 0).unwrap();
+
+    assert_eq!(app.input_box.buffer.value(), "half written");
+}
+
+#[test]
+fn run_cmdline_unknown_name_errors_without_dispatching() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    let Err(err) = app.run_cmdline("/nope", 0) else {
+        panic!("{RUN_CMDLINE_REJECTED}");
+    };
+
+    assert!(err.contains("/nope"), "err={err:?}");
+    assert!(probe.try_recv_command().is_none(), "{RUN_CMDLINE_REJECTED}");
+}
+
+#[test]
+fn run_cmdline_rejects_past_max_depth() {
+    let mut app = test_app();
+
+    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1) else {
+        panic!("{RUN_CMDLINE_REJECTED}");
+    };
+
+    assert_eq!(err, crate::app::COMMAND_DEPTH_MSG);
+    assert!(
+        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH)
+            .is_ok(),
+        "the cap itself must still run"
+    );
+}
+
+/// A Lua command reached through an alias carries the hop count onward, or a
+/// cycle of Lua aliases would never trip the cap. It goes out spelled as
+/// registered, since only that spelling dispatches.
+#[test]
+fn run_cmdline_forwards_depth_to_lua_command() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app_with_lua(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: "/Sessions".into(),
+            description: "Browse sessions".into(),
+            plugin: "sessions".into(),
+            max_args: 0,
+        }]),
+    );
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.run_cmdline("/sessions", 3).unwrap();
+
+    assert_eq!(
+        probe.try_recv_command(),
+        Some(("/Sessions".to_string(), String::new(), 3))
+    );
 }
 
 #[test]
@@ -2280,10 +2740,18 @@ fn build_rewind_app() -> App {
     app
 }
 
+fn rewind_to_second_turn() -> RewindEntry {
+    RewindEntry {
+        turn_index: 2,
+        segment_index: 0,
+        prompt_preview: "2: second".into(),
+        prompt_text: "second prompt".into(),
+    }
+}
+
 #[test]
 fn rewind_to_middle_truncates_and_populates_input() {
     let mut app = build_rewind_app();
-    app.state.context_size = 100_000;
     let old_run_id = app.run_id;
     let entry = crate::components::rewind_picker::RewindEntry {
         turn_index: 2,
@@ -2297,9 +2765,6 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert!(app.state.session.tool_outputs().contains_key("tool-1"));
     assert_eq!(app.input_box.buffer.value(), "second prompt");
     assert_eq!(app.run_id, old_run_id);
-    let expected_ctx = maki_agent::agent::estimate_message_tokens(app.state.session.messages());
-    assert_eq!(app.state.context_size, expected_ctx);
-    assert_eq!(app.chats[0].context_size, expected_ctx);
 
     let Action::LoadSession(ref loaded) = actions[0] else {
         panic!("expected LoadSession");
@@ -2307,13 +2772,32 @@ fn rewind_to_middle_truncates_and_populates_input() {
     assert_eq!(loaded.messages.len(), 2);
 }
 
+/// Dropping two short messages may shave a few tokens off the gauge, never the
+/// baseline underneath it. A session that never ran a turn has no baseline, so
+/// there the rough estimate is all we get.
+#[test_case(MEASURED_CONTEXT, MEASURED_CONTEXT - SMALL_HISTORY ; "keeps_measured_baseline")]
+#[test_case(0,                0                                ; "falls_back_to_estimate")]
+fn rewind_recomputes_context_size(measured: u32, floor: u32) {
+    let mut app = build_rewind_app();
+    app.state.context_size = measured;
+    app.rewind_to(rewind_to_second_turn());
+
+    let size = app.state.context_size;
+    assert!(
+        size > floor && size < floor + SMALL_HISTORY,
+        "context {size} left the {floor}..{} window",
+        floor + SMALL_HISTORY
+    );
+    assert_eq!(app.chats[0].context_size, size);
+}
+
 #[test]
 fn rewind_to_first_turn_clears_everything() {
     let mut app = build_rewind_app();
-    app.state.context_size = 100_000;
+    app.state.context_size = MEASURED_CONTEXT;
     app.state.token_usage.input = 500;
     app.state.token_usage.output = 200;
-    let entry = crate::components::rewind_picker::RewindEntry {
+    let entry = RewindEntry {
         turn_index: 0,
         segment_index: 0,
         prompt_preview: "1: first".into(),
@@ -2338,7 +2822,7 @@ fn tick_error_expiry(age: Duration, expect_error: bool) {
         message: "fail".into(),
         since: Instant::now() - age,
     };
-    app.tick_error_expiry();
+    let _ = app.tick_error_expiry();
     assert_eq!(matches!(app.status, Status::Error { .. }), expect_error);
 }
 
@@ -2549,7 +3033,7 @@ fn at_with_shortcut_modifier_does_not_open_picker(mods: KeyModifiers) {
 #[test]
 fn mcp_command_opens_picker() {
     let mut app = test_app();
-    app.execute_command(cmd("/mcp"));
+    app.execute_command(cmd("/mcp"), 0);
     assert!(app.mcp_picker.is_open());
 }
 
@@ -2566,6 +3050,7 @@ fn mcp_toggle_dispatches_action() {
                 status: McpServerStatus::Running,
                 config_path: PathBuf::from("/tmp/config.toml"),
                 url: None,
+                oauth: None,
             }],
             prompts: vec![],
             pids: vec![],
@@ -2573,7 +3058,7 @@ fn mcp_toggle_dispatches_action() {
         }),
         McpConfigErrors::new(PathBuf::new()),
     );
-    app.execute_command(cmd("/mcp"));
+    app.execute_command(cmd("/mcp"), 0);
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(
@@ -2639,10 +3124,13 @@ fn alt_o_opens_editor_for_input() {
 #[test]
 fn btw_empty_flashes_error() {
     let mut app = test_app();
-    let actions = app.execute_command(ParsedCommand {
-        name: "/btw".into(),
-        args: String::new(),
-    });
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/btw".into(),
+            args: String::new(),
+        },
+        0,
+    );
     assert!(actions.is_empty());
     assert_eq!(
         app.status_bar.flash_text().unwrap(),
@@ -2653,20 +3141,29 @@ fn btw_empty_flashes_error() {
 #[test]
 fn btw_with_question_returns_action() {
     let mut app = test_app();
-    let actions = app.execute_command(ParsedCommand {
-        name: "/btw".into(),
-        args: "what is rust?".into(),
-    });
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/btw".into(),
+            args: "what is rust?".into(),
+        },
+        0,
+    );
     assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
 }
 
 #[test]
 fn btw_modal_key_routing_and_animation() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded(1);
+    let (tx, rx) = flume::bounded(1);
     app.btw_modal.open("test", rx);
 
-    assert!(app.btw_modal.is_animating());
+    // A pending stream is data, drained by `poll`. Only the typewriter
+    // revealing the answer moves on its own.
+    assert!(app.btw_modal.is_streaming());
+    assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
+    tx.send(BtwEvent::TextDelta("hi".into())).unwrap();
+    assert_eq!(app.btw_modal.poll(), Dirty::YES);
+    assert_eq!(app.btw_modal.cadence(), Cadence::SMOOTH);
 
     let actions = app.update(Msg::Key(key(KeyCode::Char('x'))));
     assert!(actions.is_empty());
@@ -2676,7 +3173,7 @@ fn btw_modal_key_routing_and_animation() {
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(actions.is_empty());
     assert!(!app.btw_modal.is_open());
-    assert!(!app.btw_modal.is_animating());
+    assert_eq!(app.btw_modal.cadence(), Cadence::IDLE);
 }
 
 #[test]
@@ -2718,9 +3215,7 @@ fn streaming_app_with_history() -> App {
 
 /// The stale event is dropped, yet the cancelled turn still reaches disk: the
 /// next frame's checkpoint syncs the mirror whatever event arrived.
-#[test_case(
-    AgentEvent::Done { usage: TokenUsage::default(), num_turns: 1, stop_reason: None } ; "stale_done"
-)]
+#[test_case(done() ; "stale_done")]
 #[test_case(
     AgentEvent::Error { message: "timeout".into() } ; "stale_error"
 )]
@@ -2787,7 +3282,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
     assert!(app.state.session.subagents().is_empty());
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().is_empty());
-    assert!(!app.is_animating());
+    assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
 #[test]
@@ -2994,14 +3489,6 @@ fn flush_restored_queue_drops_recovery_snapshot() {
 }
 
 // --- Plan form integration tests ---
-
-fn done_event() -> Msg {
-    agent_msg(AgentEvent::Done {
-        usage: TokenUsage::default(),
-        num_turns: 1,
-        stop_reason: None,
-    })
-}
 
 fn implement_msg(parallel: bool) -> String {
     if parallel {
@@ -3409,10 +3896,10 @@ fn thinking_toggle_cycles_off_adaptive() {
     let mut app = test_app();
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
 
-    app.execute_command(cmd("/thinking"));
+    app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Adaptive);
 
-    app.execute_command(cmd("/thinking"));
+    app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
 }
 
@@ -3420,27 +3907,33 @@ fn thinking_toggle_cycles_off_adaptive() {
 fn thinking_explicit_args() {
     let mut app = test_app();
 
-    app.execute_command(ParsedCommand {
-        name: "/thinking".into(),
-        args: "8192".into(),
-    });
+    app.execute_command(
+        ParsedCommand {
+            name: "/thinking".into(),
+            args: "8192".into(),
+        },
+        0,
+    );
     assert_eq!(app.state.thinking, ThinkingConfig::Budget(8192));
 
-    app.execute_command(ParsedCommand {
-        name: "/thinking".into(),
-        args: "high".into(),
-    });
+    app.execute_command(
+        ParsedCommand {
+            name: "/thinking".into(),
+            args: "high".into(),
+        },
+        0,
+    );
     assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
 }
 
 #[test]
 fn thinking_unsupported_model_flashes_error() {
     let mut app = test_app();
-    app.state.model.supports_thinking_override = Some(false);
+    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
 
-    app.execute_command(cmd("/thinking"));
+    app.execute_command(cmd("/thinking"), 0);
     assert_eq!(app.state.thinking, ThinkingConfig::Off);
-    assert!(app.status_bar.flash_text().is_some());
+    assert_eq!(app.status_bar.flash_text(), Some(THINKING_UNSUPPORTED_MSG));
 }
 
 #[test]
@@ -3450,12 +3943,17 @@ fn thinking_restored_from_session_meta() {
     let mut session = AppSession::new("test-model", "/tmp/test");
     session.meta.thinking = Some(StoredThinking::Budget { tokens: 4096 });
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        session,
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
     assert_eq!(state.thinking, ThinkingConfig::Budget(4096));
 }
 
 fn set_opus_model(app: &mut App) {
-    app.state.model = maki_providers::Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    app.state.model = maki_providers::Model::from_spec(OPUS_SPEC).unwrap();
 }
 
 #[test]
@@ -3464,11 +3962,11 @@ fn fast_toggle_on_off_on_opus() {
     set_opus_model(&mut app);
     assert!(!app.state.fast);
 
-    app.execute_command(cmd("/fast"));
+    app.execute_command(cmd("/fast"), 0);
     assert!(app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_ON_MSG));
 
-    app.execute_command(cmd("/fast"));
+    app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
@@ -3482,11 +3980,11 @@ fn workflow_toggle_flows_into_agent_input() {
     };
     assert!(!app.build_agent_input(&msg).workflow);
 
-    app.execute_command(cmd("/workflow"));
+    app.execute_command(cmd("/workflow"), 0);
     assert!(app.build_agent_input(&msg).workflow);
     assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_ON_MSG));
 
-    app.execute_command(cmd("/workflow"));
+    app.execute_command(cmd("/workflow"), 0);
     assert!(!app.build_agent_input(&msg).workflow);
     assert_eq!(app.status_bar.flash_text(), Some(WORKFLOW_OFF_MSG));
 }
@@ -3517,13 +4015,13 @@ fn subagent_history_finishes_workflow_chat() {
     assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
 }
 
-#[test_case("anthropic/claude-sonnet-4-5" ; "non_opus_anthropic")]
+#[test_case(SONNET_SPEC ; "non_opus_anthropic")]
 #[test_case("openai/gpt-5.5" ; "non_anthropic")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
     let mut app = test_app();
     app.state.model = maki_providers::Model::from_spec(spec).unwrap();
 
-    app.execute_command(cmd("/fast"));
+    app.execute_command(cmd("/fast"), 0);
     assert!(!app.state.fast);
     assert_eq!(app.status_bar.flash_text(), Some(FAST_UNSUPPORTED_MSG));
 }
@@ -3535,7 +4033,12 @@ fn fast_restored_from_session_meta() {
     let mut session = AppSession::new("anthropic/claude-opus-4-8", "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        session,
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
     assert!(state.fast);
 }
 
@@ -3545,11 +4048,102 @@ fn fast_normalized_off_when_restored_onto_ineligible_model() {
     let storage = StateDir::from_path(tmp.path().to_path_buf());
     // Saved as fast=true, but sonnet cannot do fast mode, so restoring must drop
     // it to false or the UI would show a phantom [fast] badge.
-    let mut session = AppSession::new("anthropic/claude-sonnet-4-5", "/tmp/test");
+    let mut session = AppSession::new(SONNET_SPEC, "/tmp/test");
     session.meta.fast = true;
 
-    let state = SessionState::from_session(session, &test_model(), &storage);
+    let state = SessionState::from_session(
+        session,
+        &test_model(),
+        &storage,
+        &maki_config::ModelPolicy::default(),
+    );
     assert!(!state.fast);
+}
+
+#[test]
+fn model_state_reports_the_model_and_what_it_supports() {
+    let mut app = test_app();
+    app.state.model = maki_providers::Model::from_spec(PLAIN_MODEL_SPEC).unwrap();
+    assert_eq!(
+        app.model_state(),
+        serde_json::json!({
+            "spec": PLAIN_MODEL_SPEC,
+            "id": "qwen3",
+            "provider": "ollama",
+            "thinking": "off",
+            "fast": false,
+            "supports_thinking": false,
+            "supports_fast": false,
+        })
+    );
+
+    set_opus_model(&mut app);
+    app.set_thinking("high").unwrap();
+    app.set_fast(true).unwrap();
+    assert_eq!(
+        app.model_state(),
+        serde_json::json!({
+            "spec": OPUS_SPEC,
+            "id": "claude-opus-4-8",
+            "provider": "anthropic",
+            "thinking": "high",
+            "fast": true,
+            "supports_thinking": true,
+            "supports_fast": true,
+        })
+    );
+}
+
+/// What `model_state` reports has to parse back into the same state, or a
+/// `maki.model.get` -> `maki.model.set` hop would silently change it.
+#[test_case(ThinkingConfig::Off, "off" ; "off")]
+#[test_case(ThinkingConfig::Adaptive, "adaptive" ; "adaptive")]
+#[test_case(ThinkingConfig::Effort(Effort::High), "high" ; "effort")]
+#[test_case(ThinkingConfig::Budget(8192), "8192" ; "budget")]
+fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, expected: &str) {
+    let mut app = test_app();
+    app.state.thinking = thinking;
+
+    let reported = app.model_state()["thinking"].as_str().unwrap().to_owned();
+    assert_eq!(reported, expected);
+    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+}
+
+#[test]
+fn set_thinking_toggles_on_blank_input() {
+    let mut app = test_app();
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
+    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
+}
+
+#[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
+#[test_case(true, "0", THINKING_USAGE ; "zero_budget")]
+#[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]
+fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expected: &str) {
+    let mut app = test_app();
+    app.set_thinking("high").unwrap();
+    if !supported {
+        app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
+    }
+
+    assert_eq!(app.set_thinking(input).unwrap_err(), expected);
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+}
+
+/// Fast must never get stuck on: after switching to a model without fast mode,
+/// you still have to be able to turn it off.
+#[test]
+fn fast_turns_off_on_a_model_that_lost_fast_support() {
+    let mut app = test_app();
+    set_opus_model(&mut app);
+    app.execute_command(cmd("/fast"), 0);
+    assert!(app.state.fast);
+
+    app.state.model = maki_providers::Model::from_spec(SONNET_SPEC).unwrap();
+    app.execute_command(cmd("/fast"), 0);
+    assert!(!app.state.fast);
+    assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
 #[test]
@@ -3558,7 +4152,7 @@ fn update_model_to_ineligible_resets_fast() {
     set_opus_model(&mut app);
     app.state.fast = true;
 
-    let sonnet = maki_providers::Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
+    let sonnet = maki_providers::Model::from_spec(SONNET_SPEC).unwrap();
     app.state.update_model(&sonnet);
     assert!(!app.state.fast);
 }
@@ -3631,6 +4225,38 @@ fn open_split_window(app: &mut App, dir: maki_lua::Split) {
     let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
     let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
     app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+}
+
+#[test]
+fn attention_float_marks_app_as_awaiting_input_until_close() {
+    let mut app = test_app();
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let config = maki_lua::FloatConfig {
+        needs_input: true,
+        ..maki_lua::FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+    assert!(app.awaiting_input());
+    assert_eq!(app.attention(), Some(Notification::QuestionRequested));
+
+    cmd_tx
+        .send(maki_lua::WinCommand::SetVisible(false))
+        .unwrap();
+    let _ = app.float_mgr.tick();
+    assert!(!app.awaiting_input());
+    assert_eq!(app.attention(), None);
+
+    cmd_tx.send(maki_lua::WinCommand::SetVisible(true)).unwrap();
+    let _ = app.float_mgr.tick();
+    assert_eq!(app.attention(), Some(Notification::QuestionRequested));
+
+    cmd_tx.send(maki_lua::WinCommand::Close).unwrap();
+    let _ = app.float_mgr.tick();
+    assert!(!app.awaiting_input());
+    assert_eq!(app.attention(), None);
 }
 
 #[test]
@@ -3729,7 +4355,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
 
 fn app_with_active_subagent() -> App {
     let mut app = app_with_subagent();
-    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app
 }
@@ -3776,7 +4402,7 @@ fn esc_in_main_chat_with_active_subagent_no_cancel() {
 fn cancel_subagent_removes_answer_sender() {
     let (mut app, _sub_rx, _main_rx) = app_with_subagent_tx(TASK_ID);
     assert!(!app.subagent_answers.is_empty());
-    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::NextChat);
     assert_eq!(app.active_chat, 1);
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -3823,7 +4449,7 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
     app.update(Msg::Key(key(KeyCode::Esc)));
     assert!(app.chats[1].is_finished());
 
-    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
+    app.run_builtin(BuiltinAction::PrevChat);
     assert_eq!(app.active_chat, 0);
     assert_eq!(app.status, Status::Streaming);
     assert!(!app.chats[0].is_finished());
@@ -3832,14 +4458,14 @@ fn subagent_cancel_then_navigate_back_main_unaffected() {
 #[test]
 fn q_command_exits() {
     let mut app = test_app();
-    app.execute_command(cmd("/q"));
+    app.execute_command(cmd("/q"), 0);
     assert_eq!(app.exit_request, ExitRequest::Success);
 }
 
 #[test]
 fn exit_command_exits() {
     let mut app = test_app();
-    app.execute_command(cmd("/exit"));
+    app.execute_command(cmd("/exit"), 0);
     assert_eq!(app.exit_request, ExitRequest::Success);
 }
 
@@ -3847,7 +4473,7 @@ fn exit_command_exits() {
 fn settings_command_opens_picker() {
     let mut app = test_app();
     assert!(!app.settings_picker.is_open());
-    app.execute_command(cmd("/settings"));
+    app.execute_command(cmd("/settings"), 0);
     assert!(app.settings_picker.is_open());
 }
 
@@ -3855,7 +4481,7 @@ fn settings_command_opens_picker() {
 fn goto_command_flashes_on_empty_args() {
     let mut app = test_app();
     app.status_bar.clear_flash();
-    app.execute_command(cmd("/goto"));
+    app.execute_command(cmd("/goto"), 0);
     assert!(app.status_bar.flash_text().is_some());
 }
 
@@ -3868,10 +4494,13 @@ fn goto_command_with_turn_number() {
     app.state
         .session_mut()
         .push_message(Message::user("second prompt".into()));
-    app.execute_command(ParsedCommand {
-        name: "/goto".into(),
-        args: "2".into(),
-    });
+    app.execute_command(
+        ParsedCommand {
+            name: "/goto".into(),
+            args: "2".into(),
+        },
+        0,
+    );
     // should succeed (no flash)
     assert!(app.status_bar.flash_text().is_none());
 }
@@ -3882,7 +4511,7 @@ fn goto_command_with_turn_number() {
 fn export_command_opens_picker() {
     let mut app = test_app();
     assert!(!app.export_picker.is_open());
-    app.execute_command(cmd("/export"));
+    app.execute_command(cmd("/export"), 0);
     assert!(app.export_picker.is_open());
 }
 
@@ -3890,7 +4519,7 @@ fn export_command_opens_picker() {
 fn skills_command_opens_picker() {
     let mut app = test_app();
     assert!(!app.skills_modal.is_open());
-    app.execute_command(cmd("/skills"));
+    app.execute_command(cmd("/skills"), 0);
     assert!(app.skills_modal.is_open());
 }
 
@@ -3898,7 +4527,7 @@ fn skills_command_opens_picker() {
 fn plugins_command_opens_picker() {
     let mut app = test_app();
     assert!(!app.plugins_modal.is_open());
-    app.execute_command(cmd("/plugins"));
+    app.execute_command(cmd("/plugins"), 0);
     assert!(app.plugins_modal.is_open());
 }
 
@@ -3909,14 +4538,14 @@ fn rewind_command_opens_picker() {
         .session_mut()
         .push_message(Message::user("test".into()));
     assert!(!app.rewind_picker.is_open());
-    app.execute_command(cmd("/rewind"));
+    app.execute_command(cmd("/rewind"), 0);
     assert!(app.rewind_picker.is_open());
 }
 
 #[test]
 fn reload_config_command_updates_state() {
     let mut app = test_app();
-    app.execute_command(cmd("/reload_config"));
+    app.execute_command(cmd("/reload_config"), 0);
     assert_eq!(app.status_bar.flash_text(), Some("Configuration reloaded"));
 }
 
@@ -3944,6 +4573,123 @@ const BUMP_TITLE: &str = "title bump ";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
+
+#[test]
+fn turn_response_normalizes_text_and_truncates_unicode() {
+    let long = "界".repeat(201);
+    let message = Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: "  first\n\tsecond ".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "ignored".into(),
+                signature: None,
+            },
+            ContentBlock::Text { text: long },
+        ],
+        ..Default::default()
+    };
+    let response = turn_response(&message).unwrap();
+    assert_eq!(response.chars().count(), 200);
+    assert!(response.starts_with("first second 界"));
+    assert_eq!(turn_response(&Message::default()), None);
+    assert_eq!(turn_response(&tool_use_msg("tool")), None);
+}
+
+#[test]
+fn turn_response_stops_after_bounded_large_input() {
+    let message = Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::Text {
+                text: format!("first {}", "x".repeat(1_000_000)),
+            },
+            ContentBlock::Text {
+                text: "not reached".into(),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let response = turn_response(&message).unwrap();
+
+    assert_eq!(response.chars().count(), 200);
+    assert!(response.starts_with("first "));
+    assert!(!response.contains("not reached"));
+}
+
+#[test_case(Notification::TurnComplete { response: Some("answer".into()) }, "answer", false ; "turn_response")]
+#[test_case(Notification::TurnComplete { response: None }, "Agent turn complete", false ; "turn_fallback")]
+#[test_case(Notification::PermissionRequested { tool: Some("bash".into()) }, "Permission requested: bash", true ; "permission_tool")]
+#[test_case(Notification::PermissionRequested { tool: None }, "Permission requested", true ; "permission_fallback")]
+#[test_case(Notification::AuthenticationRequired, "Authentication required", true ; "authentication")]
+#[test_case(Notification::QuestionRequested, "Question requested", true ; "question")]
+#[test_case(Notification::PlanReady, "Plan ready", true ; "plan")]
+#[test_case(Notification::error_completion(), "Agent stopped with an error", false ; "error_completion")]
+fn notification_message_and_urgency(
+    notification: Notification,
+    expected_message: &str,
+    urgent: bool,
+) {
+    assert_eq!(notification.message(), expected_message);
+    assert_eq!(notification.is_urgent(), urgent);
+}
+
+#[test]
+fn attention_prioritizes_permission_and_normalizes_tool() {
+    let mut app = test_app();
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.permission_prompt.open(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
+    assert_eq!(
+        app.attention(),
+        Some(Notification::PermissionRequested {
+            tool: Some("bash".into())
+        })
+    );
+
+    app.permission_prompt
+        .open("id".into(), maki_config::ToolKey::Wildcard, vec![], None);
+    assert_eq!(
+        app.attention(),
+        Some(Notification::PermissionRequested { tool: None })
+    );
+}
+
+#[test]
+fn attention_classifies_auth_and_ready_plan() {
+    let mut app = test_app();
+    app.pending_input = PendingInput::AuthRetry { subagent_id: None };
+    assert_eq!(app.attention(), Some(Notification::AuthenticationRequired));
+
+    app.pending_input = PendingInput::None;
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.plan_form.on_plan_ready();
+    app.status = Status::Streaming;
+    assert_eq!(app.attention(), None);
+    app.status = Status::Idle;
+    assert_eq!(app.attention(), Some(Notification::PlanReady));
+    assert!(!app.awaiting_input());
+
+    app.plan_form.hide();
+    assert_eq!(app.attention(), None);
+    app.plan_form.on_plan_ready();
+    app.state.plan = PlanState::Drafting(PathBuf::from("plan.md"));
+    assert_eq!(app.attention(), None);
+    app.state.plan = PlanState::Ready(PathBuf::from("plan.md"));
+    app.state.mode = Mode::Build;
+    assert_eq!(app.attention(), None);
+}
 
 fn tool_use_msg(id: &str) -> Message {
     Message {
@@ -4042,7 +4788,7 @@ fn checkpoint_after_rewind_persists_the_truncated_history() {
     );
     app.checkpoint();
 
-    let entry = crate::components::rewind_picker::RewindEntry {
+    let entry = RewindEntry {
         turn_index: 1,
         segment_index: 0,
         prompt_preview: "2: second".into(),
@@ -4359,14 +5105,14 @@ fn queued_message_pickup_sets_turn_start() {
 #[test]
 fn compact_command_sets_turn_start() {
     let mut app = test_app();
-    app.execute_command(cmd("/compact"));
+    app.execute_command(cmd("/compact"), 0);
     assert!(app.turn_start.is_some());
 }
 
 #[test]
 fn checkpoint_command_sets_turn_start() {
     let mut app = test_app();
-    app.execute_command(cmd("/checkpoint"));
+    app.execute_command(cmd("/checkpoint"), 0);
     assert!(app.turn_start.is_some());
 }
 
@@ -4454,6 +5200,7 @@ fn turn_complete_full(usage: TokenUsage, turn_id: usize, cache_miss: bool) -> Ag
         model: "test-model".into(),
         cost: Some(0.01),
         context_size: None,
+        context_window: 0,
         cache_miss,
         upstream: None,
         turn_id,
@@ -4526,9 +5273,9 @@ fn stats_command_toggles_modal_and_new_clears_history() {
     )));
     assert_eq!(app.turn_history.len(), 1);
 
-    app.execute_command(cmd("/stats"));
+    app.execute_command(cmd("/stats"), 0);
     assert!(app.stats_modal.is_open());
-    app.execute_command(cmd("/stats"));
+    app.execute_command(cmd("/stats"), 0);
     assert!(!app.stats_modal.is_open());
 
     app.reset_session();
@@ -4556,4 +5303,32 @@ fn session_name_is_published_only_when_it_changes() {
         app.published_name.as_ref().map(|(_, t)| t.as_str()),
         Some("renamed")
     );
+}
+
+#[test]
+fn run_builtin_file_picker_opens_modal() {
+    let mut app = test_app();
+    assert!(app.run_builtin(BuiltinAction::FilePicker).is_empty());
+    assert!(app.file_picker.is_open());
+}
+
+#[test]
+fn run_builtin_model_picker_opens_and_refreshes() {
+    let mut app = test_app();
+    let actions = app.run_builtin(BuiltinAction::ModelPicker);
+    assert!(app.model_picker.is_open());
+    assert!(matches!(&actions[..], [Action::RefreshModels]));
+}
+
+#[test]
+fn alt_m_opens_model_picker() {
+    let mut app = test_app();
+    let key = KeyEvent {
+        code: KeyCode::Char('m'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: crossterm::event::KeyEventKind::Press,
+        state: crossterm::event::KeyEventState::NONE,
+    };
+    app.update(Msg::Key(key));
+    assert!(app.model_picker.is_open());
 }

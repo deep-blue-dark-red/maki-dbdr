@@ -35,6 +35,10 @@ pub struct FnDoc {
     pub returns: &'static str,
     /// Lua snippet rendered as a fenced code block, or "" when absent.
     pub example: &'static str,
+    /// Manifest key of the plugin permission gating this function, from the
+    /// `guard =` attribute. Rendered into the docs so the reference can
+    /// never drift from the actual gate.
+    pub guard: Option<&'static str>,
 }
 
 pub struct ParamDoc {
@@ -68,6 +72,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::json::VALIDATOR_DOCS,
         &api::keymap::DOCS,
         &api::log::DOCS,
+        &api::model::DOCS,
         &api::net::DOCS,
         &api::session::DOCS,
         &api::text::DOCS,
@@ -122,6 +127,7 @@ mod tests {
         let (ui_tx, _ui_rx) = flume::unbounded();
         let maki = create_maki_global(
             &lua,
+            Arc::default(),
             Arc::default(),
             Arc::from("docs-test"),
             Some(ui_tx),

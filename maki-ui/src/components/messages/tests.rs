@@ -1,6 +1,7 @@
 use super::segment;
 use super::*;
 use crate::components::scrollbar::SCROLLBAR_THUMB;
+use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
@@ -8,6 +9,7 @@ use maki_agent::{
 };
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
+use std::time::Duration;
 use test_case::test_case;
 
 fn snap_line(text: &str) -> SnapshotLine {
@@ -427,9 +429,110 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     panel.cancel_in_progress();
 
     assert_eq!(panel.in_progress_count(), 0);
-    assert!(!panel.is_animating());
+    assert_eq!(panel.cadence(), Cadence::IDLE);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Success);
     assert_eq!(msg_status(&panel, "t2"), ToolStatus::Error);
+}
+
+const THINKING_TEXT: &str = "a long chain of reasoning";
+const HIGHLIGHTED_CODE: &str = "fn main() {}";
+const HIGHLIGHT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Only `view` advances a typewriter, and collapsed thinking is never drawn,
+/// so its reveal can never finish. Believing it would hold the loop at full
+/// frame rate for as long as the model reasons.
+#[test_case(true  => Cadence::SMOOTH ; "expanded_thinking_reveals")]
+#[test_case(false => Cadence::IDLE   ; "collapsed_thinking_reveals_nothing")]
+fn thinking_animates_only_while_it_is_on_screen(show_thinking: bool) -> Cadence {
+    let config = UiConfig {
+        show_thinking,
+        ..UiConfig::default()
+    };
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+
+    panel.thinking_delta(THINKING_TEXT);
+
+    assert!(
+        panel.streaming_thinking.is_animating(),
+        "the typewriter is mid-reveal, it just has nowhere to draw"
+    );
+    panel.cadence()
+}
+
+/// A waiting tool used to claim the whole screen was animating, which is what
+/// pinned the loop at full frame rate. It draws one spinner glyph, so the
+/// glyph rate is all it may ask for. Text arriving beside it earns the smooth
+/// budget.
+#[test_case(false => Cadence::SPINNER ; "waiting_tool_only_spins")]
+#[test_case(true  => Cadence::SMOOTH  ; "streaming_text_beside_it_wins")]
+fn cadence_while_a_tool_is_in_progress(text_streaming: bool) -> Cadence {
+    let mut panel = panel_with_tools(&[("t1", BASH_TOOL_NAME)]);
+    if text_streaming {
+        panel.text_delta("an answer arriving while the tool still runs");
+    }
+    assert_eq!(
+        panel.in_progress_count(),
+        1,
+        "the spinner source has to be live or this proves nothing"
+    );
+    panel.cadence()
+}
+
+/// Without the `show_idle_splash` gate the splash keeps asking for smooth
+/// frames for the rest of the session, long after the first message pushed it
+/// off screen.
+#[test]
+fn splash_stops_driving_cadence_once_a_message_exists() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    assert_eq!(
+        panel.cadence(),
+        Cadence::SMOOTH,
+        "the starfield drifts while the splash is the only thing drawn"
+    );
+
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(done("t1"));
+
+    assert_eq!(panel.cadence(), Cadence::IDLE, "the splash is gone");
+}
+
+/// `drain_highlights` moved out of `view`, so `tick` is the only thing feeding
+/// the worker now. The wait is the worker's own round trip, not a sleep: the
+/// loop ends the moment the result lands, and the deadline only turns a broken
+/// drain into a failure instead of a hang.
+#[test]
+fn tick_drains_the_highlight_worker() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: ToolOutput::ReadCode {
+            path: "file.rs".into(),
+            start_line: 1,
+            lines: vec![HIGHLIGHTED_CODE.into()],
+            total_lines: 1,
+            instructions: None,
+        },
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    rebuild(&mut panel);
+
+    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
+    while panel.tick() == Dirty::NO {
+        assert!(
+            Instant::now() < deadline,
+            "a highlighted tool stays unstyled until some unrelated repaint"
+        );
+        std::thread::yield_now();
+    }
+
+    assert!(
+        seg_text(&panel, "t1").contains(HIGHLIGHTED_CODE),
+        "the applied result replaces the highlight range in place"
+    );
 }
 
 #[test]
@@ -1179,7 +1282,7 @@ fn second_register_live_buf_replaces_first() {
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.register_live_buf("t1".into(), Arc::clone(&preview));
     panel.register_live_buf("t1".into(), Arc::clone(&handler));
-    panel.poll_live_bufs();
+    let _ = panel.poll_live_bufs();
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
@@ -1215,13 +1318,14 @@ fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     let buf = finish_with_live_buf(&mut panel, "t1", "before", false);
     assert!(panel.watching("t1"));
-    assert!(
-        !panel.is_animating(),
-        "watched bufs must not keep the UI animating"
+    assert_eq!(
+        panel.cadence(),
+        Cadence::IDLE,
+        "a finished tool must not leave a spinner running"
     );
 
     buf.set_lines(vec![snap_line("after")]);
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES, "{OWED}");
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1253,7 +1357,11 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
     assert!(!panel.watching("t0"));
 
     buf.set_lines(vec![snap_line("after-eviction")]);
-    panel.poll_live_bufs();
+    assert_eq!(
+        panel.poll_live_bufs(),
+        Dirty::NO,
+        "evicted buf must no longer be polled"
+    );
     let msg = panel.find_tool_msg_mut("t0").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1298,7 +1406,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
 }
 
 /// The stale-run_id filter drops ToolDone events after a cancel, so the
-/// cancel path itself must retire live bufs: no `is_animating` pin, and
+/// cancel path itself must retire live bufs: no spinner left running, and
 /// the tool stays clickable through the warm path.
 #[test]
 fn cancel_in_progress_retires_live_buf_to_watched() {
@@ -1314,14 +1422,19 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
 
     panel.cancel_in_progress();
-    assert!(
-        !panel.is_animating(),
-        "cancel must not leak live bufs that pin animation"
+    assert_eq!(
+        panel.cadence(),
+        Cadence::IDLE,
+        "cancel must not leave a tool marked in progress"
     );
     assert!(panel.watching("t1"));
 
     buf.set_lines(vec![snap_line("after-cancel")]);
-    panel.poll_live_bufs();
+    // The tool hands that same repaint to the host as its reply body, and the
+    // stale-run_id filter drops it. Taking a body must not cost the screen the
+    // last thing a cancelled tool painted.
+    let _dropped_reply = buf.take();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES, "{OWED}");
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1356,7 +1469,11 @@ fn restore_reply_stops_watching_buf() {
     assert!(!panel.watching("t1"));
 
     buf.set_lines(vec![snap_line("stale-mutation")]);
-    panel.poll_live_bufs();
+    assert_eq!(
+        panel.poll_live_bufs(),
+        Dirty::NO,
+        "unwatched buf must no longer be polled"
+    );
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     assert_eq!(
         msg.render_snapshot.as_ref().unwrap().first_line_text(),
@@ -1401,11 +1518,11 @@ fn live_buf_streams_across_clean_polls() {
     panel.register_live_buf("t1".into(), Arc::clone(&buf));
 
     buf.append(snap_line("first"));
-    panel.poll_live_bufs();
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
+    assert_eq!(panel.poll_live_bufs(), Dirty::NO, "{QUIET}");
 
     buf.append(snap_line("second"));
-    panel.poll_live_bufs();
+    assert_eq!(panel.poll_live_bufs(), Dirty::YES);
 
     let msg = panel.find_tool_msg_mut("t1").unwrap();
     let snapshot = msg.render_snapshot.as_ref().unwrap();
@@ -1576,11 +1693,18 @@ fn header_snapshot_stamps_gen_on_top_level() {
 
 #[test]
 fn live_snapshot_uses_panel_generation() {
+    // Read the generation rather than assuming 0: it is a process-wide counter
+    // that never resets, so any earlier test swapping the theme moves it.
+    let gen_at_build = theme::generation();
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", BASH_TOOL_NAME));
     panel.tool_snapshot("t1", rendered_snapshot(), None);
 
-    assert_eq!(panel.snapshot_gen_of("t1"), Some(0), "{LIVE_PANEL_GEN_MSG}");
+    assert_eq!(
+        panel.snapshot_gen_of("t1"),
+        Some(gen_at_build),
+        "{LIVE_PANEL_GEN_MSG}"
+    );
 }
 
 #[test]
@@ -1843,4 +1967,341 @@ fn user_turn_numbers_count_every_user_message() {
     // A width change drops the whole cache and rebuilds from zero.
     render(&mut panel, 60, 24);
     assert_eq!(numbered(&panel), ["1‧ you ∙ ", "3‧ you ∙ "]);
+}
+
+#[test]
+fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
+    let long_line = Line::from("x".repeat(80));
+    let mut seg = Segment::with_lines(vec![long_line.clone()], "test".into(), None);
+
+    let h_wide = seg.height(80);
+    assert_eq!(h_wide, 1, "80 chars at width 80 fits on one line");
+
+    // Keeping the old height is what keeps a resize cheap: the document
+    // layout stays put until the segment is really reflowed.
+    seg.stale = true;
+    assert_eq!(
+        seg.height(40),
+        h_wide,
+        "stale segment should return old cached height, not recompute"
+    );
+    // Callers that re-wrap the lines themselves need the real number.
+    assert_eq!(
+        seg.drawn_height(40),
+        2,
+        "drawn_height must report what the lines really take at the new width"
+    );
+
+    seg.set_lines(vec![long_line]);
+    assert_eq!(seg.height(40), 2, "80 chars at width 40 wraps to two lines");
+}
+
+#[test]
+fn copy_after_resize_keeps_offscreen_text() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let body = "x".repeat(60);
+    for i in 0..30 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("m{i:02}{body}"),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    render(&mut panel, 40, 10);
+
+    let total: u32 = panel.segment_heights().iter().map(|&h| h as u32).sum();
+    let area = Rect::new(0, 0, 40, 10);
+    let sel = make_sel(area, (0, 0), (total - 1, 39));
+    let text = panel.extract_selection_text(&sel, area);
+
+    // The top of the transcript is far off-screen and never gets reflowed.
+    // Selection sizes its buffer from `height` and then re-wraps, so a height
+    // measured at the old width would clip every line it copies.
+    assert!(
+        text.contains(&format!("m00{body}")),
+        "off-screen message was truncated in the copy: {text:?}"
+    );
+}
+
+#[test]
+fn resize_reflows_only_viewport_segments() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    // 30 messages, each ~60 chars beyond the label — enough to exceed
+    // viewport (10) + reflow margin (1 * 10 = 10 lines) so top segments
+    // stay out of the reflow range when auto-scrolled to the bottom.
+    for i in 0..30 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i:02} {}", "x".repeat(60)),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    let seg_count_before = panel.cache.len();
+    assert!(seg_count_before > 0);
+
+    render(&mut panel, 40, 10);
+
+    // Cache preserved — no nuke
+    assert_eq!(
+        panel.cache.len(),
+        seg_count_before,
+        "resize must not clear the segment cache"
+    );
+
+    let segs = panel.cache.segments();
+
+    // Bottom segments (near the auto-scrolled viewport) are reflowed
+    let bottom_fresh = segs
+        .iter()
+        .filter(|s| s.msg_index.is_some())
+        .rev()
+        .take(5)
+        .all(|s| !s.stale);
+    assert!(
+        bottom_fresh,
+        "viewport segments should be reflowed to new width"
+    );
+
+    // Top segments (far above the viewport) remain width-stale
+    let top_stale = segs
+        .iter()
+        .filter(|s| s.msg_index.is_some())
+        .take(5)
+        .all(|s| s.stale);
+    assert!(
+        top_stale,
+        "off-viewport segments should stay width-stale after resize"
+    );
+}
+
+fn msg_seg_text(panel: &MessagesPanel, msg_idx: usize) -> String {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+        .unwrap()
+        .lines()
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect()
+}
+
+#[test]
+fn reflow_rebuilds_collapsed_thinking_instead_of_only_stamping() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.show_thinking = false;
+    let mut m = DisplayMessage::new(DisplayRole::Thinking, "one\ntwo".to_string());
+    m.thinking_collapsed = true;
+    panel.push(m);
+    render(&mut panel, 80, 10);
+    assert!(
+        msg_seg_text(&panel, 0).contains("(2 lines)"),
+        "indicator should report the initial line count"
+    );
+
+    // Change what the indicator renders, then mark it stale the way a theme
+    // change does. Clearing the flag without rebuilding keeps the old spans.
+    panel.messages[0].text = "one\ntwo\nthree\nfour".to_string();
+    panel.cache.mark_all_width_stale();
+    render(&mut panel, 80, 10);
+
+    assert!(
+        msg_seg_text(&panel, 0).contains("(4 lines)"),
+        "stale collapsed-thinking segment must be rebuilt, not just stamped; got: {}",
+        msg_seg_text(&panel, 0)
+    );
+}
+
+#[test]
+fn reflow_runs_without_a_width_or_scroll_change() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..5 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i}"),
+        ));
+    }
+    render(&mut panel, 80, 10);
+
+    // Segments go stale between frames without either trigger firing.
+    panel.cache.mark_all_width_stale();
+    render(&mut panel, 80, 10);
+
+    assert!(
+        panel.cache.segments().iter().all(|s| !s.stale),
+        "visible segments must be reflowed even when width and scroll_top are unchanged"
+    );
+}
+
+#[test]
+fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: read_code_with_instructions(instruction_blocks()),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    render(&mut panel, 80, 10);
+
+    // Tool + spacer + instruction segments are built up front.
+    let seg_count = panel.cache.len();
+    assert!(seg_count >= 3);
+
+    render(&mut panel, 40, 10);
+
+    // The instruction segment already exists, so reflowing the tool segment
+    // updates it in place rather than re-inserting (exercises the to_reflow
+    // index path through `rebuild_tool_segment` and the upsert).
+    assert_eq!(
+        panel.cache.len(),
+        seg_count,
+        "reflow must reuse the existing instruction segment, not re-insert"
+    );
+    // The viewport auto-scrolls to the bottom, where the tool and instruction
+    // segments sit, so neither stays stale after the resize.
+    assert!(
+        panel.cache.segments().iter().all(|s| !s.stale),
+        "tool and instruction segments in the viewport must be reflowed, not left stale"
+    );
+}
+
+#[test]
+fn big_widen_keeps_no_stale_segment_in_the_viewport() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..40 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i:02} {}", "x".repeat(150)),
+        ));
+    }
+    render(&mut panel, 80, 30);
+    render(&mut panel, 240, 30);
+
+    // 3x widen: content shrinks and the bottom pin pulls up, so a single
+    // pre-reflow pass would leave stale segments in the viewport.
+    let vh = 30u32;
+    let top = panel.scroll_top() as u32;
+    let mut offset: u32 = 0;
+    for seg in panel.cache.segments() {
+        let h = seg.height(240) as u32;
+        let in_view = offset < top.saturating_add(vh) && offset + h > top;
+        assert!(
+            !(in_view && seg.stale),
+            "a stale segment overlaps the viewport after a big widen"
+        );
+        offset += h;
+    }
+    assert!(
+        panel.cache.segments().iter().any(|s| s.stale),
+        "off-viewport segments must stay stale so the test exercises convergence"
+    );
+}
+
+#[test]
+fn anchored_resize_keeps_the_topmost_visible_segment() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..40 {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("message {i:02} {}", "x".repeat(60)),
+        ));
+    }
+    render(&mut panel, 80, 10);
+    panel.set_scroll_top(panel.max_scroll() / 2); // mid-transcript, unpins
+    render(&mut panel, 80, 10);
+    assert!(
+        !panel.auto_scroll(),
+        "the test must start anchored, not pinned"
+    );
+    let before = panel
+        .cache
+        .anchor_at(panel.scroll_top() as u32, 79)
+        .expect("scroll_top lands inside a segment");
+
+    render(&mut panel, 40, 10);
+
+    let after = panel
+        .cache
+        .anchor_at(panel.scroll_top() as u32, 39)
+        .expect("scroll_top still lands inside a segment after the resize");
+    assert_eq!(
+        after.0, before.0,
+        "narrowing must not slide the anchored topmost segment off the viewport"
+    );
+    assert!(
+        !panel.auto_scroll(),
+        "an anchored mid-transcript resize must not flip to the bottom pin"
+    );
+}
+const THEME_CODE: &str = "fn main() { let x = 1; }";
+const THEME_CODE_KEYWORDS: [&str; 3] = ["fn", "main", "let"];
+
+fn code_span_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<(String, Style)> {
+    panel
+        .cache
+        .segments()
+        .iter()
+        .find(|s| s.tool_id.as_deref() == Some(tool_id))
+        .unwrap()
+        .lines()
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .filter(|s| THEME_CODE_KEYWORDS.contains(&s.content.trim()))
+        .map(|s| (s.content.to_string(), s.style))
+        .collect()
+}
+
+fn drain_highlight_worker(panel: &mut MessagesPanel) {
+    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
+    while panel.tick() == Dirty::NO {
+        assert!(
+            Instant::now() < deadline,
+            "the highlight worker never delivered a result"
+        );
+        std::thread::yield_now();
+    }
+    render(panel, 80, 20);
+}
+
+/// The unit test above only proves two generations make two keys. This is the
+/// wiring: drop `theme_gen` at a call site and the old palette gets spliced
+/// straight back in with no test to catch it.
+#[test]
+fn theme_switch_repaints_highlighted_code() {
+    theme::set(theme::load_by_name("dracula").unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: ToolOutput::ReadCode {
+            path: "file.rs".into(),
+            start_line: 1,
+            lines: vec![THEME_CODE.into()],
+            total_lines: 1,
+            instructions: None,
+        },
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    render(&mut panel, 80, 20);
+    drain_highlight_worker(&mut panel);
+    let dracula = code_span_styles(&panel, "t1");
+    assert!(!dracula.is_empty(), "no highlighted keywords to compare");
+
+    theme::set(theme::load_by_name("tokyonight").unwrap());
+    render(&mut panel, 80, 20);
+    drain_highlight_worker(&mut panel);
+
+    assert_ne!(
+        dracula,
+        code_span_styles(&panel, "t1"),
+        "a theme switch must re-highlight, not splice old-palette lines back"
+    );
 }

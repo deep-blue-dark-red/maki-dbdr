@@ -15,9 +15,11 @@ use isahc::config::{Configurable, RedirectPolicy};
 use maki_storage::StateDir;
 use maki_storage::auth::{McpAuthData, load_mcp_auth, save_mcp_auth};
 use tracing::{info, warn};
+use url::Url;
 
 use self::callback::{CallbackResult, CallbackServer};
 use self::discovery::parse_www_authenticate;
+use super::config::OauthClientConfig;
 use super::error::McpError;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -50,6 +52,7 @@ pub async fn authenticate(
     www_authenticate: Option<&str>,
     storage: &StateDir,
     interaction: Interaction,
+    static_client: Option<OauthClientConfig>,
 ) -> Result<McpAuthData, McpError> {
     let wrap = |e: OAuthError| McpError::OAuthFailed {
         server: server_name.into(),
@@ -101,12 +104,26 @@ pub async fn authenticate(
         )));
     }
 
-    let callback = CallbackServer::bind()
-        .await
-        .map_err(|e| wrap(OAuthError::Other(e)))?;
+    let callback = CallbackServer::bind(
+        static_client.as_ref().and_then(|c| c.callback_port),
+        static_client
+            .as_ref()
+            .and_then(|c| c.callback_path.as_deref()),
+        static_client
+            .as_ref()
+            .and_then(|c| c.callback_hostname.as_deref()),
+    )
+    .await
+    .map_err(|e| wrap(OAuthError::Other(e)))?;
     let redirect_uri = callback.redirect_uri();
 
-    let reg = if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
+    let reg = if let Some(c) = static_client {
+        registration::ClientRegistration {
+            client_id: c.client_id,
+            client_secret: c.client_secret,
+            client_secret_expires_at: None,
+        }
+    } else if let Some(existing) = load_mcp_auth(storage, server_name, server_url)
         && existing.redirect_uri.as_deref() == Some(&redirect_uri)
     {
         registration::ClientRegistration {
@@ -144,7 +161,8 @@ pub async fn authenticate(
         &pkce.challenge,
         scope.as_deref(),
         server_url,
-    );
+    )
+    .map_err(&wrap)?;
 
     info!(server = server_name, endpoint = %auth_server.authorization_endpoint, "starting OAuth authorization");
     let result = match interaction {
@@ -160,7 +178,7 @@ pub async fn authenticate(
                 warn!(server = server_name, error = %e, "failed to open browser");
             }
 
-            eprintln!("Waiting for callback on 127.0.0.1:{}...", callback.port);
+            eprintln!("Waiting for callback on {redirect_uri}...");
             eprintln!("If this machine has no browser, log in on another device and paste");
             eprintln!("the full redirect URL ({redirect_uri}?...) here:");
 
@@ -207,6 +225,7 @@ pub async fn authenticate(
         client_secret: reg.client_secret,
         client_secret_expires_at: reg.client_secret_expires_at,
         redirect_uri: Some(redirect_uri),
+        token_endpoint: Some(auth_server.token_endpoint.clone()),
     };
 
     save_mcp_auth(storage, server_name, &data)
@@ -237,11 +256,21 @@ pub async fn silent_refresh(
     let client = build_http_client(SILENT_REFRESH_HTTP_TIMEOUT)
         .map_err(|e| OAuthError::Other(e.to_string()))?;
 
-    let auth_server = discover_auth_server_for(&client, server_url, None).await?;
+    // Trust the endpoint pinned at interactive auth over fresh discovery: a
+    // later-compromised server must not redirect the refresh token (and any
+    // static client secret) elsewhere. Pre-pin records fall back to discovery.
+    let token_endpoint = match existing.token_endpoint.clone() {
+        Some(pinned) => pinned,
+        None => {
+            discover_auth_server_for(&client, server_url, None)
+                .await?
+                .token_endpoint
+        }
+    };
 
     let new_tokens = token::refresh_token(
         &client,
-        &auth_server.token_endpoint,
+        &token_endpoint,
         &tokens.refresh,
         &existing.client_id,
         existing.client_secret.as_deref(),
@@ -303,9 +332,15 @@ fn build_authorization_url(
     code_challenge: &str,
     scope: Option<&str>,
     resource: &str,
-) -> String {
+) -> Result<String, OAuthError> {
+    let parsed = Url::parse(authorization_endpoint).map_err(|e| {
+        OAuthError::InvalidResponse(format!(
+            "invalid authorization endpoint {authorization_endpoint}: {e}"
+        ))
+    })?;
+    let sep = if parsed.query().is_some() { '&' } else { '?' };
     let mut url = format!(
-        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&state={state}&code_challenge={code_challenge}&code_challenge_method=S256&resource={}",
         token::url_encode(client_id),
         token::url_encode(redirect_uri),
         token::url_encode(resource),
@@ -314,5 +349,75 @@ fn build_authorization_url(
         url.push_str("&scope=");
         url.push_str(&token::url_encode(s));
     }
-    url
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OAuthError, build_authorization_url};
+    use test_case::test_case;
+    use url::Url;
+
+    const CLIENT_ID: &str = "client-id";
+    const REDIRECT_URI: &str = "http://127.0.0.1:8080/callback";
+    const STATE: &str = "state-value";
+    const CHALLENGE: &str = "challenge-value";
+
+    const SCOPE: &str = "offline#access";
+    const RESOURCE: &str = "https://example.com/resource a b";
+
+    fn query_pairs(url: &str) -> Vec<(String, String)> {
+        let parsed = Url::parse(url).expect("built authorization URL should parse");
+        parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn has(pairs: &[(String, String)], key: &str, value: &str) -> bool {
+        pairs.iter().any(|(k, v)| k == key && v == value)
+    }
+
+    #[test_case("https://example.com/authorize", None; "plain_endpoint")]
+    #[test_case("https://mcp-slack.example.com/dcr/authorize?provider=slack", Some("slack"); "slack_provider")]
+    fn builds_authorization_url(endpoint: &str, provider: Option<&str>) {
+        let url = build_authorization_url(
+            endpoint,
+            CLIENT_ID,
+            REDIRECT_URI,
+            STATE,
+            CHALLENGE,
+            Some(SCOPE),
+            RESOURCE,
+        )
+        .expect("endpoint should parse");
+
+        assert!(url.contains("resource=https%3A%2F%2Fexample.com%2Fresource%20a%20b"));
+        assert!(url.contains("scope=offline%23access"));
+
+        let pairs = query_pairs(&url);
+        assert!(has(&pairs, "response_type", "code"));
+        assert!(has(&pairs, "client_id", CLIENT_ID));
+        assert!(has(&pairs, "resource", RESOURCE));
+        assert!(has(&pairs, "scope", SCOPE));
+        if let Some(expected) = provider {
+            assert!(has(&pairs, "provider", expected));
+        }
+    }
+
+    #[test_case("not a url"; "invalid_endpoint")]
+    fn invalid_endpoint_returns_error(endpoint: &str) {
+        assert!(matches!(
+            build_authorization_url(
+                endpoint,
+                CLIENT_ID,
+                REDIRECT_URI,
+                STATE,
+                CHALLENGE,
+                None,
+                RESOURCE
+            ),
+            Err(OAuthError::InvalidResponse(_))
+        ));
+    }
 }

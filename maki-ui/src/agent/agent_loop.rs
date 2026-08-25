@@ -12,11 +12,12 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
-    CancelToken, CancelTrigger, Envelope, EventSender, History, Instructions, McpCommand,
-    PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
+    CancelToken, CancelTrigger, DoneReason, Envelope, EventSender, History, Instructions,
+    McpCommand, PromptRole, SessionMailbox, SharedMessages, ToolOutputLines,
 };
+use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, Message, Model, TokenUsage};
+use maki_providers::{AgentError, Message, Model};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::error;
@@ -48,6 +49,7 @@ pub(super) struct AgentLoop {
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    model_policy: Arc<ModelPolicy>,
 }
 
 impl AgentLoop {
@@ -71,6 +73,7 @@ impl AgentLoop {
         timeouts: maki_providers::Timeouts,
         lua_handle: EventHandle,
         subagent_cancels: Arc<CancelMap<String>>,
+        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &initial_history));
         Self {
@@ -96,6 +99,7 @@ impl AgentLoop {
             timeouts,
             lua_handle,
             subagent_cancels,
+            model_policy,
         }
     }
 
@@ -105,11 +109,18 @@ impl AgentLoop {
         }
 
         while let Ok(()) = self.queue.recv_notify().await {
+            let mut last_run_id = None;
             while let Some(entry) = self.queue.pop() {
                 if entry.run_id() < self.min_run_id {
                     continue;
                 }
+                last_run_id = Some(entry.run_id());
                 self.process_entry(entry).await;
+            }
+            if let Some(run_id) = last_run_id {
+                let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
+                self.queue
+                    .publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained));
             }
         }
     }
@@ -164,15 +175,31 @@ impl AgentLoop {
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
-        let (provider, model) =
-            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
-        agent::compact(&*provider, &model, &mut self.history, event_tx, None).await
+        let (provider, model) = agent::resolve_compaction_model(
+            &slot.provider,
+            &slot.model,
+            self.timeouts,
+            &self.model_policy,
+        );
+        agent::compact(
+            &*provider,
+            &model,
+            &mut self.history,
+            event_tx,
+            None,
+            &self.config,
+        )
+        .await
     }
 
     async fn do_checkpoint(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
-        let (provider, model) =
-            agent::resolve_compaction_model(&slot.provider, &slot.model, self.timeouts);
+        let (provider, model) = agent::resolve_compaction_model(
+            &slot.provider,
+            &slot.model,
+            self.timeouts,
+            &self.model_policy,
+        );
         agent::checkpoint(&*provider, &model, &mut self.history, event_tx, None).await
     }
 
@@ -260,6 +287,7 @@ impl AgentLoop {
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
+                model_policy: Arc::clone(&self.model_policy),
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -279,11 +307,11 @@ impl AgentLoop {
 
         self.clear_cancel_trigger(run_id);
 
-        if matches!(result, Err(AgentError::Cancelled)) {
+        if matches!(result, Ok(DoneReason::Cancelled)) {
             self.min_run_id = run_id + 1;
         }
 
-        result
+        result.map(|_| ())
     }
 
     /// Base tools only. MCP definitions are injected per request by
@@ -333,22 +361,11 @@ impl AgentLoop {
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {
+        error!(error = %error, "agent error");
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
-        match error {
-            AgentError::Cancelled => {
-                let _ = event_tx.send(AgentEvent::Done {
-                    usage: TokenUsage::default(),
-                    num_turns: 0,
-                    stop_reason: None,
-                });
-            }
-            e => {
-                error!(error = %e, "agent error");
-                let _ = event_tx.send(AgentEvent::Error {
-                    message: e.user_message(),
-                });
-            }
-        }
+        let _ = event_tx.send(AgentEvent::Error {
+            message: error.user_message(),
+        });
     }
 }
 
@@ -365,6 +382,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
         let server_name = info.name.clone();
         let server_url = server_url.clone();
         let www_auth = url.clone();
+        let oauth = info.oauth.clone();
         smol::spawn(async move {
             let storage = match maki_storage::StateDir::resolve() {
                 Ok(s) => s,
@@ -379,6 +397,7 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
                 www_auth.as_deref(),
                 &storage,
                 maki_agent::mcp::oauth::Interaction::Background,
+                oauth,
             )
             .await
             {

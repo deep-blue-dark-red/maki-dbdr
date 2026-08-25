@@ -41,6 +41,8 @@ pub struct ModelDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_thinking: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_input: Option<f64>,
@@ -131,6 +133,36 @@ pub struct BuiltInProvider {
 
 inventory::collect!(BuiltInProvider);
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OverrideFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Path prefix sent to the gateway, replacing the default (`/v1`, or
+    /// `/v1beta` for Gemini routes). Set it to `""` when the upstream's base
+    /// url already carries its own path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+}
+
+/// Overrides for a single gateway provider (Aperture), keyed by its id (e.g.
+/// `zai`, `ollama`, `ikora-openai`). Provider-level fields apply to every model
+/// from that provider; `models` refine individual models.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderOverride {
+    #[serde(flatten)]
+    pub default: OverrideFields,
+    #[serde(default)]
+    pub models: HashMap<String, OverrideFields>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderDef {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +185,10 @@ pub struct ProviderDef {
     /// entirely. Defaults to `false` when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_free_models: Option<bool>,
+    /// Aperture-only: per-gateway-provider overrides for the routed native
+    /// providers.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub overrides: HashMap<String, ProviderOverride>,
     /// OpenRouter-only: upstream routing preferences. See [`ProviderRouting`].
     #[serde(flatten)]
     pub routing: ProviderRouting,
@@ -357,8 +393,8 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
 
 /// Fields a `providers.toml` entry sets that a built-in slug ignores, because
 /// built-ins keep their compiled protocol, model catalog and auth wiring.
-/// Callers decide what counts as built-in (the inventory misses `openrouter`
-/// and `opencode`) and when to report it.
+/// Callers decide what counts as built-in (the inventory misses the `opencode`
+/// slugs) and when to report it.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
     let mut ignored = Vec::new();
     if def.protocol.is_some() {

@@ -8,6 +8,7 @@ use crate::components::rewind_picker::{RewindEntry, display_msg_index_for_turn};
 use crate::components::settings_picker::UserSettings;
 use crate::components::{Action, LoadedSession};
 use maki_agent::ToolOutput;
+use maki_agent::agent::estimate_message_tokens;
 use maki_providers::{ContentBlock, Message, Model, Role, TokenUsage};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionMeta, StoredSubagent};
@@ -224,6 +225,7 @@ impl App {
         self.active_chat = 0;
         self.chat_index.clear();
         self.status = super::Status::Idle;
+        self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();
         self.close_all_overlays();
@@ -245,12 +247,7 @@ impl App {
             &self.ui_config.tool_output_lines,
         );
         self.main_chat().load_messages(display_msgs);
-        // The restored total predates any per-turn cost, so price it once with the
-        // selected model. Later turns add their own exact cost.
-        let cost = self
-            .state
-            .model
-            .cost_of(&self.state.token_usage, self.state.fast);
+        let cost = self.state.cost;
         let context_size = self.state.context_size;
         let main = self.main_chat();
         main.cost = cost;
@@ -341,6 +338,7 @@ impl App {
         self.flush_turn_stats();
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
+        self.state.cost = None;
         self.state.context_size = 0;
         self.turn_history.clear();
         self.state.plan = PlanState::None;
@@ -387,12 +385,21 @@ impl App {
     }
 
     pub(super) fn rewind_to(&mut self, entry: RewindEntry) -> Vec<Action> {
+        // The live size came from the provider, so it also counts the system
+        // prompt and the tool schemas, a baseline the estimator cannot see.
+        // Subtract only what we drop, or the gauge collapses until the next
+        // turn measures it again. An emptied history is a fresh session though,
+        // baseline included.
+        let baseline = self
+            .state
+            .context_size
+            .saturating_sub(estimate_message_tokens(self.state.session.messages()));
         let session = self.state.session_mut();
         session.truncate_messages(entry.turn_index);
         session.prune_orphans(|m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect());
         session.update_title_if_default();
-        self.state.context_size =
-            maki_agent::agent::estimate_message_tokens(self.state.session.messages());
+        let kept = estimate_message_tokens(self.state.session.messages());
+        self.state.context_size = if kept == 0 { 0 } else { baseline + kept };
 
         self.reset_ui_chrome();
         self.restore_display();
@@ -436,7 +443,8 @@ impl App {
         self.checkpoint_now();
         self.permissions
             .load_session_rules(stored_to_rules(&session.meta.session_rules));
-        self.state = SessionState::from_session(session, fallback_model, &self.storage);
+        self.state =
+            SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }

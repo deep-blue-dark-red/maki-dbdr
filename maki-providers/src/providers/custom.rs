@@ -12,7 +12,7 @@ use super::ResolvedAuth;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::manifest::ManifestRegistry;
-use crate::model::{FastPricing, Model, ModelPricing, ModelTier};
+use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider, ProviderKind};
 use crate::providers::Timeouts;
 use crate::types::ThinkingConfig;
@@ -38,8 +38,8 @@ fn protocol_kind(protocol: Protocol) -> ProviderKind {
 }
 
 /// Builtins win their slug in `from_spec`/`create`, so every custom path skips
-/// them. Key off the manifest (all 13 builtins), not `builtin_provider`, which
-/// omits `openrouter`/`opencode` and would let them shadow the builtin.
+/// them. Key off the manifest (every builtin), not `builtin_provider`, which
+/// omits the `opencode` slugs and would let them shadow the builtin.
 fn is_builtin_slug(slug: &str) -> bool {
     ManifestRegistry::get(slug).is_some()
 }
@@ -110,16 +110,23 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
     let tier = declared
         .map(|m| ModelTier::from(m.tier))
         .unwrap_or(ModelTier::Medium);
+    let discovered = crate::model_registry::discovered(slug, model_id);
+    let discovered = discovered.as_ref();
     let max_output_tokens = declared
         .and_then(|m| m.max_output_tokens)
+        .or_else(|| discovered.and_then(|d| d.max_output_tokens))
         .or_else(|| kind.fallback_max_output());
     let context_window = declared
         .and_then(|m| m.context_window)
+        .or_else(|| discovered.and_then(|d| d.context_window))
         .unwrap_or_else(|| kind.fallback_context_window());
     let supports_tool_examples_override = declared.and_then(|m| m.supports_tool_examples);
-    let supports_thinking_override = declared
-        .and_then(|m| m.supports_thinking)
-        .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking));
+    let thinking_override = ThinkingSupport::from_flags(
+        declared
+            .and_then(|m| m.supports_thinking)
+            .or_else(|| ManifestRegistry::get(&kind.to_string()).map(|m| m.supports_thinking)),
+        declared.and_then(|m| m.requires_thinking).unwrap_or(false),
+    );
     let supports_vision_override = declared.and_then(|m| m.supports_vision);
     let pricing = declared
         .filter(|m| m.has_pricing())
@@ -142,11 +149,13 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
         tier,
         family: kind.family(),
         supports_tool_examples_override,
-        supports_thinking_override,
+        thinking_override,
         supports_vision_override,
         pricing,
+        discovered_free: false,
         max_output_tokens,
         context_window,
+        thinking_fields: None,
     }
 }
 
@@ -222,7 +231,9 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
                 let slug_c = slug.clone();
                 let result = smol::block_on(provider.list_models());
                 match result {
-                    Ok(models) => {
+                    Ok(mut models) => {
+                        overlay_declared_tiers(def, &mut models);
+                        crate::model_registry::set_known_models(&slug_c, models.clone());
                         for m in models {
                             all_specs.push(format!("{slug_c}/{}", m.id));
                         }
@@ -238,6 +249,18 @@ pub fn discover_models(timeouts: Timeouts) -> Vec<String> {
         }
     }
     all_specs
+}
+
+/// Discovery via the openai compat layer never reports tiers, so stored models
+/// would only resolve positionally in `spec_for_tier`, shadowing tiers declared
+/// in `providers.toml`. Copying declared tiers onto the discovered entries lets
+/// the metadata candidate win and keeps declared config authoritative.
+fn overlay_declared_tiers(def: &ProviderDef, models: &mut [ModelInfo]) {
+    for model in models {
+        if let Some(declared) = def.models.iter().find(|m| m.id == model.id) {
+            model.tier = Some(ModelTier::from(declared.tier));
+        }
+    }
 }
 
 struct CustomOpenAiProvider {
@@ -301,25 +324,65 @@ mod tests {
         .unwrap()
     }
 
-    // `openrouter` is a builtin whose slug is absent from the `builtin_provider`
+    // `opencode` is a builtin whose slug is absent from the `builtin_provider`
     // inventory; the old guard leaked it into the picker, where it then resolved
     // as the builtin and silently dropped the custom model. Listing must skip
     // every builtin slug so a providers.toml entry can never shadow one.
     #[test]
     fn declared_specs_skip_builtin_named_entries_but_keep_custom() {
         let mut config = ProvidersConfig::default();
-        config.upsert("openrouter".to_string(), openai_def("shadow-model"));
+        config.upsert("opencode".to_string(), openai_def("shadow-model"));
         config.upsert("my-custom".to_string(), openai_def("real-model"));
 
         let specs = declared_specs_from(&config);
         assert!(
-            !specs.iter().any(|s| s.starts_with("openrouter/")),
+            !specs.iter().any(|s| s.starts_with("opencode/")),
             "builtin slug must be skipped in custom listing: {specs:?}"
         );
         assert!(specs.contains(&"my-custom/real-model".to_string()));
 
         // Resolution owns the builtin slug regardless of the providers.toml entry.
-        let model = Model::from_spec("openrouter/shadow-model").unwrap();
-        assert_eq!(model.provider.as_ref(), "openrouter");
+        let model = Model::from_spec("opencode/shadow-model").unwrap();
+        assert_eq!(model.provider.as_ref(), "opencode");
+    }
+
+    // The exact regression this fixes: discovery parsed context_window but
+    // never stored it, so custom models always got the protocol fallback.
+    #[test]
+    fn discovered_metadata_flows_into_custom_model_from_def() {
+        let slug = "custom-discovery-metadata-test";
+        let model_id = "vllm-model";
+        let expected_window: u32 = 131_072;
+        let expected_output: u32 = 8_192;
+
+        crate::model_registry::set_known_models(
+            slug,
+            vec![ModelInfo {
+                context_window: Some(expected_window),
+                max_output_tokens: Some(expected_output),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+
+        let def = openai_def(model_id);
+        let model = model_from_def(&def, ProviderKind::OpenAi, slug, model_id);
+        assert_eq!(model.context_window, expected_window);
+        assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    #[test]
+    fn overlay_declared_tiers_sets_tier_for_declared_models_only() {
+        let def: ProviderDef = serde_json::from_str(
+            r#"{"protocol":"openai","models":[{"id":"declared","tier":"strong"}]}"#,
+        )
+        .unwrap();
+        let mut models = vec![
+            ModelInfo::id_only("declared".to_string()),
+            ModelInfo::id_only("undeclared".to_string()),
+        ];
+
+        overlay_declared_tiers(&def, &mut models);
+        assert_eq!(models[0].tier, Some(ModelTier::Strong));
+        assert_eq!(models[1].tier, None);
     }
 }

@@ -9,17 +9,20 @@
 
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{HeadlessHandle, HeadlessParams};
+use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, Envelope, ImageSource, PermissionsConfig};
+use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
+use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::model::Model;
-use maki_providers::{StopReason, TokenUsage};
+use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::SessionRef;
 use serde::Serialize;
 use serde_json::Value;
@@ -56,7 +59,7 @@ struct PrintResult {
     duration_ms: u128,
     num_turns: u32,
     result: String,
-    stop_reason: Option<StopReason>,
+    stop_reason: Option<DoneReason>,
     session_id: SessionRef,
     total_cost_usd: f64,
     usage: TokenUsage,
@@ -146,6 +149,8 @@ pub fn run(
     lua_handle: EventHandle,
     fast: bool,
     workflow: bool,
+    model_policy: Arc<ModelPolicy>,
+    plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<()> {
     let prompt = match prompt_arg {
         Some(p) => p,
@@ -179,6 +184,8 @@ pub fn run(
         initial_wd: cwd,
         fast,
         workflow,
+        model_policy,
+        plugin_rules,
     });
 
     let HeadlessHandle {
@@ -211,7 +218,10 @@ pub fn run(
     let mut is_error = false;
     let mut num_turns: u32 = 0;
     let mut usage = TokenUsage::default();
-    let mut stop_reason: Option<StopReason> = None;
+    // Summed as the turns land: rates move mid-run, and only a turn knows the
+    // rate it paid.
+    let mut cost = None;
+    let mut stop_reason: Option<DoneReason> = None;
 
     while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
         let Envelope {
@@ -233,6 +243,7 @@ pub fn run(
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
@@ -263,6 +274,7 @@ pub fn run(
                 }
             }
             AgentEvent::TurnComplete(tc) => {
+                add_cost(&mut cost, tc.cost);
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
@@ -295,11 +307,11 @@ pub fn run(
             AgentEvent::Done {
                 usage: u,
                 num_turns: turns,
-                stop_reason: sr,
+                reason,
             } => {
                 num_turns = *turns;
                 usage = *u;
-                stop_reason = *sr;
+                stop_reason = Some(*reason);
                 break;
             }
             AgentEvent::Error { message } => {
@@ -317,7 +329,8 @@ pub fn run(
     });
 
     let duration_ms = start.elapsed().as_millis();
-    let total_cost_usd = usage.cost(&model.pricing, fast);
+    // Zero on an unpriced model, which is what its turns reported too.
+    let total_cost_usd = cost.unwrap_or_default();
 
     match format {
         OutputFormat::Text => {
@@ -385,7 +398,7 @@ mod tests {
             duration_ms: 1234,
             num_turns: 2,
             result: "done".into(),
-            stop_reason: Some(StopReason::EndTurn),
+            stop_reason: Some(DoneReason::EndTurn),
             session_id: SessionRef::generate(),
             total_cost_usd: 0.003,
             usage: TokenUsage::default(),

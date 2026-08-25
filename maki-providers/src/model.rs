@@ -9,12 +9,15 @@ use std::ops::AddAssign;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use jiff::Timestamp;
+use maki_config::ModelPolicy;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
-use crate::model_registry::model_registry;
+use crate::model_registry;
 use crate::providers::{anthropic, custom, dynamic};
+use crate::types::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -28,8 +31,12 @@ pub enum ModelError {
     UnknownModel(String),
     #[error("invalid model tier '{0}' (expected: strong, medium, weak)")]
     InvalidTier(String),
+    #[error("no allowed model for {0}/{1}")]
+    NoAllowedModel(String, ModelTier),
     #[error("no default model for {0}/{1}")]
     NoDefault(String, ModelTier),
+    #[error("model '{0}' is not allowed by provider model policy")]
+    NotAllowed(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -201,6 +208,28 @@ impl ModelFamily {
 
 const FAST_PROVIDER: &str = "anthropic";
 
+/// `Required` marks APIs that reject requests with thinking disabled;
+/// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingSupport {
+    No,
+    Yes,
+    Required,
+}
+
+impl ThinkingSupport {
+    /// `requires` wins: an API that rejects thinking-off requests
+    /// necessarily supports thinking.
+    pub fn from_flags(supports: Option<bool>, requires: bool) -> Option<Self> {
+        match (requires, supports) {
+            (true, _) => Some(Self::Required),
+            (false, Some(true)) => Some(Self::Yes),
+            (false, Some(false)) => Some(Self::No),
+            (false, None) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Model {
     pub id: String,
@@ -208,12 +237,19 @@ pub struct Model {
     pub tier: ModelTier,
     pub family: ModelFamily,
     pub supports_tool_examples_override: Option<bool>,
-    pub supports_thinking_override: Option<bool>,
+    /// Resolved thinking support, used by gateway providers (e.g. Aperture)
+    /// that stream through a native provider chosen at runtime. `None` falls
+    /// back to discovery, then the provider manifest.
+    pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
     pub pricing: ModelPricing,
+    /// Discovery reported an explicit all-zero price. Distinct from a zero
+    /// `pricing`, which also covers "no price is known".
+    pub discovered_free: bool,
     /// `None` when unknown, see [`ProviderKind::fallback_max_output`].
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
+    pub thinking_fields: Option<Box<ThinkingFields>>,
 }
 
 impl Model {
@@ -224,13 +260,14 @@ impl Model {
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
-        let guard = model_registry().read().unwrap();
-        let discovered = guard.discovered(manifest.slug, model_id);
-        let tier = guard.tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
+        let discovered = model_registry::discovered(manifest.slug, model_id);
+        let discovered = discovered.as_ref();
+        let tier = model_registry::tier_for(&spec, manifest.slug, static_entry.map(|e| e.tier));
         let family = static_entry.map_or(manifest.family, |entry| entry.family);
-        let pricing = discovered
-            .and_then(|info| info.pricing.clone())
-            .or_else(|| static_entry.map(|entry| entry.pricing.clone()))
+        let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
+        let pricing = discovered_pricing
+            .or_else(|| static_entry.map(|entry| &entry.pricing))
+            .cloned()
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
@@ -241,18 +278,19 @@ impl Model {
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| static_entry.map(|entry| entry.context_window))
             .unwrap_or(manifest.fallback_context_window);
-        drop(guard);
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             tier,
             family,
             supports_tool_examples_override: None,
-            supports_thinking_override: None,
+            thinking_override: None,
             supports_vision_override: None,
             pricing,
+            discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             context_window,
+            thinking_fields: None,
         }
     }
 
@@ -272,7 +310,7 @@ impl Model {
             tier: ModelTier::Medium,
             family: ModelFamily::Generic,
             supports_tool_examples_override: None,
-            supports_thinking_override: Some(meta.supports_thinking),
+            thinking_override: ThinkingSupport::from_flags(Some(meta.supports_thinking), false),
             supports_vision_override: Some(meta.supports_vision),
             pricing: ModelPricing {
                 input: meta.input_price,
@@ -281,26 +319,29 @@ impl Model {
                 cache_read: meta.cache_read,
                 fast: None,
             },
+            discovered_free: false,
             max_output_tokens: Some(meta.output),
             context_window: meta.context,
+            thinking_fields: None,
         }
     }
 
     pub fn supports_thinking(&self) -> bool {
-        if let Some(thinking) = self.supports_thinking_override {
-            return thinking;
+        if let Some(thinking) = self.thinking_override {
+            return thinking != ThinkingSupport::No;
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
         // and custom slugs through their base manifest before looking up.
         let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
             return false;
         };
-        model_registry()
-            .read()
-            .unwrap()
-            .discovered(manifest.slug, &self.id)
+        model_registry::discovered(manifest.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .unwrap_or(manifest.supports_thinking)
+    }
+
+    pub fn requires_thinking(&self) -> bool {
+        self.thinking_override == Some(ThinkingSupport::Required)
     }
 
     pub fn supports_vision(&self) -> bool {
@@ -310,11 +351,7 @@ impl Model {
         let manifest = ManifestRegistry::for_slug(&self.provider);
         manifest
             .and_then(|m| {
-                model_registry()
-                    .read()
-                    .unwrap()
-                    .discovered(m.slug, &self.id)
-                    .and_then(|d| d.supports_vision)
+                model_registry::discovered(m.slug, &self.id).and_then(|d| d.supports_vision)
             })
             .or_else(|| {
                 manifest
@@ -352,9 +389,24 @@ impl Model {
         format!("{}/{}", self.provider, self.id)
     }
 
+    /// What the provider charges right now, so it is only ever correct for a
+    /// turn that just finished: under a
+    /// [`PricingSchedule`](crate::pricing::PricingSchedule) the answer moves
+    /// with the clock. Anything historical wants [`Self::list_cost`].
+    ///
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
-    pub fn cost_of(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+    pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        let cost = self.list_cost(usage, fast)?;
+        let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+        Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
+    }
+
+    /// The quoted rates, with no wall-clock surcharge. Deterministic, which is
+    /// what makes it right for re-pricing a session whose turns never recorded
+    /// what they paid: the rate back then is unknown, and the table price is
+    /// the honest guess.
+    pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
         (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
     }
 
@@ -363,13 +415,39 @@ impl Model {
     }
 
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
-        if let Some(spec) = model_registry().read().unwrap().spec_for_tier(slug, tier) {
+        if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);
         }
         let entry = ManifestRegistry::find_default_for_tier(slug, tier)
             .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
         let model_id = entry.prefixes[0];
         Self::from_spec(&format!("{slug}/{model_id}"))
+    }
+
+    pub fn from_tier_with_policy(
+        slug: &str,
+        tier: ModelTier,
+        policy: &ModelPolicy,
+    ) -> Result<Self, ModelError> {
+        if let Ok(model) = Self::from_tier_dynamic(slug, tier)
+            && policy.allows(&model.spec())
+        {
+            return Ok(model);
+        }
+
+        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
+            return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
+        };
+        manifest
+            .models
+            .iter()
+            .filter(|entry| entry.tier == tier)
+            .flat_map(|entry| entry.prefixes)
+            .map(|model_id| format!("{slug}/{model_id}"))
+            .find(|spec| policy.allows(spec))
+            .map(|spec| Self::from_spec(&spec))
+            .transpose()?
+            .ok_or_else(|| ModelError::NoAllowedModel(slug.to_string(), tier))
     }
 
     pub fn from_tier_dynamic(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
@@ -400,6 +478,13 @@ impl Model {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
+    }
+
+    pub fn from_spec_with_policy(spec: &str, policy: &ModelPolicy) -> Result<Self, ModelError> {
+        if !policy.allows(spec) {
+            return Err(ModelError::NotAllowed(spec.to_string()));
+        }
+        Self::from_spec(spec)
     }
 
     pub fn from_spec(spec: &str) -> Result<Self, ModelError> {
@@ -433,6 +518,19 @@ impl Model {
 
         Err(ModelError::UnsupportedProvider(slug.to_string()))
     }
+
+    /// Free public models surfaced through the OpenCode provider (Zen/Go),
+    /// using the catalog's definition of free (zero input and output price),
+    /// the same one that gates `enable_free_models`, plus models a provider's
+    /// `/models` call reported at an explicit zero price.
+    ///
+    /// Queries the live catalog rather than `self.pricing`, which may not yet
+    /// reflect catalog prices when discovery hasn't seeded the registry, and
+    /// which reads zero for "price unknown" too.
+    pub fn is_free(&self) -> bool {
+        self.discovered_free
+            || crate::providers::catalog::free_model_if_available(&self.provider, &self.id)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -459,18 +557,20 @@ impl From<StoredTokenUsage> for TokenUsage {
     }
 }
 
-impl From<TokenUsage> for StoredTokenUsage {
-    fn from(u: TokenUsage) -> Self {
-        Self {
-            input: u.input,
-            output: u.output,
-            cache_creation: u.cache_creation,
-            cache_read: u.cache_read,
+impl TokenUsage {
+    /// Ready to store, with what the turn was billed. No `From<TokenUsage>` on
+    /// purpose: a caller that forgets the cost quietly loses money from the
+    /// session total, so saying it out loud is mandatory.
+    pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
+        StoredTokenUsage {
+            input: self.input,
+            output: self.output,
+            cache_creation: self.cache_creation,
+            cache_read: self.cache_read,
+            cost,
         }
     }
-}
 
-impl TokenUsage {
     pub fn total_input(&self) -> u32 {
         self.input
             .saturating_add(self.cache_read)
@@ -502,7 +602,9 @@ impl TokenUsage {
         }
     }
 
-    pub fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
+    /// Crate-private on purpose: pricing outside [`Model`] skips the provider's
+    /// schedule.
+    pub(crate) fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
         let (input, output, cache_write, cache_read) = match &pricing.fast {
             Some(f) if fast => (
                 f.input,
@@ -521,13 +623,6 @@ impl TokenUsage {
             + self.output as f64 * output / PER_MILLION
             + self.cache_creation as f64 * cache_write / PER_MILLION
             + self.cache_read as f64 * cache_read / PER_MILLION
-    }
-}
-
-/// A total stays `None` (unpriced) until the first priced turn shows up.
-pub fn add_cost(total: &mut Option<f64>, turn: Option<f64>) {
-    if let Some(turn) = turn {
-        *total = Some(total.unwrap_or_default() + turn);
     }
 }
 
@@ -553,12 +648,55 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
+        ModelPolicy::new(
+            &allowed
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+            &excluded
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
     const TIERS: [ModelTier; 4] = [
         ModelTier::Weak,
         ModelTier::Medium,
         ModelTier::Strong,
         ModelTier::Compaction,
     ];
+
+    const EPSILON: f64 = 1e-10;
+    /// The only builtin whose rates move with the wall clock.
+    const SCHEDULED_PROVIDERS: [&str; 1] = ["deepseek"];
+    const DEEPSEEK_SPEC: &str = "deepseek/deepseek-v4-pro";
+    const UNPRICED_DEEPSEEK_SPEC: &str = "deepseek/my-custom-model";
+    const MILLION: u32 = 1_000_000;
+    const INPUT_ONLY: TokenUsage = TokenUsage {
+        input: MILLION,
+        output: 0,
+        cache_creation: 0,
+        cache_read: 0,
+    };
+    /// Four counters that cannot be confused with each other.
+    const COUNTERS: TokenUsage = TokenUsage {
+        input: 11,
+        output: 22,
+        cache_creation: 33,
+        cache_read: 44,
+    };
+    const RECORDED_COST: f64 = 0.25;
+    const FREE_MEANS_A_KNOWN_ZERO: &str = "only a price discovery reported as zero means free";
+    const PAID_PRICING: ModelPricing = ModelPricing {
+        input: 3.0,
+        output: 15.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+        fast: None,
+    };
 
     #[test_case(999, "999"         ; "under_thousand")]
     #[test_case(1_000, "1.0k"      ; "thousand")]
@@ -595,6 +733,47 @@ mod tests {
             std::mem::discriminant(&err),
             std::mem::discriminant(&expected)
         );
+    }
+
+    #[test]
+    fn from_spec_with_policy_rejects_disallowed_exact_spec() {
+        let policy = policy(&["anthropic/*"], &[]);
+        let spec = "openai/gpt-5.6-sol";
+
+        let error = Model::from_spec_with_policy(spec, &policy).unwrap_err();
+
+        assert!(matches!(error, ModelError::NotAllowed(disallowed) if disallowed == spec));
+    }
+
+    #[test]
+    fn from_spec_with_policy_resolves_allowed_exact_spec() {
+        let policy = policy(&["openai/gpt-5.6-sol"], &[]);
+
+        let model = Model::from_spec_with_policy("openai/gpt-5.6-sol", &policy).unwrap();
+
+        assert_eq!(model.spec(), "openai/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn tier_with_policy_uses_allowed_alternative() {
+        let policy = policy(&["openai/gpt-5.4-nano"], &[]);
+
+        let model = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap();
+
+        assert_eq!(model.spec(), "openai/gpt-5.4-nano");
+        assert_eq!(model.tier, ModelTier::Weak);
+    }
+
+    #[test]
+    fn tier_with_policy_errors_without_allowed_candidate() {
+        let policy = policy(&["anthropic/*"], &[]);
+
+        let error = Model::from_tier_with_policy("openai", ModelTier::Weak, &policy).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelError::NoAllowedModel(provider, ModelTier::Weak) if provider == "openai"
+        ));
     }
 
     #[test]
@@ -797,6 +976,7 @@ mod tests {
     #[test_case("anthropic/claude-99-turbo", "anthropic", "claude-99-turbo" ; "unknown_anthropic_model_accepted")]
     #[test_case("zai/glm-99", "zai", "glm-99" ; "unknown_zai_model_accepted")]
     #[test_case("openai/gpt-99", "openai", "gpt-99" ; "unknown_openai_model_accepted")]
+    #[test_case("xai/grok-99", "xai", "grok-99" ; "unknown_xai_model_accepted")]
     #[test_case("synthetic/hf:nonexistent", "synthetic", "hf:nonexistent" ; "unknown_synthetic_model_accepted")]
     #[test_case("ollama/my-custom-model", "ollama", "my-custom-model" ; "unknown_ollama_model_accepted")]
     #[test_case("deepseek/my-custom-model", "deepseek", "my-custom-model" ; "unknown_deepseek_model_accepted")]
@@ -831,6 +1011,7 @@ mod tests {
 
     #[test_case("anthropic/claude-opus-4-8",       true  ; "claude")]
     #[test_case("openai/gpt-5.4",                   true  ; "gpt")]
+    #[test_case("xai/grok-4.6",                     true  ; "grok")]
     #[test_case("google/gemini-2.5-pro",            true  ; "gemini")]
     #[test_case("copilot/claude-opus-4.7",          true  ; "copilot_entry_beats_generic_family")]
     #[test_case("zai/glm-5-code",                   false ; "glm_code_text_only")]
@@ -872,37 +1053,42 @@ mod tests {
     }
 
     #[test]
+    fn discovered_vision_flows_into_curated_provider_model() {
+        use crate::model::ModelInfo;
+
+        model_registry::set_known_models(
+            "synthetic",
+            vec![
+                ModelInfo {
+                    supports_vision: Some(true),
+                    ..ModelInfo::id_only("syn:test-vision".into())
+                },
+                ModelInfo::id_only("syn:test-blind".into()),
+            ],
+        );
+
+        let vision = |id| Model::from_spec(id).unwrap().supports_vision();
+        assert!(vision("synthetic/syn:test-vision"));
+        assert!(!vision("synthetic/syn:test-blind"));
+    }
+
+    #[test]
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
 
-        let slug: Arc<str> = Arc::from("ollama");
         let model_id = "test-discovered-context-window-model";
         let expected_window: u32 = 131_072;
 
-        // Seed discovered metadata into the global registry
-        {
-            let mut reg = model_registry().write().unwrap();
-            reg.set_known_models(
-                &slug,
-                vec![ModelInfo {
-                    id: model_id.to_string(),
-                    context_window: Some(expected_window),
-                    max_output_tokens: None,
-                    pricing: None,
-                    supports_thinking: None,
-                    supports_vision: None,
-                    tier: None,
-                    provider_info: None,
-                }],
-            );
-        }
+        model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                context_window: Some(expected_window),
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
 
-        // from_base for this unknown model should pick up the discovered context_window
         let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
-        assert_eq!(model.id, model_id);
         assert_eq!(model.context_window, expected_window);
-        // max_output_tokens falls back to provider default since not discovered
-        assert_eq!(model.max_output_tokens, Some(16_384));
 
         // A dynamic/custom slug shares its base provider's discovery.
         let wrapped = Model::from_base(
@@ -952,5 +1138,92 @@ mod tests {
         };
         assert_eq!(usage.cost(&pricing, false), 0.0);
         assert!(pricing.is_zero());
+    }
+
+    /// "We could not read a price" must never reach the picker as "free", so
+    /// only an explicit zero from discovery sets the flag.
+    #[test_case(Some(ModelPricing::ZERO), true  ; "explicit_zero_is_free")]
+    #[test_case(Some(PAID_PRICING),       false ; "priced_is_not_free")]
+    #[test_case(None,                     false ; "unknown_price_is_not_free")]
+    fn discovered_pricing_decides_free(pricing: Option<ModelPricing>, expected: bool) {
+        let model_id = "test-discovered-free-model";
+        model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                pricing,
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+
+        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
+    }
+
+    /// A schedule hung on the wrong manifest silently doubles every turn of a
+    /// provider that bills flat.
+    #[test]
+    fn only_deepseek_bills_by_the_clock() {
+        let scheduled: Vec<&str> = ManifestRegistry::builtins()
+            .iter()
+            .filter(|m| m.pricing_schedule.is_some())
+            .map(|m| m.slug)
+            .collect();
+        assert_eq!(scheduled, SCHEDULED_PROVIDERS);
+    }
+
+    /// Nothing else pins the wiring: a real DeepSeek model has to pick the
+    /// schedule up out of its manifest, and `list_cost` has to stay out of it.
+    /// `billed_cost` reads the real clock, so the expectation is sampled either
+    /// side of the call in case the hour ticks over mid-test.
+    #[test]
+    fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
+        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
+        let schedule = ManifestRegistry::for_slug(&model.provider)
+            .and_then(|m| m.pricing_schedule)
+            .expect("deepseek bills by the clock");
+
+        let list = model.list_cost(&INPUT_ONLY, false).unwrap();
+        let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
+        assert!(
+            (list - table_price).abs() < EPSILON,
+            "list_cost {list} must be the table price {table_price}, surcharge free"
+        );
+
+        let before = schedule.multiplier_at(Timestamp::now());
+        let billed = model.billed_cost(&INPUT_ONLY, false).unwrap();
+        let after = schedule.multiplier_at(Timestamp::now());
+        assert!(
+            [before, after]
+                .iter()
+                .any(|multiplier| (billed - list * multiplier).abs() < EPSILON),
+            "billed {billed} is not {list} scaled by the schedule ({before} or {after})"
+        );
+    }
+
+    /// A schedule must not turn "no price" into "$0.000". Callers hide `None`,
+    /// and any multiple of nothing is still nothing.
+    #[test]
+    fn unpriced_models_stay_unpriced_under_a_schedule() {
+        let model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        assert!(model.pricing.is_zero());
+        assert_eq!(model.list_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
+    }
+
+    /// Every later total is rebuilt from what was stored, so storing a turn must
+    /// not shuffle the counters, invent one, or drop the cost.
+    #[test]
+    fn billed_stores_every_counter_and_the_cost() {
+        assert_eq!(
+            COUNTERS.billed(Some(RECORDED_COST)),
+            StoredTokenUsage {
+                input: COUNTERS.input,
+                output: COUNTERS.output,
+                cache_creation: COUNTERS.cache_creation,
+                cache_read: COUNTERS.cache_read,
+                cost: Some(RECORDED_COST),
+            }
+        );
+        assert_eq!(COUNTERS.billed(None).cost, None);
     }
 }

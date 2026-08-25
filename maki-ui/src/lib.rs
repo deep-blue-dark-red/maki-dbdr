@@ -8,6 +8,7 @@ pub mod animation;
 pub mod app;
 pub mod chat;
 mod clipboard;
+mod clock;
 mod color_compat;
 mod components;
 pub mod config;
@@ -18,6 +19,7 @@ pub use highlight::highlight_ansi;
 pub mod image;
 mod markdown;
 mod render_worker;
+pub mod repaint;
 mod selection;
 pub mod splash;
 mod storage_writer;
@@ -30,6 +32,8 @@ mod agent;
 mod event_loop;
 mod input;
 mod terminal;
+
+use std::time::Instant;
 
 use color_eyre::Result;
 use maki_agent::ToolOutput;
@@ -67,13 +71,22 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             tabs: report.tabs,
             focused: report.focused,
         },
-        _ => RunOutcome::Exit {
-            session_id: report
+        exit => {
+            let session_id = report
                 .tabs
                 .get(report.focused)
                 .filter(|s| app::session_has_content(s))
-                .map(|s| s.id),
-            code: report.exit.code(),
-        },
+                .map(|s| s.id);
+            let started = Instant::now();
+            drop(report);
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "session buffers dropped"
+            );
+            RunOutcome::Exit {
+                session_id,
+                code: exit.code(),
+            }
+        }
     })
 }

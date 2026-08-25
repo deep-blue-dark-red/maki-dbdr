@@ -10,6 +10,7 @@ use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -328,6 +329,15 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.is_some()
     }
 
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(
+            self.state
+                .as_ref()
+                .is_some_and(|s| s.items.iter().any(PickerItem::is_spinning)),
+            Cadence::SPINNER,
+        )
+    }
+
     pub fn close(&mut self) {
         self.state = None;
     }
@@ -503,6 +513,10 @@ impl<T: PickerItem> Overlay for ListPicker<T> {
     fn close(&mut self) {
         self.close()
     }
+
+    fn cadence(&self) -> Cadence {
+        self.cadence()
+    }
 }
 
 fn render_ready<T: PickerItem>(
@@ -596,21 +610,17 @@ fn render_ready<T: PickerItem>(
     popup
 }
 
-fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize) -> usize {
-    let item = &items[filtered[idx]];
-    let is_break = match item.section() {
-        None => false,
-        Some(sec) => {
-            idx == 0
-                || items[filtered[idx - 1]]
-                    .section()
-                    .is_none_or(|prev| prev != sec)
-        }
-    };
-    if !is_break {
+fn section_gap<T: PickerItem>(filtered: &[usize], items: &[T], idx: usize, start: usize) -> usize {
+    let Some(sec) = items[filtered[idx]].section() else {
         return 0;
+    };
+    if idx == start {
+        return 1;
     }
-    if idx == 0 { 1 } else { 2 }
+    let is_break = items[filtered[idx - 1]]
+        .section()
+        .is_none_or(|prev| prev != sec);
+    if is_break { 2 } else { 0 }
 }
 
 fn visual_rows_in_range<T: PickerItem>(
@@ -620,7 +630,9 @@ fn visual_rows_in_range<T: PickerItem>(
     end: usize,
 ) -> usize {
     let item_count = end.saturating_sub(start);
-    let section_rows: usize = (start..end).map(|i| section_gap(filtered, items, i)).sum();
+    let section_rows: usize = (start..end)
+        .map(|i| section_gap(filtered, items, i, start))
+        .sum();
     item_count + section_rows
 }
 
@@ -692,12 +704,7 @@ fn render_list<T: PickerItem>(
 
     let mut lines: Vec<Line> = Vec::new();
     let mut i = scroll_offset;
-    let mut last_section: Option<&str> = if scroll_offset > 0 && scroll_offset - 1 < filtered.len()
-    {
-        items[filtered[scroll_offset - 1]].section()
-    } else {
-        None
-    };
+    let mut last_section: Option<&str> = None;
 
     while lines.len() < viewport_height && i < filtered.len() {
         let item_idx = filtered[i];
@@ -840,6 +847,7 @@ mod tests {
     struct Entry {
         label: String,
         detail: Option<String>,
+        spinning: bool,
     }
 
     impl Entry {
@@ -847,6 +855,7 @@ mod tests {
             Self {
                 label: label.into(),
                 detail: None,
+                spinning: false,
             }
         }
     }
@@ -858,6 +867,26 @@ mod tests {
         fn detail(&self) -> Option<&str> {
             self.detail.as_deref()
         }
+        fn is_spinning(&self) -> bool {
+            self.spinning
+        }
+    }
+
+    /// The running-task spinner is drawn here and nowhere else, so this is the
+    /// only place that can tell the loop to keep painting it.
+    #[test]
+    fn a_spinning_item_animates_the_picker() {
+        let mut p = ListPicker::new();
+        p.open(entries(&["idle task"]), " Test ");
+        assert_eq!(p.cadence(), Cadence::IDLE);
+
+        let mut running = Entry::new("running task");
+        running.spinning = true;
+        p.replace_items(vec![running]);
+        assert_eq!(p.cadence(), Cadence::SPINNER);
+
+        p.close();
+        assert_eq!(p.cadence(), Cadence::IDLE, "a closed picker draws nothing");
     }
 
     fn entries(names: &[&str]) -> Vec<Entry> {

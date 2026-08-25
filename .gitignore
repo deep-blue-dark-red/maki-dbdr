@@ -5,6 +5,7 @@ runs.csv
 bench/results/
 /site/_build/
 /site/.bin/
+/.playwright-mcp/
 /result
 .DS_Store
 /repository_context.txt

@@ -1,6 +1,6 @@
 +++
 title = "MCP"
-weight = 10
+weight = 7
 [extra]
 group = "Reference"
 +++
@@ -37,6 +37,14 @@ url = "https://mcp.example.com/mcp"
 headers = { Authorization = "Bearer tok123" }
 ```
 
+Some HTTP servers need OAuth but have no dynamic client registration. For those, give Maki a static client:
+
+```toml
+[mcp.acme]
+url = "https://mcp.acme.example.com/mcp"
+oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3118, callback_path = "/callback", callback_hostname = "localhost" }
+```
+
 ### All options
 
 | Field | Type | Default | Notes |
@@ -45,6 +53,7 @@ headers = { Authorization = "Bearer tok123" }
 | `url` | string | | HTTP: server URL |
 | `environment` | map | | Stdio only |
 | `headers` | map | | HTTP only |
+| `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
 | `always_load` | bool | false | Skip tool search, load all tools upfront |
@@ -62,6 +71,20 @@ One option lives at the top level of `mcp.toml`, outside any server:
 Every tool definition a server exposes costs context window space, on every request. Take Datadog's MCP server: with all toolsets on it ships over 100 tools, when a task often needs three.
 
 So Maki, like Claude Code, defers MCP tools by default. The model sees one small `tool_search` tool that lists the deferred names, searches when it actually needs something, and the matches stay loaded for the rest of the session. Resume a session and the tools it was using come back. Subagents keep their own loads, so their searches don't bloat your main conversation.
+
+```
+server ships 117 tool definitions
+        │
+  more than defer_tools (10)?
+   │ no          │ yes
+   ▼             ▼
+   all load      context gets one small tool: tool_search
+   upfront       │
+                 │  model: tool_search("logs")
+                 ▼
+                 3 matches load, stay for the session
+                 114 definitions never enter context
+```
 
 You don't configure anything for this. Add the server as usual:
 
@@ -123,6 +146,18 @@ Some HTTP servers need auth. When that happens, Maki opens your browser to log i
 maki mcp auth <server-name>     # manually trigger auth
 maki mcp logout <server-name>   # remove stored tokens
 ```
+
+Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `client_id` | string | Client id of your registered app |
+| `client_secret` | string | Optional, for confidential clients |
+| `callback_port` | u16 | Optional, pins the loopback port so the redirect URI can be pre-registered |
+| `callback_path` | string | Optional, loopback path of the redirect URI (default `/mcp/oauth/callback`) |
+| `callback_hostname` | string | Optional, loopback hostname of the redirect URI (default `127.0.0.1`) |
+
+Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Maki falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
 
 ### Headless machines
 

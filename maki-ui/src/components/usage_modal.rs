@@ -1,10 +1,13 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
+use arc_swap::ArcSwapOption;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use maki_providers::{Model, ModelPricing, ProviderUsage, TokenUsage, format_tokens};
+use maki_config::ClockFormat;
+use maki_providers::{Model, ProviderUsage, TokenUsage, format_tokens, model_cost};
 use maki_storage::sessions::StoredTokenUsage;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -16,6 +19,7 @@ use crate::components::ModalScroll;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
 const TITLE: &str = " Token usage ";
@@ -28,8 +32,8 @@ const HOUR: i64 = 3600;
 const DAY: i64 = 24 * HOUR;
 const WEEK: i64 = 7 * DAY;
 
-/// Live provider quota fetch, shared from the event loop. `Loading` is shown
-/// until the background fetch completes; the modal reads this each render.
+/// Live provider quota fetch, shared from the event loop. A detached task
+/// drops the answer into the slot, and [`UsageModal::poll`] is what notices.
 pub enum UsageFetchState {
     Loading,
     Ready(ProviderUsage),
@@ -39,15 +43,19 @@ pub enum UsageFetchState {
 
 pub struct UsageModalContext<'a> {
     pub total: &'a TokenUsage,
+    /// What the session billed, from [`maki_providers::session_cost`]. `None`
+    /// means nothing here is priced, so the modal shows tokens only.
+    pub total_cost: Option<f64>,
     pub by_model: &'a HashMap<String, StoredTokenUsage>,
     pub model: &'a Model,
     pub fast: bool,
-    pub quota: Option<&'a UsageFetchState>,
+    pub clock_format: ClockFormat,
 }
 
 pub struct UsageModal {
     open: bool,
     scroll: ModalScroll,
+    quota: Watch<UsageFetchState>,
 }
 
 impl UsageModal {
@@ -55,7 +63,18 @@ impl UsageModal {
         Self {
             open: false,
             scroll: ModalScroll::new_top(),
+            quota: Watch::default(),
         }
+    }
+
+    /// Picks up a finished quota fetch. Nothing wakes the loop when the task
+    /// stores its result, so an unpolled modal sits on `Loading` until the
+    /// user happens to press a key.
+    pub fn poll(&mut self, slot: &ArcSwapOption<UsageFetchState>) -> Dirty {
+        if !self.open {
+            return Dirty::NO;
+        }
+        self.quota.poll(slot.load_full())
     }
 
     pub fn is_open(&self) -> bool {
@@ -67,6 +86,8 @@ impl UsageModal {
         self.scroll.reset();
     }
 
+    /// Keeps the last answer: `/usage` refetches on every open, and until that
+    /// lands it beats a blank panel.
     pub fn close(&mut self) {
         self.open = false;
         self.scroll.reset();
@@ -89,7 +110,7 @@ impl UsageModal {
         }
 
         let theme = theme::current();
-        let lines = build_lines(ctx, &theme);
+        let lines = build_lines(ctx, self.quota.get(), &theme);
 
         let total = lines.len() as u16;
         let modal = Modal {
@@ -126,18 +147,11 @@ impl UsageModal {
     }
 }
 
-fn pricing_for(id: &str, current: &Model) -> Option<ModelPricing> {
-    if id == current.id {
-        return Some(current.pricing.clone());
-    }
-    Model::from_spec(id).ok().map(|m| m.pricing).or_else(|| {
-        Model::from_spec(&format!("{}/{}", current.provider, id))
-            .ok()
-            .map(|m| m.pricing)
-    })
-}
-
-fn build_lines(ctx: &UsageModalContext, theme: &crate::theme::Theme) -> Vec<Line<'static>> {
+fn build_lines(
+    ctx: &UsageModalContext,
+    quota: Option<&UsageFetchState>,
+    theme: &crate::theme::Theme,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let fg = Style::new().fg(theme.foreground);
 
@@ -146,20 +160,15 @@ fn build_lines(ctx: &UsageModalContext, theme: &crate::theme::Theme) -> Vec<Line
         theme.keybind_section,
     )));
 
-    let total_cost = if ctx.model.pricing.is_zero() {
-        None
-    } else {
-        Some(ctx.total.cost(&ctx.model.pricing, ctx.fast))
-    };
-    lines.push(Line::from(totals_row(ctx.total, total_cost, theme)));
+    lines.push(Line::from(totals_row(ctx.total, ctx.total_cost, theme)));
 
-    if let Some(state) = ctx.quota {
+    if let Some(state) = quota {
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
             format!("{PREFIX}{} quota", ctx.model.provider_display_name()),
             theme.keybind_section,
         )));
-        lines.extend(quota_lines(state, theme));
+        lines.extend(quota_lines(state, theme, ctx.clock_format));
     }
 
     if ctx.by_model.is_empty() {
@@ -184,10 +193,7 @@ fn build_lines(ctx: &UsageModalContext, theme: &crate::theme::Theme) -> Vec<Line
     lines.push(Line::from(header_row(model_w, theme)));
 
     for (id, usage) in entries {
-        let pricing = pricing_for(id, ctx.model);
-        let cost = pricing
-            .as_ref()
-            .map(|p| TokenUsage::from(*usage).cost(p, ctx.fast));
+        let cost = model_cost(id, usage, ctx.model, ctx.fast);
         lines.push(Line::from(model_row(
             id,
             usage,
@@ -287,7 +293,11 @@ impl crate::components::Overlay for UsageModal {
     }
 }
 
-fn quota_lines(state: &UsageFetchState, theme: &crate::theme::Theme) -> Vec<Line<'static>> {
+fn quota_lines(
+    state: &UsageFetchState,
+    theme: &crate::theme::Theme,
+    clock: ClockFormat,
+) -> Vec<Line<'static>> {
     let fg = Style::new().fg(theme.foreground);
     let dim = theme.status_dim;
     match state {
@@ -330,7 +340,7 @@ fn quota_lines(state: &UsageFetchState, theme: &crate::theme::Theme) -> Vec<Line
                 }
                 if let Some(ms) = limit.reset_at {
                     spans.push(Span::styled(
-                        format!("  Resets {}", format_reset(ms, &tz)),
+                        format!("  Resets {}", format_reset(ms, &tz, clock)),
                         dim,
                     ));
                 }
@@ -341,7 +351,7 @@ fn quota_lines(state: &UsageFetchState, theme: &crate::theme::Theme) -> Vec<Line
     }
 }
 
-fn format_reset(epoch_ms: u64, tz: &TimeZone) -> String {
+fn format_reset(epoch_ms: u64, tz: &TimeZone, clock: ClockFormat) -> String {
     let secs = (epoch_ms / 1000) as i64;
     let Ok(ts) = Timestamp::from_second(secs) else {
         return epoch_ms.to_string();
@@ -351,12 +361,13 @@ fn format_reset(epoch_ms: u64, tz: &TimeZone) -> String {
         return relative(delta);
     }
     let zoned = ts.to_zoned(tz.clone());
+    let clock = crate::clock::hm(clock);
     let fmt = if delta < WEEK {
-        "%a %-I:%M %p"
+        format!("%a {clock}")
     } else {
-        "%b %-d, %-I:%M %p"
+        format!("%b %-d, {clock}")
     };
-    zoned.strftime(fmt).to_string()
+    zoned.strftime(&fmt).to_string()
 }
 
 fn relative(seconds: i64) -> String {
@@ -372,9 +383,29 @@ fn relative(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::{buffer_text, test_model};
+    use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::KeyModifiers;
     use maki_providers::UsageLimit;
+    use std::sync::Arc;
     use test_case::test_case;
+
+    const RECORDED_COST: f64 = 0.123;
+    const RECORDED_TEXT: &str = "0.123";
+    /// 1M input tokens at the test model's $3/1M: what the modal would print if
+    /// it re-priced the counters.
+    const REPRICED_TEXT: &str = "3.000";
+    const ONE_MILLION: u32 = 1_000_000;
+    const ONE_MILLION_TEXT: &str = "1.0m";
+    const UNKNOWN_MODEL: &str = "a-model-no-table-has-ever-heard-of";
+    const NO_COST_TEXT: &str = "—";
+
+    fn line_texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
@@ -428,7 +459,7 @@ mod tests {
                 },
             ],
         };
-        let lines = quota_lines(&UsageFetchState::Ready(usage), &theme);
+        let lines = quota_lines(&UsageFetchState::Ready(usage), &theme, ClockFormat::Hour24);
         assert_eq!(lines.len(), 3);
         assert!(
             lines[0]
@@ -462,8 +493,12 @@ mod tests {
     #[test]
     fn quota_non_terminal_states_render_single_line() {
         let theme = crate::theme::current();
-        assert_eq!(quota_lines(&UsageFetchState::Loading, &theme).len(), 1);
-        let unsupported = quota_lines(&UsageFetchState::Unsupported, &theme);
+        let clock = ClockFormat::Hour24;
+        assert_eq!(
+            quota_lines(&UsageFetchState::Loading, &theme, clock).len(),
+            1
+        );
+        let unsupported = quota_lines(&UsageFetchState::Unsupported, &theme, clock);
         assert_eq!(unsupported.len(), 1);
         assert!(
             unsupported[0]
@@ -471,9 +506,171 @@ mod tests {
                 .iter()
                 .any(|s| s.content.contains(NO_USAGE_ENDPOINT))
         );
-        let err = quota_lines(&UsageFetchState::Error("nope".into()), &theme);
+        let err = quota_lines(&UsageFetchState::Error("nope".into()), &theme, clock);
         assert_eq!(err.len(), 1);
         assert!(err[0].spans.iter().any(|s| s.content.contains("nope")));
+    }
+
+    fn stored(cost: Option<f64>) -> StoredTokenUsage {
+        StoredTokenUsage {
+            input: ONE_MILLION,
+            cost,
+            ..Default::default()
+        }
+    }
+
+    fn modal_rows(
+        total: &TokenUsage,
+        total_cost: Option<f64>,
+        by_model: &HashMap<String, StoredTokenUsage>,
+        model: &Model,
+    ) -> Vec<String> {
+        let ctx = UsageModalContext {
+            total,
+            total_cost,
+            by_model,
+            model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+        };
+        line_texts(&build_lines(&ctx, None, &crate::theme::current()))
+    }
+
+    /// A recorded cost is what the turn was billed, and re-pricing its tokens
+    /// restates the bill every time a provider moves its rates (DeepSeek moves
+    /// them twice a day). A model the tables cannot resolve shows nothing,
+    /// since charging it the selected model's rates invents a bill.
+    #[test]
+    fn model_rows_show_what_was_recorded_and_never_todays_price() {
+        let model = test_model();
+        let total = TokenUsage {
+            input: 2 * ONE_MILLION,
+            ..Default::default()
+        };
+        let by_model = HashMap::from([
+            (model.id.clone(), stored(Some(RECORDED_COST))),
+            (UNKNOWN_MODEL.to_string(), stored(None)),
+        ]);
+
+        let rows = modal_rows(&total, Some(RECORDED_COST), &by_model, &model);
+        let row = |id: &str| {
+            rows.iter()
+                .find(|t| t.contains(id))
+                .unwrap_or_else(|| panic!("no row for {id}: {rows:?}"))
+                .clone()
+        };
+
+        let recorded_row = row(&model.id);
+        assert!(recorded_row.contains(RECORDED_TEXT), "{recorded_row}");
+        assert!(!recorded_row.contains(REPRICED_TEXT), "{recorded_row}");
+
+        let unknown_row = row(UNKNOWN_MODEL);
+        assert!(unknown_row.contains(NO_COST_TEXT), "{unknown_row}");
+        assert!(!unknown_row.contains(REPRICED_TEXT), "{unknown_row}");
+    }
+
+    /// The session's bill arrives already computed, from the turns that paid it.
+    /// These counters would price to [`REPRICED_TEXT`] against the selected
+    /// model, so a modal doing its own arithmetic prints a different number,
+    /// and "$0.000" for a session nothing priced.
+    #[test_case(Some(RECORDED_COST) => Some(RECORDED_TEXT.to_string()) ; "prints_the_bill_it_was_handed")]
+    #[test_case(None                => None                            ; "unpriced_session_shows_tokens_only")]
+    fn totals_row_never_re_prices_the_counters(total_cost: Option<f64>) -> Option<String> {
+        let model = test_model();
+        assert!(!model.pricing.is_zero(), "the fallback must be tempting");
+        let total = TokenUsage {
+            input: ONE_MILLION,
+            ..Default::default()
+        };
+
+        let rows = modal_rows(&total, total_cost, &HashMap::new(), &model);
+        // With no breakdown, the totals row is the only one carrying counters.
+        let totals = rows
+            .iter()
+            .find(|t| t.contains(ONE_MILLION_TEXT))
+            .unwrap_or_else(|| panic!("no totals row: {rows:?}"));
+        totals
+            .split_once('$')
+            .map(|(_, cost)| cost.trim().to_string())
+    }
+
+    fn slot(state: UsageFetchState) -> ArcSwapOption<UsageFetchState> {
+        ArcSwapOption::from_pointee(state)
+    }
+
+    fn render(modal: &mut UsageModal) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let model = test_model();
+        let ctx = UsageModalContext {
+            total: &TokenUsage::default(),
+            total_cost: None,
+            by_model: &HashMap::new(),
+            model: &model,
+            fast: false,
+            clock_format: ClockFormat::Hour24,
+        };
+        terminal
+            .draw(|f| {
+                modal.view(f, f.area(), &ctx);
+            })
+            .unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    /// Nothing wakes the loop when the fetch stores its answer, so the modal
+    /// has to notice on its own, and exactly once: the slot keeps holding the
+    /// same `Arc` for as long as the modal stays open, and a poll that cannot
+    /// tell "still there" from "just arrived" repaints on every tick. A closed
+    /// modal is not on screen, so it must not pick anything up.
+    #[test]
+    fn poll_owes_a_frame_only_for_a_value_the_open_modal_has_not_seen() {
+        let slot = slot(UsageFetchState::Loading);
+        let mut modal = UsageModal::new();
+
+        assert_eq!(
+            modal.poll(&slot),
+            Dirty::NO,
+            "a closed modal ignores the slot"
+        );
+        assert!(modal.quota.get().is_none());
+
+        modal.toggle();
+        assert_eq!(modal.poll(&slot), Dirty::YES, "{OWED}");
+        assert_eq!(modal.poll(&slot), Dirty::NO, "{QUIET}");
+
+        slot.store(Some(Arc::new(UsageFetchState::Unsupported)));
+        assert_eq!(
+            modal.poll(&slot),
+            Dirty::YES,
+            "a refetch owes a frame, whatever it holds"
+        );
+    }
+
+    /// `view` renders what the modal owns, never the shared slot. Reading the
+    /// slot mid render is what forced the old loop to paint constantly. Closing
+    /// keeps the last answer, so a reopen has something to show while the
+    /// refetch is on its way, and owes no frame for what is already drawn.
+    #[test]
+    fn quota_reaches_the_screen_only_after_a_poll_and_survives_a_reopen() {
+        let slot = slot(UsageFetchState::Unsupported);
+        let mut modal = UsageModal::new();
+        modal.toggle();
+
+        assert!(
+            !render(&mut modal).contains(NO_USAGE_ENDPOINT),
+            "an unpolled quota must not appear on screen"
+        );
+        assert_eq!(modal.poll(&slot), Dirty::YES, "{OWED}");
+        assert!(render(&mut modal).contains(NO_USAGE_ENDPOINT));
+
+        modal.close();
+        modal.toggle();
+        assert_eq!(modal.poll(&slot), Dirty::NO, "{QUIET}");
+        assert!(
+            render(&mut modal).contains(NO_USAGE_ENDPOINT),
+            "a reopened modal still shows the last answer it saw"
+        );
     }
 
     #[test]

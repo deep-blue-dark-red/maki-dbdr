@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
+use crate::components::input::Placeholder;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -30,8 +31,6 @@ struct ViewLayout {
 
 impl App {
     pub fn view(&mut self, frame: &mut Frame) {
-        self.status_bar.clear_expired_hint();
-
         let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
         let render_chat = self.resolve_render_chat();
@@ -192,7 +191,13 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let streaming = self.status == Status::Streaming;
+            let placeholder = if self.status == Status::Streaming {
+                Placeholder::Queue
+            } else if self.state.session.messages().is_empty() {
+                Placeholder::Suggestion
+            } else {
+                Placeholder::Blank
+            };
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()
@@ -200,7 +205,7 @@ impl App {
             self.input_box.view(
                 frame,
                 layout.input_area,
-                streaming,
+                placeholder,
                 self.separator_style(),
                 !self.any_overlay_open(),
                 panel_hint,
@@ -230,9 +235,9 @@ impl App {
         }
 
         if self.file_picker.is_open() {
-            if let Some(flash) = self.file_picker.tick() {
-                self.status_bar.flash(flash);
-            }
+            // The tick lives in `App::tick_file_picker` now: a poller inside
+            // `view` only runs when a frame happens, which `repaint.rs`
+            // forbids.
             overlay_rect = self.file_picker.view(frame, layout.msg_area);
         }
 
@@ -275,13 +280,13 @@ impl App {
             overlay_rect = r;
         }
         if self.usage_modal.is_open() {
-            let quota = self.usage_slot.load();
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
+                total_cost: self.state.cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
-                quota: quota.as_deref(),
+                clock_format: self.ui_config.clock_format,
             };
             let r = self.usage_modal.view(frame, full, &ctx);
             if r.width > 0 {
@@ -346,7 +351,7 @@ impl App {
                 .as_deref()
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
-                global_usage: &self.state.token_usage,
+                global_cost: self.state.cost,
                 context_size: chat.context_size,
                 // `chat.cost` stays `None` until the first priced turn completes; show
                 // `$0.000` from the start for any model with known (non-zero) pricing,
@@ -354,7 +359,6 @@ impl App {
                 cost: chat
                     .cost
                     .or_else(|| (!self.state.model.pricing.is_zero()).then_some(0.0)),
-                pricing: &self.state.model.pricing,
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },
@@ -468,7 +472,7 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
-        let snap = self.hint_reader.load();
+        let snap = self.hints.get()?;
         if snap.entries.is_empty() {
             return None;
         }

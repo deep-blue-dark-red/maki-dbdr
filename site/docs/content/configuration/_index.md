@@ -34,7 +34,10 @@ maki.setup({
     },
     provider = {
         default_model = "anthropic/claude-sonnet-4-6",
+        allowed_models = { "anthropic/*", "openai/gpt-5" },
+        excluded_models = { "*/*-preview" },
     },
+
     storage = {
         max_log_files = 5,
     },
@@ -46,6 +49,8 @@ maki.setup({
 ```
 
 All fields are optional. Typos in field names cause an error right away.
+
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `maki models`.
 
 `maki.setup()` can only be called once per init.lua.
 
@@ -66,18 +71,21 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
+| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
-| `show_token_stats` | bool | `false` | - | Show token statistics (tokens/sec, cache rate) in status bar |
+| `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 
 ### `ui.theme`
 
 Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
 
-Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `dark_daltonized`, `dark_daltonized_v2`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_maki`, `kanagawa_maki_ink`, `kanagawa_maki_lotus`, `kanagawa_maki_slate`, `kanagawa_maki_storm`, `kanagawa_maki_wave`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_maki`, `rose_pine_maki_bloom`, `rose_pine_maki_dusk`, `rose_pine_maki_haze`, `rose_pine_maki_midnight`, `rose_pine_maki_slate`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
+Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
+
+You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
 Themes use 24-bit colors, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 
@@ -105,15 +113,17 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
-| `max_output_tokens` | u32 | `40000` | 1 | Max LLM response length (tokens) |
+| `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
+| `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
-| `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
 
 ### `provider`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
+| `allowed_models` | string[] | `[]` | - | Glob patterns for permitted qualified model specs; empty permits all models |
+| `excluded_models` | string[] | `[]` | - | Glob patterns for excluded qualified model specs; exclusions take precedence |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
@@ -133,6 +143,8 @@ The `plugins` table turns plugins on or off and passes options to them. All bund
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, edit_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
+
+This table is for bundled plugins only. Your own plugins go in `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).
 
 ```lua
 maki.setup({
@@ -231,25 +243,6 @@ maki.setup({
 
 If a value is below its minimum, Maki shows a `ConfigError` with the field name, value, and minimum.
 
-## User Settings (`user.config`)
-
-Separate from `init.lua`, a handful of interactive-UI preferences live in `user.config`, a flat `key = value` file stored next to `init.lua` in the config directory (see [Directory layout](#directory-layout) below). Open it in-app with `/settings` — boolean options toggle inline; everything else opens `user.config` in `$EDITOR`. You can also edit the file by hand.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `user_prompt_prefix` | string | `{n}‧ you ∙ ` | Template for the line(s) shown before each of your turns. `{n}` is replaced with the 1-based turn number. Wrap the value in `"..."` to preserve leading/trailing spaces, and use `\n` for a multi-line prefix (each `\n`-separated segment before the last becomes its own leader line; the last segment shares the first line with your message) — e.g. `user_prompt_prefix = "> "`, or `user_prompt_prefix = "---\n{n}> "` for a separator line above a numbered prompt |
-| `spinner_enabled` | bool | `true` | Show the animated spinner for in-progress tool calls |
-| `spinner_style` | string | `braille` | Spinner glyph: `braille` (the default animated frame cycle) or `dot`, a single `●` that alternates between the theme's success color and yellow every 750ms |
-| `override_expand_string` | string | `click to expand` | Hint text shown next to collapsed/truncated content |
-| `log_command` | string | `tail -n 30 alog \| jlf -c \| less -R` | Shell command run by `/logs`; `alog`/`{}`/`<path>` are replaced with the log file path |
-| `export_path` | string | `cwd` | Default directory for exported transcripts; `cwd` means the current working directory |
-| `global_sessions` | bool | `false` | Show sessions from all projects, not just the current one |
-| `skills_dir` | string (repeatable) | - | Extra directory to search for skills; repeat the line to add more than one |
-| `disabled_plugin` | string (repeatable) | - | Name of a plugin to disable; repeat the line to disable more than one |
-| `keybind` | `shortcut=action` (repeatable) | - | Rebind a keyboard action |
-
-`/settings` lists a few additional toggles not in this table.
-
 ## Directory layout
 
 Maki follows platform directory conventions. On Linux and macOS that is XDG. On Windows, config, data, state, and logs all live under Roaming AppData (Windows has no separate state dir in this layout).
@@ -278,7 +271,7 @@ Safe to run more than once.
 
 ## Personal Instructions
 
-On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
@@ -293,4 +286,4 @@ The `memory` tool and `/memory` command store small Markdown notes under the sta
 
 (Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\maki\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
-Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml).
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).

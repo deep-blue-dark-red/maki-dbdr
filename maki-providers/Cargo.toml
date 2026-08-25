@@ -25,6 +25,9 @@ maki-config = { workspace = true }
 inventory = { workspace = true }
 zstd = { workspace = true }
 jiff = { workspace = true }
+getrandom = { workspace = true }
+open = { workspace = true }
+keyring = { workspace = true }
 
 [[bin]]
 name = "mlog"
@@ -33,3 +36,4 @@ path = "src/bin/mlog.rs"
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }

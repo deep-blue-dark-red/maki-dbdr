@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
-use maki_providers::{Message, Model, ProviderEvent, RequestOptions, StreamResponse};
+use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
@@ -10,19 +10,44 @@ use tracing::warn;
 use crate::cancel::CancelToken;
 use crate::{AgentError, AgentEvent, EventSender};
 
+const FUNCTIONS_PREFIX: &str = "functions.";
+
+/// GPT models sometimes emit `functions.<name>`, a Codex training habit.
+/// Stripped here at the provider boundary so no raw name enters the agent;
+/// the batch plugin mirrors the rule in Lua.
+pub(crate) fn canonical_tool_name(name: &str) -> &str {
+    name.strip_prefix(FUNCTIONS_PREFIX).unwrap_or(name)
+}
+
+fn canonicalize_tool_names(message: &mut Message) {
+    for block in &mut message.content {
+        if let ContentBlock::ToolUse { name, .. } = block {
+            *name = canonical_tool_name(name).to_owned();
+        }
+    }
+}
+
 /// Forwards provider events to the UI, returning when the first actual
-/// response content arrived (excluding `PromptProgress`, which reports
-/// upload progress of the *request*, not the start of the response).
+/// response content arrived (excluding `PromptProgress`, which reports upload
+/// progress of the *request*, not the start of the response), plus the text
+/// streamed so far so a cancel can keep what the user still sees on screen.
 async fn forward_provider_events(
     prx: flume::Receiver<ProviderEvent>,
     event_tx: &EventSender,
-) -> Option<Instant> {
+) -> (Option<Instant>, String) {
     let mut first_byte_at = None;
+    let mut streamed = String::new();
     while let Ok(pe) = prx.recv_async().await {
         let ae = match pe {
-            ProviderEvent::TextDelta { text } => AgentEvent::TextDelta { text },
+            ProviderEvent::TextDelta { text } => {
+                streamed.push_str(&text);
+                AgentEvent::TextDelta { text }
+            }
             ProviderEvent::ThinkingDelta { text } => AgentEvent::ThinkingDelta { text },
-            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending { id, name },
+            ProviderEvent::ToolUseStart { id, name } => AgentEvent::ToolPending {
+                id,
+                name: canonical_tool_name(&name).to_owned(),
+            },
             ProviderEvent::PromptProgress {
                 processed,
                 total,
@@ -44,7 +69,32 @@ async fn forward_provider_events(
             break;
         }
     }
-    first_byte_at
+    (first_byte_at, streamed)
+}
+
+/// Cancelling mid-stream carries the text the user still sees on screen,
+/// so the caller can keep it in history. A cancel during the retry backoff
+/// carries nothing: the `Retry` event already made the view drop the failed
+/// attempt's text (`stream_reset`), and history must agree with the view.
+#[derive(Debug)]
+pub(crate) enum StreamError {
+    Cancelled { streamed: String },
+    Other(AgentError),
+}
+
+impl From<AgentError> for StreamError {
+    fn from(e: AgentError) -> Self {
+        Self::Other(e)
+    }
+}
+
+impl From<StreamError> for AgentError {
+    fn from(e: StreamError) -> Self {
+        match e {
+            StreamError::Cancelled { .. } => Self::Cancelled,
+            StreamError::Other(e) => e,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,7 +110,7 @@ pub(crate) async fn stream_with_retry(
     session_id: Option<&SessionRef>,
     first_byte_at: &mut Option<Instant>,
     api_error_count: &mut u32,
-) -> Result<StreamResponse, AgentError> {
+) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
@@ -94,12 +144,16 @@ pub(crate) async fn stream_with_retry(
         )
         .await;
         drop(ptx);
-        if let Some(at) = forwarder.await {
+        let (at, streamed) = forwarder.await;
+        if let Some(at) = at {
             first_byte_at.get_or_insert(at);
         }
         match result {
-            Ok(r) => return Ok(r),
-            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Ok(mut r) => {
+                canonicalize_tool_names(&mut r.message);
+                return Ok(r);
+            }
+            Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) if e.is_retryable() => {
                 if e.should_rotate_key()
                     && let Ok(true) = provider.rotate_key().await
@@ -109,7 +163,7 @@ pub(crate) async fn stream_with_retry(
                 let (attempt, delay) = retry.next_delay();
                 *api_error_count = attempt;
                 if matches!(e, AgentError::Timeout { .. }) && attempt > MAX_TIMEOUT_RETRIES {
-                    return Err(e);
+                    return Err(e.into());
                 }
                 let delay_ms = delay.as_millis() as u64;
                 warn!(attempt, delay_ms, error = %e, "retryable, will retry");
@@ -126,10 +180,12 @@ pub(crate) async fn stream_with_retry(
                 )
                 .await;
                 if cancel.is_cancelled() {
-                    return Err(AgentError::Cancelled);
+                    return Err(StreamError::Cancelled {
+                        streamed: String::new(),
+                    });
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -184,4 +240,29 @@ pub(crate) fn estimate_input_tokens(messages: &[Message], system: &str, tools: &
     }
     const CHARS_PER_TOKEN: usize = 4;
     (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use maki_providers::Role;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn tool_use_names_canonicalized() {
+        let mut message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text { text: "hi".into() },
+                ContentBlock::tool_use("t1", "functions.bash", json!({})),
+                ContentBlock::tool_use("t2", "read", json!({})),
+                ContentBlock::tool_use("t3", "my_functions.x", json!({})),
+            ],
+            ..Default::default()
+        };
+        canonicalize_tool_names(&mut message);
+        let names: Vec<&str> = message.tool_uses().map(|(_, name, _)| name).collect();
+        assert_eq!(names, ["bash", "read", "my_functions.x"]);
+    }
 }

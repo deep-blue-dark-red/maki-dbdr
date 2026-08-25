@@ -1,22 +1,46 @@
 use std::env;
 
-use maki_config::CompactionBuffer;
+use maki_config::{AgentConfig, CompactionBuffer};
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
 };
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
-use super::streaming::stream_with_retry;
+use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
-use crate::{AgentError, AgentEvent, EventSender, TurnCompleteEvent};
+use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
-pub(super) const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
+const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const IMAGE_PLACEHOLDER: &str = "[image]";
 
 /// Framing line prepended to an interleaved checkpoint summary in history. Not a
 /// locator: checkpoints are append-only, so nothing is ever matched or removed.
 pub(super) const CHECKPOINT_INTRO: &str = "Progress summary since last checkpoint:";
+
+fn normalize(text: &Option<String>) -> Option<&str> {
+    text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
+
+pub(super) fn continue_message(config: &AgentConfig) -> String {
+    match normalize(&config.post_compaction_instructions) {
+        Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
+        None => CONTINUE_AFTER_COMPACT.to_string(),
+    }
+}
+
+/// The compaction instruction the model is finally handed: the built-in prompt
+/// plus whatever `compaction_instructions` adds. Built here rather than inside
+/// `run_summary_stream` because checkpoint mode passes its own prompt.
+fn summary_prompt(config: &AgentConfig) -> String {
+    match normalize(&config.compaction_instructions) {
+        Some(extra) => format!(
+            "{}\n\nAdditional instructions:\n{extra}",
+            crate::prompt::COMPACTION_USER
+        ),
+        None => crate::prompt::COMPACTION_USER.to_string(),
+    }
+}
 
 /// Stream a summary of `history` under the compaction system prompt using
 /// `user_prompt` as the final instruction. Mutates nothing; the caller decides
@@ -83,11 +107,11 @@ async fn run_summary_stream(
                 }
                 return Ok(response);
             }
-            Err(e) if e.is_context_overflow() && attempt < max_attempts - 1 => {
+            Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
                 truncate_oldest_round(&mut compaction_history);
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -101,26 +125,21 @@ pub(super) async fn compact_history(
     event_tx: &EventSender,
     cancel: &CancelToken,
     target_tokens: Option<usize>,
+    config: &AgentConfig,
 ) -> Result<TokenUsage, AgentError> {
     let compact_start = std::time::Instant::now();
     let response = run_summary_stream(
         provider,
         model,
         history,
-        crate::prompt::COMPACTION_USER,
+        &summary_prompt(config),
         true,
         event_tx,
         cancel,
         target_tokens,
     )
     .await?;
-    Ok(finish_compact(
-        response,
-        history,
-        event_tx,
-        compact_start,
-        model,
-    ))
+    finish_compact(response, history, event_tx, compact_start, model)
 }
 
 fn finish_compact(
@@ -129,13 +148,14 @@ fn finish_compact(
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
-) -> TokenUsage {
+) -> Result<TokenUsage, AgentError> {
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
         model: model.id.clone(),
-        cost: model.cost_of(&response.usage, false),
+        cost: model.billed_cost(&response.usage, false),
         context_size: Some(response.usage.output),
+        context_window: model.context_window,
         // Compaction summarization isn't tracked by `TurnState`'s
         // cache-miss deviance check (it's a one-off summarization call,
         // not part of the regular turn sequence).
@@ -146,6 +166,12 @@ fn finish_compact(
         ttfb_ms: None,
         api_error_count: 0,
     })));
+
+    // Swapping the history for a summary the model never wrote would throw the
+    // session away for nothing.
+    if response.message.first_text_content().is_none() {
+        return Err(AgentError::EmptySummary);
+    }
 
     let new_history = vec![
         Message::user("What did we do so far?".into()),
@@ -158,7 +184,7 @@ fn finish_compact(
         "compaction completed"
     );
 
-    response.usage
+    Ok(response.usage)
 }
 
 pub async fn compact(
@@ -167,15 +193,28 @@ pub async fn compact(
     history: &mut History,
     event_tx: &EventSender,
     target_tokens: Option<usize>,
+    config: &AgentConfig,
 ) -> Result<(), AgentError> {
     let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: false });
     let cancel = CancelToken::none();
-    let usage = compact_history(provider, model, history, event_tx, &cancel, target_tokens).await?;
+    let usage = compact_history(
+        provider,
+        model,
+        history,
+        event_tx,
+        &cancel,
+        target_tokens,
+        config,
+    )
+    .await?;
+    if let Some(post) = normalize(&config.post_compaction_instructions) {
+        history.push(Message::synthetic(post.to_string()));
+    }
 
     event_tx.send(AgentEvent::Done {
         usage,
         num_turns: 1,
-        stop_reason: None,
+        reason: DoneReason::EndTurn,
     })?;
 
     Ok(())
@@ -244,7 +283,7 @@ pub async fn checkpoint(
     event_tx.send(AgentEvent::Done {
         usage,
         num_turns: 1,
-        stop_reason: None,
+        reason: DoneReason::EndTurn,
     })?;
 
     Ok(())
@@ -303,12 +342,7 @@ fn strip_images(messages: &mut [Message]) {
 
 fn strip_thinking(messages: &mut [Message]) {
     for msg in messages {
-        msg.content.retain(|block| {
-            !matches!(
-                block,
-                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-            )
-        });
+        msg.content.retain(|block| !block.is_thinking());
     }
 }
 
@@ -479,6 +513,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 None,
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -488,6 +523,87 @@ mod tests {
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
         });
+    }
+
+    #[test_case(vec![] ; "no_content")]
+    #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
+    fn compact_keeps_history_when_summary_has_no_text(content: Vec<ContentBlock>) {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content,
+                    ..Default::default()
+                },
+                usage: TokenUsage::default(),
+                stop_reason: Some(StopReason::EndTurn),
+                upstream: None,
+            })]);
+            const KEPT: &str = "first";
+            let mut history = History::new(vec![Message::user(KEPT.into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            let err = compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                None,
+                &AgentConfig::default(),
+            )
+            .await
+            .expect_err("empty summary must fail");
+
+            assert!(matches!(err, AgentError::EmptySummary));
+            assert_eq!(history.len(), 1);
+            assert_eq!(history.as_slice()[0].user_text(), Some(KEPT));
+        });
+    }
+
+    #[test]
+    fn compact_applies_custom_instructions() {
+        smol::block_on(async {
+            const EXTRA: &str = "Record anything that belongs in plan.md";
+            const POST: &str = "Re-read plan.md and agent.md";
+
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let config = AgentConfig {
+                compaction_instructions: Some(EXTRA.into()),
+                post_compaction_instructions: Some(POST.into()),
+                ..Default::default()
+            };
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                None,
+                &config,
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            let summary_prompt = requests[0].last().unwrap();
+            assert!(matches!(
+                &summary_prompt.content[0],
+                ContentBlock::Text { text }
+                    if text.starts_with(crate::prompt::COMPACTION_USER) && text.ends_with(EXTRA)
+            ));
+            assert!(matches!(
+                &history.as_slice().last().unwrap().content[0],
+                ContentBlock::Text { text } if text == POST
+            ));
+        });
+    }
+
+    #[test_case(Some("  \n ".into()), None ; "whitespace_only_is_none")]
+    #[test_case(Some("  keep plan.md ".into()), Some("keep plan.md") ; "trimmed")]
+    fn normalize_instructions(raw: Option<String>, expected: Option<&str>) {
+        assert_eq!(normalize(&raw), expected);
     }
 
     #[test]
@@ -570,6 +686,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 None,
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -797,6 +914,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 None,
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -839,6 +957,7 @@ mod tests {
                 &EventSender::new(raw_tx, 0),
                 &CancelToken::none(),
                 None,
+                &AgentConfig::default(),
             )
             .await
             .unwrap();
@@ -1015,6 +1134,7 @@ mod tests {
                 &mut history,
                 &EventSender::new(raw_tx, 0),
                 Some(100),
+                &AgentConfig::default(),
             )
             .await
             .unwrap();

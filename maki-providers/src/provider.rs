@@ -8,12 +8,14 @@ use serde_json::Value;
 use strum::{Display, EnumIter, EnumString};
 use tracing::{debug, warn};
 
+use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
+use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
     OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
@@ -28,6 +30,7 @@ use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
+use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
@@ -52,6 +55,9 @@ pub enum ProviderKind {
     TensorX,
     #[strum(serialize = "opencode")]
     Opencode,
+    #[strum(serialize = "xai")]
+    Xai,
+    Aperture,
 }
 
 impl ProviderKind {
@@ -70,6 +76,8 @@ impl ProviderKind {
             Self::Synthetic => "Synthetic",
             Self::TensorX => "TensorX",
             Self::Opencode => "Opencode Zen",
+            Self::Xai => "xAI",
+            Self::Aperture => "Aperture",
         }
     }
 
@@ -88,6 +96,8 @@ impl ProviderKind {
             Self::Synthetic => "SYNTHETIC_API_KEY",
             Self::TensorX => "TENSORX_API_KEY",
             Self::Opencode => "OPENCODE_API_KEY",
+            Self::Xai => "XAI_API_KEY",
+            Self::Aperture => "",
         }
     }
 
@@ -108,6 +118,8 @@ impl ProviderKind {
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
             Self::TensorX => "https://api.tensorx.ai/v1",
             Self::Opencode => "https://opencode.ai/zen/v1",
+            Self::Xai => "https://api.x.ai/v1",
+            Self::Aperture => "Aperture gateway (set APERTURE_HOST)",
         }
     }
 
@@ -135,6 +147,12 @@ impl ProviderKind {
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
+            Self::Xai => Some(
+                "OAuth login, account-specific model catalog, Grok reasoning (low/medium/high/xhigh)",
+            ),
+            Self::Aperture => Some(
+                "Tailscale Aperture LLM gateway; set APERTURE_HOST or configure in providers.toml",
+            ),
             _ => None,
         }
     }
@@ -154,6 +172,8 @@ impl ProviderKind {
             Self::Synthetic => ModelFamily::Synthetic,
             Self::TensorX => ModelFamily::Generic,
             Self::Opencode => ModelFamily::Generic,
+            Self::Xai => ModelFamily::Generic,
+            Self::Aperture => ModelFamily::Generic,
         }
     }
 
@@ -177,6 +197,8 @@ impl ProviderKind {
             Self::Synthetic => Some(32_000),
             Self::TensorX => None,
             Self::Opencode => Some(128_000),
+            Self::Xai => Some(131_072),
+            Self::Aperture => Some(16_384),
         }
     }
 
@@ -195,6 +217,8 @@ impl ProviderKind {
             Self::Synthetic => 128_000,
             Self::TensorX => 200_000,
             Self::Opencode => 256_000,
+            Self::Xai => 500_000,
+            Self::Aperture => 128_000,
         }
     }
 
@@ -219,6 +243,8 @@ impl ProviderKind {
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
             Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
+            Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
+            Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }
     }
 }
@@ -303,6 +329,20 @@ pub fn from_model(model: &mut Model, timeouts: Timeouts) -> Result<Box<dyn Provi
     Ok(provider)
 }
 
+/// Adjust a model against its provider's static table without retaining the
+/// provider. Used to reconcile a resumed model so it matches one started
+/// fresh (e.g. inherited thinking support for a routed Aperture model).
+pub fn adjust_model(model: &mut Model, timeouts: Timeouts) -> Result<(), AgentError> {
+    // Script-backed providers adjust nothing but run their auth script at
+    // construction; resumed-session callers sit on the UI thread and must
+    // not wait on that.
+    if dynamic::display_name(&model.provider).is_some() {
+        return Ok(());
+    }
+    provider_for_slug(&model.provider, timeouts)?.adjust_model(model);
+    Ok(())
+}
+
 pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Provider> {
     match from_model(model, timeouts) {
         Ok(provider) => provider,
@@ -365,7 +405,7 @@ pub struct ModelBatch {
 /// and configured dynamic providers. See [`fetch_all_models`] for live lookups.
 /// Never blocks on catalog download; catalog-backed providers appear only once
 /// the catalog has warmed in the background.
-pub fn available_model_specs() -> Vec<String> {
+pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     let mut specs: Vec<String> = crate::manifest::ManifestRegistry::builtins()
         .iter()
         .filter(|m| provider_available_offline(m.slug))
@@ -404,10 +444,12 @@ pub fn available_model_specs() -> Vec<String> {
             }
         }
     }
+    specs.retain(|spec| policy.allows(spec));
     specs
 }
 
 pub async fn fetch_all_models(
+    policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
 ) {
@@ -425,15 +467,9 @@ pub async fn fetch_all_models(
         smol::spawn(async move {
             let batch = match provider.list_models().await {
                 Ok(models) => {
-                    if manifest.accepts_arbitrary_models {
-                        let slug: Arc<str> = Arc::from(slug);
-                        crate::model_registry::model_registry()
-                            .write()
-                            .unwrap()
-                            .set_known_models(&slug, models.clone());
-                    }
                     let mut specs: Vec<String> =
                         models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+                    crate::model_registry::set_known_models(slug, models);
                     for entry in manifest.models {
                         for prefix in entry.prefixes {
                             let spec = format!("{slug}/{prefix}");
@@ -550,7 +586,8 @@ pub async fn fetch_all_models(
 
     drop(tx);
 
-    while let Ok(batch) = rx.recv_async().await {
+    while let Ok(mut batch) = rx.recv_async().await {
+        batch.models.retain(|spec| policy.allows(spec));
         on_ready(batch);
     }
     if let Some(done) = on_done {
@@ -561,6 +598,33 @@ pub async fn fetch_all_models(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
+        ModelPolicy::new(
+            &allowed
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+            &excluded
+                .iter()
+                .map(|pattern| (*pattern).into())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn available_specs_apply_model_policy() {
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-model-policy") };
+        let policy = policy(&["openai/*"], &["*/gpt-5.6-terra"]);
+
+        let specs = available_model_specs(&policy);
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+
+        assert!(!specs.is_empty());
+        assert!(specs.iter().all(|spec| spec.starts_with("openai/")));
+        assert!(!specs.iter().any(|spec| spec == "openai/gpt-5.6-terra"));
+    }
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {

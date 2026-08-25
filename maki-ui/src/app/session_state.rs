@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use maki_config::Effect;
-use maki_providers::{Model, ThinkingConfig, TokenUsage};
+use maki_config::{Effect, ModelPolicy};
+use maki_providers::provider::adjust_model;
+use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -15,6 +16,10 @@ pub(crate) struct SessionState {
     pub session: Arc<AppSession>,
     pub model: Model,
     pub token_usage: TokenUsage,
+    /// What the session has billed so far: the restored total plus every turn
+    /// since. Kept running, because re-deriving it from the counters would
+    /// re-price history at today's rates. `None` while nothing was priced.
+    pub cost: Option<f64>,
     pub context_size: u32,
     pub mode: Mode,
     pub plan: PlanState,
@@ -31,11 +36,24 @@ impl SessionState {
         mut session: AppSession,
         fallback_model: &Model,
         storage: &StateDir,
+        model_policy: &ModelPolicy,
     ) -> Self {
-        let model = Model::from_spec(&session.model).unwrap_or_else(|_| {
-            session.model = fallback_model.spec();
-            fallback_model.clone()
-        });
+        let mut model = model_policy
+            .allows(&session.model)
+            .then(|| Model::from_spec(&session.model))
+            .transpose()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                session.model = fallback_model.spec();
+                fallback_model.clone()
+            });
+        // Apply the provider's per-model adjustments (e.g. ZAI's glm-5.2
+        // thinking support, or Aperture's routed-provider inheritance) so a
+        // resumed session matches one started fresh.
+        if let Err(e) = adjust_model(&mut model, Timeouts::default()) {
+            tracing::warn!(model = %model.id, error = %e, "failed to adjust resumed model");
+        }
 
         let mode = match session.meta.mode {
             Some(StoredMode::Plan) => Mode::Plan,
@@ -63,7 +81,9 @@ impl SessionState {
             plan.allocate_path(storage);
         }
 
+        let fast = session.meta.fast && model.supports_fast();
         let token_usage = session.token_usage;
+        let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
 
         Self {
@@ -75,11 +95,12 @@ impl SessionState {
                 .map(Into::into)
                 .filter(|_| model.supports_thinking())
                 .unwrap_or_default(),
-            fast: session.meta.fast && model.supports_fast(),
+            fast,
             workflow: session.meta.workflow,
             session: Arc::new(session),
             model,
             token_usage,
+            cost,
             context_size,
             mode,
             plan,
@@ -186,7 +207,38 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::test_model;
+    use crate::components::{test_model, test_pricing};
+    use maki_providers::{FastPricing, ModelPricing};
+    use maki_storage::sessions::StoredThinking;
+    use test_case::test_case;
+
+    const RECORDED_COST: f64 = 0.42;
+    /// A round million, so a per-million rate reads straight off the bill.
+    const MILLION_INPUT: TokenUsage = TokenUsage {
+        input: 1_000_000,
+        output: 0,
+        cache_creation: 0,
+        cache_read: 0,
+    };
+    /// [`MILLION_INPUT`] at `test_pricing`'s standard input rate.
+    const LIST_PRICE: f64 = 3.0;
+    /// Twice the standard rate, so a resume that ignores `fast` bills half.
+    const FAST_INPUT_RATE: f64 = 6.0;
+    const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
+    const FAST_FLAG_LOST: &str = "the model has fast pricing, so the flag must survive as stored";
+
+    fn resumed(session: AppSession, model: &Model) -> SessionState {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        SessionState::from_session(session, model, &storage, &ModelPolicy::default())
+    }
+
+    /// An old session: counters, no per-model breakdown.
+    fn session_with_counters() -> AppSession {
+        let mut session = AppSession::new("test-model", "/tmp");
+        session.token_usage = MILLION_INPUT;
+        session
+    }
 
     fn make_plan_session(mode: Option<StoredMode>, plan_path: Option<String>) -> AppSession {
         let mut session = AppSession::new("test-model", "/tmp");
@@ -195,12 +247,52 @@ mod tests {
         session
     }
 
+    /// A resumed session opens on the bill it ran up, not on its counters
+    /// re-priced with whatever model is selected now. The model that recorded
+    /// this one prices to nothing, so only the recorded cost can answer.
+    #[test]
+    fn resumed_session_opens_on_the_cost_its_turns_recorded() {
+        let mut session = session_with_counters();
+        session.add_model_usage(
+            UNRESOLVABLE_MODEL,
+            session.token_usage.billed(Some(RECORDED_COST)),
+        );
+        let state = resumed(session, &test_model());
+        assert_eq!(state.cost, Some(RECORDED_COST));
+    }
+
+    /// Older sessions kept counters only, and those are priced with the
+    /// session's own clamped `fast` flag. A hardcoded `false` would open a
+    /// resumed fast session on half its bill.
+    #[test_case(false => Some(LIST_PRICE)     ; "standard_rates")]
+    #[test_case(true  => Some(FAST_INPUT_RATE) ; "fast_rates")]
+    fn resume_without_a_breakdown_prices_the_counters(fast: bool) -> Option<f64> {
+        let mut session = session_with_counters();
+        session.meta.fast = fast;
+        let model = Model {
+            pricing: ModelPricing {
+                fast: Some(FastPricing {
+                    input: FAST_INPUT_RATE,
+                    output: test_pricing().output,
+                }),
+                ..test_pricing()
+            },
+            ..test_model()
+        };
+
+        let state = resumed(session, &model);
+
+        assert_eq!(state.fast, fast, "{FAST_FLAG_LOST}");
+        state.cost
+    }
+
     #[test]
     fn plan_mode_without_path_allocates_path() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Plan), None);
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Plan);
         assert!(state.plan.path().is_some(), "plan path should be allocated");
     }
@@ -211,7 +303,8 @@ mod tests {
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session =
             make_plan_session(Some(StoredMode::Plan), Some("/nonexistent/plan.md".into()));
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Plan);
         let path = state.plan.path().expect("plan path should be allocated");
         assert_ne!(path, Path::new("/nonexistent/plan.md"));
@@ -229,9 +322,29 @@ mod tests {
             Some(StoredMode::Plan),
             Some(plan_file.to_string_lossy().into_owned()),
         );
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Plan);
         assert_eq!(state.plan.path(), Some(plan_file.as_path()));
+    }
+
+    #[test]
+    fn disallowed_restored_model_uses_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let fallback = test_model();
+        let mut session = make_plan_session(Some(StoredMode::Build), None);
+        session.model = "openai/gpt-5".into();
+        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
+            "provider": {"allowed_models": [fallback.spec()]}
+        }))
+        .unwrap();
+        let policy = raw.into_config(false).unwrap().provider.model_policy;
+
+        let state = SessionState::from_session(session, &fallback, &storage, &policy);
+
+        assert_eq!(state.model.spec(), fallback.spec());
+        assert_eq!(state.session.model, fallback.spec());
     }
 
     #[test]
@@ -239,8 +352,30 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(tmp.path().to_path_buf());
         let session = make_plan_session(Some(StoredMode::Build), None);
-        let state = SessionState::from_session(session, &test_model(), &storage);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
+    }
+
+    #[test]
+    fn from_session_applies_provider_adjust_model() {
+        // SAFETY: this test runs single-threaded; no other thread reads the env.
+        unsafe { std::env::set_var("APERTURE_HOST", "https://example.com") };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session = AppSession::new("aperture/zai/glm-5.2", "/tmp");
+        session.meta.thinking = Some(StoredThinking::Adaptive);
+        let state =
+            SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
+        assert!(
+            state.model.supports_thinking(),
+            "resumed aperture/zai/glm-5.2 should inherit thinking support from adjust_model",
+        );
+        assert_eq!(
+            state.thinking,
+            ThinkingConfig::Adaptive,
+            "resumed thinking config should be preserved when the model supports it",
+        );
     }
 }

@@ -20,9 +20,14 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 
+use crate::repaint::{Cadence, Dirty};
+
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+/// One notice per streak: a wedged model can spend twenty nudges, and twenty
+/// identical bubbles bury the conversation they are about.
+const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 
 pub enum ChatEventResult {
     Continue,
@@ -122,6 +127,7 @@ impl Chat {
             AgentEvent::QueueItemConsumed { text, image_count } => {
                 return ChatEventResult::QueueItemConsumed { text, image_count };
             }
+            AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
@@ -140,10 +146,12 @@ impl Chat {
             AgentEvent::RenameResult { .. } => {}
             AgentEvent::Nudge => {
                 self.messages_panel.flush();
-                self.messages_panel.push(DisplayMessage::new(
-                    DisplayRole::Assistant,
-                    "Model stalled after tool calls, nudging...".into(),
-                ));
+                if self.messages_panel.last_message_text() != NUDGE_TEXT {
+                    self.messages_panel.push(DisplayMessage::new(
+                        DisplayRole::Assistant,
+                        NUDGE_TEXT.into(),
+                    ));
+                }
             }
             AgentEvent::SubagentHistory { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -213,8 +221,12 @@ impl Chat {
         self.messages_panel.set_accent(color);
     }
 
-    pub fn is_animating(&self) -> bool {
-        self.messages_panel.is_animating()
+    pub fn tick(&mut self) -> Dirty {
+        self.messages_panel.tick()
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        self.messages_panel.cadence()
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {

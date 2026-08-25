@@ -5,7 +5,7 @@ use crate::animation::{self, active_spinner_frame, active_spinner_str};
 use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
-use maki_config::ToolOutputLines;
+use maki_config::{ClockFormat, ToolOutputLines};
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -160,9 +160,9 @@ impl ToolLines {
     }
 }
 
-pub fn format_timestamp_now() -> String {
+pub fn format_timestamp_now(format: ClockFormat) -> String {
     let zoned = Timestamp::now().to_zoned(TimeZone::system());
-    zoned.strftime("%H:%M:%S").to_string()
+    zoned.strftime(crate::clock::hms(format)).to_string()
 }
 
 pub fn append_right_info(
@@ -205,6 +205,7 @@ pub fn append_right_info(
     }
 }
 
+#[derive(Clone, Copy)]
 enum Indicator {
     InProgress,
     Success,
@@ -306,10 +307,16 @@ struct ToolLineBuilder {
     truncation: SectionFlags,
     limits: RenderLimits,
     markdown: bool,
+    indicator: Indicator,
 }
 
 impl ToolLineBuilder {
-    fn new(width: u16, expanded: SectionFlags, max_output_lines: usize) -> Self {
+    fn new(
+        width: u16,
+        expanded: SectionFlags,
+        max_output_lines: usize,
+        indicator: Indicator,
+    ) -> Self {
         let limits = RenderLimits::new(expanded, max_output_lines);
         Self {
             lines: Vec::new(),
@@ -321,6 +328,7 @@ impl ToolLineBuilder {
             truncation: SectionFlags::default(),
             limits,
             markdown: false,
+            indicator,
         }
     }
 
@@ -350,6 +358,7 @@ impl ToolLineBuilder {
                     &mut spans,
                     active_spinner_str(0),
                     0,
+                    self.indicator,
                     |span_idx| {
                         spinners.push((line_idx, span_idx));
                     },
@@ -377,11 +386,11 @@ impl ToolLineBuilder {
         self.search_text.push_str(text);
     }
 
-    fn prepend_indicator(&mut self, indicator: Indicator, started_at: Instant) {
+    fn prepend_indicator(&mut self, started_at: Instant) {
         if self.lines.is_empty() {
             return;
         }
-        let (text, style) = match indicator {
+        let (text, style) = match self.indicator {
             Indicator::InProgress => {
                 let elapsed = started_at.elapsed().as_millis();
                 let ch = active_spinner_frame(elapsed);
@@ -392,15 +401,14 @@ impl ToolLineBuilder {
                 );
                 (format!("{ch} "), style)
             }
-            Indicator::Success => (TOOL_INDICATOR.into(), theme::current().tool_success),
-            Indicator::Error => (TOOL_INDICATOR.into(), theme::current().tool_error),
+            finished => (TOOL_INDICATOR.into(), finished_style(finished)),
         };
         for (line, span) in &mut self.spinner_lines {
             if *line == 0 {
                 *span += 1;
             }
         }
-        if matches!(indicator, Indicator::InProgress) {
+        if matches!(self.indicator, Indicator::InProgress) {
             self.spinner_lines.push((0, 0));
         }
         self.lines[0].spans.insert(0, Span::styled(text, style));
@@ -489,8 +497,14 @@ impl ToolLineBuilder {
         let total = snapshot.lines.len();
         let elapsed = started_at.elapsed().as_millis();
         let frame = active_spinner_str(elapsed);
-        let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, elapsed);
+        let (lines, spinners) = snapshot_to_lines_range(
+            snapshot,
+            TOOL_BODY_INDENT,
+            0..total,
+            frame,
+            elapsed,
+            self.indicator,
+        );
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
@@ -530,24 +544,34 @@ fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static 
 }
 
 /// Bakes snapshot spans onto `out`. `"spinner"`-styled spans bake to the
-/// current frame, and `on_spinner` gets their span index in the same pass,
-/// so animation offsets can never drift from the baked spans.
+/// current frame while a tool is in progress, and `on_spinner` gets their
+/// span index in the same pass, so animation offsets can never drift from
+/// the baked spans. Finished tools bake a static dot instead and record no
+/// spinner position, so a stale `"spinner"` span can never keep animating.
 fn bake_spans(
     src: &[SnapshotSpan],
     out: &mut Vec<Span<'static>>,
     frame_str: &'static str,
     elapsed_ms: u128,
+    indicator: Indicator,
     mut on_spinner: impl FnMut(usize),
 ) {
     for span in src {
         if matches!(&span.style, SpanStyle::Named(n) if n == SPINNER_STYLE_NAME) {
-            on_spinner(out.len());
-            let style = animation::active_spinner_style(
-                elapsed_ms,
-                theme::current().spinner,
-                theme::current().tool_success,
-            );
-            out.push(Span::styled(frame_str, style));
+            // A finished tool must stop spinning, so only a live one registers
+            // as a spinner span and takes the animated colour.
+            match indicator {
+                Indicator::InProgress => {
+                    on_spinner(out.len());
+                    let style = animation::active_spinner_style(
+                        elapsed_ms,
+                        theme::current().spinner,
+                        theme::current().tool_success,
+                    );
+                    out.push(Span::styled(frame_str, style));
+                }
+                finished => out.push(Span::styled(TOOL_INDICATOR, finished_style(finished))),
+            }
         } else {
             out.push(Span::styled(
                 span.text.clone(),
@@ -557,12 +581,21 @@ fn bake_spans(
     }
 }
 
+fn finished_style(indicator: Indicator) -> Style {
+    if matches!(indicator, Indicator::Error) {
+        theme::current().tool_error
+    } else {
+        theme::current().tool_success
+    }
+}
+
 fn snapshot_to_lines_range(
     snapshot: &BufferSnapshot,
     indent: &str,
     range: std::ops::Range<usize>,
     frame_str: &'static str,
     elapsed_ms: u128,
+    indicator: Indicator,
 ) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
     let mut spinners = Vec::new();
     let lines = snapshot.lines[range]
@@ -575,6 +608,7 @@ fn snapshot_to_lines_range(
                 &mut spans,
                 frame_str,
                 elapsed_ms,
+                indicator,
                 |span_idx| {
                     spinners.push((i, span_idx));
                 },
@@ -632,7 +666,12 @@ pub fn build_tool_lines(
         None => (msg.text.as_str(), None),
     };
 
-    let mut b = ToolLineBuilder::new(rctx.width, expanded, rctx.tool_output_lines.get(tool_name));
+    let mut b = ToolLineBuilder::new(
+        rctx.width,
+        expanded,
+        rctx.tool_output_lines.get(tool_name),
+        status.into(),
+    );
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
         tool_name,
@@ -640,7 +679,7 @@ pub fn build_tool_lines(
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
-    b.prepend_indicator(status.into(), rctx.started_at);
+    b.prepend_indicator(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
@@ -727,9 +766,14 @@ pub fn build_instructions_lines(
         script: false,
         output: expanded,
     };
-    let mut b = ToolLineBuilder::new(width, exp, code_view::instruction_limit(expanded));
+    let mut b = ToolLineBuilder::new(
+        width,
+        exp,
+        code_view::instruction_limit(expanded),
+        Indicator::Success,
+    );
     b.push_header("load", header, annotation.as_deref(), None);
-    b.prepend_indicator(Indicator::Success, Instant::now());
+    b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
     let has_truncation =
@@ -1720,7 +1764,8 @@ mod tests {
             text: "content".into(),
             style: SpanStyle::Default,
         }]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", 0);
+        let (lines, _) =
+            snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", 0, Indicator::InProgress);
         assert_eq!(lines.len(), 1);
         let first_span = &lines[0].spans[0];
         assert_eq!(first_span.content.as_ref(), ">>");
@@ -1742,7 +1787,8 @@ mod tests {
                 style: SpanStyle::Default,
             },
         ]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", 0);
+        let (lines, _) =
+            snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", 0, Indicator::InProgress);
         let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
     }
@@ -1765,8 +1811,63 @@ mod tests {
                 },
             ],
         ]);
-        let (lines, spinners) = snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", 0);
+        let (lines, spinners) =
+            snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", 0, Indicator::InProgress);
         assert_eq!(spinners, vec![(1, 2)]);
         assert_eq!(lines[1].spans[2].content.as_ref(), "⠹ ");
+    }
+
+    #[test_case(ToolStatus::Success ; "success_bakes_dot")]
+    #[test_case(ToolStatus::Error ; "error_bakes_dot")]
+    fn done_snapshot_with_spinner_span_bakes_dot_and_records_no_spinner(status: ToolStatus) {
+        let snapshot = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "child ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let tl = build_tool_lines(
+            &snapshot_msg(snapshot),
+            status,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.spinner_lines, vec![]);
+        let body = tl.lines.get(1).expect("snapshot body line");
+        let dot = body.spans.last().expect("baked dot span");
+        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
+    }
+
+    #[test]
+    fn done_header_with_spinner_span_bakes_dot_and_records_no_spinner() {
+        let header = make_snapshot(vec![vec![
+            SnapshotSpan {
+                text: "3 tools ".into(),
+                style: SpanStyle::Default,
+            },
+            SnapshotSpan {
+                text: "· ".into(),
+                style: SpanStyle::Named(SPINNER_STYLE_NAME.into()),
+            },
+        ]]);
+        let msg = DisplayMessage {
+            render_header: Some(header),
+            render_snapshot: None,
+            ..snapshot_msg(make_snapshot(vec![]))
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(80),
+            SectionFlags::default(),
+        );
+        assert_eq!(tl.spinner_lines, vec![]);
+        let header_line = tl.lines.first().expect("header line");
+        let dot = header_line.spans.last().expect("baked dot span");
+        assert_eq!(dot.content.as_ref(), TOOL_INDICATOR);
     }
 }

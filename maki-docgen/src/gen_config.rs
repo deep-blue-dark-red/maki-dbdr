@@ -121,6 +121,13 @@ fn write_theme_section(out: &mut String) {
     writeln!(out, "Available themes: {names}.\n").unwrap();
     writeln!(
         out,
+        "You can add your own themes too. Drop a `<name>.toml` file into \
+         `themes/` inside your Maki config directory, for example \
+         `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Themes use 24-bit colors, but not every terminal can show them. Maki \
          checks the environment, terminfo, and the terminal itself, and when \
          truecolor is missing it quietly falls back to the closest of the 256 \
@@ -189,7 +196,10 @@ maki.setup({{
     }},
     provider = {{
         default_model = \"anthropic/claude-sonnet-4-6\",
+        allowed_models = {{ \"anthropic/*\", \"openai/gpt-5\" }},
+        excluded_models = {{ \"*/*-preview\" }},
     }},
+
     storage = {{
         max_log_files = {max_log_files},
     }},
@@ -201,6 +211,8 @@ maki.setup({{
 ```
 
 All fields are optional. Typos in field names cause an error right away.
+
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{{}}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `maki models`.
 
 `maki.setup()` can only be called once per init.lua.
 
@@ -237,7 +249,9 @@ All fields are optional. Typos in field names cause an error right away.
          The edit plugin's extra tools are options too: \
          `plugins.edit = {{ multiedit = false, edit_lines = true }}`. \
          The old `tools` table is gone. If your config still uses it, \
-         Maki stops at startup and shows you the new form.\n"
+         Maki stops at startup and shows you the new form.\n\n\
+         This table is for bundled plugins only. Your own plugins go in \
+         `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).\n"
     )
     .unwrap();
     writeln!(
@@ -295,7 +309,7 @@ Safe to run more than once.
 
 ## Personal Instructions
 
-On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Quick Start](/docs/quick-start/#instruction-files)), you can add:
+On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
 - `~/.config/maki/AGENTS.md` for preferences that apply to all projects
@@ -310,7 +324,7 @@ The `memory` tool and `/memory` command store small Markdown notes under the sta
 
 (Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\\maki\\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
-Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providerstoml)."
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml)."
     )
     .unwrap();
 

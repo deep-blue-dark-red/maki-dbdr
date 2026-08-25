@@ -1,7 +1,8 @@
 use crate::model::{ModelEntry, ModelFamily, ModelTier};
+use crate::pricing::PricingSchedule;
 use crate::providers::{
-    anthropic, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama, openai,
-    openrouter, synthetic, tensorx, zai,
+    anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
+    openai, openrouter, synthetic, tensorx, xai, zai,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +15,9 @@ pub struct ProviderManifest {
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
     pub models: &'static [ModelEntry],
+    /// Set by the providers whose rates move with the wall clock, so the hours
+    /// sit next to the prices they scale. Everyone else bills flat.
+    pub pricing_schedule: Option<&'static PricingSchedule>,
 }
 
 const ANTHROPIC: ProviderManifest = ProviderManifest {
@@ -25,6 +29,7 @@ const ANTHROPIC: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models: anthropic::models(),
+    pricing_schedule: None,
 };
 
 const OPENAI: ProviderManifest = ProviderManifest {
@@ -36,6 +41,7 @@ const OPENAI: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models: openai::models(),
+    pricing_schedule: None,
 };
 
 const GOOGLE: ProviderManifest = ProviderManifest {
@@ -47,6 +53,7 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models: google::models(),
+    pricing_schedule: None,
 };
 
 const COPILOT: ProviderManifest = ProviderManifest {
@@ -58,6 +65,7 @@ const COPILOT: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models: copilot::models(),
+    pricing_schedule: None,
 };
 
 const OLLAMA: ProviderManifest = ProviderManifest {
@@ -69,6 +77,7 @@ const OLLAMA: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models: ollama::models(),
+    pricing_schedule: None,
 };
 
 const LLAMA_CPP: ProviderManifest = ProviderManifest {
@@ -80,6 +89,7 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models: llama_cpp::models(),
+    pricing_schedule: None,
 };
 
 const MISTRAL: ProviderManifest = ProviderManifest {
@@ -91,6 +101,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models: mistral::models(),
+    pricing_schedule: None,
 };
 
 const ZAI: ProviderManifest = ProviderManifest {
@@ -102,6 +113,7 @@ const ZAI: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models: zai::models(),
+    pricing_schedule: None,
 };
 
 const DEEPSEEK: ProviderManifest = ProviderManifest {
@@ -113,6 +125,7 @@ const DEEPSEEK: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(384_000),
     fallback_context_window: 1_000_000,
     models: deepseek::models(),
+    pricing_schedule: Some(&deepseek::PEAK_HOURS),
 };
 
 const OPENROUTER: ProviderManifest = ProviderManifest {
@@ -124,6 +137,7 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models: openrouter::models(),
+    pricing_schedule: None,
 };
 
 const SYNTHETIC: ProviderManifest = ProviderManifest {
@@ -135,6 +149,7 @@ const SYNTHETIC: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models: synthetic::models(),
+    pricing_schedule: None,
 };
 
 const TENSORX: ProviderManifest = ProviderManifest {
@@ -146,6 +161,7 @@ const TENSORX: ProviderManifest = ProviderManifest {
     fallback_max_output: None,
     fallback_context_window: 200_000,
     models: tensorx::models(),
+    pricing_schedule: None,
 };
 
 const OPENCODE: ProviderManifest = ProviderManifest {
@@ -157,6 +173,19 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
     models: &[],
+    pricing_schedule: None,
+};
+
+const XAI: ProviderManifest = ProviderManifest {
+    slug: "xai",
+    display_name: "xAI",
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(131_072),
+    fallback_context_window: 500_000,
+    models: xai::models(),
+    pricing_schedule: None,
 };
 
 const OPENCODE_GO: ProviderManifest = ProviderManifest {
@@ -168,6 +197,19 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
     models: &[],
+    pricing_schedule: None,
+};
+
+const APERTURE: ProviderManifest = ProviderManifest {
+    slug: "aperture",
+    display_name: "Aperture",
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(16_384),
+    fallback_context_window: 128_000,
+    models: aperture::models(),
+    pricing_schedule: None,
 };
 
 const BUILTINS: &[ProviderManifest] = &[
@@ -185,6 +227,8 @@ const BUILTINS: &[ProviderManifest] = &[
     TENSORX,
     OPENCODE,
     OPENCODE_GO,
+    XAI,
+    APERTURE,
 ];
 
 pub struct ManifestRegistry;
@@ -280,6 +324,28 @@ mod tests {
                 ManifestRegistry::get(&kind.to_string()).is_some(),
                 "ProviderKind variant {:?} has no manifest",
                 kind,
+            );
+        }
+    }
+
+    /// Opencode Zen and Opencode Go come from the fetched catalog and stay
+    /// hidden until the user is authed, so they never join the inventory.
+    const CATALOG_ONLY_SLUGS: &[&str] = &["opencode", "opencode-go"];
+
+    /// The picker lists the inventory, so a manifest without an entry is a
+    /// provider the user cannot reach. OpenRouter shipped that way for months.
+    #[test]
+    fn every_builtin_manifest_has_inventory_entry() {
+        for manifest in BUILTINS {
+            if CATALOG_ONLY_SLUGS.contains(&manifest.slug) {
+                continue;
+            }
+            assert!(
+                inventory::iter::<BuiltInProvider>()
+                    .into_iter()
+                    .any(|b| b.slug == manifest.slug),
+                "manifest {:?} has no BuiltInProvider entry, so it never shows in the picker",
+                manifest.slug,
             );
         }
     }

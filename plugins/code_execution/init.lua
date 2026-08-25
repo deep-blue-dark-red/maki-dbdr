@@ -1,21 +1,56 @@
 -- Policy for the Python interpreter: which tools it may call, what the model
--- sees (via the `describe(dctx)` callback), and the import preamble. The
--- sandbox and dispatch live in Rust, which exposes primitives only
--- (`maki.api.get_tools`, `maki.agent.call_tool`); orchestration policy is here.
+-- sees (via the `describe(dctx)` callback), and the preamble. The sandbox and
+-- dispatch live in Rust, which exposes primitives only (`maki.api.get_tools`,
+-- `maki.agent.call_tool`); orchestration policy is here.
 
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+local partial = require("maki.partial")
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
-local PREAMBLE = "import re\nimport asyncio\nimport sys\nimport os\nimport json\n"
+local CANCELLED_ERR = "cancelled"
+local TIME_LIMIT_SUBSTR = "time limit exceeded"
+-- Same marker the batch tool uses for a failed child, so a failure reads the
+-- same wherever the model meets it.
+local ERROR_PREFIX = "[ERROR] "
+local ASYNCIO_GATHER = "asyncio.gather"
+local GATHER_HINT = "\n\nHint: `gather(...)` keeps the other results, returning `"
+  .. ERROR_PREFIX
+  .. "...` for the failed call."
+-- `asyncio.gather` cancels its siblings the moment one call raises, throwing away
+-- results the model already paid for, so `gather` awaits each call in its own
+-- `try` instead. Awaiting one at a time is still concurrent: every call was made
+-- before the first await, so they all sit pending and the host dispatches them in
+-- one batch. Tasks look like the obvious fix, but monty 0.0.21 fails the whole
+-- gather on an external call error rather than raising inside the awaiting task,
+-- and a coroutine wrapper is lazy, so a call handed over that way would run alone.
+-- Only `RuntimeError` is caught, the shape a failed tool call arrives in; a
+-- TypeError from the script itself must still stop the run.
+local PREAMBLE = ([[
+import re
+import asyncio
+import sys
+import os
+import json
+async def gather(*calls):
+    if len(calls) == 1 and isinstance(calls[0], list):
+        calls = calls[0]
+    results = []
+    for c in calls:
+        try:
+            results.append(await c)
+        except RuntimeError as e:
+            results.append('%s' + str(e))
+    return results
+]]):format(ERROR_PREFIX)
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
 local WORKFLOW_TOOLS_NOTE =
-  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `asyncio.gather` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -31,11 +66,6 @@ local function new_view(ctx, buf)
   return ToolView.new(buf, { max_lines = ctx:tool_output_lines().code_execution or 30 })
 end
 
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count, 10)) + 1)
-  return "%" .. w .. "d "
-end
-
 -- One body builder for every path (start preview, handler, restore), so the
 -- script renders the same no matter which lifecycle callbacks ran. The
 -- header is always rebuilt from scratch; nothing mutates existing lines.
@@ -48,7 +78,7 @@ local function build_body(ctx, code)
   local function header()
     local total = #lines
     local shown = view.expanded and total or math.min(total, MAX_SCRIPT_LINES)
-    local fmt = line_nr_fmt(shown)
+    local fmt = ToolView.line_nr_fmt(shown) .. " "
     local out = {}
     for i = 1, shown do
       local spans = { { string.format(fmt, i), "line_nr" } }
@@ -82,8 +112,9 @@ end
 
 local description = "Run Python to chain dependent tool calls or filter their output. The same "
   .. "tools are async functions here: `r = await read(path='x')`. Tools return strings — parse "
-  .. "them yourself. Concurrency via asyncio.gather. Libs: re, asyncio, sys, os, json. No imports, "
-  .. "no network. 30s default timeout."
+  .. "them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — "
+  .. "pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. "
+  .. "No imports, no network. 30s default timeout."
 
 local schema = {
   type = "object",
@@ -92,7 +123,7 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await asyncio.gather(...)` for concurrency.",
+      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency.",
     },
     timeout = {
       type = "integer",
@@ -104,7 +135,7 @@ local schema = {
 local examples = {
   {
     code = [[files = (await glob(pattern='**/*.rs')).strip().split('\n')
-results = await asyncio.gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
+results = await gather(*[read(path=f, offset=1, limit=0) for f in files if f.strip()])
 for f, c in zip(files, results):
     if 'fn main' in c: print(f)]],
   },
@@ -218,13 +249,32 @@ local function handler(input, ctx)
   view:append({ { "Waiting for output...", "dim" } })
 
   local waiting = true
+  local output_parts = {}
   local function show(line)
     if waiting then
       waiting = false
       view:clear()
     end
+    output_parts[#output_parts + 1] = line
     view:append(line)
   end
+
+  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
+
+  -- Memoized, because a cancel reaches us twice: once through the hook and
+  -- again as the interpreter's error, and the view is painted only once.
+  local cut_reply
+  local function cut(reason)
+    cut_reply = cut_reply
+      or partial.cut(view, truncate(table.concat(output_parts, "\n"), max_lines, max_bytes), reason, timeout)
+    return cut_reply
+  end
+
+  -- Only for a handler still parked when the host gives up on it: normally
+  -- the interpreter sees the cancel and we return the partial reply below.
+  maki.async.on_cancel(function(reason)
+    ctx:finish(cut(reason))
+  end)
 
   local tools = {}
   for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
@@ -235,20 +285,30 @@ local function handler(input, ctx)
     end
   end
 
-  local result, err = maki.interpreter.run(PREAMBLE .. input.code, {
+  local result, err = maki.interpreter.run(input.code, {
     timeout = timeout,
     max_memory_mb = opts.max_memory_mb,
+    preamble = PREAMBLE,
     on_output = show,
     tools = tools,
   })
 
   if err then
+    if err == CANCELLED_ERR then
+      return cut("cancelled")
+    end
+    if err:find(TIME_LIMIT_SUBSTR, 1, true) then
+      return cut("timeout")
+    end
     if waiting then
       view:clear()
     end
     view:append_text(err)
     view:finish()
-    return { llm_output = err, is_error = true, body = buf }
+    -- The run is already paid for, so point a script that reached for
+    -- `asyncio.gather` at the wrapper that would have kept its other results.
+    local hint = input.code:find(ASYNCIO_GATHER, 1, true) and GATHER_HINT or ""
+    return { llm_output = err .. hint, is_error = true, body = buf }
   end
 
   local output = result.stdout or ""
@@ -262,7 +322,6 @@ local function handler(input, ctx)
     view:append({ { "No output", "dim" } })
   end
 
-  local max_lines, max_bytes = output_limits.resolve(opts, ctx)
   local llm_output = truncate(output, max_lines, max_bytes)
   view:finish()
 

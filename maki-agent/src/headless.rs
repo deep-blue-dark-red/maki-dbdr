@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_lock::Mutex;
 use flume::Receiver;
+use maki_config::ModelPolicy;
 use maki_providers::Message;
 use maki_providers::Timeouts;
 use maki_providers::TokenUsage;
@@ -16,10 +17,12 @@ use tracing::{error, warn};
 
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
-use crate::permissions::PermissionManager;
+use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{DescriptionContext, FileReadTracker, ToolAudience, ToolFilter, ToolRegistry};
+use crate::tools::{
+    DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
+};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
     EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
@@ -81,6 +84,8 @@ pub struct HeadlessParams {
     pub initial_wd: PathBuf,
     pub fast: bool,
     pub workflow: bool,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
 }
 
 pub struct HeadlessHandle {
@@ -211,6 +216,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     permissions: Arc::new(PermissionManager::new(
                         params.permissions_config,
                         working_dir_path,
+                        params.plugin_rules,
                     )),
                     session_id: Some(session_ref_clone.clone()),
                     mailbox: Some(mailbox.clone()),
@@ -220,6 +226,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     subagent_cancels: Arc::new(CancelMap::new()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
+                    model_policy: Arc::clone(&params.model_policy),
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -282,6 +289,11 @@ pub struct InteractiveParams {
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub workflow: bool,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
+    /// Host-side overrides that shadow a registered tool's execution while
+    /// keeping its advertised schema (e.g. ACP answers `question` via elicitation).
+    pub local_tools: LocalTools,
 }
 
 pub struct InteractiveHandle {
@@ -333,6 +345,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let permissions = Arc::new(PermissionManager::new(
         params.permissions_config,
         params.initial_wd,
+        Arc::clone(&params.plugin_rules),
     ));
     if params.yolo {
         permissions.toggle_yolo();
@@ -363,10 +376,30 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
             let mut run_id: u64 = 0;
 
             while let Ok(input) = input_rx.recv_async().await {
+                let (trigger, cancel) = CancelToken::new();
+                let cancel_task = smol::spawn({
+                    let cancel_rx = cancel_rx.clone();
+                    async move {
+                        if cancel_rx.recv_async().await.is_ok() {
+                            trigger.cancel();
+                        }
+                    }
+                });
+
+                // MCP connects in the background, so a prompt that beats it waits
+                // here instead of shipping a turn without the MCP tools. The wait
+                // is racing cancel: a slow server must not pin the whole session.
+                if let Some(mcp) = &mcp {
+                    let _ = cancel.race(mcp.ready()).await;
+                }
+
                 let event_tx = EventSender::new(raw_tx.clone(), run_id);
                 let error_tx = event_tx.clone();
 
-                if let Some(mut new_model) = model_rx.try_iter().last()
+                if let Some(mut new_model) = model_rx
+                    .try_iter()
+                    .last()
+                    .filter(|candidate| params.model_policy.allows(&candidate.spec()))
                     && new_model.spec() != model.spec()
                 {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
@@ -407,16 +440,6 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     system.push_str(append);
                 }
 
-                let (trigger, cancel) = CancelToken::new();
-                let cancel_task = smol::spawn({
-                    let cancel_rx = cancel_rx.clone();
-                    async move {
-                        if cancel_rx.recv_async().await.is_ok() {
-                            trigger.cancel();
-                        }
-                    }
-                });
-
                 while answer_rx.lock().await.try_recv().is_ok() {}
 
                 let mut agent = Agent::new(
@@ -434,6 +457,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         subagent_cancels: Arc::new(CancelMap::new()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
+                        model_policy: Arc::clone(&params.model_policy),
                     },
                     AgentRunParams {
                         history: &mut history,
@@ -445,6 +469,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 .with_loaded_instructions(instructions.loaded.clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
                 .with_cancel(cancel)
+                .with_local_tools(Arc::clone(&params.local_tools))
                 .with_mcp(mcp.clone());
 
                 let result = agent.run(input).await;

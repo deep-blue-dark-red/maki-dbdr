@@ -1,6 +1,6 @@
 +++
 title = "Lua API"
-weight = 11
+weight = 10
 [extra]
 group = "Reference"
 +++
@@ -10,6 +10,8 @@ group = "Reference"
 Maki plugins are plain Lua files. Everything a plugin can touch lives under
 one global table: `maki`. This reference documents every module, function,
 and method. It is generated straight from the source code by `maki-docgen`.
+For where plugin files live and how to load them, read the
+[Plugins guide](/docs/plugins/) first.
 
 The API tries to mirror Neovim as much as possible (`maki.fs`, `maki.uv`,
 `maki.treesitter`, `maki.keymap`, `maki.base64`), signatures are kept identical
@@ -50,6 +52,33 @@ end
 Lua errors are reserved for programmer mistakes, like passing a number where
 a string belongs.
 
+## Permissions and plugin.toml {#plugin-permissions}
+
+Sensitive APIs are gated per plugin file; every gated function's entry in
+this reference names the permission it needs. The permissions are: `fs_read`, `fs_write`, `net`, `run`, `env`.
+A gated call without its permission raises
+`permission denied: '<name>' not granted for this plugin`.
+
+Grants come from a `plugin.toml` next to the Lua file (for
+`~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
+
+```toml
+[permissions]
+fs_read = true
+fs_write = true
+net = true
+run = true
+env = true
+```
+
+The rules:
+
+- No `plugin.toml` at all: every permission is denied, and maki logs a
+  warning at load time.
+- `plugin.toml` exists: permissions default to granted; set a key to
+  `false` to revoke it. An empty file grants everything.
+- Invalid TOML: everything denied, with a warning in the log.
+
 ## Overview
 
 | Module | What it is for |
@@ -72,6 +101,7 @@ a string belongs.
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
+| [`maki.model`](#maki-model) | The model behind the focused session. |
 | [`maki.net`](#maki-net) | HTTP client for fetching web content. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.text`](#maki-text) | Text transformation utilities. |
@@ -230,6 +260,40 @@ maki.api.register_tool({
     f:close()
     return tostring(n) .. " words"
   end,
+})
+```
+
+---
+
+### `maki.api.register_permission_rule()` {#maki-api-register_permission_rule}
+
+```lua
+maki.api.register_permission_rule({spec})
+```
+
+Declare an agent permission rule for a native tool. Use it to pre-allow
+(or pre-deny) tool calls on paths your plugin owns, like a storage
+directory outside the working dir, so the user is not prompted for them.
+
+Rules live as long as the plugin is loaded: a reload replaces them, and a
+reload that registers none clears the old ones. User config and session
+deny rules always win over a plugin allow.
+
+**Parameters:**
+
+- `{spec}` (`table`) Rule specification:
+  - `tool` (`string`) Required. Native tool name (e.g. "edit", "write").
+    MCP tools and the "*" wildcard are not allowed.
+  - `scope` (`string`) Required. Scope pattern the rule applies to, e.g.
+    "/abs/dir/**" for a directory subtree.
+  - `effect` (`string`) Optional. "allow" (default) or "deny".
+
+**Example:**
+
+```lua
+maki.api.register_permission_rule({
+  tool = "write",
+  scope = notes_dir .. "/**",
 })
 ```
 
@@ -440,6 +504,53 @@ end
 
 ---
 
+### `maki.api.run_command()` {#maki-api-run_command}
+
+```lua
+maki.api.run_command({cmdline})
+```
+
+Runs a slash command by name, exactly as typing it in the input would.
+Works for built-ins, custom `/project:` and `/user:` commands, MCP
+prompts, and commands other plugins registered.
+
+Use it to alias a command you like under a name you prefer, instead of
+reimplementing what it does. See `maki.ui.action` for the same idea
+applied to keybound UI actions.
+
+Pass the whole command line, arguments included: `"/cd ~/src"`. The
+leading slash is optional. Names match exactly apart from case, so a typo
+reports an error instead of running the closest command, and a cycle of
+aliases stops with one too.
+
+This returns as soon as the command has been dispatched, not when it
+finishes, so aliasing something long-running like `/compact` does not
+block your handler.
+
+**Parameters:**
+
+- `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown command.
+
+**Example:**
+
+```lua
+-- /resume as an alias for the built-in session picker:
+maki.api.register_command({
+  name = "/resume",
+  description = "Alias for /sessions",
+  handler = function()
+    local ok, err = maki.api.run_command("/sessions")
+    if not ok then
+      maki.ui.flash("could not run /sessions: " .. err)
+    end
+  end,
+})
+```
+
+---
+
 ### `maki.api.create_autocmd()` {#maki-api-create_autocmd}
 
 ```lua
@@ -450,15 +561,17 @@ Listen for one or more events. Returns an id you can pass to
 `del_autocmd` later to remove the listener.
 
 Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
-`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`, and
-`"SessionFocusChanged"`. Plugins can also fire their own events with
-`exec_autocmds`.
+`"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"SessionReset"`,
+`"SessionFocusChanged"`, and `"SessionStatusChanged"`. Plugins can also
+fire their own events with `exec_autocmds`.
 
 Each host event carries `data.session_id`. For `"SessionReset"` that
 is the session being left behind; the other events name the session now
 running or focused. Tool events also carry `data.tool_id` and `data.tool`.
 `"SessionFocusChanged"` also carries `data.previous_session_id` except on
-initial startup.
+initial startup. `"SessionStatusChanged"` fires whenever a session moves
+between `"working"`, `"needs_input"`, and `"idle"`; it carries
+`data.status`, `data.title`, and `data.focused` (boolean).
 
 **Parameters:**
 
@@ -859,13 +972,17 @@ loop runs to completion, calling tools as needed. Conversation history is
 kept across calls, so you can have a multi-turn conversation.
 
 The returned table has fields: `text` (string), `duration_ms` (integer),
-`input_tokens` (integer), `output_tokens` (integer).
+`input_tokens` (integer), `output_tokens` (integer). `text` is an empty
+string when the subagent produced no text block (e.g. it only called
+tools).
 
 **Parameters:**
 
 - `{message}` (`string`) User message to send.
 
-**Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on failure.
+**Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
+failure. A run cut short after streaming some text hands you both: the
+error and a `{ text = <what it streamed> }` table.
 
 **Example:**
 
@@ -1072,11 +1189,16 @@ permit:release()
 maki.async.on_cancel({fn})
 ```
 
-Register {fn} to run as soon as the current task is cancelled, without
-waiting for whatever it is doing to finish. Use it to paint the
-cancelled state: a handler waiting on children (`gather`, `call_tool`)
-stays parked until they wind down, so anything after the wait is too
-late to reach the screen.
+Register {fn} to run as soon as the current task is cancelled or hits
+its deadline, without waiting for whatever it is doing to finish. Use
+it to paint the cancelled state: a handler waiting on children
+(`gather`, `call_tool`) stays parked until they wind down, so anything
+after the wait is too late to reach the screen.
+
+The callback receives the reason (`"cancelled"` or `"timeout"`) and may
+still call `ctx:finish`; the host prefers that reply over the generic
+cancelled/timeout error. Mark it `is_error = true` and end it with a
+marker, so the model knows the output it gets is cut short.
 
 The callback runs outside your coroutine, so it must not yield. It
 fires at most once, immediately if the task is already cancelled. An
@@ -1085,13 +1207,14 @@ other hooks still run.
 
 **Parameters:**
 
-- `{fn}` (`function`) Zero-argument function to run on cancel.
+- `{fn}` (`function`) Function to run on cancel; receives the reason string.
 
 **Example:**
 
 ```lua
-maki.async.on_cancel(function()
-  view:append({ { "cancelled", "tool_error" } })
+maki.async.on_cancel(function(reason)
+  view:append({ { reason, "tool_error" } })
+  ctx:finish({ llm_output = partial .. "\n[cancelled; output is partial]", is_error = true })
 end)
 maki.async.gather(children)
 ```
@@ -1227,6 +1350,8 @@ maki.env.state_dir()
 Return the directory where maki stores runtime state (sessions, auth tokens, etc.).
 Typically something like `~/.local/state/maki`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) State directory path, or nil if it cannot be determined.
 
 **Example:**
@@ -1245,6 +1370,8 @@ maki.env.config_dir()
 
 Return the directory where maki looks for user configuration files.
 Typically something like `~/.config/maki`.
+
+Requires the `env` [plugin permission](#plugin-permissions).
 
 **Returns:** (`string?`) Config directory path, or nil if it cannot be determined.
 
@@ -1265,6 +1392,8 @@ maki.env.logs_dir()
 Return the directory where maki writes its log files (`maki.log`).
 Typically something like `~/.local/logs/maki`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Logs directory path, or nil if it cannot be determined.
 
 **Example:**
@@ -1284,6 +1413,8 @@ maki.env.legacy_dir()
 Return the legacy config path (`~/.maki`), if it exists on disk.
 Useful for migration logic. Returns nil when there is no legacy directory.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Legacy directory path, or nil if not present.
 
 
@@ -1292,9 +1423,6 @@ Useful for migration logic. Returns nil when there is no legacy directory.
 Process and environment helpers, modeled after Neovim's `vim.fn` job
 control. Use these to run shell commands, wait for output, and check
 whether programs are installed.
-
-Job functions need the `run` permission. `executable` needs the `env`
-permission.
 
 ```lua
 local id = maki.fn.jobstart("git status", {
@@ -1313,6 +1441,8 @@ maki.fn.jobstart({cmd}, {opts?})
 Run a shell command in the background. The command runs through
 `bash -c` on Unix or `cmd /C` on Windows. You get back a job id
 that you can pass to `jobstop` or `jobwait` to control the process.
+
+Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1350,6 +1480,8 @@ maki.fn.jobstop({job_id})
 Kill a running job immediately (SIGKILL on Unix). Safe to call on
 jobs that already exited or on unknown ids.
 
+Requires the `run` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{job_id}` (`integer`) Job id returned by `jobstart`.
@@ -1375,6 +1507,8 @@ job does not finish before the timeout.
 While waiting, the job's `on_stdout`, `on_stderr`, and `on_exit`
 callbacks fire as events arrive (like Neovim), so you can stream
 output into a buffer while parked here.
+
+Requires the `run` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1404,6 +1538,8 @@ maki.fn.executable({name})
 Check whether {name} can be found on `$PATH` or is an absolute path
 to a file. Returns 1 when found, 0 otherwise (matches Neovim's
 `vim.fn.executable`).
+
+Requires the `env` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1498,6 +1634,8 @@ Read the entire file at {path} as a UTF-8 string.
 If the file contains bytes that are not valid UTF-8, this function throws.
 Use `read_bytes` for binary files.
 
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
@@ -1524,6 +1662,8 @@ maki.fs.read_bytes({path})
 
 Read the entire file at {path} as raw bytes, returned as a Luau buffer.
 Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1552,6 +1692,8 @@ Returns a table with `size` (integer), `is_file` (boolean), `is_dir` (boolean),
 and `mtime` (number, fractional seconds since the Unix epoch; absent when the
 filesystem does not report a modification time).
 If {path} does not exist, returns nil with no error.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1716,6 +1858,8 @@ Walk upward from {source} looking for a directory that contains one of the
 {marker} files or directories. Like `vim.fs.root`. Useful for finding the
 project root.
 
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{source}` (`string`) Starting file or directory path.
@@ -1788,6 +1932,8 @@ List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
 
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Directory path.
@@ -1816,6 +1962,8 @@ maki.fs.write({path}, {content})
 Write {content} to the file at {path}, creating it if it does not exist
 or overwriting it if it does.
 
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
@@ -1841,6 +1989,8 @@ maki.fs.atomic_write({path}, {content})
 Atomically replace {path} with {content}. The parent directory must exist.
 Readers observe either the old file or the complete new file.
 Existing file permissions are preserved. On Unix, new files use mode 0600.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1869,6 +2019,8 @@ Pass `recursive = true` to remove a non-empty directory tree (like `rm -r`).
 Unlike `vim.fs.rm`, this also removes an empty directory without `recursive`.
 Symlinks are removed themselves, never followed.
 
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Path to the file or directory to remove.
@@ -1895,6 +2047,8 @@ maki.fs.mkdir({path}, {opts?})
 Create the directory at {path}. Set `parents = true` to create
 intermediate directories, like `mkdir -p`.
 
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{path}` (`string`) Directory path to create.
@@ -1919,6 +2073,8 @@ maki.fs.glob({pattern}, {opts?})
 Find files matching one or more glob patterns.
 Respects `.gitignore` by default. Pass `sort = "mtime"` to get the most
 recently modified files first.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1948,6 +2104,8 @@ grouped by file, similar to ripgrep output.
 
 Each result entry has a `path` and a list of `groups`. Each group contains
 `lines`, where every line has `line_nr`, `text`, and `is_match`.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -2126,8 +2284,7 @@ local bytes = img:encode("png")
 Run Python code in a memory-safe, time-limited sandbox.
 
 The sandbox uses the monty interpreter. Python code can call back into
-Lua-defined tools, and stdout is streamed line by line. Requires the
-`run` permission.
+Lua-defined tools, and stdout is streamed line by line.
 
 ```lua
 local r, err = maki.interpreter.run("print('hello')", {
@@ -2154,6 +2311,8 @@ The result table has optional fields: `stdout` (string, trimmed combined
 output) and `output` (string, the final expression value). On error, the
 table is empty and the second return value is the error message.
 
+Requires the `run` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{code}` (`string`) Python source code to execute.
@@ -2165,6 +2324,8 @@ table is empty and the second return value is the error message.
 
   Optional fields:
 
+  - `preamble` (`string?`) Python source (imports, helpers) compiled ahead of
+    {code}. Tracebacks are rebased so line 1 is {code} line 1.
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.
@@ -2461,6 +2622,88 @@ maki.log.error("failed to connect to API")
 ```
 
 
+## maki.model {#maki-model}
+
+The model behind the focused session. Good for a keybind that flips
+between your two go-to models, or lifts thinking for one hard question.
+Without an interactive UI every function returns
+`nil, "no interactive UI attached"`.
+
+---
+
+### `maki.model.get()` {#maki-model-get}
+
+```lua
+maki.model.get()
+```
+
+Reads the focused session's model, thinking level, and fast mode.
+`thinking` comes back in the spelling `set` accepts, so a table from here
+can go straight back in.
+
+**Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking, fast,
+  supports_thinking, supports_fast}`, or nil and an error.
+
+**Example:**
+
+```lua
+local m = maki.model.get()
+if m.spec ~= "anthropic/claude-opus-4-6" then ... end
+```
+
+---
+
+### `maki.model.available()` {#maki-model-available}
+
+```lua
+maki.model.available()
+```
+
+Lists the model specs you can switch to: what the providers you are logged
+into offer, minus what your model policy blocks. The list fills in the
+background at startup, so right after launch it can still be empty.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `"provider/id"` specs, or nil and an error.
+
+**Example:**
+
+```lua
+local specs = maki.model.available()
+```
+
+---
+
+### `maki.model.set()` {#maki-model-set}
+
+```lua
+maki.model.set({opts})
+```
+
+Switches the focused session's model, thinking level, or fast mode. Fields
+you leave out stay as they are, so this doubles as a thinking-only switch.
+Answers with the new state, in the same shape `get` returns.
+
+**Parameters:**
+
+- `{opts}` (`string|table`) A model spec, or a table with any of:
+  - `spec` (`string`) `"provider/id"`, as listed by `available()`;
+  - `thinking` (`string|number`) `"off"`, `"adaptive"`, an effort level
+
+  (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
+
+  - `fast` (`boolean`) Anthropic fast mode.
+
+**Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
+
+**Example:**
+
+```lua
+maki.model.set("anthropic/claude-opus-4-6")
+maki.model.set({ spec = "zai/glm-5", thinking = "high" })
+maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+```
+
+
 ## maki.net {#maki-net}
 
 HTTP client for fetching web content. All traffic goes over HTTPS
@@ -2495,6 +2738,8 @@ or metadata IP addresses are blocked for safety.
 
 The response table has three fields: `body` (string), `status`
 (integer), and `content_type` (string).
+
+Requires the `net` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -2558,7 +2803,8 @@ maki.session.live()
 ```
 
 Lists the sessions currently running in this UI. Status is "working",
-"needs_input", or "idle".
+"needs_input", or "idle". A mailbox follow-up stays "working" without an
+intermediate "idle" status.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
 
@@ -2594,7 +2840,7 @@ local id = maki.session.current()
 maki.session.focus({id})
 ```
 
-Switches the UI to the session with {id}. The session must be live.
+Switches the UI to the session with {id}.
 
 **Parameters:**
 
@@ -4154,6 +4400,41 @@ maki.ui.flash("Copied to clipboard!")
 
 ---
 
+### `maki.ui.action()` {#maki-ui-action}
+
+```lua
+maki.ui.action({name})
+```
+
+Runs a built-in UI action by name, exactly as its default keybinding
+would. Handy when a default key never reaches maki because tmux or
+your terminal grabs it first: bind a new key with `maki.keymap.set`
+and call this from it.
+
+Valid names: `"file_picker"`, `"search"`, `"tasks"`, `"help"`,
+`"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
+`"prev_chat"`, `"next_chat"`.
+
+For slash commands rather than keybound actions, see
+`maki.api.run_command`.
+
+**Parameters:**
+
+- `{name}` (`string`) Action name, e.g. `"file_picker"`.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error message for an unknown name.
+
+**Example:**
+
+```lua
+-- Open the built-in file picker with Ctrl+Q instead of Ctrl+S:
+maki.keymap.set("n", "<C-q>", function()
+  maki.ui.action("file_picker")
+end)
+```
+
+---
+
 ### `maki.ui.open_editor()` {#maki-ui-open_editor}
 
 ```lua
@@ -4212,6 +4493,7 @@ and close the window when you are done.
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
   - `visible` (`boolean`) whether the window is initially visible. Default true.
+  - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
 
 **Returns:** ([`Win`](#maki-ui-Win)) Window handle.
 
@@ -4332,6 +4614,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `reserved_top` (`integer`) rows reserved at the top of the content area.
   - `split` (`string`) edge docking, "above", "below", "left", "right", "panel", or "".
   - `order` (`integer`) paint order among split windows.
+  - `needs_input` (`boolean`) whether the window means the session needs user input.
 
 **Example:**
 
@@ -4694,6 +4977,8 @@ maki.uv.cwd()
 
 Return the current working directory as an absolute path. Like `vim.uv.cwd`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Current working directory, or nil if it cannot be determined.
 
 **Example:**
@@ -4713,6 +4998,8 @@ maki.uv.os_homedir()
 
 Return the current user's home directory. Like `vim.uv.os_homedir`.
 
+Requires the `env` [plugin permission](#plugin-permissions).
+
 **Returns:** (`string?`) Home directory path, or nil if it cannot be determined.
 
 **Example:**
@@ -4731,6 +5018,8 @@ maki.uv.os_getenv({name})
 
 Look up the environment variable {name}. Like `vim.uv.os_getenv`.
 Returns nil when the variable is not set.
+
+Requires the `env` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4839,7 +5128,7 @@ return M
 ### `require("maki.dir_listing")`
 
 ```lua
--- Shared directory listing for index and read plugins.
+-- Shared directory listing for index and list plugins.
 -- Lists entries, filters instruction files, sorts dirs before files, and
 -- renders the listing so every caller shows a directory the same way.
 function M.list(path, ctx)
@@ -4907,6 +5196,20 @@ end
 return M
 ```
 
+### `require("maki.partial")`
+
+```lua
+-- When a tool is cut short, it still hands back what it printed. The marker
+-- tells the model that output is real but unfinished. One home for the
+-- wording and the painting, so every tool says it the same way.
+
+--- Close {view} on the marker and build the tool reply. {out} is everything
+--- the tool streamed, already truncated; empty means the view still shows a
+--- placeholder to drop. {reason} is a cancel-hook reason ("cancelled" |
+--- "timeout").
+function M.cut(view, out, reason, timeout_secs)
+```
+
 ### `require("maki.scroll")`
 
 ```lua
@@ -4964,6 +5267,7 @@ return shorten_path
 -- and surfaced by `report()` at the end.
 function M.case(name, fn)
 function M.eq(actual, expected, msg)
+function M.has(s, substr, msg)
 function M.mktmpdir(prefix)
 function M.rmtree(dir)
 function M.report()
@@ -5040,6 +5344,10 @@ function TextInput:render(prefix, prefix_width, width)
 -- stays a pure flag flip + re-render, deterministic across replays.
 -- Async highlighting goes through `maki.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
+
+-- Right aligned, so the content column stays put when a number gains a digit.
+-- Formats the number alone, callers add their own separator.
+function ToolView.line_nr_fmt(max_line_nr)
 
 -- opts: max_lines (default 80) shown while collapsed, keep "head"|"tail"
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,

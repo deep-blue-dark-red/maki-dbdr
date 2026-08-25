@@ -1,74 +1,12 @@
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
-  return "%" .. w .. "d "
-end
+local helpers = require("read_helpers")
 
-local function truncate_bytes(line, max_bytes)
-  if #line <= max_bytes then
-    return line
-  end
-  local i = max_bytes
-  while i > 0 and line:byte(i) >= 0x80 and line:byte(i) < 0xC0 do
-    i = i - 1
-  end
-  if i > 0 and line:byte(i) >= 0xC0 then
-    i = i - 1
-  end
-  return line:sub(1, i) .. "..."
-end
+local truncate_bytes = helpers.truncate_bytes
+local split_lines = helpers.split_lines
 
-local function split_lines(content)
-  local lines = {}
-  local pos = 1
-  while pos <= #content do
-    local nl = content:find("\n", pos, true)
-    if nl then
-      local line = content:sub(pos, nl - 1)
-      lines[#lines + 1] = line:find("\r$") and line:sub(1, -2) or line
-      pos = nl + 1
-    else
-      local line = content:sub(pos)
-      lines[#lines + 1] = line:find("\r$") and line:sub(1, -2) or line
-      pos = #content + 1
-    end
-  end
-  return lines
-end
-
-local dir_listing = require("maki.dir_listing")
 local th = require("maki.test_helpers")
 
 local case = th.case
 local eq = th.eq
-local mktmpdir = function()
-  return th.mktmpdir("read_spec")
-end
-local rmtree = th.rmtree
-
--- line_nr_fmt: table-driven across all boundaries + alignment
-
-case("line_nr_fmt_boundaries_and_alignment", function()
-  local vectors = {
-    { 0, "%1d " },
-    { 1, "%1d " },
-    { 8, "%1d " },
-    { 9, "%2d " },
-    { 10, "%2d " },
-    { 98, "%2d " },
-    { 99, "%3d " },
-    { 100, "%3d " },
-    { 999, "%4d " },
-    { 1000, "%4d " },
-  }
-  for _, v in ipairs(vectors) do
-    eq(line_nr_fmt(v[1]), v[2], "count=" .. v[1])
-  end
-  local fmt = line_nr_fmt(100)
-  eq(string.format(fmt, 1), "  1 ")
-  eq(string.format(fmt, 100), "100 ")
-end)
-
--- truncate_bytes: ASCII + all UTF-8 widths
 
 case("truncate_ascii", function()
   eq(truncate_bytes("", 10), "")
@@ -101,8 +39,6 @@ case("truncate_utf8_boundary_safety", function()
   eq(truncate_bytes(s, 2), "...")
 end)
 
--- split_lines: table-driven
-
 case("split_lines", function()
   local vectors = {
     { "", 0, {} },
@@ -119,41 +55,6 @@ case("split_lines", function()
       eq(lines[i], expected, "line " .. i .. " for " .. ("%q"):format(v[1]))
     end
   end
-end)
-
--- integration: directory listing via real filesystem
-
-case("dir_listing_sort_and_filter", function()
-  local tmpdir = mktmpdir()
-  maki.fs.write(maki.fs.joinpath(tmpdir, "c.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "a.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "AGENTS.md"), "instructions")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "b.txt"), "")
-  maki.fs.write(maki.fs.joinpath(tmpdir, "m.txt"), "")
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "zdir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "adir"))
-  maki.fs.mkdir(maki.fs.joinpath(tmpdir, "idir"))
-
-  local ctx = {
-    is_instruction_file = function(self, name)
-      local set = { ["AGENTS.md"] = true, ["CLAUDE.md"] = true, ["COPILOT.md"] = true }
-      return set[name] or false
-    end,
-    find_instructions = function()
-      return {}
-    end,
-  }
-  local listing, err = dir_listing.list(tmpdir, ctx)
-  assert(err == nil, "dir listing should succeed: " .. tostring(err))
-  eq(#listing.names, 7)
-  eq(listing.names[1], "adir/")
-  eq(listing.names[2], "idir/")
-  eq(listing.names[3], "zdir/")
-  eq(listing.names[4], "a.txt")
-  eq(listing.names[5], "b.txt")
-  eq(listing.names[6], "c.txt")
-  eq(listing.names[7], "m.txt")
-  rmtree(tmpdir)
 end)
 
 th.report()

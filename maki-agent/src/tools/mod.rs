@@ -34,7 +34,7 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::{AgentConfig, AgentMode, EventSender, SharedBuf};
-use maki_config::ToolOutputLines;
+use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_providers::Model;
 use maki_providers::RequestOptions;
 use maki_providers::provider::Provider;
@@ -185,8 +185,18 @@ pub fn timeout_annotation(secs: u64) -> String {
     format!("{formatted} timeout")
 }
 
-pub type LocalToolFn = Arc<dyn Fn(&Value) -> Result<String, String> + Send + Sync>;
+pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
+pub type LocalToolFn = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
 pub type LocalTools = Arc<HashMap<String, LocalToolFn>>;
+
+/// Coerces a closure into a [`LocalToolFn`]; the bound gives the boxed
+/// future a coercion target that `Arc::new` alone does not.
+pub fn local_tool<F>(f: F) -> LocalToolFn
+where
+    F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
+{
+    Arc::new(f)
+}
 
 #[derive(Clone)]
 pub struct ToolContext {
@@ -221,6 +231,7 @@ pub struct ToolContext {
     /// Never inherited: `to_tool_context` clears it, and each caller sets
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -439,6 +450,7 @@ pub fn interpreter_ctx(
         audience: ToolAudience::MAIN,
         local_tools: LocalTools::default(),
         live_sink: None,
+        model_policy: Arc::new(ModelPolicy::default()),
     }
 }
 
@@ -458,6 +470,7 @@ pub fn cli_tool_ctx() -> ToolContext {
                 ..Default::default()
             },
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            Arc::default(),
         )),
         Arc::new(FileReadTracker::new()),
         None,
@@ -520,6 +533,7 @@ pub mod test_support {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
+            Arc::default(),
         ))
     });
 
@@ -629,6 +643,7 @@ mod tests {
     #[test_case(&"x".repeat(LINE_LIMIT),       &"x".repeat(LINE_LIMIT)        ; "exact_boundary")]
     #[test_case(&"x".repeat(LINE_LIMIT + 500), &format!("{}...", "x".repeat(LINE_LIMIT)) ; "long_truncated")]
     #[test_case(&format!("{}\u{1F600}", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "multibyte_char_boundary")]
+    #[test_case(&format!("{}\u{0430}tail", "a".repeat(LINE_LIMIT - 1)), &format!("{}...", "a".repeat(LINE_LIMIT - 1)) ; "two_byte_char_boundary")]
     fn truncate_bytes_cases(input: &str, expected: &str) {
         let result = truncate_bytes(input, LINE_LIMIT);
         assert_eq!(result, expected);

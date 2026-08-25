@@ -23,6 +23,7 @@ pub mod protocol;
 pub mod stdio;
 pub mod transport;
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -35,8 +36,8 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use self::config::{
-    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, ServerConfig, Transport,
-    load_config, parse_server, transport_kind,
+    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig,
+    RawTransport, ServerConfig, Transport, load_config, parse_server, transport_kind,
 };
 use self::error::McpError;
 use self::http::HttpTransport;
@@ -262,6 +263,10 @@ impl McpSnapshotReader {
 
     pub fn load(&self) -> Guard<Arc<McpSnapshot>> {
         self.0.load()
+    }
+
+    pub fn load_full(&self) -> Arc<McpSnapshot> {
+        self.0.load_full()
     }
 }
 
@@ -576,6 +581,28 @@ pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors)
     (handle, config_errors)
 }
 
+/// `start` plus servers declared at runtime. `mcp.toml` wins on name, so a
+/// runtime server can never swap out the credentials the user configured or
+/// revive one they disabled.
+pub async fn start_with_extra(
+    cwd: &Path,
+    extra: Vec<(String, RawTransport)>,
+) -> (Option<McpHandle>, McpConfigErrors) {
+    let owned_cwd = cwd.to_owned();
+    let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
+    for (name, transport) in extra {
+        match config.mcp.entry(name) {
+            Entry::Vacant(slot) => {
+                slot.insert(RawServerConfig::runtime(transport));
+            }
+            Entry::Occupied(slot) => {
+                warn!(server = slot.key(), "runtime MCP server already configured");
+            }
+        }
+    }
+    (start_with_config(config), config_errors)
+}
+
 pub fn start_with_config(config: McpConfig) -> Option<McpHandle> {
     if config.is_empty() {
         tracing::info!("no MCP servers configured, skipping");
@@ -818,7 +845,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             environment,
             config.timeout,
         )?),
-        Transport::Http { url, headers } => Arc::new(HttpTransport::new(
+        Transport::Http { url, headers, .. } => Arc::new(HttpTransport::new(
             &config.name,
             url,
             headers,
@@ -950,6 +977,10 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
             .config
             .as_ref()
             .and_then(|c| transport_url(&c.transport));
+        let oauth = entry
+            .config
+            .as_ref()
+            .and_then(|c| transport_oauth(&c.transport));
 
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
@@ -995,6 +1026,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
             status: entry.status.clone(),
             config_path: entry.origin.clone(),
             url,
+            oauth,
         });
     }
 
@@ -1161,6 +1193,13 @@ fn transport_url(transport: &Transport) -> Option<String> {
     match transport {
         Transport::Http { url, .. } => Some(url.clone()),
         Transport::Stdio { .. } => None,
+    }
+}
+
+fn transport_oauth(transport: &Transport) -> Option<OauthClientConfig> {
+    match transport {
+        Transport::Http { oauth, .. } => oauth.clone(),
+        _ => None,
     }
 }
 

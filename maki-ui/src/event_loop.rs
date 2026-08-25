@@ -19,10 +19,13 @@ use crossterm::event::{
 };
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
-use maki_agent::{AgentConfig, CancelToken, McpCommand, McpConfigErrors, McpHandle, mcp};
-use maki_config::UiConfig;
+use maki_agent::{
+    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+};
+use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, SessionReply, SessionRequest, UiAction,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
+    UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -37,27 +40,29 @@ use tracing::{info, warn};
 use crate::AppSession;
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
 use crate::app::shell::{ShellEvent, spawn_shell};
-use crate::app::{App, Msg, QueuedMessage, SubmitOutcome};
+use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
+use crate::repaint::{Dirty, IDLE_POLL};
 
 use crate::storage_writer::StorageWriter;
 use crate::terminal;
 
-const ANIMATION_INTERVAL_MS: u64 = 16;
-const IDLE_POLL_INTERVAL_MS: u64 = 100;
-/// Decorative animation (the idle splash, spinners) is worth 60 FPS only
-/// while someone is looking. Unfocused, the loop still wakes instantly on
-/// any agent/input/plugin event, so streamed output stays live; only
-/// time-driven repaints slow down.
-const BACKGROUND_POLL_INTERVAL_MS: u64 = 500;
+/// Decorative animation (the idle splash, spinners) is worth its full frame
+/// rate only while someone is looking. Unfocused, the loop still wakes
+/// instantly on any agent/input/plugin event, so streamed output stays live;
+/// only clock-driven repaints slow to this floor.
+const BACKGROUND_FRAME: Duration = Duration::from_millis(500);
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
+const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
+const INVALID_MODEL_ERR: &str = "Invalid model";
+const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
@@ -87,6 +92,7 @@ pub struct EventLoopParams {
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub lua_event_handle: EventHandle,
+    pub model_policy: Arc<ModelPolicy>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,6 +100,94 @@ enum SessionStatus {
     Working,
     NeedsInput,
     Idle,
+}
+
+enum PendingCompletion {
+    WaitingForQueueDrain(Notification),
+    Due(Notification),
+}
+
+#[derive(Default)]
+struct RunNotificationState {
+    response_candidate: Option<String>,
+    pending_completion: Option<PendingCompletion>,
+    last_attention: Option<Notification>,
+}
+
+impl RunNotificationState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn on_queue_item_consumed(&mut self) {
+        self.response_candidate = None;
+        self.pending_completion = None;
+    }
+
+    fn on_turn_complete(&mut self, message: &Message) {
+        self.response_candidate = turn_response(message);
+    }
+
+    fn on_done(&mut self, event: &AgentEvent) {
+        let notification = match event {
+            AgentEvent::Done { .. } => Notification::TurnComplete {
+                response: self.response_candidate.take(),
+            },
+            AgentEvent::Error { .. } => {
+                self.response_candidate = None;
+                Notification::error_completion()
+            }
+            _ => return,
+        };
+        self.pending_completion = Some(PendingCompletion::WaitingForQueueDrain(notification));
+    }
+
+    fn on_drain(&mut self) {
+        self.pending_completion = match self.pending_completion.take() {
+            Some(PendingCompletion::WaitingForQueueDrain(notification)) => {
+                Some(PendingCompletion::Due(notification))
+            }
+            pending => pending,
+        };
+    }
+
+    fn on_manual_exit(&mut self) {
+        self.pending_completion = None;
+    }
+
+    /// True between `Done`/`Error` and the run's `QueueDrained`. An exit must
+    /// not fire in that window: a queued follow-up may still start a new run.
+    fn waiting_for_drain(&self) -> bool {
+        matches!(
+            self.pending_completion,
+            Some(PendingCompletion::WaitingForQueueDrain(_))
+        )
+    }
+
+    fn reconcile(
+        &mut self,
+        attention: Option<Notification>,
+        status: SessionStatus,
+        queue_empty: bool,
+        terminal_focused: bool,
+    ) -> Option<Notification> {
+        let settled = attention.is_none() && status == SessionStatus::Idle && queue_empty;
+        let prompt = (attention != self.last_attention)
+            .then(|| attention.clone())
+            .flatten();
+        self.last_attention = attention;
+
+        // A due completion is decided on its first reconcile: fire if the
+        // session settled, otherwise drop it for good.
+        let completion = match self.pending_completion.take() {
+            Some(PendingCompletion::Due(notification)) => settled.then_some(notification),
+            waiting => {
+                self.pending_completion = waiting;
+                None
+            }
+        };
+        (!terminal_focused).then(|| prompt.or(completion)).flatten()
+    }
 }
 
 impl SessionStatus {
@@ -116,20 +210,54 @@ impl SessionStatus {
     }
 }
 
-fn claim_idle_wake(
-    status: SessionStatus,
-    claim: impl FnOnce() -> Vec<Message>,
-) -> Option<Vec<Message>> {
-    if status != SessionStatus::Idle {
-        return None;
-    }
-    let preamble = claim();
-    (!preamble.is_empty()).then_some(preamble)
-}
-
 fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
     leading.append(preamble);
     *preamble = leading;
+}
+
+fn is_current_top_level(current_run_id: u64, envelope: &Envelope) -> bool {
+    envelope.run_id == current_run_id && envelope.subagent.is_none()
+}
+
+fn select_notification(
+    selected: Option<Notification>,
+    candidate: Option<Notification>,
+) -> Option<Notification> {
+    match (selected, candidate) {
+        (Some(current), Some(candidate)) if candidate.is_urgent() && !current.is_urgent() => {
+            Some(candidate)
+        }
+        (selected @ Some(_), _) => selected,
+        (None, candidate) => candidate,
+    }
+}
+
+#[cfg(not(windows))]
+fn terminal_focus_event(event: &Event) -> Option<bool> {
+    match event {
+        Event::FocusGained => Some(true),
+        Event::FocusLost => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn terminal_focus_event(_event: &Event) -> Option<bool> {
+    None
+}
+
+#[cfg(not(windows))]
+fn terminal_input_proves_focus(event: &Event) -> bool {
+    match event {
+        Event::Key(key) => key.kind == KeyEventKind::Press,
+        Event::Paste(_) | Event::Mouse(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn terminal_input_proves_focus(_event: &Event) -> bool {
+    false
 }
 
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
@@ -142,11 +270,31 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    notifications: RunNotificationState,
 }
 
 impl SessionRuntime {
     fn id(&self) -> MakiId {
         self.app.state.session.id
+    }
+
+    /// New work cancels an `exit_on_done` exit still waiting on its drain.
+    fn reset_run_notifications(&mut self) {
+        if self.notifications.waiting_for_drain() {
+            self.app.clear_exit_request();
+        }
+        self.notifications.reset();
+    }
+
+    /// A wake may only start a background run when the session is fully
+    /// quiescent. Idle status alone is not enough: restored queue items start
+    /// runs without `start_run` (the app only learns of them via
+    /// `QueueItemConsumed`), and `start_run` destroys text held for recovery
+    /// after an agent error.
+    fn quiescent(&self) -> bool {
+        SessionStatus::of(&self.app) == SessionStatus::Idle
+            && self.handles.queue.is_empty()
+            && !self.app.holds_recovery_text()
     }
 }
 
@@ -170,6 +318,7 @@ struct SpawnCtx {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
+    model_policy: Arc<ModelPolicy>,
 }
 
 impl SpawnCtx {
@@ -187,6 +336,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
+            Arc::clone(&self.model_policy),
         );
         let mut app = App::new(
             &self.model_slot.load().model,
@@ -204,6 +354,7 @@ impl SpawnCtx {
             permissions,
             Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
+            Arc::clone(&self.model_policy),
         );
         handles.apply_to_app(&mut app);
         if resumed {
@@ -216,6 +367,7 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            notifications: RunNotificationState::default(),
         }
     }
 }
@@ -225,14 +377,13 @@ pub(crate) struct EventLoop<'t> {
     sessions: Vec<SessionRuntime>,
     focused: usize,
     last_focused: Option<MakiId>,
+    terminal_focused: bool,
+    notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
     input: InputReader,
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
-    /// Terminals that do not report focus never send `FocusLost`, so this
-    /// stays true and they keep the foreground frame rate.
-    terminal_focused: bool,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -274,7 +425,11 @@ fn merge_batch(
     available.store(Some(Arc::new(merged)));
 }
 
-fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -> BackgroundModels {
+fn spawn_model_fetch(
+    model_slot: &Arc<ArcSwap<ModelSlot>>,
+    timeouts: Timeouts,
+    policy: Arc<ModelPolicy>,
+) -> BackgroundModels {
     let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
     let bg = Arc::clone(&available);
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
@@ -303,7 +458,12 @@ fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>, timeouts: Timeouts) -
                 provider: Arc::from(provider),
             }));
         });
-        fetch_all_models(|batch| merge_batch(&bg, batch, &warn_tx), Some(done)).await;
+        fetch_all_models(
+            &policy,
+            |batch| merge_batch(&bg, batch, &warn_tx),
+            Some(done),
+        )
+        .await;
     });
     BackgroundModels {
         available,
@@ -337,6 +497,7 @@ impl<'t> EventLoop<'t> {
             hint_reader,
             ui_action_rx,
             lua_event_handle,
+            model_policy,
         } = params;
 
         // Apply the config theme before the warmup thread spawns, or warmup
@@ -372,9 +533,10 @@ impl<'t> EventLoop<'t> {
             model: model.clone(),
             provider,
         }));
-        let bg = spawn_model_fetch(&model_slot, timeouts);
+        let bg = spawn_model_fetch(&model_slot, timeouts, Arc::clone(&model_policy));
         let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
 
+        let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {
             storage,
             config,
@@ -392,6 +554,7 @@ impl<'t> EventLoop<'t> {
             model_slot,
             available_models: bg.available,
             storage_writer,
+            model_policy,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -420,12 +583,13 @@ impl<'t> EventLoop<'t> {
             sessions: runtimes,
             focused,
             last_focused: None,
+            terminal_focused: false,
+            notifier,
             ctx,
             input: InputReader::spawn(),
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             ui_action_rx,
-            terminal_focused: true,
             _model_fetch_task: bg.task,
         })
     }
@@ -443,36 +607,60 @@ impl<'t> EventLoop<'t> {
             let actions = self.focused_app().handle_submit(sub);
             self.dispatch(self.focused, actions);
         }
+        // The first frame always paints. After that only a poller, an event or
+        // an animation tick owes another.
+        let mut dirty = Dirty::YES;
         let result = loop {
-            self.tick();
-            if let Err(e) = self.drain_channels() {
-                break Err(e);
+            dirty |= self.tick();
+            match self.drain_channels() {
+                Ok(d) => dirty |= d,
+                Err(e) => break Err(e),
             }
             self.checkpoint_all();
-            let app = &mut self.sessions[self.focused].app;
-            if let Err(e) = self.terminal.draw(|f| {
-                app.view(f);
-                color_compat::downgrade_if_needed(f.buffer_mut());
-            }) {
-                break Err(e.into());
+            if dirty.take() {
+                let app = &mut self.sessions[self.focused].app;
+                if let Err(e) = self.terminal.draw(|f| {
+                    app.view(f);
+                    color_compat::downgrade_if_needed(f.buffer_mut());
+                }) {
+                    break Err(e.into());
+                }
             }
 
-            if let Some(i) = self
-                .sessions
-                .iter()
-                .position(|rt| rt.app.exit_request != ExitRequest::None)
-            {
+            if let Some(i) = self.sessions.iter().position(|rt| {
+                rt.app.exit_request != ExitRequest::None && !rt.notifications.waiting_for_drain()
+            }) {
                 // A backgrounded session can finish an `exit_on_done` turn;
                 // focus it so shutdown reports its exit code and id.
                 self.focused = i;
+                self.emit_notifications();
                 break Ok(());
             }
 
-            let timeout = Duration::from_millis(self.poll_interval_ms());
-            if let Some(wake) = self.next_wake(timeout)
-                && let Err(e) = self.handle_wake(wake)
-            {
-                break Err(e);
+            // Sleeping a whole frame instead of a fraction of one is what
+            // makes a spinner cost 12 paints a second instead of 62, and
+            // throttling it again when nobody is looking makes a backgrounded
+            // session cost almost nothing.
+            let cadence = self.sessions[self.focused].app.cadence();
+            let cadence = if self.unattended() {
+                cadence.throttled(BACKGROUND_FRAME)
+            } else {
+                cadence
+            };
+            match self.next_wake(cadence.frame().unwrap_or(IDLE_POLL)) {
+                // Any event can change the screen, so paint after handling it
+                // rather than asking every handler to prove it did.
+                Some(wake) => {
+                    dirty = Dirty::YES;
+                    if let Err(e) = self.handle_wake(wake) {
+                        break Err(e);
+                    }
+                }
+                // Only the clock moved, so motion alone owes the frame. The
+                // cadence is the one from before the sleep, so motion that
+                // just stopped still gets a last paint to clear itself off
+                // the screen.
+                None => dirty |= Dirty::from(cadence.moves()),
             }
         };
         // Fatal errors still save every session, kill MCP process groups,
@@ -506,11 +694,15 @@ impl<'t> EventLoop<'t> {
         sel.wait_timeout(timeout).ok().flatten()
     }
 
-    fn poll_interval_ms(&self) -> u64 {
-        poll_interval_ms(
-            self.terminal_focused,
-            self.sessions[self.focused].app.is_animating(),
-        )
+    /// Whether the terminal has actually told us it lost focus. Terminals that
+    /// never answer DECSET 1004 leave `terminal_focused` false forever, so
+    /// throttling on the flag alone would slow the UI for everyone on them.
+    fn unattended(&self) -> bool {
+        !self.terminal_focused
+            && self
+                .notifier
+                .as_ref()
+                .is_some_and(terminal::TerminalNotifier::supports_focus_reporting)
     }
 
     fn handle_wake(&mut self, wake: Wake) -> Result<()> {
@@ -534,31 +726,57 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn tick(&mut self) {
+    /// Only the focused session is drawn, so only it can owe a frame; focusing
+    /// another is an event, and events always repaint. Background sessions
+    /// still drain their floats, or a plugin writing to a window nobody is
+    /// looking at would lose the output.
+    fn tick(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
-            rt.app.float_mgr.tick();
-            if i != self.focused {
-                continue;
+            if i == self.focused {
+                dirty |= rt.app.tick();
+            } else {
+                let _ = rt.app.float_mgr.tick();
             }
-            rt.app.tick_edge_scroll();
-            rt.app.tick_error_expiry();
-            rt.app.poll_image_paste();
-            rt.app.btw_modal.poll();
-            rt.app.status_bar.poll_branch_update();
-            rt.app.mcp_picker.refresh();
         }
+        dirty
     }
 
     fn handle_agent(&mut self, idx: usize, envelope: Box<maki_agent::Envelope>) {
+        let rt = &mut self.sessions[idx];
+        let current = is_current_top_level(rt.app.run_id, &envelope);
+        match &envelope.event {
+            AgentEvent::QueueDrained => {
+                if current {
+                    rt.notifications.on_drain();
+                }
+                return;
+            }
+            AgentEvent::QueueItemConsumed { .. } if current => {
+                rt.notifications.on_queue_item_consumed();
+                if rt.app.exit_on_done {
+                    rt.app.clear_exit_request();
+                }
+            }
+            AgentEvent::TurnComplete(turn) if current => {
+                rt.notifications.on_turn_complete(&turn.message);
+            }
+            event if current => rt.notifications.on_done(event),
+            _ => {}
+        }
         let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
         self.dispatch(idx, actions);
     }
 
-    fn drain_channels(&mut self) -> Result<()> {
+    fn drain_channels(&mut self) -> Result<Dirty> {
+        let mut dirty = Dirty::NO;
         // Leftovers beyond the budget are picked up right after the next draw.
         for _ in 0..DRAIN_BUDGET {
             match self.next_wake(Duration::ZERO) {
-                Some(wake) => self.handle_wake(wake)?,
+                Some(wake) => {
+                    self.handle_wake(wake)?;
+                    dirty = Dirty::YES;
+                }
                 None => break,
             }
         }
@@ -570,14 +788,31 @@ impl<'t> EventLoop<'t> {
                 || rt.app.state.model.context_window != slot_model.model.context_window
             {
                 rt.app.update_model(&slot_model.model);
+                dirty = Dirty::YES;
             }
         }
         drop(slot_model);
 
+        // These two only fire Lua autocmds. Anything a handler does comes back
+        // as a `UiAction` on the next wake, which repaints then.
         self.emit_focus_change();
+        dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
-        self.start_mailbox_runs();
-        Ok(())
+        self.emit_notifications();
+        // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
+        // can never send it, so fail instead of hanging forever.
+        if let Some(runtime) = self.sessions.iter().find(|rt| {
+            rt.app.exit_request != ExitRequest::None
+                && rt.notifications.waiting_for_drain()
+                && rt.handles.is_finished()
+                && rt.handles.agent_rx.is_empty()
+        }) {
+            return Err(eyre!(
+                "agent for session {} stopped before queue drain",
+                runtime.id()
+            ));
+        }
+        Ok(dirty)
     }
 
     fn handle_ui_action(&mut self, action: UiAction) {
@@ -605,11 +840,35 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::Model { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_model_request(req));
+            }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().set_scroll_top(scroll_top);
+            }
+            UiAction::Builtin(action) => {
+                let actions = self.focused_app().run_builtin(action);
+                self.dispatch(self.focused, actions);
+            }
+            UiAction::RunCommand {
+                cmdline,
+                depth,
+                reply_tx,
+            } => {
+                // Answer before dispatching: the caller only waits on the name
+                // resolving, and dispatch may take a while (or exit the app).
+                match self.focused_app().run_cmdline(&cmdline, depth) {
+                    Ok(actions) => {
+                        let _ = reply_tx.send(Ok(()));
+                        self.dispatch(self.focused, actions);
+                    }
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                    }
+                }
             }
         }
     }
@@ -624,6 +883,8 @@ impl<'t> EventLoop<'t> {
         if matches!(crate::config::config_path(), Ok(p) if p == path) {
             crate::components::settings_picker::UserSettings::reload();
         }
+        // The editor owned the terminal; whatever focus state we had is stale.
+        self.terminal_focused = false;
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -653,6 +914,28 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    fn emit_notifications(&mut self) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        let mut selected = None;
+        for rt in &mut self.sessions {
+            let candidate = rt.notifications.reconcile(
+                rt.app.attention(),
+                rt.last_status,
+                rt.handles.queue.is_empty(),
+                self.terminal_focused,
+            );
+            selected = select_notification(selected, candidate);
+        }
+        if let Some(notification) = selected
+            && let Err(error) = notifier.notify(&notification.message())
+        {
+            warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
+            self.notifier = None;
+        }
+    }
+
     fn emit_focus_change(&mut self) {
         let id = self.sessions[self.focused].id();
         if self.last_focused == Some(id) {
@@ -668,33 +951,32 @@ impl<'t> EventLoop<'t> {
             .fire_autocmd("SessionFocusChanged", data);
     }
 
-    fn start_mailbox_runs(&mut self) {
+    fn start_mailbox_runs(&mut self) -> Dirty {
         let ready: Vec<_> = self
             .sessions
             .iter()
             .enumerate()
             .filter_map(|(index, runtime)| {
-                claim_idle_wake(SessionStatus::of(&runtime.app), || {
-                    runtime.handles.claim_mailbox_wake()
-                })
-                .map(|preamble| (index, preamble))
+                if !runtime.quiescent() {
+                    return None;
+                }
+                let preamble = runtime.handles.claim_mailbox_wake();
+                (!preamble.is_empty()).then_some((index, preamble))
             })
             .collect();
 
+        let dirty = Dirty::from(!ready.is_empty());
         for (index, preamble) in ready {
             let actions = self.sessions[index].app.start_mailbox_run(preamble);
             self.dispatch(index, actions);
         }
+        dirty
     }
 
     /// `List` replies from a background task (the scan can be slow); every
     /// other request is answered synchronously by the event loop, which owns
     /// the live runtimes.
-    fn handle_session_request(
-        &mut self,
-        req: SessionRequest,
-        reply_tx: flume::Sender<SessionReply>,
-    ) {
+    fn handle_session_request(&mut self, req: SessionRequest, reply_tx: flume::Sender<UiReply>) {
         match req {
             SessionRequest::List { global } => {
                 let storage = self.ctx.storage.clone();
@@ -813,7 +1095,38 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn submit_text(&mut self, idx: usize, text: String) -> SessionReply {
+    /// Lua acts on the focused session, the same target the model picker and
+    /// `/thinking` write to.
+    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
+        match req {
+            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Available => {
+                let available = self.ctx.available_models.load();
+                Ok(json!(
+                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                ))
+            }
+            ModelRequest::Set {
+                spec,
+                thinking,
+                fast,
+            } => {
+                if let Some(spec) = spec {
+                    self.change_model(&spec)?;
+                }
+                let app = self.focused_app();
+                if let Some(thinking) = thinking {
+                    app.set_thinking(&thinking)?;
+                }
+                if let Some(fast) = fast {
+                    app.set_fast(fast)?;
+                }
+                Ok(app.model_state())
+            }
+        }
+    }
+
+    fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
@@ -885,6 +1198,19 @@ impl<'t> EventLoop<'t> {
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
+        let supports_focus_reporting = self
+            .notifier
+            .as_ref()
+            .is_some_and(terminal::TerminalNotifier::supports_focus_reporting);
+        if let Some(focused) = terminal_focus_event(&raw) {
+            if supports_focus_reporting {
+                self.terminal_focused = focused;
+            }
+            return (None, None);
+        }
+        if supports_focus_reporting && terminal_input_proves_focus(&raw) {
+            self.terminal_focused = true;
+        }
         match raw {
             Event::Key(key) if key.kind == KeyEventKind::Press => (Some(Msg::Key(key)), None),
             Event::Key(_) => (None, None),
@@ -972,6 +1298,7 @@ impl<'t> EventLoop<'t> {
 
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>) {
         let rt = &mut self.sessions[idx];
+        rt.reset_run_notifications();
         let lua_handle = rt.app.lua_event_handle.clone();
         let permissions = Arc::clone(&rt.app.permissions);
         rt.handles.respawn(
@@ -989,6 +1316,7 @@ impl<'t> EventLoop<'t> {
         match action {
             Action::SendMessage(input) => {
                 let rt = &mut self.sessions[idx];
+                rt.reset_run_notifications();
                 let mut input = *input;
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
@@ -1001,10 +1329,9 @@ impl<'t> EventLoop<'t> {
                 });
             }
             Action::CancelAgent { run_id } => {
-                let _ = self.sessions[idx]
-                    .handles
-                    .cmd_tx
-                    .try_send(AgentCommand::Cancel { run_id });
+                let rt = &mut self.sessions[idx];
+                rt.notifications.reset();
+                let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
             }
             Action::CancelSubagent { tool_use_id } => {
                 let _ = self.sessions[idx]
@@ -1018,6 +1345,7 @@ impl<'t> EventLoop<'t> {
             Action::LoadSession(loaded) => {
                 let loaded = *loaded;
                 if loaded.model_spec != self.ctx.model_slot.load().model.spec()
+                    && self.ctx.model_policy.allows(&loaded.model_spec)
                     && let Ok(mut new_model) = Model::from_spec(&loaded.model_spec)
                     && let Ok(new_provider) = from_model(&mut new_model, self.ctx.timeouts)
                 {
@@ -1029,7 +1357,11 @@ impl<'t> EventLoop<'t> {
                 }
                 self.respawn_agent(idx, loaded.messages);
             }
-            Action::ChangeModel(spec) => self.change_model(spec),
+            Action::ChangeModel(spec) => {
+                if let Err(e) = self.change_model(&spec) {
+                    self.focused_app().flash(e);
+                }
+            }
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
                 maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
@@ -1039,6 +1371,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::Compact => {
                 let rt = &mut self.sessions[idx];
+                rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Compact { run_id });
             }
@@ -1079,6 +1412,7 @@ impl<'t> EventLoop<'t> {
                     let _pause = self.input.pause();
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
+                self.terminal_focused = false;
                 match result {
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
                     Err(e) => self.sessions[idx].app.flash(e),
@@ -1095,6 +1429,7 @@ impl<'t> EventLoop<'t> {
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
+                self.terminal_focused = false;
             }
             Action::RenameSession(messages) => {
                 self.sessions[idx].handles.queue.push(QueueItem::Rename {
@@ -1144,36 +1479,41 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(e);
                 }
             }
+            Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
     }
 
-    fn change_model(&mut self, spec: String) {
-        match Model::from_spec(&spec) {
-            Ok(mut new_model) => match from_model(&mut new_model, self.ctx.timeouts) {
-                Ok(new_provider) => {
-                    let app = self.focused_app();
-                    app.update_model(&new_model);
-                    app.record_recent_model(&spec);
-                    app.usage_slot.store(None);
-                    self.ctx.model_slot.store(Arc::new(ModelSlot {
-                        model: new_model,
-                        provider: Arc::from(new_provider),
-                    }));
-                }
-                Err(e) => self
-                    .focused_app()
-                    .flash(format!("Failed to create provider: {e}")),
-            },
-            Err(e) => self.focused_app().flash(format!("Invalid model: {e}")),
+    fn change_model(&mut self, spec: &str) -> Result<(), String> {
+        if !self.ctx.model_policy.allows(spec) {
+            return Err(format!("{MODEL_POLICY_ERR}: {spec}"));
         }
+        let mut new_model =
+            Model::from_spec(spec).map_err(|e| format!("{INVALID_MODEL_ERR}: {e}"))?;
+        let new_provider = from_model(&mut new_model, self.ctx.timeouts)
+            .map_err(|e| format!("{PROVIDER_INIT_ERR}: {e}"))?;
+        let app = self.focused_app();
+        app.update_model(&new_model);
+        app.record_recent_model(spec);
+        app.usage_slot.store(None);
+        self.ctx.model_slot.store(Arc::new(ModelSlot {
+            model: new_model,
+            provider: Arc::from(new_provider),
+        }));
+        Ok(())
     }
 
     fn refresh_models(&self) {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
+        let policy = Arc::clone(&self.ctx.model_policy);
         available.store(None);
         smol::spawn(async move {
-            fetch_all_models(|batch| merge_batch(&available, batch, &warn_tx), None).await;
+            fetch_all_models(
+                &policy,
+                |batch| merge_batch(&available, batch, &warn_tx),
+                None,
+            )
+            .await;
         })
         .detach();
     }
@@ -1205,8 +1545,10 @@ impl<'t> EventLoop<'t> {
                     provider: Arc::from(provider),
                 }));
             }
-        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
-            self.change_model(builtin.default_model.to_string());
+        } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug)
+            && let Err(e) = self.change_model(builtin.default_model)
+        {
+            self.focused_app().flash(e);
         }
     }
 
@@ -1269,17 +1611,6 @@ impl<'t> EventLoop<'t> {
     }
 }
 
-/// Backgrounded terminals drop to the slow tick whether or not anything is
-/// animating: a repaint nobody can see is worth no CPU, and real events still
-/// wake the loop immediately.
-fn poll_interval_ms(focused: bool, animating: bool) -> u64 {
-    match (focused, animating) {
-        (false, _) => BACKGROUND_POLL_INTERVAL_MS,
-        (true, true) => ANIMATION_INTERVAL_MS,
-        (true, false) => IDLE_POLL_INTERVAL_MS,
-    }
-}
-
 fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     if kind == MouseEventKind::ScrollUp {
         lines as i32
@@ -1290,60 +1621,152 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
-    use test_case::test_case;
 
     use super::*;
+    use crate::repaint::Cadence;
+    use maki_agent::DoneReason;
+    use maki_providers::TokenUsage;
+    use test_case::test_case;
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";
 
-    #[test_case(true, true => ANIMATION_INTERVAL_MS ; "focused and animating runs at full rate")]
-    #[test_case(true, false => IDLE_POLL_INTERVAL_MS ; "focused and settled idles")]
-    #[test_case(false, true => BACKGROUND_POLL_INTERVAL_MS ; "animation does not raise the rate in the background")]
-    #[test_case(false, false => BACKGROUND_POLL_INTERVAL_MS ; "backgrounded and settled idles slowest")]
-    fn poll_interval_by_focus(focused: bool, animating: bool) -> u64 {
-        poll_interval_ms(focused, animating)
+    /// Backgrounding must slow clock-driven repaints without silencing the
+    /// motion flag: a spinner that stops reporting movement never gets the
+    /// last frame that clears it off the screen.
+    #[test_case(Cadence::SMOOTH  => (Some(BACKGROUND_FRAME), true)  ; "typewriter slows to the floor")]
+    #[test_case(Cadence::SPINNER => (Some(BACKGROUND_FRAME), true)  ; "spinner slows to the floor")]
+    #[test_case(Cadence::PENDING => (Some(BACKGROUND_FRAME), false) ; "pending poll slows and still does not move")]
+    #[test_case(Cadence::IDLE    => (None, false)                   ; "idle stays asleep")]
+    fn backgrounding_throttles_without_dropping_motion(
+        cadence: Cadence,
+    ) -> (Option<Duration>, bool) {
+        let throttled = cadence.throttled(BACKGROUND_FRAME);
+        (throttled.frame(), throttled.moves())
     }
 
+    /// A cadence already slower than the floor must not be sped up by it.
     #[test]
-    fn idle_wake_claims_a_non_empty_preamble() {
-        let preamble = claim_idle_wake(SessionStatus::Idle, || {
-            vec![Message::observation(OBSERVATION.into())]
-        })
-        .unwrap();
-
-        assert_eq!(preamble.len(), 1);
-        assert_eq!(preamble[0].user_text(), Some(OBSERVATION));
+    fn throttling_never_raises_the_frame_rate() {
+        let slow = Cadence::SMOOTH.throttled(Duration::from_secs(5));
+        assert_eq!(slow.throttled(BACKGROUND_FRAME).frame(), slow.frame());
     }
 
-    #[test]
-    fn idle_without_messages_and_non_idle_sessions_do_not_start() {
-        assert!(claim_idle_wake(SessionStatus::Idle, Vec::new).is_none());
-
-        for status in [SessionStatus::Working, SessionStatus::NeedsInput] {
-            let called = Cell::new(false);
-            let preamble = claim_idle_wake(status, || {
-                called.set(true);
-                vec![Message::observation(OBSERVATION.into())]
-            });
-
-            assert!(preamble.is_none());
-            assert!(!called.get());
+    fn done_event() -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
         }
     }
 
-    #[test]
-    fn wake_arriving_while_working_runs_when_idle() {
-        let id = maki_storage::id::MakiId::generate();
-        let mailbox = maki_agent::SessionMailbox::register(id);
-        maki_agent::SessionMailbox::notify(id, OBSERVATION.into(), true).unwrap();
+    fn due_completion() -> RunNotificationState {
+        let mut state = RunNotificationState::default();
+        state.on_done(&done_event());
+        state.on_drain();
+        state
+    }
 
-        assert!(claim_idle_wake(SessionStatus::Working, || mailbox.claim_wake()).is_none());
-        let preamble = claim_idle_wake(SessionStatus::Idle, || mailbox.claim_wake()).unwrap();
-        assert_eq!(preamble.len(), 1);
-        assert_eq!(preamble[0].user_text(), Some(OBSERVATION));
+    #[test]
+    fn completion_waits_for_queue_drain() {
+        let mut state = RunNotificationState {
+            response_candidate: Some("done".into()),
+            ..RunNotificationState::default()
+        };
+
+        state.on_done(&done_event());
+        assert!(state.waiting_for_drain());
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            None
+        );
+
+        state.on_drain();
+        assert!(!state.waiting_for_drain());
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            Some(Notification::TurnComplete {
+                response: Some("done".into())
+            })
+        );
+    }
+
+    #[test_case(SessionStatus::Idle, true, false, true ; "fires_when_settled_and_unfocused")]
+    #[test_case(SessionStatus::Idle, true, true, false ; "focused_terminal_swallows")]
+    #[test_case(SessionStatus::Idle, false, false, false ; "queued_message_swallows")]
+    #[test_case(SessionStatus::Working, true, false, false ; "busy_session_swallows")]
+    fn due_completion_is_decided_on_first_reconcile(
+        status: SessionStatus,
+        queue_empty: bool,
+        terminal_focused: bool,
+        fires: bool,
+    ) {
+        let mut state = due_completion();
+
+        let first = state.reconcile(None, status, queue_empty, terminal_focused);
+        assert_eq!(first.is_some(), fires);
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_wins_over_completion_and_is_not_repeated_unchanged() {
+        let prompt = Notification::QuestionRequested;
+        let mut state = due_completion();
+
+        assert_eq!(
+            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true, false),
+            Some(prompt.clone())
+        );
+        assert_eq!(
+            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true, false),
+            None
+        );
+        assert_eq!(
+            state.reconcile(None, SessionStatus::Idle, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn notification_selection_prefers_priority_then_session_order() {
+        let completion = Notification::TurnComplete { response: None };
+        let first_prompt = Notification::QuestionRequested;
+        let second_prompt = Notification::AuthenticationRequired;
+
+        let selected = select_notification(None, Some(completion));
+        let selected = select_notification(selected, Some(first_prompt.clone()));
+        let selected = select_notification(selected, Some(second_prompt));
+
+        assert_eq!(selected, Some(first_prompt));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn focus_events_map_to_terminal_focus_state() {
+        assert_eq!(terminal_focus_event(&Event::FocusGained), Some(true));
+        assert_eq!(terminal_focus_event(&Event::FocusLost), Some(false));
+        assert_eq!(terminal_focus_event(&Event::Resize(80, 24)), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn interactive_input_proves_terminal_focus() {
+        let release = crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Enter,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+
+        assert!(terminal_input_proves_focus(&Event::Key(
+            crate::components::key(crossterm::event::KeyCode::Enter)
+        )));
+        assert!(terminal_input_proves_focus(&Event::Paste("text".into())));
+        assert!(!terminal_input_proves_focus(&Event::Key(release)));
+        assert!(!terminal_input_proves_focus(&Event::Resize(80, 24)));
     }
 
     #[test]

@@ -19,14 +19,16 @@ use color_eyre::eyre::{Context, eyre};
 use flume::{Receiver, Sender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
-use maki_agent::permissions::PermissionAnswer;
+use maki_agent::permissions::{PermissionAnswer, PluginRuleStore};
 use maki_agent::prompt::ResolvedSlots;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, Envelope, PermissionsConfig, ToolOutput,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
+    ToolOutput,
 };
+use maki_config::ModelPolicy;
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage};
+use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::Session;
@@ -447,6 +449,8 @@ pub struct SdkParams {
     pub prompt_slots: ResolvedSlots,
     pub fast: bool,
     pub workflow: bool,
+    pub model_policy: Arc<ModelPolicy>,
+    pub plugin_rules: Arc<PluginRuleStore>,
 }
 
 struct Shared {
@@ -466,6 +470,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         prompt_slots,
         fast,
         workflow,
+        model_policy,
+        plugin_rules,
     } = params;
     cli.warn_ignored_flags();
     if let Some(max) = cli.max_turns {
@@ -498,6 +504,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         workflow,
+        model_policy: Arc::clone(&model_policy),
+        plugin_rules,
+        local_tools: Default::default(),
     });
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -545,10 +554,10 @@ pub fn run(params: SdkParams) -> Result<()> {
         shared: Arc::clone(&shared),
         answer_tx: handle.answer_tx.clone(),
         include_partial_messages: cli.include_partial_messages,
-        fast,
         synth: StreamSynth::new(),
         tool_inputs: HashMap::new(),
         result_text: String::new(),
+        cost: None,
         request_counter: 0,
     }
     .spawn(handle.event_rx.clone());
@@ -600,7 +609,14 @@ pub fn run(params: SdkParams) -> Result<()> {
                 else {
                     continue;
                 };
-                handle_control_request(&cr, &writer, &handle, &shared, &startup_model)?;
+                handle_control_request(
+                    &cr,
+                    &writer,
+                    &handle,
+                    &shared,
+                    &startup_model,
+                    &model_policy,
+                )?;
             }
             "control_response" => {
                 let Some(cr) =
@@ -726,6 +742,7 @@ fn handle_control_request(
     handle: &InteractiveHandle,
     shared: &Mutex<Shared>,
     startup_model: &Model,
+    model_policy: &ModelPolicy,
 ) -> Result<()> {
     let ok = Some(Value::Object(Default::default()));
     match cr.request.subtype.as_str() {
@@ -763,11 +780,18 @@ fn handle_control_request(
             }
         }
         "set_model" => {
-            if let Some(model) = resolve_set_model(cr.request.extra.get("model"), startup_model) {
-                let _ = handle.model_tx.send(model.clone());
-                shared.lock().unwrap().model = model;
+            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
+                Some(model) => {
+                    let _ = handle.model_tx.send(model.clone());
+                    shared.lock().unwrap().model = model;
+                    writer.emit_control_response(&cr.request_id, ok, None)
+                }
+                None => writer.emit_control_response(
+                    &cr.request_id,
+                    None,
+                    Some("invalid or disallowed model".into()),
+                ),
             }
-            writer.emit_control_response(&cr.request_id, ok, None)
         }
         other => writer.emit_control_response(
             &cr.request_id,
@@ -777,18 +801,27 @@ fn handle_control_request(
     }
 }
 
-fn resolve_set_model(model_val: Option<&Value>, startup_model: &Model) -> Option<Model> {
+fn resolve_set_model(
+    model_val: Option<&Value>,
+    startup_model: &Model,
+    model_policy: &ModelPolicy,
+) -> Option<Model> {
     match model_val? {
         Value::Null => Some(startup_model.clone()),
-        Value::String(model_str) => match Model::from_spec(&resolve_model_spec(model_str)) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to resolve model '{model_str}': {e}, keeping current model"
-                );
-                None
+        Value::String(model_str) => {
+            let spec = resolve_model_spec(model_str);
+            if !model_policy.allows(&spec) {
+                warn!(model = %spec, "ignoring model disallowed by policy");
+                return None;
             }
-        },
+            match Model::from_spec(&spec) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(model = %model_str, error = %e, "ignoring invalid model");
+                    None
+                }
+            }
+        }
         _ => None,
     }
 }
@@ -820,10 +853,12 @@ struct EventPump {
     shared: Arc<Mutex<Shared>>,
     answer_tx: Sender<String>,
     include_partial_messages: bool,
-    fast: bool,
     synth: StreamSynth,
     tool_inputs: HashMap<String, (String, Value)>,
     result_text: String,
+    /// Summed as the turns land: rates move mid-prompt, and only a turn knows
+    /// the rate it paid.
+    cost: Option<f64>,
     request_counter: u64,
 }
 
@@ -854,6 +889,7 @@ impl EventPump {
         self.synth.reset();
         self.tool_inputs.clear();
         self.result_text.clear();
+        self.cost = None;
         self.shared.lock().unwrap().pending.clear();
     }
 
@@ -864,13 +900,9 @@ impl EventPump {
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let (duration_ms, total_cost_usd) = {
-            let shared = self.shared.lock().unwrap();
-            (
-                shared.turn_start.elapsed().as_millis(),
-                usage.cost(&shared.model.pricing, self.fast),
-            )
-        };
+        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        // Zero on an unpriced model, which is what its turns reported too.
+        let total_cost_usd = self.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
             subtype: if is_error {
                 "error_during_execution"
@@ -931,6 +963,7 @@ impl EventPump {
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
+            | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting
             | AgentEvent::CompactionDone
             | AgentEvent::AuthRequired
@@ -958,6 +991,7 @@ impl EventPump {
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
+                add_cost(&mut self.cost, tc.cost);
                 if self.include_partial_messages {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
@@ -1019,10 +1053,12 @@ impl EventPump {
             AgentEvent::Done {
                 usage,
                 num_turns,
-                stop_reason: _,
+                reason,
             } => {
+                // An interrupted run leaves a partial answer, so it is not a success.
+                let is_error = *reason == DoneReason::Cancelled;
                 let result = mem::take(&mut self.result_text);
-                self.emit_turn_result(false, result, *num_turns, *usage)?;
+                self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
@@ -1399,8 +1435,32 @@ mod tests {
     #[test]
     fn resolve_set_model_null_returns_startup() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let result = resolve_set_model(Some(&Value::Null), &startup).unwrap();
+        let result = resolve_set_model(
+            Some(&Value::Null),
+            &startup,
+            &maki_config::ModelPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(result.id, startup.id);
+    }
+
+    #[test]
+    fn resolve_set_model_rejects_disallowed_exact_spec() {
+        let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
+            "provider": {"allowed_models": [startup.spec()]}
+        }))
+        .unwrap();
+        let policy = raw.into_config(false).unwrap().provider.model_policy;
+
+        assert!(
+            resolve_set_model(
+                Some(&Value::String("openai/gpt-5".into())),
+                &startup,
+                &policy
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -1,9 +1,12 @@
-local dir_listing = require("maki.dir_listing")
 local ToolView = require("maki.tool_view")
 local shorten_path = require("maki.shorten_path")
 local output_limits = require("maki.output_limits")
+local helpers = require("read_helpers")
 
-local DESCRIPTION = [[Read a file or directory. Returns contents with line numbers (1-indexed).
+local truncate_bytes = helpers.truncate_bytes
+local split_lines = helpers.split_lines
+
+local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
 - **offset** and **limit** are required. Use offset=1 to read from the first line.
@@ -23,25 +26,6 @@ local opts = maki.api.register_options({
   max_line_bytes = { default = 500, min = 80, desc = "Truncate lines longer than this many bytes." },
   max_output_lines = output_limits.specs.max_output_lines,
 })
-
-local function line_nr_fmt(count)
-  local w = math.max(1, math.floor(math.log(count + 1, 10)) + 1)
-  return "%" .. w .. "d "
-end
-
-local function truncate_bytes(line, max_bytes)
-  if #line <= max_bytes then
-    return line
-  end
-  local i = max_bytes
-  while i > 0 and line:byte(i) >= 0x80 and line:byte(i) < 0xC0 do
-    i = i - 1
-  end
-  if i > 0 and line:byte(i) >= 0xC0 then
-    i = i - 1
-  end
-  return line:sub(1, i) .. "..."
-end
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -67,7 +51,7 @@ end
 local function build_file_view(lines, start_line, total_lines, path, ctx, prefix)
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, read_view_opts(ctx))
-  local nr_fmt = line_nr_fmt(total_lines)
+  local nr_fmt = ToolView.line_nr_fmt(start_line + #lines - 1) .. " "
 
   for i, line in ipairs(lines) do
     view:append({ { string.format(nr_fmt, start_line + i - 1), "line_nr" }, { line } })
@@ -106,17 +90,10 @@ local function read_file(path, offset, limit, ctx)
     return { llm_output = "read error: " .. tostring(err), is_error = true }
   end
 
-  local all_lines = {}
-  local pos = 1
-  while pos <= #content do
-    local nl = content:find("\n", pos, true)
-    local raw = nl and content:sub(pos, nl - 1) or content:sub(pos)
-    all_lines[#all_lines + 1] = raw:find("\r$") and raw:sub(1, -2) or raw
-    pos = nl and nl + 1 or #content + 1
-  end
+  local all_lines = split_lines(content)
   local total_lines = #all_lines
 
-  local start = math.max(offset, 1)
+  local start = math.max(math.floor(offset), 1)
   local default_max = opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES)
   local max_lines = limit == 0 and default_max or math.min(limit, default_max)
   local max_line_bytes = opts.max_line_bytes
@@ -129,8 +106,9 @@ local function read_file(path, offset, limit, ctx)
   ctx:record_read(path)
 
   local parts = {}
+  local nr_fmt = ToolView.line_nr_fmt(start + #lines - 1) .. ": %s"
   for i, line in ipairs(lines) do
-    parts[#parts + 1] = (start + i - 1) .. ": " .. line
+    parts[#parts + 1] = string.format(nr_fmt, start + i - 1, line)
   end
   local llm_output = table.concat(parts, "\n")
 
@@ -174,23 +152,6 @@ local function read_file(path, offset, limit, ctx)
   }
 end
 
-local function list_dir(path, ctx)
-  local listing, err = dir_listing.list(path, ctx)
-  if not listing then
-    return { llm_output = "read error: " .. tostring(err), is_error = true }
-  end
-
-  local result = {
-    llm_output = listing.text,
-    body = dir_listing.view(listing.text, ctx),
-    annotation = listing.count .. " entries",
-  }
-  if listing.instructions then
-    result.instructions = listing.instructions
-  end
-  return result
-end
-
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
@@ -208,7 +169,7 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file or directory",
+        description = "Absolute path to the file",
         required = true,
         alias = "file_path",
       },
@@ -271,7 +232,7 @@ maki.api.register_tool({
       return { llm_output = "error: path not found: " .. path, is_error = true }
     end
     if meta.is_dir then
-      return list_dir(path, ctx)
+      return { llm_output = "error: path is a directory, use the list tool instead", is_error = true }
     end
     return read_file(path, input.offset, input.limit, ctx)
   end,

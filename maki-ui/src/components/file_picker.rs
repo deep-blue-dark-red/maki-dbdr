@@ -1,5 +1,5 @@
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -23,6 +23,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -33,10 +34,34 @@ const MAX_HEIGHT_PERCENT: u16 = 60;
 const SEARCH_ROW: u16 = 1;
 const NO_MATCHES: &str = "  No matches";
 const LABEL_INDENT: &str = "  ";
-const EMPTY_DIR_MSG: &str = "Current directory is empty";
+/// Not "empty": a directory full of ignored files walks up just as short.
+const NOTHING_TO_PICK_MSG: &str = "Nothing to pick in the current directory";
+pub(crate) const UNREADABLE_DIR_MSG: &str = "Cannot list the current directory";
 const WALKER_CRASHED_MSG: &str = "File scanner crashed";
 const PENDING_DEBOUNCE_MS: u128 = 100;
 const MAX_MATERIALIZED: u32 = 640;
+
+/// The walker answers once, and its answer only matters when the list came up
+/// empty: an empty directory, a fully ignored one and one we could not open
+/// look identical from the injector's side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walk {
+    Running,
+    Listed,
+    Unreadable,
+}
+
+impl Walk {
+    /// What to tell the user when the walk is over and the list is still empty.
+    /// Total over the state, so no ending can be forgotten.
+    fn nothing_found_msg(self) -> Option<&'static str> {
+        match self {
+            Self::Running => None,
+            Self::Listed => Some(NOTHING_TO_PICK_MSG),
+            Self::Unreadable => Some(UNREADABLE_DIR_MSG),
+        }
+    }
+}
 
 pub enum FilePickerModalAction {
     Consumed,
@@ -62,10 +87,11 @@ struct Session {
     inner_area: Rect,
 
     cancel: Arc<AtomicBool>,
-    done_rx: flume::Receiver<()>,
+    done_rx: flume::Receiver<Walk>,
     started_at: Instant,
 
-    walking: bool,
+    walk: Walk,
+    /// The matcher owes an answer. Nothing delivers it, so `tick` has to look.
     matching: bool,
     visible: bool,
 }
@@ -106,6 +132,10 @@ impl FilePickerModal {
                     .unwrap();
                 WalkBuilder::new(&root)
                     .hidden(false)
+                    // Depth 0 is the root, which strips to an empty name: a
+                    // bare separator at the top of every list, selected by
+                    // default.
+                    .min_depth(Some(1))
                     .overrides(overrides)
                     .build_parallel()
                     .run(|| {
@@ -136,7 +166,7 @@ impl FilePickerModal {
                             ignore::WalkState::Continue
                         })
                     });
-                let _ = done_tx.send(());
+                let _ = done_tx.send(walk_end(&root));
             })
         {
             warn!("{WALKER_CRASHED_MSG}: failed to spawn thread: {e}");
@@ -156,7 +186,7 @@ impl FilePickerModal {
             cancel: cancel_clone,
             done_rx,
             started_at: Instant::now(),
-            walking: true,
+            walk: Walk::Running,
             matching: false,
             visible: false,
         });
@@ -168,12 +198,6 @@ impl FilePickerModal {
 
     pub fn is_open(&self) -> bool {
         self.session.is_some()
-    }
-
-    pub fn is_loading(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|s| s.walking || s.matching)
     }
 
     pub fn contains(&self, pos: Position) -> bool {
@@ -248,43 +272,66 @@ impl FilePickerModal {
         FilePickerModalAction::Consumed
     }
 
-    pub fn tick(&mut self) -> Option<String> {
-        let s = self.session.as_mut()?;
+    pub fn cadence(&self) -> Cadence {
+        let Some(s) = self.session.as_ref() else {
+            return Cadence::IDLE;
+        };
+        Cadence::any([
+            Cadence::when(s.visible && s.walk == Walk::Running, Cadence::SPINNER),
+            // Results stream in all through the walk, and the spinner above is
+            // already bringing the loop back for them. Once it ends, every
+            // keystroke leaves one last answer in flight, and the list sits on
+            // the old query until someone looks.
+            Cadence::when(s.matching && s.walk != Walk::Running, Cadence::PENDING),
+        ])
+    }
+
+    /// Returns the frame owed plus a message to flash if the picker gave up.
+    pub fn tick(&mut self) -> (Dirty, Option<String>) {
+        let Some(s) = self.session.as_mut() else {
+            return (Dirty::NO, None);
+        };
 
         let status = s.nucleo.tick(0);
         s.matching = status.running;
+        // The title says "scanning…" while walking, so finishing redraws too.
+        let mut dirty = Dirty::from(status.changed);
 
-        if s.walking {
+        if s.walk == Walk::Running {
             match s.done_rx.try_recv() {
-                Ok(()) => s.walking = false,
+                Ok(end) => {
+                    s.walk = end;
+                    dirty = Dirty::YES;
+                }
                 Err(flume::TryRecvError::Disconnected) => {
                     warn!("{WALKER_CRASHED_MSG}: walker thread panicked");
                     self.session = None;
-                    return Some(WALKER_CRASHED_MSG.into());
+                    return (Dirty::YES, Some(WALKER_CRASHED_MSG.into()));
                 }
                 Err(flume::TryRecvError::Empty) => {}
             }
         }
 
-        if !s.visible {
-            let has_files = s.nucleo.injector().injected_items() > 0;
-            let debounce_elapsed = s.started_at.elapsed().as_millis() >= PENDING_DEBOUNCE_MS;
+        let has_files = s.nucleo.injector().injected_items() > 0;
 
-            if has_files || (s.walking && debounce_elapsed) {
-                s.visible = true;
-            } else if !s.walking {
-                self.session = None;
-                return Some(EMPTY_DIR_MSG.into());
-            }
+        // A walk slow enough to cross the debounce is already on screen when it
+        // answers, so the close cannot sit behind the visibility gate below.
+        if !has_files && let Some(msg) = s.walk.nothing_found_msg() {
+            self.session = None;
+            return (Dirty::YES, Some(msg.into()));
+        }
+
+        if !s.visible && (has_files || s.started_at.elapsed().as_millis() >= PENDING_DEBOUNCE_MS) {
+            s.visible = true;
+            dirty = Dirty::YES;
         }
 
         if status.changed {
-            let s = self.session.as_mut()?;
             refresh_matches(s);
             clamp_selection(s);
         }
 
-        None
+        (dirty, None)
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -294,7 +341,11 @@ impl FilePickerModal {
         };
 
         let match_count = s.matches.len() as u16;
-        let title = if s.walking { TITLE_WALKING } else { TITLE };
+        let title = if s.walk == Walk::Running {
+            TITLE_WALKING
+        } else {
+            TITLE
+        };
 
         let has_query_without_matches = s.matches.is_empty() && !s.search.value().is_empty();
         let max_visible = area.height.saturating_sub(SEARCH_ROW + 2);
@@ -335,6 +386,23 @@ impl Overlay for FilePickerModal {
 
     fn close(&mut self) {
         self.close();
+    }
+
+    fn cadence(&self) -> Cadence {
+        self.cadence()
+    }
+}
+
+/// Only the directory itself can say whether an empty walk means "nothing to
+/// pick" or "I could not even look". Asking happens here, on the walker thread,
+/// where a slow filesystem cannot stall the UI.
+fn walk_end(root: &Path) -> Walk {
+    match root.read_dir() {
+        Ok(_) => Walk::Listed,
+        Err(e) => {
+            warn!("{UNREADABLE_DIR_MSG}: {}: {e}", root.display());
+            Walk::Unreadable
+        }
     }
 }
 
@@ -426,7 +494,9 @@ fn render_list(frame: &mut Frame, area: Rect, s: &Session) {
     let more = s.total_matches > MAX_MATERIALIZED;
     let at_bottom = s.scroll_offset + s.viewport_height >= s.matches.len();
     let hint_row = usize::from(more && at_bottom);
-    let visible_rows = s.viewport_height - hint_row;
+    // A viewport one row tall spends it all on the hint, and `end` below would
+    // then slice backwards from `scroll_offset`.
+    let visible_rows = s.viewport_height.saturating_sub(hint_row);
 
     let max_label_width = area.width.saturating_sub(LABEL_INDENT.len() as u16) as usize;
     let end = (s.scroll_offset + visible_rows).min(s.matches.len());
@@ -462,7 +532,7 @@ fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
 
     let mut spans = vec![super::chevron_span()];
 
-    if s.walking {
+    if s.walk == Walk::Running {
         let elapsed = s.started_at.elapsed().as_millis();
         let ch = active_spinner_frame(elapsed);
         let style = animation::active_spinner_style(elapsed, t.item_desc, t.tool_success);
@@ -523,8 +593,43 @@ fn build_highlighted_line<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repaint::expect::{OWED, QUIET};
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
+    use std::time::Duration;
+    use tempfile::TempDir;
     use test_case::test_case;
+
+    /// Waits on the matcher are bounded by wall clock, not by a tick budget:
+    /// nucleo matches on a worker thread, and a tight loop can burn through N
+    /// ticks before that thread is ever scheduled.
+    const CONVERGE_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Far enough from `PENDING_DEBOUNCE_MS` that no scheduling delay can
+    /// cross it in either direction.
+    const DEBOUNCE_HELD_OFF: Duration = Duration::from_secs(60);
+    const NEVER_CONVERGED: &str = "picker never rebuilt its matches from later ticks";
+    const NEVER_CLOSED: &str = "picker never closed on an empty walk";
+
+    const MAIN_PATH: &str = "src/main.rs";
+    const README_PATH: &str = "docs/readme.md";
+    const README_QUERY: &str = "readme";
+    const MISSING_DIR: &str = "gone";
+    const MAIN_FILE: &str = "main.rs";
+
+    /// Ticks until `ready` holds, collecting the frames owed on the way, or
+    /// `None` if the picker never got there.
+    fn tick_until(picker: &mut FilePickerModal, ready: impl Fn(&Session) -> bool) -> Option<Dirty> {
+        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        let mut dirty = Dirty::NO;
+        while Instant::now() < deadline {
+            let (owed, _) = picker.tick();
+            dirty |= owed;
+            if picker.session.as_ref().is_some_and(&ready) {
+                return Some(dirty);
+            }
+            std::thread::yield_now();
+        }
+        None
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -535,7 +640,7 @@ mod tests {
         }
     }
 
-    fn pending_picker() -> (FilePickerModal, flume::Sender<()>) {
+    fn pending_picker() -> (FilePickerModal, flume::Sender<Walk>) {
         let mut picker = FilePickerModal::new();
         let notify = Arc::new(|| {});
         let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), notify, None, 1);
@@ -553,7 +658,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             done_rx,
             started_at: Instant::now(),
-            walking: true,
+            walk: Walk::Running,
             matching: false,
             visible: false,
         });
@@ -567,48 +672,183 @@ mod tests {
         });
     }
 
-    #[test]
-    fn pending_transitions_to_visible_when_files_arrive() {
+    /// Files are counted straight off the injector, so one tick settles the
+    /// question. `started_at` in the future keeps the debounce out of it,
+    /// however long the test is descheduled for.
+    fn tick_once_before_the_debounce(picker: &mut FilePickerModal) {
+        picker.session.as_mut().unwrap().started_at = Instant::now() + DEBOUNCE_HELD_OFF;
+        let _ = picker.tick();
+    }
+
+    /// Nothing else in the app knows the walk is running, so the picker is the
+    /// one that has to claim the spinner. `view` draws nothing until files
+    /// arrive, so a hidden walk claiming `SPINNER` would animate pixels that
+    /// are not on screen.
+    #[test_case(&[MAIN_PATH] => Cadence::SPINNER ; "on_screen_walk_spins")]
+    #[test_case(&[]          => Cadence::IDLE    ; "hidden_walk_does_not")]
+    fn walking_picker_spins_only_once_it_is_on_screen(files: &[&str]) -> Cadence {
         let (mut picker, _done_tx) = pending_picker();
-        inject_file(&picker, "src/main.rs");
-        picker.tick();
-        assert!(picker.session.as_ref().unwrap().visible);
+        for path in files {
+            inject_file(&picker, path);
+        }
+        tick_once_before_the_debounce(&mut picker);
+
+        let s = picker.session.as_ref().unwrap();
+        assert_eq!(s.walk, Walk::Running);
+        assert_eq!(
+            s.visible,
+            !files.is_empty(),
+            "the picker shows itself exactly when it has something"
+        );
+        picker.cadence()
     }
 
-    #[test]
-    fn pending_closes_on_empty_walk() {
+    /// Neither ending leaves anything to pick, so the picker closes itself and
+    /// says why: one frame, one flash, and then quiet, or the loop never
+    /// settles again. A walk slow enough to cross the debounce is already on
+    /// screen when it comes back empty, and it still has to close, or the user
+    /// is left staring at an empty list with no reason for it.
+    #[test_case(Some(Walk::Listed), false => NOTHING_TO_PICK_MSG ; "walk_finished_with_nothing")]
+    #[test_case(Some(Walk::Listed), true  => NOTHING_TO_PICK_MSG ; "shown_walk_finished_with_nothing")]
+    #[test_case(None,               false => WALKER_CRASHED_MSG  ; "walker_died")]
+    fn self_close_flashes_once_then_stays_quiet(end: Option<Walk>, on_screen: bool) -> String {
         let (mut picker, done_tx) = pending_picker();
-        let _ = done_tx.send(());
-        picker.tick();
-        picker.tick();
+        picker.session.as_mut().unwrap().visible = on_screen;
+        match end {
+            Some(end) => done_tx.send(end).unwrap(),
+            None => drop(done_tx),
+        }
+
+        let (dirty, flash) = picker.tick();
         assert!(picker.session.is_none());
+        assert_eq!(dirty, Dirty::YES, "{OWED}");
+        assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
+        flash.unwrap()
     }
 
+    /// Both endings inject nothing, and the flash is the only trace the user
+    /// gets, so this is the difference between "there is nothing here" and "I
+    /// could not look".
+    #[test]
+    fn walk_end_tells_an_empty_directory_from_an_unopenable_one() {
+        let tmp = TempDir::new().unwrap();
+
+        assert_eq!(walk_end(tmp.path()), Walk::Listed);
+        assert_eq!(walk_end(&tmp.path().join(MISSING_DIR)), Walk::Unreadable);
+    }
+
+    /// Depth 0 is the root itself, which strips to an empty name: a bare
+    /// separator at the top of the list, selected by default, one Enter away
+    /// from picking the user's own directory. It also counts as an injected
+    /// item, so every directory used to look non-empty.
+    #[test]
+    fn a_real_walk_offers_the_files_and_not_the_root_itself() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(MAIN_FILE), "").unwrap();
+
+        let mut picker = FilePickerModal::new();
+        picker.open(&tmp.path().to_string_lossy());
+        let _ = tick_until(&mut picker, |s| !s.matches.is_empty()).expect(NEVER_CONVERGED);
+
+        let s = picker.session.as_ref().unwrap();
+        let paths: Vec<&str> = s.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, [MAIN_FILE]);
+    }
+
+    /// An empty directory only reads as empty once the root stops counting as
+    /// a find, so this is the close that never used to happen.
+    #[test]
+    fn a_real_walk_of_an_empty_directory_closes_the_picker() {
+        let tmp = TempDir::new().unwrap();
+        let mut picker = FilePickerModal::new();
+        picker.open(&tmp.path().to_string_lossy());
+
+        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        let flash = loop {
+            if let (_, Some(flash)) = picker.tick() {
+                break flash;
+            }
+            assert!(Instant::now() < deadline, "{NEVER_CLOSED}");
+            std::thread::yield_now();
+        };
+
+        assert_eq!(flash, NOTHING_TO_PICK_MSG);
+        assert!(!picker.is_open());
+    }
+
+    /// A walk with nothing to show yet still opens once it drags on, so the
+    /// user is not left staring at an unchanged screen.
     #[test]
     fn pending_debounce_controls_visibility() {
         let (mut picker, _done_tx) = pending_picker();
-        picker.tick();
-        assert!(
-            !picker.session.as_ref().unwrap().visible,
-            "should stay hidden before debounce"
-        );
+        tick_once_before_the_debounce(&mut picker);
+        assert!(!picker.session.as_ref().unwrap().visible, "hidden so far");
 
-        picker.session.as_mut().unwrap().started_at =
-            Instant::now() - std::time::Duration::from_millis(200);
-        picker.tick();
+        picker.session.as_mut().unwrap().started_at = Instant::now() - DEBOUNCE_HELD_OFF;
+        let _ = picker.tick();
         assert!(
             picker.session.as_ref().unwrap().visible,
-            "should show after debounce"
+            "shown once the walk drags on"
         );
     }
 
+    /// A finished walk with an unchanged query draws the same pixels every
+    /// frame, so the loop has to be free to settle.
     #[test]
-    fn walker_crash_returns_flash() {
+    fn settled_picker_owes_no_frame_and_does_not_animate() {
         let (mut picker, done_tx) = pending_picker();
-        drop(done_tx);
-        let flash = picker.tick();
-        assert!(picker.session.is_none());
-        assert_eq!(flash.as_deref(), Some(WALKER_CRASHED_MSG));
+        inject_file(&picker, MAIN_PATH);
+        done_tx.send(Walk::Listed).unwrap();
+
+        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        while picker.tick() != (Dirty::NO, None) {
+            assert!(Instant::now() < deadline, "the picker never stopped");
+            std::thread::yield_now();
+        }
+
+        assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
+        assert_eq!(picker.cadence(), Cadence::IDLE);
+    }
+
+    /// The matcher answers on a worker thread, long after the keypress was
+    /// handled, so typing is only redrawn because a later `tick` reports the
+    /// change. Without that the list freezes on the previous query.
+    #[test]
+    fn query_change_owes_a_frame_from_a_later_tick() {
+        let (mut picker, done_tx) = pending_picker();
+        inject_file(&picker, MAIN_PATH);
+        inject_file(&picker, README_PATH);
+        done_tx.send(Walk::Listed).unwrap();
+        let _ = tick_until(&mut picker, |s| s.matches.len() == 2).expect(NEVER_CONVERGED);
+
+        for c in README_QUERY.chars() {
+            picker.handle_key(key(KeyCode::Char(c)));
+        }
+
+        let dirty = tick_until(&mut picker, |s| s.matches.len() == 1).expect(NEVER_CONVERGED);
+        assert_eq!(dirty, Dirty::YES, "{OWED}");
+        assert_eq!(
+            picker.session.as_ref().unwrap().matches[0].path,
+            README_PATH
+        );
+    }
+
+    /// Nucleo matches on a worker thread and hands the answer to nobody, long
+    /// after the keystroke that started it. Only looking again finds it, so an
+    /// idle cadence here leaves the list on the previous query until some
+    /// unrelated poll comes round. It is not motion either: nothing lands, so
+    /// there is nothing to paint.
+    #[test_case(true,  Walk::Listed  => Cadence::PENDING ; "matching_after_the_walk")]
+    #[test_case(true,  Walk::Running => Cadence::SPINNER ; "walk_spinner_already_comes_back")]
+    #[test_case(false, Walk::Listed  => Cadence::IDLE    ; "settled")]
+    fn a_matcher_mid_answer_keeps_the_loop_coming_back(matching: bool, walk: Walk) -> Cadence {
+        let (mut picker, _done_tx) = pending_picker();
+        let s = picker.session.as_mut().unwrap();
+        s.visible = true;
+        s.matching = matching;
+        s.walk = walk;
+
+        picker.cadence()
     }
 
     #[test]
@@ -650,7 +890,7 @@ mod tests {
     fn picker_with_matches(n: usize) -> FilePickerModal {
         let (mut picker, _done_tx) = pending_picker();
         let s = picker.session.as_mut().unwrap();
-        s.walking = false;
+        s.walk = Walk::Listed;
         s.visible = true;
         s.matches = (0..n)
             .map(|i| Match {

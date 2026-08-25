@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
 use maki_storage::sessions::{StoredThinking, ThinkingParseError};
@@ -24,6 +25,8 @@ pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
+
+pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
@@ -64,6 +67,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "glob",
     "grep",
     "index",
+    "list",
     "memory",
     "question",
     "read",
@@ -177,6 +181,13 @@ pub enum ConfigError {
          A .bak backup is left next to the file."
     )]
     RenamedToolsTable,
+    #[error("invalid config: provider.{field} contains invalid glob pattern `{pattern}`: {source}")]
+    InvalidModelPattern {
+        field: &'static str,
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
 }
 
 fn check(
@@ -281,7 +292,7 @@ impl RawConfig {
                 .transpose()?,
             ui: UiConfig::from_file(self.ui),
             agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
-            provider: ProviderConfig::from_file(self.provider),
+            provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
@@ -330,11 +341,13 @@ pub struct PluginFileConfig {
 pub struct UiFileConfig {
     pub splash_animation: Option<bool>,
     pub scrollbar: Option<bool>,
+    pub notifications: Option<NotificationMethod>,
     pub flash_duration_ms: Option<u64>,
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
     pub theme: Option<String>,
+    pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub show_token_stats: Option<bool>,
     pub max_input_lines: Option<u32>,
@@ -348,12 +361,14 @@ impl UiFileConfig {
             overlay,
             splash_animation,
             scrollbar,
+            notifications,
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
             show_thinking,
             show_token_stats,
             theme,
+            clock_format,
             max_input_lines,
             cache_miss_warn_context
         );
@@ -363,6 +378,16 @@ impl UiFileConfig {
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationMethod {
+    #[default]
+    Auto,
+    Osc9,
+    Bell,
+    Off,
 }
 
 #[derive(Deserialize, Default, Debug)]
@@ -474,6 +499,8 @@ pub struct AgentFileConfig {
     pub compaction_buffer: Option<CompactionBuffer>,
     pub max_output_tokens: Option<u32>,
     pub task_max_concurrent: Option<usize>,
+    pub compaction_instructions: Option<String>,
+    pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
 }
 
@@ -488,6 +515,8 @@ impl AgentFileConfig {
             compaction_buffer,
             max_output_tokens,
             task_max_concurrent,
+            compaction_instructions,
+            post_compaction_instructions,
             stale_read_check
         );
     }
@@ -497,6 +526,8 @@ impl AgentFileConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderFileConfig {
     pub default_model: Option<String>,
+    pub allowed_models: Option<Vec<String>>,
+    pub excluded_models: Option<Vec<String>>,
     pub connect_timeout_secs: Option<u64>,
     pub low_speed_timeout_secs: Option<u64>,
     pub stream_timeout_secs: Option<u64>,
@@ -508,6 +539,8 @@ impl ProviderFileConfig {
             self,
             overlay,
             default_model,
+            allowed_models,
+            excluded_models,
             connect_timeout_secs,
             low_speed_timeout_secs,
             stream_timeout_secs
@@ -820,6 +853,17 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum ClockFormat {
+    #[serde(rename = "12h")]
+    Hour12,
+    #[serde(rename = "24h")]
+    Hour24,
+    #[default]
+    #[serde(rename = "system")]
+    System,
+}
+
 #[derive(Debug, Clone, ConfigSection)]
 #[config(section = "ui")]
 pub struct UiConfig {
@@ -828,6 +872,14 @@ pub struct UiConfig {
 
     #[config(default = true, desc = "Show vertical scrollbar in scrollable areas")]
     pub scrollbar: bool,
+
+    #[config(
+        default = NotificationMethod::Auto,
+        ty = "string",
+        default_doc = "auto",
+        desc = "Terminal notification method: auto, osc9, bell, or off"
+    )]
+    pub notifications: NotificationMethod,
 
     #[config(default = DEFAULT_FLASH_DURATION_MS, desc = "Duration of flash messages (ms)")]
     pub flash_duration_ms: u64,
@@ -846,6 +898,9 @@ pub struct UiConfig {
         desc = "When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes"
     )]
     pub show_thinking: bool,
+
+    #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
+    pub clock_format: ClockFormat,
 
     #[config(skip, default = "None")]
     pub theme: Option<String>,
@@ -876,6 +931,7 @@ impl UiConfig {
         Self {
             splash_animation: f.splash_animation.unwrap_or(true),
             scrollbar: f.scrollbar.unwrap_or(true),
+            notifications: f.notifications.unwrap_or_default(),
             flash_duration_ms: f.flash_duration_ms.unwrap_or(DEFAULT_FLASH_DURATION_MS),
             typewriter_ms_per_char: f
                 .typewriter_ms_per_char
@@ -883,6 +939,7 @@ impl UiConfig {
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
+            clock_format: f.clock_format.unwrap_or_default(),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             show_token_stats: f.show_token_stats.unwrap_or(false),
@@ -1019,6 +1076,20 @@ pub struct AgentConfig {
     pub max_output_tokens: u32,
 
     #[config(
+        ty = "String",
+        default = "None",
+        desc = "Extra instructions appended to the compaction summary prompt"
+    )]
+    pub compaction_instructions: Option<String>,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Extra instructions the agent receives after any compaction (e.g. re-read plan.md)"
+    )]
+    pub post_compaction_instructions: Option<String>,
+
+    #[config(
         default = true,
         desc = "Require re-reading a file that changed on disk before editing it"
     )]
@@ -1054,6 +1125,8 @@ impl AgentConfig {
             task_max_concurrent: file
                 .task_max_concurrent
                 .unwrap_or(DEFAULT_TASK_MAX_CONCURRENT),
+            compaction_instructions: file.compaction_instructions,
+            post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
@@ -1070,6 +1143,23 @@ pub struct ProviderConfig {
         desc = "Default model identifier (e.g. `anthropic/claude-sonnet-4-6`)"
     )]
     pub default_model: Option<String>,
+
+    #[config(
+        ty = "string[]",
+        default_doc = "[]",
+        desc = "Glob patterns for permitted qualified model specs; empty permits all models"
+    )]
+    pub allowed_models: Vec<String>,
+
+    #[config(
+        ty = "string[]",
+        default_doc = "[]",
+        desc = "Glob patterns for excluded qualified model specs; exclusions take precedence"
+    )]
+    pub excluded_models: Vec<String>,
+
+    #[config(skip)]
+    pub model_policy: ModelPolicy,
 
     #[config(key = "connect_timeout_secs", ty = "u64", default = DEFAULT_CONNECT_TIMEOUT_SECS,
              min = MIN_CONNECT_TIMEOUT_SECS, val = "self.connect_timeout.as_secs()",
@@ -1091,6 +1181,9 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             default_model: None,
+            allowed_models: Vec::new(),
+            excluded_models: Vec::new(),
+            model_policy: ModelPolicy::allow_all(),
             connect_timeout: Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS),
             low_speed_timeout: Duration::from_secs(DEFAULT_LOW_SPEED_TIMEOUT_SECS),
             stream_timeout: Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS),
@@ -1099,9 +1192,15 @@ impl Default for ProviderConfig {
 }
 
 impl ProviderConfig {
-    fn from_file(f: ProviderFileConfig) -> Self {
-        Self {
+    fn from_file(f: ProviderFileConfig) -> Result<Self, ConfigError> {
+        let allowed_models = f.allowed_models.unwrap_or_default();
+        let excluded_models = f.excluded_models.unwrap_or_default();
+        let model_policy = ModelPolicy::new(&allowed_models, &excluded_models)?;
+        Ok(Self {
             default_model: f.default_model,
+            allowed_models,
+            excluded_models,
+            model_policy,
             connect_timeout: Duration::from_secs(
                 f.connect_timeout_secs
                     .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
@@ -1113,7 +1212,64 @@ impl ProviderConfig {
             stream_timeout: Duration::from_secs(
                 f.stream_timeout_secs.unwrap_or(DEFAULT_STREAM_TIMEOUT_SECS),
             ),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelPolicy {
+    allowed: GlobSet,
+    excluded: GlobSet,
+    has_allowed_models: bool,
+}
+
+impl Default for ModelPolicy {
+    fn default() -> Self {
+        Self::allow_all()
+    }
+}
+
+impl ModelPolicy {
+    fn allow_all() -> Self {
+        Self::new(&[], &[]).expect("empty model policy is valid")
+    }
+
+    pub fn new(allowed_models: &[String], excluded_models: &[String]) -> Result<Self, ConfigError> {
+        Ok(Self {
+            allowed: Self::compile("allowed_models", allowed_models)?,
+            excluded: Self::compile("excluded_models", excluded_models)?,
+            has_allowed_models: !allowed_models.is_empty(),
+        })
+    }
+
+    fn compile(field: &'static str, patterns: &[String]) -> Result<GlobSet, ConfigError> {
+        let mut globset = GlobSetBuilder::new();
+        for pattern in patterns {
+            let glob = GlobBuilder::new(pattern)
+                .literal_separator(false)
+                .build()
+                .map_err(|source| ConfigError::InvalidModelPattern {
+                    field,
+                    pattern: pattern.clone(),
+                    source,
+                })?;
+            globset.add(glob);
         }
+        globset
+            .build()
+            .map_err(|source| ConfigError::InvalidModelPattern {
+                field,
+                pattern: String::new(),
+                source,
+            })
+    }
+
+    pub fn is_restrictive(&self) -> bool {
+        self.has_allowed_models || !self.excluded.is_empty()
+    }
+
+    pub fn allows(&self, spec: &str) -> bool {
+        (!self.has_allowed_models || self.allowed.is_match(spec)) && !self.excluded.is_match(spec)
     }
 }
 
@@ -1240,7 +1396,7 @@ fn push_rules(
 
 pub fn is_valid_server_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= MAX_SERVER_NAME_LEN
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
@@ -1924,6 +2080,7 @@ mod tests {
     fn empty_config_returns_defaults() {
         let config = RawConfig::default().into_config(false).unwrap();
         assert!(config.ui.splash_animation);
+        assert_eq!(config.ui.notifications, NotificationMethod::Auto);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         assert_eq!(
             config.provider.connect_timeout,
@@ -1933,6 +2090,22 @@ mod tests {
             config.storage.max_log_bytes,
             DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
         );
+    }
+
+    #[test_case("auto", NotificationMethod::Auto ; "auto")]
+    #[test_case("osc9", NotificationMethod::Osc9 ; "osc9")]
+    #[test_case("bell", NotificationMethod::Bell ; "bell")]
+    #[test_case("off", NotificationMethod::Off ; "off")]
+    fn notifications_deserialize(value: &str, expected: NotificationMethod) {
+        let raw: RawConfig =
+            toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
+        assert_eq!(raw.into_config(false).unwrap().ui.notifications, expected);
+    }
+
+    #[test]
+    fn notifications_reject_unknown_value() {
+        let result: Result<RawConfig, _> = toml::from_str("[ui]\nnotifications = \"desktop\"\n");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1955,6 +2128,7 @@ mod tests {
             always_yolo: Some(false),
             ui: UiFileConfig {
                 splash_animation: Some(false),
+                notifications: Some(NotificationMethod::Bell),
                 flash_duration_ms: Some(2000),
                 ..Default::default()
             },
@@ -1967,6 +2141,10 @@ mod tests {
         };
         let overlay = RawConfig {
             always_yolo: Some(true),
+            ui: UiFileConfig {
+                notifications: Some(NotificationMethod::Off),
+                ..Default::default()
+            },
             agent: AgentFileConfig {
                 max_output_lines: Some(5000),
                 ..Default::default()
@@ -1979,7 +2157,92 @@ mod tests {
         assert_eq!(base.agent.max_output_lines, Some(5000), "overlay wins");
         assert_eq!(base.agent.max_output_bytes, Some(80_000), "base preserved");
         assert_eq!(base.ui.splash_animation, Some(false), "base preserved");
+        assert_eq!(
+            base.ui.notifications,
+            Some(NotificationMethod::Off),
+            "overlay wins"
+        );
         assert_eq!(base.ui.flash_duration_ms, Some(2000), "base preserved");
+    }
+
+    #[test]
+    fn provider_model_lists_inherit_replace_and_clear() {
+        let mut global = RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(vec!["anthropic/*".into()]),
+                excluded_models: Some(vec!["*/*-preview".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        global.merge(RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(Vec::new()),
+                excluded_models: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let provider = global.into_config(false).unwrap().provider;
+        assert!(provider.allowed_models.is_empty());
+        assert_eq!(provider.excluded_models, ["*/*-preview"]);
+        assert!(provider.model_policy.allows("openai/gpt-5"));
+        assert!(!provider.model_policy.allows("openai/gpt-5-preview"));
+    }
+
+    #[test]
+    fn model_policy_matches_qualified_specs() {
+        let config = RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(vec!["openai/gpt-5".into(), "opencode/*".into()]),
+                excluded_models: Some(vec!["*/*-preview".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(false)
+        .unwrap();
+        let policy = &config.provider.model_policy;
+
+        assert!(policy.allows("openai/gpt-5"));
+        assert!(policy.allows("opencode/nvidia/openai/gpt-oss-120b"));
+        assert!(!policy.allows("anthropic/claude-sonnet-4-6"));
+        assert!(!policy.allows("opencode/gpt-5-preview"));
+
+        let exclude_only = RawConfig {
+            provider: ProviderFileConfig {
+                excluded_models: Some(vec!["anthropic/*".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(false)
+        .unwrap();
+        assert!(exclude_only.provider.model_policy.allows("openai/gpt-5"));
+        assert!(
+            !exclude_only
+                .provider
+                .model_policy
+                .allows("anthropic/claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn invalid_model_pattern_is_a_config_error() {
+        let result = RawConfig {
+            provider: ProviderFileConfig {
+                allowed_models: Some(vec!["[".into()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(false);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidModelPattern { field: "allowed_models", pattern, .. }) if pattern == "["
+        ));
     }
 
     #[test]

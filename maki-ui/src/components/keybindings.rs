@@ -473,6 +473,7 @@ pub mod key {
 
     pub const QUIT: Bind = ctrl_bind!('c', "quit");
     pub const HELP: Bind = ctrl_bind!('h', "help");
+    pub const MODEL_PICKER: Bind = ctrl_bind!('m', "model_picker");
     pub const PREV_CHAT: Bind = ctrl_bind!('p', "prev_chat");
     pub const NEXT_CHAT: Bind = ctrl_bind!('n', "next_chat");
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u', "scroll_half_up");
@@ -789,6 +790,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Action("tasks"),
         description: "Open tasks",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Action("model_picker"),
+        description: "Model picker",
         context: KeybindContext::General,
         platform: Platform::All,
     },

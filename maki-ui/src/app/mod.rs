@@ -55,6 +55,7 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
+use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -63,9 +64,11 @@ use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
 };
-use maki_config::UiConfig;
-use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, WinView};
-use maki_providers::{Message, Model, ThinkingConfig, TokenUsage, add_cost};
+use maki_config::{ModelPolicy, UiConfig};
+use maki_lua::{
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
+};
+use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::input_history::InputHistory;
@@ -98,6 +101,7 @@ const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
@@ -109,6 +113,13 @@ const CACHE_MISS_IDLE: Duration = Duration::from_secs(300);
 
 const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
+const NOTIFICATION_PREVIEW_CHARS: usize = 200;
+
+/// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
+/// in practice; the cap only exists so a command aliasing itself reports an
+/// error instead of ping-ponging with the Lua thread forever.
+pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
+pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
 
 #[derive(Clone)]
 pub(super) struct TaskEntry {
@@ -127,6 +138,73 @@ impl PickerItem for TaskEntry {
     fn is_spinning(&self) -> bool {
         matches!(self.finished, Some(false))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Notification {
+    TurnComplete { response: Option<String> },
+    PermissionRequested { tool: Option<String> },
+    AuthenticationRequired,
+    QuestionRequested,
+    PlanReady,
+}
+
+impl Notification {
+    /// Prompts blocking the agent outrank turn completions.
+    pub(crate) fn is_urgent(&self) -> bool {
+        !matches!(self, Self::TurnComplete { .. })
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::TurnComplete { response } => response
+                .clone()
+                .unwrap_or_else(|| "Agent turn complete".into()),
+            Self::PermissionRequested { tool: Some(tool) } => {
+                format!("Permission requested: {tool}")
+            }
+            Self::PermissionRequested { tool: None } => "Permission requested".into(),
+            Self::AuthenticationRequired => "Authentication required".into(),
+            Self::QuestionRequested => "Question requested".into(),
+            Self::PlanReady => "Plan ready".into(),
+        }
+    }
+
+    pub(crate) fn error_completion() -> Self {
+        Self::TurnComplete {
+            response: Some("Agent stopped with an error".into()),
+        }
+    }
+}
+
+/// Lazy, so a huge response only costs the first `NOTIFICATION_PREVIEW_CHARS`
+/// characters.
+fn notification_preview<'a>(chunks: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut preview: String = chunks
+        .flat_map(str::split_whitespace)
+        .enumerate()
+        .flat_map(|(i, word)| (i > 0).then_some(' ').into_iter().chain(word.chars()))
+        .take(NOTIFICATION_PREVIEW_CHARS)
+        .collect();
+    if preview.ends_with(' ') {
+        preview.pop();
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+
+fn normalize_preview(text: &str) -> Option<String> {
+    notification_preview(std::iter::once(text))
+}
+
+pub(crate) fn turn_response(message: &Message) -> Option<String> {
+    if message.has_tool_calls() {
+        return None;
+    }
+
+    notification_preview(message.content.iter().filter_map(|block| match block {
+        ContentBlock::Text { text } => Some(text.as_str()),
+        _ => None,
+    }))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -235,9 +313,11 @@ pub struct App {
     pub(crate) ui_config: UiConfig,
     pub(super) show_token_stats: bool,
     pub(crate) permissions: Arc<PermissionManager>,
+    pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
+    hints: Watch<HintSnapshot>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -262,9 +342,10 @@ impl App {
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
+        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
-        let state = SessionState::from_session(session, model, &storage);
+        let state = SessionState::from_session(session, model, &storage, &model_policy);
         let typewriter = ui_config.typewriter_ms_per_char;
         let flash = ui_config.flash_duration();
         let input_box = InputBox::new(
@@ -345,7 +426,9 @@ impl App {
             ui_config,
             show_token_stats: UserSettings::load().show_token_stats,
             permissions,
+            model_policy: Arc::clone(&model_policy),
             lua_event_handle,
+            hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
             restore_event_tx: None,
@@ -358,8 +441,12 @@ impl App {
             enabled: startup_settings.spinner_enabled,
             style: spinner_style_from_str(&startup_settings.spinner_style),
         });
-        app.model_picker
-            .set_recents(maki_storage::model::read_recents(&app.storage));
+        app.model_picker.set_recents(
+            maki_storage::model::read_recents(&app.storage)
+                .into_iter()
+                .filter(|spec| model_policy.allows(spec))
+                .collect(),
+        );
         *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.to_string());
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(app.state.session.title.clone());
         app
@@ -382,8 +469,44 @@ impl App {
         persist_model(&self.storage, &self.state.session.model);
     }
 
+    /// Takes the spelling both `/thinking` and `maki.model.set` accept; a
+    /// blank {input} toggles.
+    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
+        if !self.state.model.supports_thinking() {
+            return Err(THINKING_UNSUPPORTED_MSG.into());
+        }
+        self.state.thinking =
+            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
+        Ok(self.state.thinking)
+    }
+
+    pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
+        if fast && !self.state.model.supports_fast() {
+            return Err(FAST_UNSUPPORTED_MSG.into());
+        }
+        self.state.fast = fast;
+        Ok(())
+    }
+
+    /// What `maki.model.get` hands to Lua.
+    pub(crate) fn model_state(&self) -> serde_json::Value {
+        let model = &self.state.model;
+        serde_json::json!({
+            "spec": model.spec(),
+            "id": model.id,
+            "provider": model.provider.to_string(),
+            "thinking": self.state.thinking.to_string(),
+            "fast": self.state.fast,
+            "supports_thinking": model.supports_thinking(),
+            "supports_fast": model.supports_fast(),
+        })
+    }
+
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = maki_storage::model::push_recent(&self.storage, spec);
+        let recents = maki_storage::model::push_recent(&self.storage, spec)
+            .into_iter()
+            .filter(|spec| self.model_policy.allows(spec))
+            .collect();
         self.model_picker.set_recents(recents);
     }
 
@@ -451,10 +574,12 @@ impl App {
         let _ = file.write_all(buf.as_bytes());
     }
 
-    pub fn tick_error_expiry(&mut self) {
-        if self.status.is_error_expired() {
-            self.status = Status::Idle;
+    pub fn tick_error_expiry(&mut self) -> Dirty {
+        if !self.status.is_error_expired() {
+            return Dirty::NO;
         }
+        self.status = Status::Idle;
+        Dirty::YES
     }
 
     /// Sets `cache_miss_warning` when the session has been idle past the cache
@@ -469,11 +594,17 @@ impl App {
             .last_turn_at
             .is_some_and(|t| t.elapsed() >= CACHE_MISS_IDLE);
         if idle_too_long && self.state.context_size > threshold {
-            let extra = TokenUsage {
-                input: self.state.context_size,
-                ..Default::default()
-            }
-            .cost(&self.state.model.pricing, self.state.fast);
+            let extra = self
+                .state
+                .model
+                .billed_cost(
+                    &TokenUsage {
+                        input: self.state.context_size,
+                        ..Default::default()
+                    },
+                    self.state.fast,
+                )
+                .unwrap_or(0.0);
             self.cache_miss_warning = Some(format!(
                 "cache miss likely — extra cost ${:.2} · Enter to resend, or /new",
                 extra
@@ -648,20 +779,10 @@ impl App {
             });
         }
         if key::HELP.matches(key) {
-            self.help_modal.toggle();
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::Help));
         }
         if key::TASKS.matches(key) {
-            self.open_tasks();
-            return Some(vec![]);
-        }
-        if key::PREV_CHAT.matches(key) {
-            self.active_chat = self.active_chat.saturating_sub(1);
-            return Some(vec![]);
-        }
-        if key::NEXT_CHAT.matches(key) {
-            self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
-            return Some(vec![]);
+            return Some(self.run_builtin(BuiltinAction::Tasks));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -1064,15 +1185,66 @@ impl App {
             });
         }
 
-        if key::PLAN_TOGGLE.matches(key)
-            && self.state.mode == Mode::Plan
-            && self.state.plan.is_ready()
-        {
-            self.plan_form.toggle();
-            return Some(vec![]);
+        if key::PLAN_TOGGLE.matches(key) && self.plan_toggle_ready() {
+            return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
 
         None
+    }
+
+    fn plan_toggle_ready(&self) -> bool {
+        self.state.mode == Mode::Plan && self.state.plan.is_ready()
+    }
+
+    /// Single implementation behind both the default keybindings and
+    /// `maki.ui.action`, so a Lua rebind can never drift from the
+    /// original key's behavior.
+    pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
+        match action {
+            BuiltinAction::FilePicker => {
+                self.file_picker.open(&self.state.session.cwd);
+            }
+            BuiltinAction::Search => {
+                let top = self.chats[self.active_chat].scroll_top();
+                let auto = self.chats[self.active_chat].auto_scroll();
+                self.search_modal.open(top, auto);
+            }
+            BuiltinAction::Tasks => {
+                if self.task_picker.is_open() {
+                    self.task_picker.close();
+                } else {
+                    self.open_tasks();
+                }
+            }
+            BuiltinAction::Help => self.help_modal.toggle(),
+            BuiltinAction::PlanToggle => {
+                if self.plan_toggle_ready() {
+                    self.plan_form.toggle();
+                }
+            }
+            BuiltinAction::PlanEditor => {
+                return match self.state.plan.path() {
+                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                    None => {
+                        self.flash(FLASH_NO_PLAN.into());
+                        vec![]
+                    }
+                };
+            }
+            BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
+            BuiltinAction::PopQueue => {
+                self.queue.remove(0);
+            }
+            BuiltinAction::PrevChat => self.active_chat = self.active_chat.saturating_sub(1),
+            BuiltinAction::NextChat => {
+                self.active_chat = (self.active_chat + 1).min(self.chats.len() - 1);
+            }
+            BuiltinAction::ModelPicker => {
+                self.model_picker.open(&self.state.model.spec());
+                return vec![Action::RefreshModels];
+            }
+        }
+        vec![]
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1135,7 +1307,7 @@ impl App {
             return vec![Action::EditSystemPrompt];
         }
         if key::SESSIONS.matches(key) {
-            self.run_lua_command("/sessions", String::new());
+            self.run_lua_command("/sessions", String::new(), 0);
             return vec![];
         }
         if key::SHIFT_SESSION_DOWN.matches(key) {
@@ -1156,7 +1328,10 @@ impl App {
             return vec![];
         }
         if key::EDIT_INPUT.matches(key) {
-            return vec![Action::EditInputInEditor];
+            return self.run_builtin(BuiltinAction::EditInput);
+        }
+        if key::MODEL_PICKER.matches(key) {
+            return self.run_builtin(BuiltinAction::ModelPicker);
         }
         if key::OPEN_EDITOR.matches(key) {
             return match self.state.plan.path() {
@@ -1169,13 +1344,13 @@ impl App {
         }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
-                self.queue.remove(0);
+                // OPEN_EDITOR is Alt+P here, handled above rather than in this
+                // Ctrl-only chain.
+                return self.run_builtin(BuiltinAction::PopQueue);
             } else if key::SEARCH.matches(key) {
-                let top = self.chats[self.active_chat].scroll_top();
-                let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(top, auto);
+                return self.run_builtin(BuiltinAction::Search);
             } else if key::FILE_PICKER.matches(key) {
-                self.file_picker.open(&self.state.session.cwd);
+                return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
@@ -1189,7 +1364,10 @@ impl App {
             .handle_key(key, &self.input_box.buffer.value())
         {
             CommandAction::Consumed => return vec![],
-            CommandAction::Execute(cmd) => return self.execute_command(cmd),
+            CommandAction::Execute(cmd) => {
+                self.input_box.discard();
+                return self.execute_command(cmd, 0);
+            }
             CommandAction::Complete(text) => {
                 self.command_palette.sync(&text);
                 self.input_box.set_input(text);
@@ -1200,7 +1378,9 @@ impl App {
         }
 
         if key.code == KeyCode::Char('@')
-            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             self.file_picker.open(&self.state.session.cwd);
             return vec![];
@@ -1264,7 +1444,11 @@ impl App {
         self.save_input_history();
         self.flush_turn_stats();
         self.exit_request = req;
-        vec![]
+        vec![Action::ManualExit]
+    }
+
+    pub(crate) fn clear_exit_request(&mut self) {
+        self.exit_request = ExitRequest::None;
     }
 
     pub fn reload_config(&mut self) {
@@ -1528,10 +1712,11 @@ impl App {
 
         if let AgentEvent::TurnComplete(ref tc) = envelope.event {
             self.state.token_usage += tc.usage;
+            add_cost(&mut self.state.cost, tc.cost);
             add_cost(&mut self.chats[chat_idx].cost, tc.cost);
             self.state
                 .session_mut()
-                .add_model_usage(&tc.model, tc.usage.into());
+                .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
             self.chats[chat_idx].context_size = ctx_size;
             if chat_idx == 0 {
@@ -1563,16 +1748,28 @@ impl App {
                 } else {
                     0.0
                 };
-                let cache_hit_cost = TokenUsage {
-                    cache_read: tc.usage.cache_read,
-                    ..Default::default()
-                }
-                .cost(&self.state.model.pricing, self.state.fast);
-                let cache_miss_cost = TokenUsage {
-                    input: total,
-                    ..Default::default()
-                }
-                .cost(&self.state.model.pricing, self.state.fast);
+                let cache_hit_cost = self
+                    .state
+                    .model
+                    .billed_cost(
+                        &TokenUsage {
+                            cache_read: tc.usage.cache_read,
+                            ..Default::default()
+                        },
+                        self.state.fast,
+                    )
+                    .unwrap_or(0.0);
+                let cache_miss_cost = self
+                    .state
+                    .model
+                    .billed_cost(
+                        &TokenUsage {
+                            input: total,
+                            ..Default::default()
+                        },
+                        self.state.fast,
+                    )
+                    .unwrap_or(0.0);
                 self.last_turn_stats = Some(crate::components::status_bar::TurnStats {
                     pp_tps,
                     tg_tps,
@@ -1788,8 +1985,35 @@ impl App {
         self.last_seen_output_tokens = 0;
     }
 
-    fn execute_command(&mut self, cmd: ParsedCommand) -> Vec<Action> {
-        self.input_box.discard();
+    /// Entry point for `maki.api.run_command`: splits a command line into the
+    /// name and args the input bar would hand over, leading slash optional.
+    /// `Err` means nothing ran at all, so the Lua caller can say why.
+    pub(crate) fn run_cmdline(&mut self, cmdline: &str, depth: u8) -> Result<Vec<Action>, String> {
+        if depth > MAX_COMMAND_DEPTH {
+            return Err(COMMAND_DEPTH_MSG.to_string());
+        }
+        let trimmed = cmdline.trim();
+        let (name, args) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        let resolved = self
+            .command_palette
+            .resolve(&format!("/{}", name.trim_start_matches('/')))
+            .ok_or_else(|| format!("unknown command '{name}'"))?;
+        Ok(self.execute_command(
+            ParsedCommand {
+                name: resolved,
+                args: args.trim().to_string(),
+            },
+            depth,
+        ))
+    }
+
+    /// {depth} is the `maki.api.run_command` hop count, forwarded to a Lua
+    /// handler so an alias cycle keeps counting. 0 when the user typed it.
+    fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
+        // The discard belongs to the typed path only: `run_cmdline` comes from
+        // Lua and must leave whatever the user is halfway through writing.
         match cmd.name.as_str() {
             "/tasks" => {
                 self.open_tasks();
@@ -1898,33 +2122,18 @@ impl App {
                 vec![]
             }
             "/thinking" => {
-                if !self.state.model.supports_thinking() {
-                    self.flash("Thinking requires a model that supports it".into());
-                    return vec![];
-                }
-                match ThinkingConfig::parse(cmd.args.trim(), self.state.thinking) {
-                    Ok(thinking) => {
-                        self.state.thinking = thinking;
-                        self.flash(format!("Thinking: {thinking}"));
-                    }
-                    Err(msg) => self.flash(msg.into()),
+                match self.set_thinking(&cmd.args) {
+                    Ok(thinking) => self.flash(format!("Thinking: {thinking}")),
+                    Err(msg) => self.flash(msg),
                 }
                 vec![]
             }
             "/fast" => {
-                if !self.state.model.supports_fast() {
-                    self.flash(FAST_UNSUPPORTED_MSG.into());
-                    return vec![];
+                let fast = !self.state.fast;
+                match self.set_fast(fast) {
+                    Ok(()) => self.flash(if fast { FAST_ON_MSG } else { FAST_OFF_MSG }.into()),
+                    Err(msg) => self.flash(msg),
                 }
-                self.state.fast = !self.state.fast;
-                self.flash(
-                    if self.state.fast {
-                        FAST_ON_MSG
-                    } else {
-                        FAST_OFF_MSG
-                    }
-                    .into(),
-                );
                 vec![]
             }
             "/workflow" => {
@@ -1971,14 +2180,14 @@ impl App {
                 self.execute_mcp_prompt(name, &cmd.args)
             }
             name if self.command_palette.find_lua_command(name).is_some() => {
-                self.run_lua_command(name, cmd.args);
+                self.run_lua_command(name, cmd.args, depth);
                 vec![]
             }
             _ => vec![],
         }
     }
 
-    fn run_lua_command(&self, name: &str, args: String) {
+    fn run_lua_command(&self, name: &str, args: String, depth: u8) {
         let Some(lua_cmd) = self.command_palette.find_lua_command(name) else {
             return;
         };
@@ -1986,6 +2195,7 @@ impl App {
             Arc::clone(&lua_cmd.plugin),
             Arc::clone(&lua_cmd.name),
             args,
+            depth,
         );
     }
 
@@ -2145,10 +2355,36 @@ impl App {
         self.overlays().iter().any(|o| o.is_open())
     }
 
-    /// True when the agent is parked on user input: a permission prompt or an
-    /// auth retry. Drives the `needs_input` session status.
+    /// True when the agent is parked on user input. Drives the `needs_input`
+    /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_prompt.is_open() || self.pending_input != PendingInput::None
+        self.permission_prompt.is_open()
+            || self.pending_input != PendingInput::None
+            || self.float_mgr.needs_input()
+    }
+
+    /// True while `recoverable_queue` holds user text captured at an agent
+    /// error; a background run would wipe it (`start_run` clears the queue).
+    pub(crate) fn holds_recovery_text(&self) -> bool {
+        !self.recoverable_queue.is_empty()
+    }
+
+    pub(crate) fn attention(&self) -> Option<Notification> {
+        if let Some(tool) = self.permission_prompt.tool() {
+            let tool = (!matches!(tool, maki_config::ToolKey::Wildcard))
+                .then(|| normalize_preview(&tool.to_string()))
+                .flatten();
+            return Some(Notification::PermissionRequested { tool });
+        }
+        if matches!(self.pending_input, PendingInput::AuthRetry { .. }) {
+            return Some(Notification::AuthenticationRequired);
+        }
+        if self.status != Status::Streaming && self.plan_form_active() {
+            return Some(Notification::PlanReady);
+        }
+        self.float_mgr
+            .needs_input()
+            .then_some(Notification::QuestionRequested)
     }
 
     pub fn has_modal_overlay(&self) -> bool {
@@ -2159,17 +2395,49 @@ impl App {
         self.overlays_mut().iter_mut().for_each(|o| o.close());
     }
 
-    pub fn is_animating(&self) -> bool {
-        !self.image_paste_rx.is_empty()
-            || self.btw_modal.is_animating()
-            || self.file_picker.is_loading()
-            || self.float_mgr.is_open()
-            || self
-                .selection_state
+    /// Every poller that feeds the screen, in one place and never in `view`;
+    /// see [`crate::repaint`] for why.
+    pub fn tick(&mut self) -> Dirty {
+        // `|` never short-circuits: every poller must run on every tick.
+        self.float_mgr.tick()
+            | self.tick_edge_scroll()
+            | self.tick_error_expiry()
+            | self.poll_image_paste()
+            | self.btw_modal.poll()
+            | self.status_bar.poll_branch_update()
+            | self.status_bar.clear_expired_hint()
+            | self.mcp_picker.refresh()
+            | self.model_picker.refresh()
+            | self.usage_modal.poll(&self.usage_slot)
+            | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_file_picker()
+            | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    fn tick_file_picker(&mut self) -> Dirty {
+        let (dirty, flash) = self.file_picker.tick();
+        if let Some(flash) = flash {
+            self.status_bar.flash(flash);
+        }
+        dirty
+    }
+
+    /// What moves with the clock alone; changes that come from arriving data
+    /// are reported by [`Self::tick`] instead. Overlays answer as a group, so
+    /// adding one to [`Self::overlays`] is enough.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::any([
+            Cadence::any(self.overlays().into_iter().map(Overlay::cadence)),
+            StatusBar::cadence(
+                &self.status,
+                self.restoring.load(Ordering::Relaxed),
+                self.retry_info.is_some(),
+            ),
+            self.selection_state
                 .as_ref()
-                .is_some_and(|s| s.is_edge_scrolling())
-            || self.restoring.load(Ordering::Relaxed)
-            || self.chats.iter().any(|c| c.is_animating())
+                .map_or(Cadence::IDLE, SelectionState::cadence),
+            Cadence::any(self.chats.iter().map(Chat::cadence)),
+        ])
     }
 
     fn finish_subagents(&mut self, role: DisplayRole, text: &str) {

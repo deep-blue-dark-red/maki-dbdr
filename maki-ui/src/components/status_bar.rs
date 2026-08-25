@@ -7,21 +7,26 @@ use super::{RetryInfo, Status};
 
 use crate::theme;
 
-use maki_providers::{ModelPricing, TokenUsage, format_tokens};
+use maki_providers::format_tokens;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::repaint::{Cadence, Dirty};
+
+const TRUNCATE_PREFIX: &str = "..";
+const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 
-pub struct UsageStats<'a> {
-    pub global_usage: &'a TokenUsage,
+pub struct UsageStats {
+    /// The whole session's bill, drawn next to the focused chat's own once
+    /// subagents make the two differ.
+    pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
-    pub pricing: &'a ModelPricing,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -56,7 +61,7 @@ pub struct StatusBarContext<'a> {
     pub mode_label: Cow<'static, str>,
     pub mode_style: Style,
     pub model_id: &'a str,
-    pub stats: UsageStats<'a>,
+    pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
     pub session_name: Option<&'a str>,
@@ -105,27 +110,43 @@ impl StatusBar {
         self.cwd_branch = cwd_branch_label();
     }
 
-    pub fn poll_branch_update(&mut self) {
+    pub fn poll_branch_update(&mut self) -> Dirty {
         let Some(rx) = &self.branch_update_rx else {
-            return;
+            return Dirty::NO;
         };
-        if rx.try_iter().next().is_some() {
-            self.cwd_branch = cwd_branch_label();
+        if rx.try_iter().next().is_none() {
+            return Dirty::NO;
         }
+        let branch = cwd_branch_label();
+        let changed = branch != self.cwd_branch;
+        self.cwd_branch = branch;
+        Dirty::from(changed)
     }
 
     pub fn clear_flash(&mut self) {
         self.flash = None;
     }
 
-    pub fn clear_expired_hint(&mut self) {
+    pub fn clear_expired_hint(&mut self) -> Dirty {
         if self
             .flash
             .as_ref()
-            .is_some_and(|(_, t)| t.elapsed() >= self.flash_duration)
+            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration)
         {
-            self.flash = None;
+            return Dirty::NO;
         }
+        self.flash = None;
+        Dirty::YES
+    }
+
+    /// The bar spins for a whole turn, again while a restore is in flight, and
+    /// it counts a retry down by the second. It sits next to [`Self::view`] so
+    /// a new moving span cannot forget to claim its frames.
+    pub fn cadence(status: &Status, restoring: bool, retrying: bool) -> Cadence {
+        Cadence::when(
+            *status == Status::Streaming || restoring || retrying,
+            Cadence::SPINNER,
+        )
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext) {
@@ -298,11 +319,8 @@ impl StatusBar {
             };
             right_spans.push(Span::styled(rest_text, context_style));
 
-            if ctx.stats.show_global && !ctx.stats.pricing.is_zero() {
-                let global_text = format!(
-                    "\u{03a3}${:.3}  ",
-                    ctx.stats.global_usage.cost(ctx.stats.pricing, ctx.fast),
-                );
+            if let Some(global) = ctx.stats.global_cost.filter(|_| ctx.stats.show_global) {
+                let global_text = format!("\u{03a3}${global:.3}  ");
                 right_spans.push(Span::styled(global_text, context_style));
             }
 
@@ -524,8 +542,78 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::repaint::expect::QUIET;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const FLASH_TTL: Duration = Duration::from_secs(3600);
+    const FLASH_MSG: &str = "Copied";
+    const STALE_BRANCH: &str = "/nowhere:gone";
+    const BAR_WIDTH: u16 = 120;
+    const MODEL_ID: &str = "test-model";
+    const CONTEXT_SIZE: u32 = 12_000;
+    const CHAT_COST: f64 = 0.25;
+    const CHAT_COST_TEXT: &str = "$0.250";
+    const SESSION_COST: f64 = 1.5;
+    const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
+    const SIGMA: char = '\u{03a3}';
+
+    fn render(global_cost: Option<f64>, show_global: bool) -> String {
+        let bar = StatusBar::new(FLASH_TTL);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
+        let ctx = StatusBarContext {
+            status: &Status::Idle,
+            mode_label: "build".into(),
+            mode_style: Style::new(),
+            model_id: MODEL_ID,
+            stats: UsageStats {
+                global_cost,
+                context_size: CONTEXT_SIZE,
+                cost: Some(CHAT_COST),
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                show_global,
+            },
+            auto_scroll: true,
+            chat_name: None,
+            session_name: None,
+            retry_info: None,
+            thinking_label: None,
+            fast: false,
+            workflow: false,
+            restoring: false,
+            streaming_info: None,
+            streaming_active: false,
+            verbose: false,
+            last_turn_stats: None,
+            show_token_stats: false,
+            cache_miss_warning: None,
+        };
+        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    /// The sigma is the whole session's bill, and only the session can hand it
+    /// over. Pricing the focused chat's counters instead (what the bar used to
+    /// do) tells the user a paid session was free, or bills another chat's
+    /// tokens at this model's rates. A lone chat has nothing extra to show.
+    #[test_case(Some(SESSION_COST), true  => true  ; "subagents_add_the_session_total")]
+    #[test_case(Some(SESSION_COST), false => false ; "single_chat_shows_its_own_cost_only")]
+    #[test_case(None,               true  => false ; "unpriced_session_claims_nothing")]
+    fn session_total_appears_only_when_there_is_one_to_show(
+        global_cost: Option<f64>,
+        show_global: bool,
+    ) -> bool {
+        let text = render(global_cost, show_global);
+        assert_eq!(text.matches(CHAT_COST_TEXT).count(), 1, "{text}");
+        let shown = text.matches(SESSION_COST_TEXT).count() == 1;
+        assert_eq!(
+            text.contains(SIGMA),
+            shown,
+            "a sigma carrying another number is a misrender: {text}"
+        );
+        shown
+    }
 
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
     #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]
@@ -564,12 +652,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clear_expired_hint_removes_stale_flash() {
-        let mut bar = StatusBar::new(Duration::ZERO);
-        bar.flash("Copied".into());
-        bar.clear_expired_hint();
-        assert!(bar.flash.is_none());
+    /// Once the flash is gone nothing clears the debt, so only the tick that
+    /// removes it may report a change, or the loop never settles. The two
+    /// lifetimes stand in for time passing: rewinding an `Instant` by an hour
+    /// panics on a machine that booted less than an hour ago.
+    #[test_case(false, FLASH_TTL      => Dirty::NO  ; "no_flash")]
+    #[test_case(true,  FLASH_TTL      => Dirty::NO  ; "flash_still_visible")]
+    #[test_case(true,  Duration::ZERO => Dirty::YES ; "flash_expired")]
+    fn clear_expired_hint_owes_the_frame_only_once(flashing: bool, ttl: Duration) -> Dirty {
+        let mut bar = StatusBar::new(ttl);
+        if flashing {
+            bar.flash(FLASH_MSG.into());
+        }
+
+        let first = bar.clear_expired_hint();
+        assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
+        first
+    }
+
+    /// The watcher fires for any write near `.git/HEAD`, most of which leave
+    /// the branch alone, so repainting on each one means a repaint per commit,
+    /// stash and index refresh while a build touches the repo. Either way the
+    /// poll has to leave the bounded channel empty, or the watcher's
+    /// `try_send` drops the next real switch.
+    #[test_case(false => Dirty::NO  ; "unchanged_branch")]
+    #[test_case(true  => Dirty::YES ; "switched_branch")]
+    fn poll_branch_update_reports_only_real_changes(stale: bool) -> Dirty {
+        let label = cwd_branch_label();
+        let (tx, rx) = flume::bounded(1);
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.cwd_branch = if stale {
+            STALE_BRANCH.into()
+        } else {
+            label.clone()
+        };
+        bar.branch_update_rx = Some(rx);
+        tx.send(()).unwrap();
+
+        let dirty = bar.poll_branch_update();
+        assert_eq!(bar.cwd_branch, label);
+        assert!(
+            tx.try_send(()).is_ok(),
+            "a full channel makes the watcher drop the next switch"
+        );
+        dirty
     }
 
     #[test_case("llama-cpp//mnt/commons/models/Qwen3.gguf", "llama-cpp/Qwen3.gguf" ; "strips_middle")]

@@ -98,8 +98,17 @@ fn extract_with(
             continue;
         }
 
-        let rel_start = doc_start.row.saturating_sub(seg_start) as u16;
-        let rel_end = ((doc_end.row + 1).saturating_sub(seg_start) as u16).min(h);
+        // `h` is the document layout height, which can predate a resize (see
+        // `Segment::height`), while the window below is cut at the real width.
+        // The rows we copy come from that wrap, so measure and clamp against
+        // it, and take the whole segment whenever the selection covers it.
+        let drawn = seg.drawn_height(width);
+        let rel_start = (doc_start.row.saturating_sub(seg_start) as u16).min(drawn);
+        let rel_end = if doc_end.row + 1 >= seg_end {
+            drawn
+        } else {
+            ((doc_end.row + 1 - seg_start) as u16).min(drawn)
+        };
         let rows = rel_end.saturating_sub(rel_start);
         if rows == 0 {
             continue;

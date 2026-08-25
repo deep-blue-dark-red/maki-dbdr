@@ -14,7 +14,7 @@ use std::mem;
 use maki_providers::ImageSource;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
@@ -40,6 +40,17 @@ const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "refactor a module",
     "remove dead code",
 ];
+const QUEUE_PLACEHOLDER: &str = "Queue another prompt...";
+const ASK_PREFIX: &str = "Ask maki to ";
+const ASK_SUFFIX: &str = "...";
+const BLANK_PLACEHOLDER: &str = " ";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Placeholder {
+    Suggestion,
+    Blank,
+    Queue,
+}
 
 pub enum InputAction {
     Submit(Submission),
@@ -88,8 +99,11 @@ struct RenderKey {
     cursor: (usize, usize),
     ew: usize,
     focused: bool,
-    streaming: bool,
+    placeholder: Placeholder,
     image_count: usize,
+    /// `render_lines` reads `theme::current()`, so a palette swap has to miss
+    /// the cache or the input keeps painting in the old theme's colours.
+    theme_gen: u64,
 }
 
 impl InputBox {
@@ -333,7 +347,7 @@ impl InputBox {
         &mut self,
         frame: &mut Frame,
         area: Rect,
-        streaming: bool,
+        placeholder: Placeholder,
         border_style: Style,
         focused: bool,
         top_right_hint: Option<Line<'_>>,
@@ -364,13 +378,14 @@ impl InputBox {
             cursor: (self.buffer.x(), self.buffer.y()),
             ew,
             focused,
-            streaming,
+            placeholder,
             image_count: self.pending_images.len(),
+            theme_gen: theme::generation(),
         };
         let styled_lines = match &self.render_cache {
             Some((k, lines)) if *k == key => lines.clone(),
             _ => {
-                let lines = render_lines(self, ew, focused, streaming);
+                let lines = render_lines(self, ew, focused, placeholder);
                 self.render_cache = Some((key, lines.clone()));
                 lines
             }
@@ -412,6 +427,84 @@ impl InputBox {
         self.scroll_y = apply_scroll_delta(self.scroll_y, delta).min(self.max_scroll());
         self.follow_cursor = false;
     }
+
+    /// Move the text cursor to the position corresponding to a mouse click at
+    /// the terminal coordinates (row, col) within the input content area.
+    pub fn handle_click(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
+        let Some((y, x)) = self.click_position(area, row, col, focused) else {
+            return;
+        };
+        self.buffer.set_cursor(y, x);
+        self.follow_cursor = true;
+    }
+
+    /// Convert a mouse click at terminal (row, col) within the input content
+    /// area into a (line_index, char_index) in the text buffer, accounting
+    /// for scroll offset, word-wrap, and the chevron/padding prefix.
+    fn click_position(
+        &self,
+        area: Rect,
+        row: u16,
+        col: u16,
+        focused: bool,
+    ) -> Option<(usize, usize)> {
+        let content_y = row.checked_sub(area.y)?;
+        let content_x = col.checked_sub(area.x)?;
+
+        let ew = effective_width(area.width as usize);
+        let visual_line = content_y as usize + self.scroll_y as usize;
+
+        let cursor_line = self.buffer.y();
+        let mut visual = 0usize;
+
+        for (buf_line_idx, line) in self.buffer.lines().iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
+
+            let is_cursor_line = buf_line_idx == cursor_line && focused;
+            let ranges = wrap_ranges(&widths, ew, is_cursor_line);
+
+            let n_visual_rows = ranges.len();
+
+            if visual_line < visual + n_visual_rows {
+                let wrap_row = visual_line - visual;
+                let (row_char_start, row_char_end) = ranges[wrap_row];
+
+                let row_display_width: usize = widths[row_char_start..row_char_end].iter().sum();
+
+                // The first visual row of each buffer line has a 2-cell prefix
+                // (chevron or continuation padding).  Wrapped rows have none.
+                let text_col = if wrap_row == 0 {
+                    (content_x as usize).saturating_sub(PREFIX_WIDTH as usize)
+                } else {
+                    content_x as usize
+                };
+                let text_col = text_col.min(row_display_width);
+
+                // Walk character widths to find which char the column hits.
+                let mut accum = 0;
+                let mut char_idx = row_char_start;
+                for &w in &widths[row_char_start..row_char_end] {
+                    if accum + w > text_col {
+                        break;
+                    }
+                    accum += w;
+                    char_idx += 1;
+                }
+
+                return Some((buf_line_idx, char_idx));
+            }
+            visual += n_visual_rows;
+        }
+
+        None
+    }
+}
+
+fn cursor_on_first_char(text: &'static str, base: Style, focused: bool) -> [Span<'static>; 2] {
+    let (first, rest) = text.split_at(text.chars().next().map_or(0, char::len_utf8));
+    let cursor = if focused { base.reversed() } else { base };
+    [Span::styled(first, cursor), Span::styled(rest, base)]
 }
 
 fn random_placeholder_hint() -> &'static str {
@@ -426,37 +519,31 @@ fn effective_width(content_width: usize) -> usize {
     content_width.saturating_sub(PREFIX_WIDTH as usize)
 }
 
-fn render_lines(input: &InputBox, ew: usize, focused: bool, streaming: bool) -> Vec<Line<'static>> {
+fn render_lines(
+    input: &InputBox,
+    ew: usize,
+    focused: bool,
+    placeholder: Placeholder,
+) -> Vec<Line<'static>> {
     let is_empty =
         input.buffer.line_count() <= 1 && input.buffer.lines().first().is_none_or(String::is_empty);
     if is_empty && input.pending_images.is_empty() {
-        let placeholder_base = theme::current().input_placeholder;
-        return if streaming {
-            vec![Line::from(vec![
-                super::chevron_span(),
-                if focused {
-                    Span::styled("Q", placeholder_base.reversed())
-                } else {
-                    Span::styled("Q", placeholder_base)
-                },
-                Span::styled("ueue another prompt...", placeholder_base),
-            ])]
-        } else {
-            vec![Line::from(vec![
-                super::chevron_span(),
-                if focused {
-                    Span::styled("A", placeholder_base.reversed())
-                } else {
-                    Span::styled("A", placeholder_base)
-                },
-                Span::styled("sk maki to ", placeholder_base),
-                Span::styled(
-                    input.placeholder_hint,
-                    placeholder_base.add_modifier(ratatui::style::Modifier::ITALIC),
-                ),
-                Span::styled("...", placeholder_base),
-            ])]
+        let base = theme::current().input_placeholder;
+        let (head, tail) = match placeholder {
+            Placeholder::Suggestion => (
+                ASK_PREFIX,
+                vec![
+                    Span::styled(input.placeholder_hint, base.add_modifier(Modifier::ITALIC)),
+                    Span::styled(ASK_SUFFIX, base),
+                ],
+            ),
+            Placeholder::Queue => (QUEUE_PLACEHOLDER, Vec::new()),
+            Placeholder::Blank => (BLANK_PLACEHOLDER, Vec::new()),
         };
+        let mut spans = vec![super::chevron_span()];
+        spans.extend(cursor_on_first_char(head, base, focused));
+        spans.extend(tail);
+        return vec![Line::from(spans)];
     }
 
     let cursor_y = input.buffer.y();
@@ -508,27 +595,8 @@ fn wrap_line(
 ) -> Vec<Line<'static>> {
     let chars: Vec<char> = line.chars().collect();
     let widths: Vec<usize> = chars.iter().map(|c| c.width().unwrap_or(1)).collect();
-    let row_width = ew.max(1);
 
-    let mut row_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut row_start = 0;
-    let mut row_col = 0;
-    for (i, &w) in widths.iter().enumerate() {
-        if row_col + w > row_width && row_col > 0 {
-            row_ranges.push((row_start, i));
-            row_start = i;
-            row_col = 0;
-        }
-        row_col += w;
-    }
-    if row_start < chars.len() || row_ranges.is_empty() {
-        row_ranges.push((row_start, chars.len()));
-    }
-    if is_cursor_line && row_col + 1 > row_width {
-        row_ranges.push((chars.len(), chars.len()));
-    }
-
-    row_ranges
+    wrap_ranges(&widths, ew, is_cursor_line)
         .into_iter()
         .enumerate()
         .map(|(row, (start, end))| {
@@ -558,6 +626,31 @@ fn wrap_line(
             Line::from(spans)
         })
         .collect()
+}
+
+/// Split a line (given per-char display widths) into wrapped row ranges of
+/// char indices, exactly as it is rendered: an extra empty row is appended
+/// when the cursor sits past a completely full last row.
+fn wrap_ranges(widths: &[usize], ew: usize, is_cursor_line: bool) -> Vec<(usize, usize)> {
+    let row_width = ew.max(1);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut row_start = 0;
+    let mut row_col = 0;
+    for (i, &w) in widths.iter().enumerate() {
+        if row_col + w > row_width && row_col > 0 {
+            ranges.push((row_start, i));
+            row_start = i;
+            row_col = 0;
+        }
+        row_col += w;
+    }
+    if row_start < widths.len() || ranges.is_empty() {
+        ranges.push((row_start, widths.len()));
+    }
+    if is_cursor_line && row_col + 1 > row_width {
+        ranges.push((widths.len(), widths.len()));
+    }
+    ranges
 }
 
 fn shell_highlight_spans(line: &str) -> Option<Vec<Span<'static>>> {
@@ -655,6 +748,7 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> u
 mod tests {
     use super::*;
     use crate::components::scrollbar::SCROLLBAR_THUMB;
+    use ratatui::layout::Rect;
     use test_case::test_case;
 
     fn type_text(input: &mut InputBox, text: &str) {
@@ -825,15 +919,15 @@ mod tests {
         input: &mut InputBox,
         width: u16,
         height: u16,
-        streaming: bool,
-        border_style: Style,
+        placeholder: Placeholder,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let border_style = Style::new().fg(theme::current().mode_build);
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                input.view(frame, area, streaming, border_style, true, None);
+                input.view(frame, area, placeholder, border_style, true, None);
             })
             .unwrap();
         terminal
@@ -844,13 +938,7 @@ mod tests {
         width: u16,
         height: u16,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        render_input_with(
-            input,
-            width,
-            height,
-            false,
-            Style::new().fg(theme::current().mode_build),
-        )
+        render_input_with(input, width, height, Placeholder::Suggestion)
     }
 
     fn has_scrollbar_thumb(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {
@@ -972,12 +1060,27 @@ mod tests {
         assert_eq!(input.copy_text(), "❯ line1\n  line2");
     }
 
-    #[test]
-    fn placeholder_has_prefix() {
+    #[test_case(Placeholder::Blank, "" ; "blank_shows_only_the_chevron")]
+    #[test_case(Placeholder::Queue, QUEUE_PLACEHOLDER ; "queue_asks_for_another_prompt")]
+    fn placeholder_row(placeholder: Placeholder, expected: &str) {
         let mut input = InputBox::new(InputHistory::default(), 20);
+        let terminal = render_input_with(&mut input, 40, 4, placeholder);
+        assert_eq!(
+            rendered_row(&terminal, 1),
+            format!("{CHEVRON}{expected}").trim_end()
+        );
+    }
+
+    #[test]
+    fn suggestion_placeholder_shows_a_hint() {
+        const HINT: &str = "fix a bug";
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.placeholder_hint = HINT;
         let terminal = render_input(&mut input, 40, 4);
-        let row = rendered_row(&terminal, 1);
-        assert!(row.starts_with(CHEVRON), "placeholder row: {row:?}");
+        assert_eq!(
+            rendered_row(&terminal, 1),
+            format!("{CHEVRON}{ASK_PREFIX}{HINT}{ASK_SUFFIX}")
+        );
     }
 
     fn test_image() -> ImageSource {
@@ -1149,5 +1252,61 @@ mod tests {
         input.history_down();
         let back = rendered_text(&render_input(&mut input, 40, 5));
         assert!(back.contains("draft!"), "stale render, got: {back}");
+    }
+
+    // ew = area.width - PREFIX_WIDTH (2); with width 10, row_width is 8.
+    fn area(width: u16) -> Rect {
+        Rect::new(0, 0, width, 10)
+    }
+
+    fn single_line(text: &str) -> InputBox {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, text);
+        input
+    }
+
+    #[test_case("abc", (0, 0) => Some((0, 0)); "click in chevron prefix of first row")]
+    #[test_case("abc", (0, 1) => Some((0, 0)); "click on trailing part of prefix")]
+    #[test_case("abc", (0, 2) => Some((0, 0)); "click on first text column")]
+    #[test_case("abc", (0, 9) => Some((0, 3)); "click past end of line clamps to line end")]
+    #[test_case("abc", (1, 0) => None; "click below content returns None")]
+    fn click_position_prefix_and_clamp(
+        text: &str,
+        (row, col): (u16, u16),
+    ) -> Option<(usize, usize)> {
+        single_line(text).click_position(area(10), row, col, true)
+    }
+
+    #[test_case((1, 0) => Some((1, 0)); "second line col 0 is its start")]
+    #[test_case((1, 1) => Some((1, 0)); "second line prefix occupies its first two cols")]
+    #[test_case((1, 3) => Some((1, 1)); "second line text starts after the prefix")]
+    #[test_case((1, 4) => Some((1, 2)); "second line maps last column")]
+    fn click_position_second_line_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "abc");
+        input.buffer.add_line();
+        type_text(&mut input, "def");
+        input.click_position(area(10), row, col, true)
+    }
+
+    #[test_case((1, 0) => Some((0, 8)); "continuation row first col maps to wrapped chunk start")]
+    #[test_case((1, 1) => Some((0, 9)); "continuation row has no prefix offset")]
+    fn click_position_wrapped_line_has_no_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
+        // width 10 -> ew 8 -> "abcdefghij" wraps as [0,8) then [8,10).
+        single_line("abcdefghij").click_position(area(10), row, col, true)
+    }
+
+    #[test_case(true, (1, 2) => Some((0, 8)); "focused full cursor line gets an extra row")]
+    #[test_case(false, (1, 2) => Some((1, 0)); "unfocused full cursor line has no extra row")]
+    fn click_position_cursor_extra_row(
+        focused: bool,
+        (row, col): (u16, u16),
+    ) -> Option<(usize, usize)> {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "abcdefgh");
+        input.buffer.add_line();
+        type_text(&mut input, "xy");
+        input.buffer.set_cursor(0, 8);
+        input.click_position(area(10), row, col, focused)
     }
 }

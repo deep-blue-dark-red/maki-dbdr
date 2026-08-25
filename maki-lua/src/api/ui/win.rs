@@ -109,6 +109,7 @@ const recv__doc: FnDoc = FnDoc {
         desc: "Max milliseconds to wait before a timeout event is returned.",
     }],
     returns: "(table|nil) Event table, or nil if the window has closed.",
+    guard: None,
     example: "while true do\n  local ev = win:recv()\n  if not ev or ev.key == \"q\" then break end\n  if ev.type == \"key\" and ev.key == \"j\" then\n    -- move cursor down\n  end\nend\nwin:close()",
 };
 
@@ -178,6 +179,7 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - reserved_top (integer): rows reserved at the top of the content area.
 ///   - split (string): edge docking, "above", "below", "left", "right", "panel", or "".
 ///   - order (integer): paint order among split windows.
+///   - needs_input (boolean): whether the window means the session needs user input.
 /// @return
 /// @example
 /// win:set_config({ title = "Updated!", width = "80%" })
@@ -207,7 +209,7 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(z) = opts.get::<u16>("zindex") {
         patch.zindex = Some(z);
     }
-    if let Ok(cl) = opts.get::<bool>("cursor_line") {
+    if let Ok(Some(cl)) = opts.get::<Option<bool>>("cursor_line") {
         patch.cursor_line = Some(cl);
     }
     if let Ok(rt) = opts.get::<usize>("reserved_top") {
@@ -218,6 +220,9 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     }
     if let Ok(o) = opts.get::<u16>("order") {
         patch.order = Some(o);
+    }
+    if let Ok(Some(ni)) = opts.get::<Option<bool>>("needs_input") {
+        patch.needs_input = Some(ni);
     }
     patch.width = try_parse_dimension(&opts, "width");
     patch.height = try_parse_dimension(&opts, "height");
@@ -342,6 +347,7 @@ lua_class! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::util::command::FloatConfig;
 
     fn make_channels() -> (
         flume::Sender<WinEvent>,
@@ -450,6 +456,43 @@ mod tests {
             assert_eq!(recv_task.await.unwrap(), "key");
         }));
         assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::SetCursor(2))));
+    }
+
+    #[test]
+    fn set_config_without_needs_input_keeps_flag() {
+        let lua = mlua::Lua::new();
+        let (_event_tx, cmd_rx, handle) = make_channels();
+        lua.globals().set("win", handle).unwrap();
+        lua.load("win:set_config({ title = \"t\" })")
+            .exec()
+            .unwrap();
+        let Ok(WinCommand::SetConfig(patch)) = cmd_rx.try_recv() else {
+            panic!("expected SetConfig command");
+        };
+        assert_eq!(
+            patch.needs_input, None,
+            "absent key must not touch the flag"
+        );
+        let mut cfg = FloatConfig {
+            needs_input: true,
+            ..FloatConfig::default()
+        };
+        cfg.apply_patch(patch);
+        assert!(cfg.needs_input, "patch without the key must keep the flag");
+    }
+
+    #[test]
+    fn set_config_with_needs_input_false_clears_flag() {
+        let lua = mlua::Lua::new();
+        let (_event_tx, cmd_rx, handle) = make_channels();
+        lua.globals().set("win", handle).unwrap();
+        lua.load("win:set_config({ needs_input = false })")
+            .exec()
+            .unwrap();
+        let Ok(WinCommand::SetConfig(patch)) = cmd_rx.try_recv() else {
+            panic!("expected SetConfig command");
+        };
+        assert_eq!(patch.needs_input, Some(false));
     }
 
     #[test]

@@ -1,17 +1,16 @@
 # CONTRIBUTING
 
-> [!NOTE]
-> Currently undergoing a heavy refactor in the code to support neovim style lua plugins, which means migrating existing functionality to lua from native rust code too. This means you should avoid adding large features, and focus on bug fixes, and small changes in general. https://github.com/tontinton/maki/issues/112.
-
 Thanks for taking an interest in contributing to maki.
 
-Just remember I'd like to keep the project minimal to not become bloat.
+Just remember I'd like to keep the project minimal to not become bloat - think if some functionality you need can be done as a Lua plugin, and if not, think about the Lua APIs you need in order to implement the plugin. Do these APIs exist in neovim? If so, shoot up a PR. If the APIs don't exist, open an issue about it, let's discuss.
 
 When opening an issue, validate there is no open / closed issue talking about the exact thing you want to post about.
 
 Regarding AI use in PRs, describe how you used AI, even include the prompts if unsure.
 
 Useful commands are in the `justfile` file, most useful probably is `just ci` that runs locally basically everything we run in the CI automatically to block PRs.
+
+Rebuilds are slow mostly because of the linker, so dev builds skip debug info for the dependencies and for the C we build from source (`profile.dev.build-override` is where `cc` picks up `-g`). Our own crates keep theirs, so debugging maki feels the same as always, and if you ever want to step into a dependency, add `[profile.dev.package.<name>] debug = true`, or comment out `[profile.dev.package."*"]` in `Cargo.toml` to get all of them back.
 
 My most useful prompts:
 

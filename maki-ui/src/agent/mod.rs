@@ -13,6 +13,7 @@ use maki_agent::{
     AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
     McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
 };
+use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
@@ -54,6 +55,7 @@ pub(crate) struct AgentHandles {
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
     pub(crate) timeouts: maki_providers::Timeouts,
+    model_policy: Arc<ModelPolicy>,
     mailbox: Option<SessionMailbox>,
     task: smol::Task<()>,
 }
@@ -73,6 +75,7 @@ impl AgentHandles {
         lua_handle: EventHandle,
         mcp_handle: Option<McpHandle>,
         mcp_config_errors: McpConfigErrors,
+        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         spawn_agent_internal(
             flume::unbounded(),
@@ -86,6 +89,7 @@ impl AgentHandles {
             session_id,
             timeouts,
             lua_handle,
+            model_policy,
         )
     }
 
@@ -158,6 +162,7 @@ impl AgentHandles {
             Some(SessionRef::from(app.state.session.id)),
             self.timeouts,
             lua_handle,
+            Arc::clone(&self.model_policy),
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
@@ -165,6 +170,10 @@ impl AgentHandles {
         self.apply_to_app(app);
         app.flush_restored_queue();
         old.cancel();
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
     }
 
     /// Hand back the agent task, dropping every channel so the loop can
@@ -215,6 +224,7 @@ fn spawn_agent_internal(
     session_id: Option<SessionRef>,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
+    model_policy: Arc<ModelPolicy>,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
@@ -257,6 +267,7 @@ fn spawn_agent_internal(
         timeouts,
         lua_handle,
         subagent_cancels,
+        Arc::clone(&model_policy),
     );
 
     let task = smol::spawn(agent_loop.run());
@@ -272,6 +283,7 @@ fn spawn_agent_internal(
         mcp_config_errors,
         queue: queue_tx,
         timeouts,
+        model_policy,
         mailbox,
         task,
     }
@@ -338,6 +350,7 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            Arc::default(),
         ));
         let handles = AgentHandles::spawn(
             &model_slot,
@@ -350,6 +363,7 @@ mod tests {
             EventHandle::disconnected_for_test(),
             None,
             McpConfigErrors::new(PathBuf::new()),
+            Arc::new(ModelPolicy::default()),
         );
         (handles, model_slot, permissions)
     }

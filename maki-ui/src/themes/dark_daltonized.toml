@@ -1,5 +1,5 @@
-# Dark Daltonized — colorblind-safe dark theme (IBM palette)
-# Avoids red/green as critical contrast pairs; uses blue/orange/yellow/cyan instead.
+# Dark Daltonized theme for Maki, built on IBM's colorblind safe palette.
+# Red and green never carry meaning on their own here, so errors and diffs lean on blue, orange and yellow.
 
 "comment"                         = { fg = "comment" }
 "comment.block"                   = { fg = "comment" }

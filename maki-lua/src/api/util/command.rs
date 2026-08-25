@@ -5,10 +5,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
-use mlua::RegistryKey;
+use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
+use strum::{EnumString, VariantNames};
+
+use crate::api::util::convert::json_to_lua;
+use crate::api::util::pair::{Pair, try_pair};
 
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
-const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
+pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
 #[derive(Clone)]
 pub struct LuaCommandInfo {
@@ -88,11 +92,14 @@ impl HintReader {
         Self(Arc::new(ArcSwap::from_pointee(HintSnapshot::default())))
     }
 
-    pub fn load(&self) -> arc_swap::Guard<Arc<HintSnapshot>> {
-        self.0.load()
+    /// Full `Arc` rather than a `Guard`: the UI keeps the last one alive to
+    /// compare identity against the next, which is how it notices a publish.
+    pub fn load_full(&self) -> Arc<HintSnapshot> {
+        self.0.load_full()
     }
 }
 
+/// Publishing end of a plugin's status hints, owned by the Lua thread.
 pub(crate) struct HintWriter {
     store: Arc<ArcSwap<HintSnapshot>>,
     generation: AtomicU64,
@@ -303,6 +310,7 @@ pub struct FloatConfig {
     pub split: Split,
     pub order: u16,
     pub visible: bool,
+    pub needs_input: bool,
 }
 
 impl Default for FloatConfig {
@@ -324,6 +332,7 @@ impl Default for FloatConfig {
             split: Split::None,
             order: 50,
             visible: true,
+            needs_input: false,
         }
     }
 }
@@ -354,7 +363,8 @@ impl FloatConfig {
             reserved_top,
             split,
             order,
-            visible
+            visible,
+            needs_input
         );
     }
 }
@@ -377,6 +387,7 @@ pub struct FloatConfigPatch {
     pub split: Option<Split>,
     pub order: Option<u16>,
     pub visible: Option<bool>,
+    pub needs_input: Option<bool>,
 }
 
 pub enum WinEvent {
@@ -404,7 +415,17 @@ pub enum SessionRequest {
     SetTitle { id: String, title: String },
 }
 
-pub type SessionReply = Result<serde_json::Value, String>;
+pub enum ModelRequest {
+    Get,
+    Available,
+    Set {
+        spec: Option<String>,
+        thinking: Option<String>,
+        fast: Option<bool>,
+    },
+}
+
+pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
 /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
@@ -414,6 +435,24 @@ pub struct WinView {
     pub line_count: u16,
     pub height: u16,
     pub auto_scroll: bool,
+}
+
+/// Lua sees these through `maki.ui.action` as the snake_case variant
+/// names, so renaming a variant breaks user configs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, VariantNames)]
+#[strum(serialize_all = "snake_case")]
+pub enum BuiltinAction {
+    FilePicker,
+    Search,
+    Tasks,
+    Help,
+    PlanToggle,
+    PlanEditor,
+    EditInput,
+    PopQueue,
+    PrevChat,
+    NextChat,
+    ModelPicker,
 }
 
 pub enum UiAction {
@@ -431,13 +470,26 @@ pub enum UiAction {
     },
     Session {
         req: SessionRequest,
-        reply_tx: flume::Sender<SessionReply>,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Model {
+        req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
     },
     WinSaveView {
         reply_tx: flume::Sender<WinView>,
     },
     WinRestView {
         scroll_top: u16,
+    },
+    Builtin(BuiltinAction),
+    /// `reply_tx` answers whether {cmdline} resolved to a known command, not
+    /// how the command itself went: `/compact` streams for a minute, and the
+    /// Lua caller must not park for that long.
+    RunCommand {
+        cmdline: String,
+        depth: u8,
+        reply_tx: flume::Sender<Result<(), String>>,
     },
 }
 
@@ -460,6 +512,19 @@ pub(crate) async fn ui_roundtrip<T>(
     let (reply_tx, reply_rx) = flume::bounded(1);
     ui_send(tx, action(reply_tx))?;
     reply_rx.recv_async().await.map_err(|_| UI_DROPPED_ERR)
+}
+
+/// `ui_roundtrip` for JSON replies, shaped into the `(value, err)` pair Lua
+/// expects. Never reaching the UI and the UI refusing both land in the error
+/// slot.
+pub(crate) async fn ui_json_roundtrip(
+    lua: &Lua,
+    tx: Option<&flume::Sender<UiAction>>,
+    action: impl FnOnce(flume::Sender<UiReply>) -> UiAction,
+) -> LuaResult<Pair<Value>> {
+    let reply = try_pair!(ui_roundtrip(tx, action).await);
+    let value = try_pair!(reply);
+    Ok((Some(json_to_lua(lua, &value)?), None))
 }
 
 #[cfg(test)]
@@ -510,6 +575,16 @@ mod tests {
             .filter(|c| c.plugin.as_ref() == "plugA")
             .collect();
         assert_eq!(plug_a_cmds.len(), 2);
+    }
+
+    #[test]
+    fn builtin_action_names_are_snake_case() {
+        for name in BuiltinAction::VARIANTS {
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "lua-facing action name '{name}' is not snake_case"
+            );
+        }
     }
 
     #[test]
@@ -655,14 +730,14 @@ mod tests {
     #[test]
     fn hint_snapshot_publish_and_read() {
         let (writer, reader) = HintWriter::new();
-        assert!(reader.load().entries.is_empty());
+        assert!(reader.load_full().entries.is_empty());
 
         writer.publish(vec![(
             Arc::from("plugA"),
             vec![(" 2/4 ".into(), "fg".into())],
         )]);
 
-        let snap = reader.load();
+        let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(snap.generation, 1);
     }

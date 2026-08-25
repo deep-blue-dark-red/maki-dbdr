@@ -223,7 +223,10 @@ check "dismiss keys plan form" "maki-ui/src/components/plan_form.rs" "DISMISS_KE
 
 # 21. 481b9885: chore: commit plugin tool usage prompt hints
 check "bash tool usage hint" "plugins/bash/init.lua" "Reserve bash for system commands"
-check "todo_write tool usage hint" "plugins/todo_write/init.lua" "Use todo_write to plan and track"
+# Upstream 0aa0d8b4 reworded this hint ("Use todo_write for multi-step tasks
+# ... update **after EACH step**"). What the fork cares about is that the
+# per-step instruction survives in the prompt, so match that, not the phrasing.
+check "todo_write tool usage hint" "plugins/todo_write/init.lua" "after EACH step"
 
 # 22. 4c394b86: feat: implement config reload command in TUI
 check "reload_config function" "maki-ui/src/app/mod.rs" "pub fn reload_config"

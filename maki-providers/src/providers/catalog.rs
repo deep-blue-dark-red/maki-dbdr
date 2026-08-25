@@ -44,6 +44,8 @@ const CATALOG_CACHE_TTL: Duration = Duration::from_secs(86400);
 
 const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"];
 
+const FREE_MODELS_OPT_IN: &str = "providers.opencode.enable_free_models = true";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointType {
     ChatCompletions,
@@ -182,22 +184,7 @@ impl ProviderData {
                 if !allow_model {
                     return None;
                 }
-                Some(ModelInfo {
-                    id: model_id.clone(),
-                    context_window: Some(meta.context),
-                    max_output_tokens: Some(meta.output),
-                    pricing: Some(ModelPricing {
-                        input: meta.input_price,
-                        output: meta.output_price,
-                        cache_read: meta.cache_read,
-                        cache_write: meta.cache_write,
-                        fast: None,
-                    }),
-                    supports_thinking: Some(meta.supports_thinking),
-                    supports_vision: Some(meta.supports_vision),
-                    tier: None,
-                    provider_info: None,
-                })
+                Some(meta.model_info(model_id))
             })
             .collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -215,6 +202,27 @@ pub struct CatalogMeta {
     pub cache_write: f64,
     pub supports_thinking: bool,
     pub supports_vision: bool,
+}
+
+impl CatalogMeta {
+    fn model_info(&self, model_id: &str) -> ModelInfo {
+        ModelInfo {
+            id: model_id.to_string(),
+            context_window: Some(self.context),
+            max_output_tokens: Some(self.output),
+            pricing: Some(ModelPricing {
+                input: self.input_price,
+                output: self.output_price,
+                cache_read: self.cache_read,
+                cache_write: self.cache_write,
+                fast: None,
+            }),
+            supports_thinking: Some(self.supports_thinking),
+            supports_vision: Some(self.supports_vision),
+            tier: None,
+            provider_info: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -416,6 +424,13 @@ pub(crate) fn init_shared_catalog_if_needed() -> &'static Mutex<CatalogData> {
     SHARED_CATALOG.get_or_init(|| Mutex::new(init_catalog_blocking(all_slugs, enable_free)))
 }
 
+/// Loads the models.dev catalog from the on-disk cache, fetching once if the
+/// cache is cold or stale. Blocks, so only call it from startup paths; every
+/// other lookup must stay on the `*_if_available` variants.
+pub fn warm_catalog() {
+    init_shared_catalog_if_needed();
+}
+
 /// Returns the list of all providers in alphabetical order.
 pub fn catalog_providers() -> Vec<ProviderData> {
     let guard = init_shared_catalog_if_needed().lock().unwrap();
@@ -605,12 +620,21 @@ fn init_catalog_blocking(
 /// auth that the models.dev catalog would have used for that sub-provider.
 pub struct CatalogProvider {
     data: ProviderData,
-    auth: Arc<Mutex<ResolvedAuth>>,
-    /// Auth came from the no-key public fallback: only free models are usable.
-    free_fallback: bool,
+    auth: CatalogAuth,
     chat_compat: OpenAiCompatProvider,
     client: HttpClient,
     stream_timeout: Duration,
+}
+
+/// Which models the resolved auth unlocks: a real key unlocks all, the
+/// no-key `enable_free_models` opt-in unlocks free models only, and `Gated`
+/// unlocks nothing. `Gated` holds no credentials at all, so it can never send
+/// the public token by accident: discovery lists nothing, and only an actual
+/// attempt to stream tells the user to log in or opt in.
+enum CatalogAuth {
+    Keyed(ResolvedAuth),
+    FreeOnly(ResolvedAuth),
+    Gated,
 }
 
 impl CatalogProvider {
@@ -618,10 +642,14 @@ impl CatalogProvider {
         data: ProviderData,
         state_dir: &StateDir,
         timeouts: Timeouts,
+        allow_free_fallback: bool,
     ) -> Result<Self, AgentError> {
-        let (auth, free_fallback) = match data.build_auth(state_dir) {
-            Authentication::KeyBased(auth) => (auth, false),
-            Authentication::OpenCodeFreeKey(auth) => (auth, true),
+        let auth = match data.build_auth(state_dir) {
+            Authentication::KeyBased(auth) => CatalogAuth::Keyed(auth),
+            Authentication::OpenCodeFreeKey(auth) if allow_free_fallback => {
+                CatalogAuth::FreeOnly(auth)
+            }
+            Authentication::OpenCodeFreeKey(_) => CatalogAuth::Gated,
             Authentication::NoAuth => {
                 return Err(AgentError::Config {
                     message: format!(
@@ -633,8 +661,7 @@ impl CatalogProvider {
         };
         Ok(Self {
             data,
-            auth: Arc::new(Mutex::new(auth)),
-            free_fallback,
+            auth,
             chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts),
             client: http_client(timeouts),
             stream_timeout: timeouts.stream,
@@ -654,6 +681,17 @@ impl Provider for CatalogProvider {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let auth = match &self.auth {
+                CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => auth,
+                CatalogAuth::Gated => {
+                    let slug = &self.data.slug;
+                    return Err(AgentError::Config {
+                        message: format!(
+                            "provider '{slug}' has no API key; run `maki auth login {slug}` or set {FREE_MODELS_OPT_IN} to use its free models"
+                        ),
+                    });
+                }
+            };
             let meta = self
                 .data
                 .models
@@ -664,7 +702,6 @@ impl Provider for CatalogProvider {
                         model.id, self.data.slug
                     ),
                 })?;
-            let auth = self.auth.lock().unwrap().clone();
             let stream_model = Model {
                 id: model.id.clone(),
                 max_output_tokens: Some(meta.output),
@@ -683,7 +720,7 @@ impl Provider for CatalogProvider {
                         &stream_model,
                     );
                     self.chat_compat
-                        .do_stream(&stream_model, &[], &body, event_tx, &auth)
+                        .do_stream(&stream_model, &[], &body, event_tx, auth)
                         .await
                 }
                 EndpointType::Messages => {
@@ -735,42 +772,35 @@ impl Provider for CatalogProvider {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        let data = self.data.clone();
-        let free_fallback = self.free_fallback;
         Box::pin(async move {
-            Ok(data
+            Ok(self
+                .data
                 .models
                 .iter()
-                .filter(|(_, meta)| !free_fallback || is_free_model(meta))
-                .map(|(model_id, meta)| ModelInfo {
-                    id: model_id.clone(),
-                    context_window: Some(meta.context),
-                    max_output_tokens: Some(meta.output),
-                    pricing: Some(ModelPricing {
-                        input: meta.input_price,
-                        output: meta.output_price,
-                        cache_read: meta.cache_read,
-                        cache_write: meta.cache_write,
-                        fast: None,
-                    }),
-                    supports_thinking: Some(meta.supports_thinking),
-                    supports_vision: Some(meta.supports_vision),
-                    tier: None,
-                    provider_info: None,
+                .filter(|(_, meta)| match &self.auth {
+                    CatalogAuth::Keyed(_) => true,
+                    CatalogAuth::FreeOnly(_) => is_free_model(meta),
+                    CatalogAuth::Gated => false,
                 })
+                .map(|(model_id, meta)| meta.model_info(model_id))
                 .collect())
         })
     }
 }
 
 #[cfg(test)]
-pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
+pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
     let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(
-        HashMap::new(),
+        index,
         false,
         &state_dir,
         std::collections::HashSet::new(),
     )));
+}
+
+#[cfg(test)]
+pub(crate) fn warm_empty_catalog_for_tests(state_dir: StateDir) {
+    seed_catalog_for_tests(HashMap::new(), state_dir);
 }
 
 /// Defers catalog resolution to first use so that provider construction
@@ -831,7 +861,16 @@ fn create_resolved(slug: &str, timeouts: Timeouts) -> Result<CatalogProvider, Ag
     let state_dir = StateDir::resolve().map_err(|e| AgentError::Config {
         message: format!("failed to resolve state dir: {e}"),
     })?;
-    CatalogProvider::new(data, &state_dir, timeouts)
+    CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
+}
+
+/// Zen hides free models behind `providers.opencode.enable_free_models`;
+/// the no-key public-token fallback must honor the same opt-in.
+fn free_fallback_allowed() -> bool {
+    SHARED_CATALOG
+        .get()
+        .and_then(|m| m.lock().ok())
+        .is_some_and(|guard| guard.enable_free_models)
 }
 
 /// Try to create a `CatalogProvider` for the given slug. Returns `None` if
@@ -843,7 +882,7 @@ pub fn try_create(slug: &str, timeouts: Timeouts) -> Option<Result<Box<dyn Provi
         let data = catalog_provider_if_available(slug)?;
         let state_dir = StateDir::resolve().ok()?;
         return Some(
-            CatalogProvider::new(data, &state_dir, timeouts)
+            CatalogProvider::new(data, &state_dir, timeouts, free_fallback_allowed())
                 .map(|c| Box::new(c) as Box<dyn Provider>),
         );
     }
@@ -873,6 +912,15 @@ pub fn model_meta_if_available(slug: &str, model_id: &str) -> Option<CatalogMeta
     })
 }
 
+/// True when the model is an OpenCode-family catalog entry that is free by
+/// the same [`is_free_model`] definition gating `enable_free_models` (zero
+/// input and output price). Never triggers a fetch.
+pub(crate) fn free_model_if_available(slug: &str, model_id: &str) -> bool {
+    OPENCODE_FAMILY_SLUGS.contains(&slug)
+        && catalog_provider_if_available(slug)
+            .is_some_and(|data| data.models.get(model_id).is_some_and(is_free_model))
+}
+
 /// Metadata shape `Model::from_spec` consumes when a spec resolves to a catalog
 /// sub-provider. Public so `maki-providers/src/model.rs` can name it without
 /// depending on the opencode-internal `CatalogMeta` struct.
@@ -893,13 +941,17 @@ mod tests {
     use std::collections::HashMap;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
+    use std::sync::Arc;
+
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, StateDir,
-        available_if_warm, determine_catalog_format,
+        Authentication, CatalogData, CatalogMeta, EndpointType, FREE_MODELS_OPT_IN, ProviderData,
+        StateDir, available_if_warm, determine_catalog_format,
     };
-    use crate::AgentError;
+    use crate::model::{Model, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::Timeouts;
+    use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
+    use test_case::test_case;
 
     #[test]
     fn new_rejects_no_auth() {
@@ -913,7 +965,7 @@ mod tests {
             api_format: EndpointType::ChatCompletions,
             models: HashMap::new(),
         };
-        let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default());
+        let result = super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true);
         assert!(matches!(result, Err(AgentError::Config { .. })));
     }
 
@@ -957,10 +1009,49 @@ mod tests {
     }
 
     #[test]
+    fn gated_free_fallback_hides_models_and_refuses_streaming() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_52814");
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
+
+        let model = Model {
+            id: "free-model".into(),
+            provider: Arc::from("opencode-go"),
+            tier: ModelTier::Medium,
+            family: ModelFamily::Generic,
+            supports_tool_examples_override: None,
+            thinking_override: None,
+            supports_vision_override: None,
+            pricing: ModelPricing::default(),
+            discovered_free: false,
+            max_output_tokens: None,
+            context_window: 0,
+            thinking_fields: None,
+        };
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(provider.stream_message(
+            &model,
+            &[],
+            "",
+            &serde_json::json!([]),
+            &tx,
+            RequestOptions::default(),
+            None,
+        ));
+        assert!(matches!(
+            result,
+            Err(AgentError::Config { message }) if message.contains(FREE_MODELS_OPT_IN)
+        ));
+    }
+
+    #[test]
     fn catalog_provider_list_models_free_fallback_hides_paid_models() {
         let (_tmp, state_dir) = temp_state_dir();
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_UNSET_KEY_91472");
-        let provider = super::CatalogProvider::new(data, &state_dir, Timeouts::default()).unwrap();
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), true).unwrap();
         let models = smol::block_on(provider.list_models()).unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["free-model"]);
@@ -971,7 +1062,8 @@ mod tests {
         let (_tmp, state_dir) = temp_state_dir();
         unsafe { std::env::set_var("MAKI_TEST_OPENCODE_GO_KEY_41827", "real-key") };
         let data = opencode_go_provider_data("MAKI_TEST_OPENCODE_GO_KEY_41827");
-        let provider = super::CatalogProvider::new(data, &state_dir, Timeouts::default()).unwrap();
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
         let models = smol::block_on(provider.list_models()).unwrap();
         let mut ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         ids.sort_unstable();
@@ -1375,6 +1467,56 @@ mod tests {
             opencode.build_auth(&state_dir),
             Authentication::OpenCodeFreeKey(_)
         ));
+    }
+
+    #[test_case("free-model", true; "free_opencode_model_is_free")]
+    #[test_case("paid-output-model", false; "free_input_paid_output_is_not_free")]
+    fn model_is_free_uses_catalog_definition(model_id: &str, expected: bool) {
+        let (_tmp, state_dir) = temp_state_dir();
+        let models = HashMap::from([
+            (
+                "free-model".into(),
+                CatalogModel {
+                    limit: None,
+                    cost: Some(CatalogCost {
+                        input: Some(0.0),
+                        output: Some(0.0),
+                        cache_read: None,
+                        cache_write: None,
+                    }),
+                    provider: None,
+                    ..Default::default()
+                },
+            ),
+            (
+                "paid-output-model".into(),
+                CatalogModel {
+                    limit: None,
+                    cost: Some(CatalogCost {
+                        input: Some(0.0),
+                        output: Some(25.0),
+                        cache_read: None,
+                        cache_write: None,
+                    }),
+                    provider: None,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let index: CatalogIndex = HashMap::from([(
+            "opencode".into(),
+            CatalogProvider {
+                name: "Opencode".into(),
+                env: vec!["OPENCODE_API_KEY".into()],
+                npm: "@ai-sdk/openai-compatible".into(),
+                api: Some("https://opencode.ai/zen/v1".into()),
+                models,
+            },
+        )]);
+        super::seed_catalog_for_tests(index, state_dir);
+
+        let model = super::Model::from_spec(&format!("opencode/{model_id}")).unwrap();
+        assert_eq!(model.is_free(), expected);
     }
 
     #[test]

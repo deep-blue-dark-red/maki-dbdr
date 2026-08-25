@@ -23,7 +23,8 @@ use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
 use crate::theme;
-use maki_config::{ToolOutputLines, UiConfig};
+use crate::update;
+use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -39,11 +40,14 @@ use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+
+use crate::repaint::{Cadence, Dirty};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
+const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -83,6 +87,7 @@ pub struct MessagesPanel {
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
     thinking_collapsed: bool,
+    clock_format: ClockFormat,
     /// One re-bake per tool per generation; `snapshot_theme_gen`
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
@@ -130,6 +135,7 @@ impl MessagesPanel {
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
             thinking_collapsed: !ui_config.show_thinking,
+            clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
         }
@@ -179,7 +185,7 @@ impl MessagesPanel {
             name: Arc::from(name),
         }));
         let mut msg = DisplayMessage::new(role, String::new());
-        msg.timestamp = Some(format_timestamp_now());
+        msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
     }
 
@@ -211,7 +217,7 @@ impl MessagesPanel {
         msg.tool_output = event.output.map(Arc::new);
         msg.annotation = event.annotation;
         msg.render_header = event.render_header;
-        msg.timestamp = Some(format_timestamp_now());
+        msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
     }
 
@@ -429,7 +435,7 @@ impl MessagesPanel {
         for id in &affected_ids {
             // The stale-run_id filter drops these tools' ToolDone events,
             // so retire their live bufs here: keeps them clickable via
-            // the warm path and stops them pinning `is_animating`.
+            // the warm path and stops them being polled forever.
             self.retire_live_buf(id);
             self.rebuild_tool_segment(id);
         }
@@ -475,7 +481,6 @@ impl MessagesPanel {
         self.messages.len()
     }
 
-    #[cfg(test)]
     pub fn last_message_text(&self) -> &str {
         self.messages.last().map(|m| m.text.as_str()).unwrap_or("")
     }
@@ -703,14 +708,32 @@ impl MessagesPanel {
         msg.tool_output.as_deref()?.owned_instructions()
     }
 
-    pub fn is_animating(&self) -> bool {
-        self.in_progress_count() > 0
-            || self.streaming_thinking.is_animating()
-            || self.streaming_text.is_animating()
-            || self.show_idle_splash()
+    /// Drains the highlight worker and every live tool buffer. These used to
+    /// run inside [`Self::view`], which is why a running tool had to claim it
+    /// was animating: it was the only way to keep them fed.
+    pub fn tick(&mut self) -> Dirty {
+        let mut dirty = self.drain_highlights() | self.poll_live_bufs();
+        if self.show_idle_splash() {
+            dirty |= self.idle_splash.poll_update(update::latest_version());
+        }
+        dirty
+    }
+
+    pub fn cadence(&self) -> Cadence {
+        // Collapsed thinking draws a line count, not the text, so its
+        // typewriter reveals nothing and never advances either, since only
+        // `view` ticks it. Believing it would pin the loop at full frame rate
+        // for the whole reasoning phase.
+        let smooth = self.streaming_text.is_animating()
             || self.accent.is_animating()
-            || !self.live_bufs.is_empty()
-            || self.streaming_thinking_collapsed()
+            || (self.streaming_thinking.is_animating() && !self.streaming_thinking_collapsed());
+        Cadence::any([
+            // A running tool draws a spinner. Its output arriving is data, and
+            // `tick` reports that separately.
+            Cadence::when(self.in_progress_count() > 0, Cadence::SPINNER),
+            Cadence::when(smooth, Cadence::SMOOTH),
+            Cadence::when(self.show_idle_splash(), self.idle_splash.cadence()),
+        ])
     }
 
     fn streaming_thinking_collapsed(&self) -> bool {
@@ -744,7 +767,7 @@ impl MessagesPanel {
         }
 
         if width_changed {
-            self.cache.invalidate_from_msg_count();
+            self.cache.mark_all_width_stale();
             let thinking = thinking_style();
             let assistant = assistant_style();
             self.streaming_thinking.set_style(
@@ -758,8 +781,6 @@ impl MessagesPanel {
                 assistant.prefix_style,
             );
         }
-        self.drain_highlights();
-        self.poll_live_bufs();
         self.rebuild_line_cache();
         if self.in_progress_count() > 0 {
             self.update_spinners();
@@ -797,20 +818,13 @@ impl MessagesPanel {
             streaming_heights.push(self.streaming_text.wrapped_height());
         }
 
-        let cached_height = self.cache.total_height(width);
         let streaming_sum: u32 = streaming_heights.iter().map(|&h| h as u32).sum();
-        let total_lines: u16 = (cached_height + streaming_sum).min(u16::MAX as u32) as u16;
-        self.last_total_lines = total_lines;
-        let max_scroll = total_lines.saturating_sub(self.viewport_height);
-        self.scroll_top = self.scroll_top.min(max_scroll);
-        if !has_selection {
-            if self.scroll_top >= max_scroll {
-                self.auto_scroll = true;
-            }
-            if self.auto_scroll {
-                self.scroll_top = max_scroll;
-            }
-        }
+        // The reflow window is picked from `scroll_top` and the bottom pin,
+        // and the reflow changes the heights both are derived from: resolve
+        // before to aim the window, and after to place the result.
+        self.resolve_scroll(width, streaming_sum, has_selection);
+        self.reflow_viewport(width);
+        let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
 
         let viewport = Rect::new(area.x, area.y, width, area.height);
         let mut cursor = RenderCursor::new(self.scroll_top, viewport);
@@ -971,7 +985,8 @@ impl MessagesPanel {
 
     /// Moves a finished tool's live buf to the watched set, flushing any
     /// last dirty lines. Called on completion and on cancellation, so
-    /// `live_bufs` never leaks entries that keep `is_animating` true.
+    /// `live_bufs` never leaks entries that outlive their tool, and the capped
+    /// watched set keeps what `tick` polls bounded.
     /// Returns whether a live buf existed for this id.
     fn retire_live_buf(&mut self, id: &str) -> bool {
         let Some(buf) = self.live_bufs.remove(id) else {
@@ -1111,16 +1126,21 @@ impl MessagesPanel {
         self.live_bufs.insert(id, body);
     }
 
-    fn poll_live_bufs(&mut self) {
-        let dirty: Vec<_> = self
+    /// Snapshots are baked at the last width `view` saw, and a resize
+    /// invalidates every segment anyway (see `width_changed` in `view`), so
+    /// polling ahead of the frame that reflows them is safe.
+    fn poll_live_bufs(&mut self) -> Dirty {
+        let updated: Vec<_> = self
             .live_bufs
             .iter()
             .chain(self.watched_bufs.iter().map(|(id, buf)| (id, buf)))
             .filter_map(|(id, buf)| buf.read_if_dirty().map(|lines| (id.clone(), lines)))
             .collect();
-        for (tool_id, lines) in dirty {
+        let dirty = Dirty::from(!updated.is_empty());
+        for (tool_id, lines) in updated {
             self.store_snapshot(&tool_id, BufferSnapshot::from_arc(lines), false, None);
         }
+        dirty
     }
 
     fn build_tool_segment_lines(
@@ -1242,7 +1262,8 @@ impl MessagesPanel {
         }
     }
 
-    fn drain_highlights(&mut self) {
+    fn drain_highlights(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
         while let Some(result) = self.hl_worker.try_recv() {
             if let Some(seg) = self
                 .cache
@@ -1251,8 +1272,10 @@ impl MessagesPanel {
                 .find(|s| s.matches_pending_highlight(result.id))
             {
                 seg.apply_highlight_result(result.lines);
+                dirty = Dirty::YES;
             }
         }
+        dirty
     }
 
     fn rebuild_tool_segment(&mut self, tool_id: &str) {
@@ -1346,71 +1369,161 @@ impl MessagesPanel {
                         .push(Segment::with_lines(lines, search_text, Some(i)));
                     continue;
                 }
-                let style = match &msg.role {
-                    DisplayRole::User => user_style(),
-                    DisplayRole::Assistant => assistant_style(),
-                    DisplayRole::Thinking => thinking_style(),
-                    DisplayRole::Error => error_style(),
-                    DisplayRole::Done => done_style(),
-                    DisplayRole::Tool(_) => unreachable!(),
-                    DisplayRole::Compaction { .. } => assistant_style(),
-                };
-                let dynamic_prefix;
-                let prefix = if msg.plan_path.is_some() {
-                    ""
-                } else if msg.role == DisplayRole::User {
+                let dynamic_prefix = (msg.role == DisplayRole::User).then(|| {
                     let template = prefix_template.get_or_insert_with(|| {
                         crate::components::settings_picker::UserSettings::load()
                             .user_prompt_prefix_template()
                     });
-                    dynamic_prefix = template.replace("{n}", &user_turns.to_string());
-                    &dynamic_prefix
-                } else {
-                    style.prefix
-                };
-                let mut lines = if style.use_markdown {
-                    text_to_lines(
-                        &msg.text,
-                        prefix,
-                        style.text_style,
-                        style.prefix_style,
-                        self.viewport_width,
-                        style.max_line_bytes,
-                    )
-                } else {
-                    plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
-                };
-                if let Some(pp) = &msg.plan_path {
-                    if !msg.text.is_empty() {
-                        let rule = hr_line(self.viewport_width, theme::current().plan_rule);
-                        lines.insert(0, rule.clone());
-                        lines.push(rule);
-                    } else {
-                        lines.clear();
-                    }
-                    if !msg.text.is_empty() {
-                        lines.push(Line::from(""));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        pp.to_owned(),
-                        theme::current().plan_path,
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} to open in editor ($VISUAL / $EDITOR)",
-                            key::OPEN_EDITOR.label
-                        ),
-                        theme::current().tool_dim,
-                    )));
-                }
-
-                let search_text = format!("{prefix}{}", msg.text);
+                    template.replace("{n}", &user_turns.to_string())
+                });
+                let (lines, search_text) =
+                    build_message_lines(msg, self.viewport_width, dynamic_prefix.as_deref());
                 self.cache.push_spacer_if_needed();
                 self.cache
                     .push(Segment::with_lines(lines, search_text, Some(i)));
             }
         }
         self.cache.mark_built(self.messages.len());
+    }
+
+    /// Clamps `scroll_top` against the document height and applies the bottom
+    /// pin, returning the total the scrollbar draws from.
+    fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u16 {
+        let total_lines: u16 =
+            (self.cache.total_height(width) + streaming_sum).min(u16::MAX as u32) as u16;
+        self.last_total_lines = total_lines;
+        let max_scroll = total_lines.saturating_sub(self.viewport_height);
+        self.scroll_top = self.scroll_top.min(max_scroll);
+        if !has_selection {
+            if self.scroll_top >= max_scroll {
+                self.auto_scroll = true;
+            }
+            if self.auto_scroll {
+                self.scroll_top = max_scroll;
+            }
+        }
+        total_lines
+    }
+
+    /// Re-lays out the stale segments the viewport plus its margin reaches,
+    /// keeping the topmost visible one pinned: `scroll_top` is a line offset,
+    /// so re-laying out anything above the viewport would slide the content
+    /// the reader is looking at.
+    ///
+    /// The window is walked outward from an anchor segment, counting heights
+    /// only after each segment is reflowed. Document offsets move as the
+    /// reflow runs, so a window expressed in them would need repeated passes
+    /// to settle; this one is right the first time.
+    fn reflow_viewport(&mut self, width: u16) {
+        let anchor = (!self.auto_scroll)
+            .then(|| self.cache.anchor_at(self.scroll_top as u32, width))
+            .flatten();
+        let viewport = self.viewport_height as u32;
+        let margin = viewport.saturating_mul(REFLOW_MARGIN_VIEWPORTS);
+        let below = viewport.saturating_add(margin);
+        // Pinned to the bottom (or scrolled into the streaming tail): the
+        // viewport is the last `below` lines, so the window is all above.
+        let (start, above) = match anchor {
+            Some((i, _)) => (i, margin),
+            None => (self.cache.len().saturating_sub(1), below),
+        };
+        let len_before = self.cache.len();
+
+        let mut acc = 0;
+        let mut i = start;
+        while i < self.cache.len() && acc < below {
+            acc += self.reflowed_height(i, width);
+            i += 1;
+        }
+        let mut acc = 0;
+        let mut i = start;
+        while i > 0 && acc < above {
+            i -= 1;
+            acc += self.reflowed_height(i, width);
+        }
+
+        // A rebuild can insert a missing instruction segment, which shifts the
+        // anchor index. Rare enough to just skip the pin for one frame.
+        if let Some(anchor) = anchor
+            && self.cache.len() == len_before
+        {
+            self.scroll_top = self.cache.anchor_offset(anchor, width).min(u16::MAX as u32) as u16;
+        }
+    }
+
+    /// Reflows `seg_idx` if it is stale, then reports the height it draws at.
+    fn reflowed_height(&mut self, seg_idx: usize, width: u16) -> u32 {
+        // A tool segment and its instruction segment both map back to the
+        // same parent, and one `rebuild_tool_segment` clears both flags.
+        // Re-check so the parent is not rebuilt twice.
+        if self.cache.get(seg_idx).is_some_and(|s| s.stale) {
+            self.reflow_segment(seg_idx, width);
+        }
+        self.cache
+            .get(seg_idx)
+            .map_or(0, |s| s.height(width) as u32)
+    }
+
+    fn reflow_segment(&mut self, seg_idx: usize, width: u16) {
+        // Clear up front so a reflow that bails early (message gone, empty
+        // instructions) costs one frame of old-width lines instead of
+        // retrying forever.
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return;
+        };
+        seg.stale = false;
+        let (tool_id, msg_idx) = (seg.tool_id.clone(), seg.msg_index);
+
+        if let Some(tid) = tool_id {
+            let parent = segment::instruction_parent(&tid)
+                .map(str::to_string)
+                .unwrap_or(tid);
+            self.rebuild_tool_segment(&parent);
+            return;
+        }
+
+        let Some(msg_idx) = msg_idx else {
+            return;
+        };
+
+        let collapsed = self
+            .messages
+            .get(msg_idx)
+            .is_some_and(|m| matches!(m.role, DisplayRole::Thinking) && m.thinking_collapsed);
+        if collapsed {
+            // Geometry is width-independent, but `width_changed` also fires on
+            // theme changes; rebuild so spans pick up the new palette.
+            self.rebuild_thinking_segment(msg_idx, width);
+        } else {
+            self.reflow_text_segment(seg_idx, width);
+        }
+    }
+
+    fn reflow_text_segment(&mut self, seg_idx: usize, width: u16) {
+        let Some(msg_idx) = self.cache.get(seg_idx).and_then(|s| s.msg_index) else {
+            return;
+        };
+        let Some(msg) = self.messages.get(msg_idx) else {
+            return;
+        };
+        // Reflow rebuilds one segment in isolation, so the turn number has to
+        // be recounted here; getting it from a carried counter like
+        // `rebuild_line_cache` does would renumber every user turn on resize.
+        let dynamic_prefix = (msg.role == DisplayRole::User).then(|| {
+            let turn = self.messages[..=msg_idx]
+                .iter()
+                .filter(|m| m.role == DisplayRole::User)
+                .count();
+            crate::components::settings_picker::UserSettings::load()
+                .user_prompt_prefix_template()
+                .replace("{n}", &turn.to_string())
+        });
+        let (lines, search_text) = build_message_lines(msg, width, dynamic_prefix.as_deref());
+        let Some(seg) = self.cache.get_mut(seg_idx) else {
+            return;
+        };
+        seg.set_lines(lines);
+        seg.search_text = search_text;
     }
 }
 
@@ -1436,4 +1549,68 @@ fn logical_line_count(text: &str) -> usize {
     } else {
         text.bytes().filter(|&b| b == b'\n').count() + 1
     }
+}
+
+/// Builds ratatui lines for a non-Tool, non-collapsed-Thinking message at the
+/// given width, returning the lines and search text. Shared by
+/// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
+/// messages) so both paths produce identical segments.
+fn build_message_lines(
+    msg: &DisplayMessage,
+    width: u16,
+    user_prefix: Option<&str>,
+) -> (Vec<Line<'static>>, String) {
+    let style = match &msg.role {
+        DisplayRole::User => user_style(),
+        DisplayRole::Assistant => assistant_style(),
+        DisplayRole::Thinking => thinking_style(),
+        DisplayRole::Error => error_style(),
+        DisplayRole::Done => done_style(),
+        DisplayRole::Tool(_) => unreachable!(),
+        DisplayRole::Compaction { .. } => assistant_style(),
+    };
+    let prefix = if msg.plan_path.is_some() {
+        ""
+    } else if let Some(p) = user_prefix.filter(|_| msg.role == DisplayRole::User) {
+        p
+    } else {
+        style.prefix
+    };
+    let mut lines = if style.use_markdown {
+        text_to_lines(
+            &msg.text,
+            prefix,
+            style.text_style,
+            style.prefix_style,
+            width,
+            style.max_line_bytes,
+        )
+    } else {
+        plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
+    };
+    if let Some(pp) = &msg.plan_path {
+        if !msg.text.is_empty() {
+            let rule = hr_line(width, theme::current().plan_rule);
+            lines.insert(0, rule.clone());
+            lines.push(rule);
+        } else {
+            lines.clear();
+        }
+        if !msg.text.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            pp.to_owned(),
+            theme::current().plan_path,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} to open in editor ($VISUAL / $EDITOR)",
+                key::OPEN_EDITOR.label
+            ),
+            theme::current().tool_dim,
+        )));
+    }
+    let search_text = format!("{prefix}{}", msg.text);
+    (lines, search_text)
 }

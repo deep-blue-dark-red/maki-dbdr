@@ -148,6 +148,13 @@ impl PermissionPrompt {
         };
     }
 
+    pub(crate) fn tool(&self) -> Option<&ToolKey> {
+        match self {
+            Self::Open { tool, .. } => Some(tool),
+            Self::Closed => None,
+        }
+    }
+
     pub fn subagent_id(&self) -> Option<&str> {
         match self {
             Self::Open { subagent_id, .. } => subagent_id.as_deref(),
@@ -300,7 +307,7 @@ impl PermissionPrompt {
             };
             let (before, after) = display_text.split_at(cursor_pos);
             let mut chars = after.chars();
-            let cursor_ch = chars.next().map_or(' ', |c| c);
+            let cursor_ch = chars.next().unwrap_or(' ');
             let rest: String = chars.collect();
 
             let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];

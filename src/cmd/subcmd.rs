@@ -12,21 +12,22 @@ use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_config::{load_env_files, load_permissions};
+use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::PluginHost;
 use maki_providers::provider::fetch_all_models;
 use maki_providers::{ProviderData, catalog_providers};
-use maki_providers::{copilot_auth, dynamic, openai_auth};
+use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
 use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
-    delete_provider_credentials, load_provider_credentials, save_provider_credentials,
+    delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
         Some("openai") => openai_auth::login(storage)?,
+        Some("xai") => xai_auth::login(storage)?,
         Some("copilot") => copilot_auth::login(storage)?,
         Some(slug) => {
             let slug = slugify(slug);
@@ -411,6 +412,7 @@ pub fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
     let slug = slugify(provider);
     match provider {
         "openai" => openai_auth::logout(storage)?,
+        "xai" => xai_auth::logout(storage)?,
         "copilot" => copilot_auth::logout(storage)?,
         _ => {
             let mut config = ProvidersConfig::load();
@@ -439,7 +441,9 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
         let def = config.get(b.slug);
         let display = resolve_display_name(b.slug, def);
 
-        if let Some(creds) = load_provider_credentials(storage, b.slug) {
+        if load_tokens(storage, b.slug).is_some() {
+            println!("  \x1b[32m✓\x1b[0m {:<14} {} (oauth)", b.slug, display);
+        } else if let Some(creds) = load_provider_credentials(storage, b.slug) {
             let plan_info = def
                 .and_then(|d| d.plan.as_deref())
                 .map(|p| format!(" ({})", p))
@@ -533,8 +537,16 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
     Ok(())
 }
 
-pub fn models() {
+pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    load_env_files(&cwd);
+
+    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+        .context("initialize lua plugin host")?;
+    let config = load_effective_config(&host, no_plugins, &cwd)?;
+
     smol::block_on(fetch_all_models(
+        &config.provider.model_policy,
         |batch| {
             for model in batch.models {
                 println!("{model}");
@@ -545,6 +557,15 @@ pub fn models() {
         },
         None,
     ));
+    Ok(())
+}
+
+fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
+    host.load_init_files_or_skip(no_plugins, cwd)
+        .context("load init.lua files")?
+        .unwrap_or_default()
+        .into_config(false)
+        .context("invalid config")
 }
 
 pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
@@ -596,11 +617,20 @@ pub fn mcp_auth(server: &str, storage: &StateDir) -> Result<()> {
             .mcp
             .get(server)
             .ok_or_else(|| color_eyre::eyre::eyre!("unknown MCP server: {server}"))?;
-        let url = match mcp_config::parse_server(server.to_owned(), raw.clone())?.transport {
-            mcp_config::Transport::Http { url, .. } => url,
+        let (url, oauth) = match mcp_config::parse_server(server.to_owned(), raw.clone())?.transport
+        {
+            mcp_config::Transport::Http { url, oauth, .. } => (url, oauth),
             _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
         };
-        mcp_oauth::authenticate(server, &url, None, storage, mcp_oauth::Interaction::Cli).await?;
+        mcp_oauth::authenticate(
+            server,
+            &url,
+            None,
+            storage,
+            mcp_oauth::Interaction::Cli,
+            oauth,
+        )
+        .await?;
         eprintln!("Successfully authenticated with MCP server '{server}'");
         Ok(())
     })
