@@ -12,6 +12,13 @@ use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction};
 use crate::update;
 
 pub fn dispatch(cli: Cli) -> Result<()> {
+    // `/system_prompt` edits <config_dir>/system.md; pick it up before any
+    // command builds a prompt. A broken file shouldn't stop the CLI booting,
+    // so warn and fall back to the built-in prompt.
+    if let Err(e) = maki_agent::prompt::load_user_system_prompt() {
+        eprintln!("warning: could not read custom system prompt: {e}");
+    }
+
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;

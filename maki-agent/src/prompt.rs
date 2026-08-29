@@ -1,6 +1,8 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
 
 pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
@@ -13,6 +15,55 @@ pub trait ValidNames: IntoEnumIterator + std::fmt::Display {
 }
 
 pub const SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
+
+/// File under the config dir that `/system_prompt` opens for editing.
+pub const USER_SYSTEM_PROMPT_FILE: &str = "system.md";
+
+/// User-authored replacement for [`SYSTEM_PROMPT`], populated by
+/// [`load_user_system_prompt`]. Empty until something loads it, so unit tests
+/// and library consumers never pick up whatever is on the host's disk.
+static USER_SYSTEM_PROMPT: ArcSwapOption<String> = ArcSwapOption::const_empty();
+
+/// Read `<config_dir>/system.md` into the system prompt override.
+///
+/// Call once at startup and again whenever the config is reloaded — the file
+/// is only re-read here, so an edit lands on the next `/reload` or restart.
+/// A missing or blank file clears the override and restores the built-in
+/// prompt. Returns whether an override is now active.
+pub fn load_user_system_prompt() -> Result<bool, std::io::Error> {
+    let dir = maki_storage::paths::config_dir()?;
+    let text = read_user_system_prompt(&dir)?;
+    if let Some(text) = text {
+        tracing::info!(dir = %dir.display(), bytes = text.len(), "loaded user system prompt");
+        USER_SYSTEM_PROMPT.store(Some(Arc::new(text)));
+        Ok(true)
+    } else {
+        USER_SYSTEM_PROMPT.store(None);
+        Ok(false)
+    }
+}
+
+/// Whether this prompt's body came from the user's `system.md` rather than the
+/// built-in template. Callers that validate against the template's slot markers
+/// use this to soften "no such slot" into a warning: a hand-edited prompt is
+/// under no obligation to keep every marker, and a plugin shouldn't fail to
+/// load because the user deleted one.
+pub fn is_user_supplied(id: PromptId) -> bool {
+    id == PromptId::System && USER_SYSTEM_PROMPT.load().is_some()
+}
+
+/// Read `system.md` out of `dir`. `None` means "use the built-in prompt": the
+/// file is absent, or holds nothing but whitespace. Any other read failure is
+/// an error, so a permissions problem is reported rather than silently
+/// swapping the user's prompt back to the default.
+fn read_user_system_prompt(dir: &std::path::Path) -> Result<Option<String>, std::io::Error> {
+    match std::fs::read_to_string(dir.join(USER_SYSTEM_PROMPT_FILE)) {
+        Ok(text) if text.trim().is_empty() => Ok(None),
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
 pub const PLAN_PROMPT: &str = include_str!("prompts/plan.md");
 pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
@@ -140,11 +191,16 @@ impl ResolvedSlots {
 }
 
 impl PromptId {
-    fn template(self) -> &'static str {
+    /// The prompt body before slots are filled. `System` yields the user's
+    /// `system.md` when one is loaded; the other prompts are always built in.
+    fn template(self) -> Cow<'static, str> {
         match self {
-            PromptId::System => SYSTEM_PROMPT,
-            PromptId::Research => RESEARCH_PROMPT,
-            PromptId::General => GENERAL_PROMPT,
+            PromptId::System => match USER_SYSTEM_PROMPT.load_full() {
+                Some(user) => Cow::Owned(user.as_str().to_owned()),
+                None => Cow::Borrowed(SYSTEM_PROMPT),
+            },
+            PromptId::Research => Cow::Borrowed(RESEARCH_PROMPT),
+            PromptId::General => Cow::Borrowed(GENERAL_PROMPT),
         }
     }
 
@@ -196,7 +252,18 @@ fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
 /// Fill each `{{slot}}` marker in the template with its rendered content and
 /// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
 pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
-    let mut out = id.template().to_string();
+    fill_template(id.template().into_owned(), id, slots, instructions)
+}
+
+/// Slot- and instruction-fill an already-chosen template. Split out from
+/// [`assemble`] so a caller-supplied body (a user's `system.md`) can be
+/// exercised without touching the process-wide override.
+fn fill_template(
+    mut out: String,
+    id: PromptId,
+    slots: &ResolvedSlots,
+    instructions: &str,
+) -> String {
     for slot in Slot::iter() {
         out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
     }
@@ -240,6 +307,43 @@ mod tests {
     fn at(out: &str, needle: &str) -> usize {
         out.find(needle)
             .unwrap_or_else(|| panic!("missing: {needle}"))
+    }
+
+    #[test]
+    fn absent_system_md_falls_back_to_builtin() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_user_system_prompt(dir.path()).unwrap(), None);
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("   \n\t\n  " ; "whitespace")]
+    fn blank_system_md_falls_back_to_builtin(body: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USER_SYSTEM_PROMPT_FILE), body).unwrap();
+        assert_eq!(read_user_system_prompt(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn system_md_is_read_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "You are Custom.\n\n{{instructions}}\n";
+        std::fs::write(dir.path().join(USER_SYSTEM_PROMPT_FILE), body).unwrap();
+        assert_eq!(
+            read_user_system_prompt(dir.path()).unwrap().as_deref(),
+            Some(body)
+        );
+    }
+
+    #[test]
+    fn user_prompt_replaces_builtin_and_still_fills_slots() {
+        let user = "You are Custom.\n{{tool_usage}}\n{{instructions}}\n";
+        let s = slots(PromptId::System, &[(Slot::ToolUsage, "HINT")]);
+        let out = fill_template(user.to_string(), PromptId::System, &s, "INSTR");
+
+        assert!(out.starts_with("You are Custom."), "got:\n{out}");
+        assert!(out.contains("HINT"), "slot not filled:\n{out}");
+        assert!(out.contains("INSTR"), "instructions not filled:\n{out}");
+        assert!(!out.contains("{{"), "unfilled marker left:\n{out}");
     }
 
     #[test]

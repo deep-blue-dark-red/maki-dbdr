@@ -948,6 +948,7 @@ mod tests {
             output,
             cache_creation: 0,
             cache_read: 0,
+            reasoning: 0,
         }
     }
 

@@ -550,6 +550,16 @@ fn validate_slot_prompt_compatibility(
     if let Some(prompts) = prompts {
         for &pid in prompts {
             if !pid.has_slot(slot) {
+                // A user-authored system.md need not keep every marker, so a
+                // missing one drops the hint instead of failing the load.
+                if maki_agent::prompt::is_user_supplied(pid) {
+                    tracing::warn!(
+                        %slot,
+                        prompt = %pid,
+                        "custom system prompt has no marker for this slot; hint dropped"
+                    );
+                    continue;
+                }
                 return Err(mlua::Error::runtime(format!(
                     "slot '{}' is not available for prompt '{}'",
                     slot, pid

@@ -544,6 +544,12 @@ pub struct TokenUsage {
     pub cache_creation: u32,
     #[serde(rename = "cache_read_input_tokens")]
     pub cache_read: u32,
+    /// Thinking/reasoning tokens the model billed as part of this turn. A
+    /// *subset* of `output`, not an addition to it, so it never feeds the
+    /// input/context/cost totals. Zero for providers that don't break it out
+    /// (Anthropic folds thinking into `output_tokens`).
+    #[serde(default, rename = "reasoning_tokens")]
+    pub reasoning: u32,
 }
 
 impl From<StoredTokenUsage> for TokenUsage {
@@ -553,6 +559,9 @@ impl From<StoredTokenUsage> for TokenUsage {
             output: s.output,
             cache_creation: s.cache_creation,
             cache_read: s.cache_read,
+            // Not persisted: thinking counts are a live readout for the
+            // current run, and a resumed session has no turn in flight.
+            reasoning: 0,
         }
     }
 }
@@ -640,6 +649,7 @@ impl AddAssign for TokenUsage {
         self.output = self.output.saturating_add(rhs.output);
         self.cache_creation = self.cache_creation.saturating_add(rhs.cache_creation);
         self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
+        self.reasoning = self.reasoning.saturating_add(rhs.reasoning);
     }
 }
 
@@ -680,6 +690,7 @@ mod tests {
         output: 0,
         cache_creation: 0,
         cache_read: 0,
+        reasoning: 0,
     };
     /// Four counters that cannot be confused with each other.
     const COUNTERS: TokenUsage = TokenUsage {
@@ -687,6 +698,7 @@ mod tests {
         output: 22,
         cache_creation: 33,
         cache_read: 44,
+        reasoning: 0,
     };
     const RECORDED_COST: f64 = 0.25;
     const FREE_MEANS_A_KNOWN_ZERO: &str = "only a price discovery reported as zero means free";
@@ -706,9 +718,9 @@ mod tests {
         assert_eq!(format_tokens(tokens), expected);
     }
 
-    #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100 }, None, "12.3k↑ 456↓" ; "without_cost")]
-    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000 }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
-    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100, reasoning: 0 }, None, "12.3k↑ 456↓" ; "without_cost")]
+    #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000, reasoning: 0 }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
+    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1, reasoning: 0 }, None, "4295.0m↑ 1↓" ; "input_saturates")]
     fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
         assert_eq!(usage.format(cost), expected);
     }
@@ -720,6 +732,7 @@ mod tests {
             output: 456,
             cache_creation: 200,
             cache_read: 100,
+            reasoning: 0,
         };
         assert_eq!(usage.format_sum_cost(Some(1.5)), "12.3k↑ 456↓ Σ$1.500");
         assert_eq!(usage.format_sum_cost(None), usage.format(None));
@@ -793,6 +806,7 @@ mod tests {
             output: 1_000,
             cache_creation: 10_000,
             cache_read: 150_000,
+            reasoning: 0,
         };
         assert_eq!(usage.total_input(), 165_000);
     }
@@ -811,6 +825,7 @@ mod tests {
             output: 100_000,
             cache_creation: 200_000,
             cache_read: 500_000,
+            reasoning: 0,
         };
         let cost = usage.cost(&pricing, false);
         let expected = 3.0 + 1.5 + 0.75 + 0.15;
@@ -834,6 +849,7 @@ mod tests {
             output: 1_000_000,
             cache_creation: 1_000_000,
             cache_read: 1_000_000,
+            reasoning: 0,
         };
         let fast = usage.cost(&pricing, true);
         let expected = 30.0 + 150.0 + 37.5 + 3.0;
@@ -855,6 +871,7 @@ mod tests {
             output: 1_000_000,
             cache_creation: 0,
             cache_read: 0,
+            reasoning: 0,
         };
         assert_eq!(usage.cost(&pricing, true), usage.cost(&pricing, false));
     }
@@ -1117,6 +1134,7 @@ mod tests {
             output: 1_000_000,
             cache_creation: 500_000,
             cache_read: 4_000_000,
+            reasoning: 0,
         };
         let cost = usage.cost(&pricing, false);
         // 2M*0.5/1M + 1M*1.5/1M + 0.5M*0.1/1M + 4M*0.05/1M
@@ -1135,6 +1153,7 @@ mod tests {
             output: 1_000,
             cache_creation: 1_000,
             cache_read: 1_000,
+            reasoning: 0,
         };
         assert_eq!(usage.cost(&pricing, false), 0.0);
         assert!(pricing.is_zero());

@@ -73,6 +73,9 @@ impl From<Usage> for TokenUsage {
             output: u.output_tokens,
             cache_creation: u.cache_creation_input_tokens,
             cache_read: u.cache_read_input_tokens,
+            // Anthropic bills thinking inside `output_tokens` and never breaks
+            // it out separately, so there is nothing to report here.
+            reasoning: 0,
         }
     }
 }

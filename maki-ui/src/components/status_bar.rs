@@ -46,6 +46,10 @@ pub struct StreamingInfo {
 pub struct TurnStats {
     pub pp_tps: f64,
     pub tg_tps: f64,
+    /// Thinking tokens the last round billed, a subset of its output tokens.
+    /// Zero when the provider doesn't report them (Anthropic folds thinking
+    /// into `output_tokens`), which hides the field rather than showing "0".
+    pub thinking_tokens: u32,
     /// Cumulative cache hit rate across the session.
     pub cache_rate: f64,
     /// Whether the most recent turn was a cache miss (cache_read == 0).
@@ -406,12 +410,13 @@ impl StatusBar {
     }
 }
 
-/// Builds the `show_token_stats` status-bar text in full (`PP/TG/CR/CH/CM`)
+/// Builds the `show_token_stats` status-bar text in full (`PP/TG/TH/CR/CH/CM`)
 /// and abbreviated (`CR/CH/CM` only, dropped when space runs out) forms.
 /// Both start with a double leading space, since either can be spliced
 /// directly after the previous span. The `CH $.. CM $..` cost figures are
 /// omitted entirely when both are zero (e.g. the model has no known
-/// pricing) instead of showing a meaningless "CH $0.00 CM $0.00".
+/// pricing) instead of showing a meaningless "CH $0.00 CM $0.00", and `TH`
+/// is omitted when the provider reports no thinking tokens.
 fn format_token_stats(stats: &TurnStats) -> (String, String) {
     let mark = if stats.last_turn_cache_miss {
         "𐄂"
@@ -426,9 +431,15 @@ fn format_token_stats(stats: &TurnStats) -> (String, String) {
             stats.cache_hit_cost, stats.cache_miss_cost
         )
     };
+    // Sits next to TG: both describe the output side of the round.
+    let thinking = if stats.thinking_tokens > 0 {
+        format!(" | TH {}", format_tokens(stats.thinking_tokens))
+    } else {
+        String::new()
+    };
     let abbrev = format!("  CR {:.1}% {mark}{cost_suffix}", stats.cache_rate * 100.0);
     let full = format!(
-        "  PP {:.1} t/s | TG {:.1} t/s | CR {:.1}% {mark}{cost_suffix}",
+        "  PP {:.1} t/s | TG {:.1} t/s{thinking} | CR {:.1}% {mark}{cost_suffix}",
         stats.pp_tps,
         stats.tg_tps,
         stats.cache_rate * 100.0,
@@ -727,11 +738,35 @@ mod tests {
         TurnStats {
             pp_tps: 12.3,
             tg_tps: 45.6,
+            thinking_tokens: 0,
             cache_rate: 0.5,
             last_turn_cache_miss: false,
             cache_hit_cost,
             cache_miss_cost,
         }
+    }
+
+    #[test]
+    fn format_token_stats_omits_thinking_when_provider_reports_none() {
+        let (full, abbrev) = format_token_stats(&turn_stats(0.0, 0.0));
+        assert!(!full.contains("TH"), "full: {full:?}");
+        assert!(!abbrev.contains("TH"), "abbrev: {abbrev:?}");
+    }
+
+    #[test]
+    fn format_token_stats_shows_thinking_tokens_next_to_tg() {
+        let stats = TurnStats {
+            thinking_tokens: 1_234,
+            ..turn_stats(0.0, 0.0)
+        };
+        let (full, abbrev) = format_token_stats(&stats);
+        assert!(
+            full.contains("TG 45.6 t/s | TH 1.2k | CR"),
+            "full: {full:?}"
+        );
+        // The abbreviated form is what survives a narrow terminal; thinking
+        // is a nice-to-have and drops out with PP/TG.
+        assert!(!abbrev.contains("TH"), "abbrev: {abbrev:?}");
     }
 
     #[test]

@@ -10,19 +10,20 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 - `maki-providers/src/bin/mlog.rs` — `mlog` binary for reading wire logs
 - `maki-providers/src/providers/tensorx.rs` — tensorx provider
 
-### Infrastructure
-- `maki-tool-macro/` crate — proc macro for tool definitions
-
 ### UI components
 - `maki-ui/src/components/settings_picker.rs` — UserSettings + interactive settings menu
 - `maki-ui/src/components/export_picker.rs` — `/export` transcript picker
 - `maki-ui/src/components/goto_picker.rs` — `/goto` turn navigation
 - `maki-ui/src/components/skills_modal.rs` — `/skills` TUI skills manager
-- `maki-ui/src/components/render_hints.rs` — render hints component
 - `maki-ui/src/config.rs` — flat Ghostty-style config loader (`user.config`)
 
-### Plugins
-- `plugins/hackernews/init.lua` — HackerNews reader
+### Removed on purpose (do not restore on merge)
+- `maki-tool-macro/` and `maki-ui/src/components/render_hints.rs` — deleted in
+  `d952f8aa` when the last native Rust tool moved to Lua. The macro declared
+  native tools; nothing declares those any more.
+- `plugins/hackernews/` — deleted in `efaefdb8`.
+- `maki-ui/src/components/session_picker.rs` — the session list is now the Lua
+  `plugins/sessions/init.lua` plugin. See conflict zone 6.
 
 ### Themes
 - `maki-ui/src/themes/kanagawa_maki.toml` + 5 variants (ink, lotus, slate, storm, wave)
@@ -128,27 +129,32 @@ All of the above names must route to the right field.
 
 ### 5. `maki-ui/src/components/messages/mod.rs`
 
-Turn numbering must be present in the message render loop:
-```rust
-} else if msg.role == DisplayRole::User {
-    let turn_num = self.messages[..=i]
-        .iter()
-        .filter(|m| m.role == DisplayRole::User)
-        .count();
-    dynamic_prefix = format!("{turn_num}‧ you ∙ ");
-    &dynamic_prefix
-```
+Turn numbering. The hardcoded prefix became a configurable template, so the
+requirement now spans two files:
+
+- `settings_picker.rs` must keep
+  `const DEFAULT_USER_PROMPT_PREFIX: &str = "{n}‧ you ∙ ";`
+- `messages/mod.rs` must substitute the turn number into it:
+  `template.replace("{n}", &user_turns.to_string())`
 
 ---
 
-### 6. `maki-ui/src/components/session_picker.rs`
+### 6. `plugins/sessions/init.lua`
 
-Session list must show context size:
+The session list moved out of Rust into this Lua plugin. It must show context
+size:
 ```
 devise-a-brilliant ...  ctx: 135.8K · 1d ago
 ```
+which needs the plugin's `format_context_size()` helper, `context_size` on
+`SessionSummary` (conflict zone 7), and `event_loop.rs` exposing
+`"context_size": rt.app.state.context_size` to Lua.
 
-Requires `format_context_size()` helper and `context_size` field in `SessionEntry`.
+**Upstream re-adds `maki.keymap.set("n", "<C-p>", open, ...)` here.** Ctrl+P is
+this fork's `prev_chat`, and Lua keymaps are dispatched *before* native binds
+(`app/mod.rs`, `dispatch_override` runs ahead of `handle_main_chat_key`), so
+that line silently shadows `prev_chat`. Sessions are reached through the
+configurable `sessions` bind (Alt+S) instead. `verify-fork.sh` guards this.
 
 ---
 
@@ -207,6 +213,49 @@ impl Default for UserSettings {
 ```
 
 ---
+
+---
+
+### 12. User-editable system prompt (`maki-agent/src/prompt.rs`)
+
+`/system_prompt` seeds and opens `<config_dir>/system.md`. That file must
+actually be **read back**, not just written:
+
+- `load_user_system_prompt()` stores it in the `USER_SYSTEM_PROMPT` `ArcSwap`.
+- `PromptId::template()` returns it for `PromptId::System` when set.
+- Called from `src/cmd/mod.rs::dispatch` (startup, every subcommand) and from
+  the `RunOutcome::Reload` arm in `src/cmd/tui.rs` (so `/reload` re-reads it).
+- A blank or missing file falls back to the built-in prompt.
+
+Because `PromptId::has_slot()` tests the *live* template, a user prompt that
+drops a `{{slot}}` marker would otherwise abort plugin loading. `is_user_supplied()`
+downgrades that to a warning in `maki-lua/src/api/tool.rs` — without it, editing
+system.md can brick startup.
+
+---
+
+### 13. Thinking tokens in the status bar
+
+`TokenUsage::reasoning` carries provider-reported thinking tokens. It is a
+**subset of `output`**, never added to it, so it must stay out of
+`total_input()` / `context_tokens()` / cost math.
+
+- Parsed from `output_tokens_details.reasoning_tokens` (OpenAI Responses) and
+  `completion_tokens_details.reasoning_tokens` (openai_compat: OpenRouter,
+  DeepSeek, …). Anthropic folds thinking into `output_tokens` and reports 0.
+- Not persisted to `StoredTokenUsage` — it is a live per-round readout.
+- `TurnStats::thinking_tokens` renders as ` | TH 1.2k` next to `TG`, and is
+  omitted entirely when zero.
+
+---
+
+## Known gaps (not regressions, but broken)
+
+- **`Ctrl+Shift+D` (delete current session) has no handler.** The bind is
+  declared in `keybindings.rs`, is user-configurable via `config.rs`, and is
+  advertised — but nothing matches `key::DELETE_CURRENT_SESSION`. The handler
+  lived on the deleted Rust `session_picker` (`remove_entry`) and was not
+  reimplemented when the session list moved to Lua. Pressing it does nothing.
 
 ## Merge checklist
 

@@ -393,7 +393,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 stack.plugin_host.begin_shutdown();
                 ToolRegistry::global().clear_lua();
                 teardown.defer(move || drop(stack));
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                let (new_stack, mut new_warnings) =
+                    build_stack(&cli, &cwd, &storage, Some(last_good))?;
+                // Re-read <config_dir>/system.md so an edit made via
+                // `/system_prompt` takes effect without restarting maki.
+                if let Err(e) = maki_agent::prompt::load_user_system_prompt() {
+                    new_warnings.push(format!("could not read custom system prompt: {e}"));
+                }
                 tabs = reloaded;
                 if tabs.is_empty() {
                     tabs.push(AppSession::new(&new_stack.model.spec(), &cwd_str));

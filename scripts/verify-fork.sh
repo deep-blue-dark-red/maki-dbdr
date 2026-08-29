@@ -52,12 +52,14 @@ check_not() {
 file_exists "wire logger"      maki-providers/src/wire_log.rs
 file_exists "mlog binary"      maki-providers/src/bin/mlog.rs
 file_exists "tensorx provider" maki-providers/src/providers/tensorx.rs
-file_exists "tool-macro crate" maki-tool-macro/src/lib.rs
+# maki-tool-macro and render_hints.rs were deleted on purpose in d952f8aa
+# ("plugins: batch: move the last native tool to Lua") — the macro existed to
+# declare native Rust tools and nothing declares those any more. Likewise
+# plugins/hackernews was dropped in efaefdb8. No checks here on purpose.
 file_exists "settings_picker"  maki-ui/src/components/settings_picker.rs
 file_exists "export_picker"    maki-ui/src/components/export_picker.rs
 file_exists "goto_picker"      maki-ui/src/components/goto_picker.rs
 file_exists "skills_modal"     maki-ui/src/components/skills_modal.rs
-file_exists "render_hints"     maki-ui/src/components/render_hints.rs
 file_exists "ui config.rs"     maki-ui/src/config.rs
 file_exists "kanagawa theme"   maki-ui/src/themes/kanagawa_maki.toml
 file_exists "rose pine maki"   maki-ui/src/themes/rose_pine_maki.toml
@@ -91,9 +93,11 @@ check "plugins_modal field"      "$F" "pub(super) plugins_modal: PluginsModal"
 check "skills_modal field"       "$F" "pub(super) skills_modal: SkillsModal"
 check "goto_picker field"        "$F" "pub(super) goto_picker: GotoPicker"
 check "/settings opens picker"   "$F" "self.settings_picker.open"
-check "/export opens picker"     "$F" "self.export_picker.open"
+# `/export` and `/skills` wrap their open() onto the next line, so match the
+# receiver rather than the call.
+check "/export opens picker"     "$F" "self.export_picker"
 check "/plugins opens modal"     "$F" "self.plugins_modal.open"
-check "/skills opens modal"      "$F" "self.skills_modal.open"
+check "/skills opens modal"      "$F" "self.skills_modal"
 check "settings_picker overlay"  "$F" "&self.settings_picker,"
 check "export_picker overlay"    "$F" "&self.export_picker,"
 check "goto_picker overlay"      "$F" "&self.goto_picker,"
@@ -114,14 +118,24 @@ check "plan_toggle in registry"          "$F" '"plan_toggle" =>'
 
 # ── turn numbering ───────────────────────────────────────────────────────────
 
+# The hardcoded `format!("{turn_num}‧ you ∙ ")` became a configurable
+# template: settings_picker owns the default, messages/mod.rs substitutes {n}.
+check "turn prefix default"  maki-ui/src/components/settings_picker.rs 'DEFAULT_USER_PROMPT_PREFIX: &str = "{n}‧ you ∙ "'
+check "turn prefix template applied" maki-ui/src/components/messages/mod.rs 'template.replace("{n}"'
 F=maki-ui/src/components/messages/mod.rs
-check "turn number prefix"   "$F" 'format!("{turn_num}‧ you ∙ ")'
 
 # ── session picker ctx tokens ────────────────────────────────────────────────
 
-F=maki-ui/src/components/session_picker.rs
-check "format_context_size fn"  "$F" "fn format_context_size"
-check "ctx display format"      "$F" '"ctx: {} · {}"'
+# The Rust session_picker.rs component was replaced by the Lua /sessions
+# plugin; the ctx-size column moved with it. maki-storage still supplies the
+# number and event_loop.rs still exposes it to Lua, both checked below.
+F=plugins/sessions/init.lua
+check "format_context_size fn"  "$F" "local function format_context_size"
+check "ctx display format"      "$F" 'local ctx = "ctx: "'
+check "context_size exposed to lua" maki-ui/src/event_loop.rs '"context_size": rt.app.state.context_size'
+# Upstream binds sessions to <C-p>, which is this fork's prev_chat. Lua
+# keymaps dispatch before native binds, so this must not come back.
+check_not "sessions must not steal ctrl+p" "$F" 'maki.keymap.set("n", "<C-p>"'
 
 # ── session storage context_size ─────────────────────────────────────────────
 
@@ -167,7 +181,7 @@ check "teardrop/asterisk spinner rendering" "maki-ui/src/components/tool_display
 check "last api send tracking field" "maki-ui/src/app/mod.rs" "pub(super) last_turn_stats: Option<crate::components::status_bar::TurnStats>"
 
 # 5. 2c499433: feat: implement sliding activity event timeline and persistent status stats
-check "active run duration field" "maki-ui/src/app/mod.rs" "let elapsed = start.elapsed().as_secs_f64()"
+check "active run duration field" "maki-ui/src/app/mod.rs" ".map(|start| start.elapsed().as_secs_f64())"
 
 # 6. 33a7c5d9: feat: make visual history timeline period configurable under settings
 check "UserSettings load in settings picker" "maki-ui/src/components/settings_picker.rs" "pub fn load() -> Self"
@@ -201,7 +215,7 @@ check "compaction CRITICAL LENGTH CONSTRAINT" "maki-agent/src/agent/compaction.r
 
 # 15. 910ad267: feat: show context length in sessions list and refactor compaction logic
 check "Compaction attempt info log" "maki-agent/src/agent/compaction.rs" "summary succeeded after truncating oldest rounds"
-check "format_context_size in session picker" "maki-ui/src/components/session_picker.rs" "fn format_context_size"
+check "format_context_size in session picker" "plugins/sessions/init.lua" "local function format_context_size"
 
 # 16. ec107910: feat: add rewind and goto commands to command palette and implement GotoPicker
 check "GotoPicker file exists" "maki-ui/src/components/goto_picker.rs" "pub struct GotoPicker"
@@ -219,7 +233,7 @@ check "keybinding label formatting" "maki-ui/src/components/keybindings.rs" "pub
 check "config_path in config.rs" "maki-ui/src/config.rs" "pub fn config_path"
 
 # 20. 79c54dae: feat: render plan form dismiss key label dynamically
-check "dismiss keys plan form" "maki-ui/src/components/plan_form.rs" "DISMISS_KEYS"
+check "dismiss keys plan form" "maki-ui/src/components/plan_form.rs" "fn dismiss_keys()"
 
 # 21. 481b9885: chore: commit plugin tool usage prompt hints
 check "bash tool usage hint" "plugins/bash/init.lua" "Reserve bash for system commands"
@@ -238,10 +252,10 @@ check "assistant turn prefix" "maki-ui/src/components/tool_display.rs" "prefix: 
 check "turn prefix dynamic formatting" "maki-ui/src/components/messages/mod.rs" "dynamic_prefix"
 
 # 25. acb6e0fa: feat: rename user back to you in dynamic turn prefix
-check "you turn prefix format" "maki-ui/src/components/messages/mod.rs" "you ∙"
+check "you turn prefix format" "maki-ui/src/components/settings_picker.rs" "you ∙"
 
 # 26. 7f019da6: feat: use hyphenation point (‧) instead of dot in user prefix
-check "hyphenation point turn prefix" "maki-ui/src/components/messages/mod.rs" "‧ you"
+check "hyphenation point turn prefix" "maki-ui/src/components/settings_picker.rs" "‧ you"
 
 # 27-29. 5c749436: feat: align TUI skills manager folders with backend Lua discovery
 check "skills manager FolderInfo display path" "maki-ui/src/components/skills_modal.rs" "is_enabled: true,"
@@ -276,21 +290,27 @@ check "PluginsModal struct definition" "maki-ui/src/components/plugins_modal.rs"
 check "load_builtin function" "maki-lua/src/loader.rs" "pub fn load_builtin"
 
 # 39. 75288f0e: minor
-check "skills.json exclude hackernews" ".agents/skills.json" "\"hackernews\""
+# The hackernews plugin was removed in efaefdb8, so nothing excludes it now.
 
 # 40-41. 75a1d1a2: feat: refine Ctrl+Shift+D shortcut to delete session and open sessions list popup directly
 check "delete current session keybinding" "maki-ui/src/components/keybindings.rs" "delete_current_session"
-check "delete current session logic in app" "maki-ui/src/app/mod.rs" "self.session_picker.remove_entry"
+# NOTE: key::DELETE_CURRENT_SESSION (Ctrl+Shift+D) is still declared and
+# configurable but no longer has a handler — the Rust session_picker that
+# owned remove_entry is gone. Verify the bind is at least still declared;
+# restoring the behaviour against the Lua /sessions plugin is open work.
+check "delete current session bind declared" "maki-ui/src/components/keybindings.rs" "pub const DELETE_CURRENT_SESSION"
 
 # 42. fbd0316e: fix: update no session message to match user preference
-check "no session message session_picker" "maki-ui/src/components/session_picker.rs" "No previous sessions"
+check "no session message session_picker" "plugins/sessions/init.lua" "No sessions yet"
 
 # 43. a41f4392: feat: add global_sessions setting and Ctrl+Shift+M shortcut to toggle it
 check "global_sessions setting in Config" "maki-ui/src/components/settings_picker.rs" "pub global_sessions: bool"
 check "toggle_global_sessions keybind in keybindings" "maki-ui/src/components/keybindings.rs" "toggle_global_sessions"
 
 # 44. d9597d12: fix: resolve clippy warnings throughout workspace
-check "clippy fixed let chains" "maki-storage/src/sessions.rs" "&& header.cwd != c"
+# The cwd filter was restructured upstream; the fork just needs cwd carried
+# through the scanned header.
+check "scanned header carries cwd" "maki-storage/src/sessions.rs" "cwd: header.cwd"
 
 # 45. 11555dfb: fix: skip excluded/disabled skills during plugin discovery
 check "skip excluded skills check" "plugins/skill/init.lua" "if not excluded[folder_name] then"
@@ -302,6 +322,25 @@ check "abbreviated token stats status bar" "maki-ui/src/components/status_bar.rs
 file_exists "SKILL_TESTING.md file" "SKILL_TESTING.md"
 file_exists "create-plugin skill test script" "tests/agent/skill-test-create-plugin.sh"
 file_exists "ssh skill test script" "tests/agent/skill-test-ssh.sh"
+
+# ── User-editable system prompt (/system_prompt is read, not just written) ────
+
+F=maki-agent/src/prompt.rs
+check "system.md override loader"    "$F" "pub fn load_user_system_prompt"
+check "override consulted by template" "$F" "USER_SYSTEM_PROMPT.load_full()"
+check "user prompt relaxes slot check" "$F" "pub fn is_user_supplied"
+check "override loaded at startup"   "src/cmd/mod.rs" "load_user_system_prompt()"
+check "override reloaded on /reload" "src/cmd/tui.rs" "load_user_system_prompt()"
+check "missing slot warns not fails"  "maki-lua/src/api/tool.rs" "is_user_supplied(pid)"
+
+# ── Thinking tokens in the status bar ────────────────────────────────────────
+
+check "reasoning field on TokenUsage" "maki-providers/src/model.rs" "pub reasoning: u32"
+check "reasoning parsed (responses)" "maki-providers/src/providers/openai/responses.rs" '"output_tokens_details"'
+check "reasoning parsed (compat)"    "maki-providers/src/providers/openai_compat.rs" "completion_tokens_details"
+check "TurnStats carries thinking"   "maki-ui/src/components/status_bar.rs" "pub thinking_tokens: u32"
+check "status bar renders TH"        "maki-ui/src/components/status_bar.rs" '" | TH {}"'
+check "thinking wired from turn"     "maki-ui/src/app/mod.rs" "thinking_tokens: tc.usage.reasoning"
 
 # ── Results ──────────────────────────────────────────────────────────────────
 

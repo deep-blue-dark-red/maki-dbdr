@@ -735,6 +735,7 @@ mod tests {
             output,
             cache_read,
             cache_creation,
+            reasoning: 0,
         };
         assert_eq!(
             is_overflow(&usage, &model, AgentConfig::default().compaction_buffer),

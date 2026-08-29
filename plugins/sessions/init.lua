@@ -600,7 +600,10 @@ maki.api.register_command({
   handler = open,
 })
 
-maki.keymap.set("n", "<C-p>", open, { desc = "Browse sessions" })
+-- Upstream binds session browsing to <C-p>. This fork keeps Ctrl+P on
+-- prev_chat and reaches sessions through the configurable `sessions` bind
+-- (Alt+S by default). Lua keymaps dispatch ahead of the native binds, so
+-- restoring this line silently shadows prev_chat.
 
 maki.api.register_command({
   name = "/rename",

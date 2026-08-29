@@ -1773,6 +1773,7 @@ impl App {
                 self.last_turn_stats = Some(crate::components::status_bar::TurnStats {
                     pp_tps,
                     tg_tps,
+                    thinking_tokens: tc.usage.reasoning,
                     cache_rate,
                     last_turn_cache_miss: tc.cache_miss,
                     cache_hit_cost,

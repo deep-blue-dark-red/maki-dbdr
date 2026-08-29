@@ -462,6 +462,14 @@ struct PromptTokensDetails {
     cached_tokens: u32,
 }
 
+/// Reasoning-model breakdown of `completion_tokens`. OpenRouter, DeepSeek and
+/// other OpenAI-shaped providers all use OpenAI's field name here.
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
+}
+
 #[derive(Deserialize)]
 struct ChunkUsage {
     #[serde(default)]
@@ -472,6 +480,7 @@ struct ChunkUsage {
     /// DeepSeek reports cache hits here instead of `prompt_tokens_details`.
     #[serde(default)]
     prompt_cache_hit_tokens: u32,
+    completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
 #[derive(Deserialize)]
@@ -551,6 +560,9 @@ pub async fn parse_sse(
                 output: u.completion_tokens,
                 cache_read: cached,
                 cache_creation: 0,
+                reasoning: u
+                    .completion_tokens_details
+                    .map_or(0, |d| d.reasoning_tokens),
             };
         }
 
@@ -756,6 +768,43 @@ mod tests {
     fn default_model_parser_vision_flag(m: Value, expected: Option<bool>) {
         let info = OpenAiCompatProvider::default_model_parser(&m).unwrap();
         assert_eq!(info.supports_vision, expected);
+    }
+
+    #[test]
+    fn parse_sse_reads_reasoning_tokens_from_usage() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":30,\"completion_tokens_details\":{\"reasoning_tokens\":18}}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.output, 30);
+            // Reasoning is a slice of completion_tokens, not an addition.
+            assert_eq!(resp.usage.reasoning, 18);
+            assert_eq!(resp.usage.context_tokens(), 40);
+        })
+    }
+
+    #[test]
+    fn parse_sse_without_reasoning_details_reports_no_thinking() {
+        smol::block_on(async {
+            let sse = "\
+data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\
+\n\
+data: [DONE]\n";
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.usage.reasoning, 0);
+        })
     }
 
     #[test]

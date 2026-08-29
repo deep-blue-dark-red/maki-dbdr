@@ -750,6 +750,7 @@ mod tests {
                 output: 200,
                 cache_creation: 0,
                 cache_read: 50_000,
+                reasoning: 0,
             },
             model: "test-model".into(),
             cost,

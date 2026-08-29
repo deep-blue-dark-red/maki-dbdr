@@ -709,7 +709,8 @@ data: {\"type\":\"message_stop\"}\n";
                     input: 42,
                     output: 10,
                     cache_creation: 5,
-                    cache_read: 8
+                    cache_read: 8,
+                    reasoning: 0,
                 }
             );
             assert!(

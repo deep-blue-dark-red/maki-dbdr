@@ -535,6 +535,9 @@ fn parse_usage(u: &Value) -> TokenUsage {
         output: output_tokens,
         cache_read: cached,
         cache_creation: 0,
+        reasoning: u["output_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or(0) as u32,
     }
 }
 
@@ -1128,6 +1131,29 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
             assert_eq!(resp.usage.input, 60);
             assert_eq!(resp.usage.output, 10);
             assert_eq!(resp.usage.cache_read, 40);
+            assert_eq!(
+                resp.usage.reasoning, 0,
+                "absent details must not invent a count"
+            );
+        })
+    }
+
+    #[test]
+    fn parse_sse_reads_reasoning_tokens_from_usage() {
+        smol::block_on(async {
+            let sse = "\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":30,\"output_tokens_details\":{\"reasoning_tokens\":18}}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            assert_eq!(resp.usage.output, 30);
+            // Thinking is billed inside output_tokens, so it must not inflate
+            // the totals the context/cost math is built on.
+            assert_eq!(resp.usage.reasoning, 18);
+            assert_eq!(resp.usage.context_tokens(), 130);
         })
     }
 }

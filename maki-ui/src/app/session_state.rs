@@ -219,6 +219,7 @@ mod tests {
         output: 0,
         cache_creation: 0,
         cache_read: 0,
+        reasoning: 0,
     };
     /// [`MILLION_INPUT`] at `test_pricing`'s standard input rate.
     const LIST_PRICE: f64 = 3.0;
