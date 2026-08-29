@@ -24,6 +24,7 @@ maki-config = { workspace = true }
 maki-providers = { workspace = true }
 maki-storage = { workspace = true }
 maki-lua = { workspace = true }
+maki-otel = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
@@ -53,6 +54,7 @@ members = [
   "maki-interpreter",
   "maki-lua",
   "maki-markdown",
+  "maki-otel",
   "maki-providers",
   "maki-storage",
   "maki-config-macro",
@@ -62,7 +64,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -82,6 +84,7 @@ maki-config-macro = { path = "maki-config-macro" }
 maki-lua-macro = { path = "maki-lua-macro" }
 maki-highlight = { path = "maki-highlight" }
 maki-markdown = { path = "maki-markdown" }
+maki-otel = { path = "maki-otel" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 bs58 = "0.5"
@@ -136,7 +139,8 @@ async-io = "2"
 event-listener = "5"
 futures-lite = "2"
 futures = "0.3"
-isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl"] }
+isahc = { version = "1.7", default-features = false, features = ["text-decoding", "static-curl", "static-ssl", "http2"] }
+flate2 = "1"
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
 nucleo = "0.5"
