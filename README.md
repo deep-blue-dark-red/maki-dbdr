@@ -15,6 +15,7 @@ This fork adds:
 * Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary.
 * `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
+* An optimized default system prompt, benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks.
 
 ### Skills Manager
 
