@@ -17,6 +17,12 @@ This fork adds:
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
 * An optimized default system prompt, benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks.
 
+### `/stats`
+
+![Per-call API statistics](./screenshots/stats.png)
+
+Inspect every turn, request, tool duration, cache hit, provider, token rate, and itemized cost.
+
 ### Skills Manager
 
 ![Skills Manager](./screenshots/skills-manager.png)
