@@ -1,4 +1,4 @@
-<img src="./banner.png">
+<img src="./landing.png">
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
