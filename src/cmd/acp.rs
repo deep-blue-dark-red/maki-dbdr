@@ -21,24 +21,28 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
     let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
-    let raw_config = plugin_host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
+    let (config, warnings) = super::load_plugins(
+        &mut plugin_host,
+        no_plugins,
+        super::BuiltinFailure::Fatal,
+        maki_lua::Interaction::None,
+        |host, names, warnings| {
+            let mut config = host
+                .load_init_files_or_skip(no_plugins, &cwd, warnings)
+                .context("load init.lua files")?
+                .unwrap_or_default()
+                .into_config(&names(host)?)
+                .context("invalid config")?;
+            config.permissions = load_permissions(&cwd);
 
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")?;
-    config.permissions = load_permissions(&cwd);
-
-    if yolo || config.always_yolo {
-        config.permissions.yolo = true;
-    }
-    config.validate()?;
-
-    plugin_host
-        .load_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+            if yolo || config.always_yolo {
+                config.permissions.yolo = true;
+            }
+            config.validate()?;
+            Ok(config)
+        },
+    )?;
+    super::report_warnings(warnings);
 
     let timeouts = maki_providers::Timeouts {
         connect: config.provider.connect_timeout,
@@ -55,6 +59,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
 
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
 
+    let event_handle = plugin_host.event_handle();
     maki_acp::run(maki_acp::AcpParams {
         model,
         config: config.agent,
@@ -65,5 +70,9 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
         plugin_rules: plugin_host.plugin_rules(),
+        on_session_end: Some(Arc::new(move |id, reason| {
+            let handle = event_handle.clone();
+            Box::pin(async move { handle.end_session_async(id, reason).await })
+        })),
     })
 }

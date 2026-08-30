@@ -43,8 +43,10 @@ inventory::submit!(maki_config::providers::BuiltInProvider {
 });
 
 /// Peak hours double every rate, and the tables below quote the off-peak ones.
+/// The weekend stays off-peak around the clock.
 /// <https://api-docs.deepseek.com/quick_start/pricing/>
-pub(crate) const PEAK_HOURS: PricingSchedule = PricingSchedule::new(PEAK_WINDOWS, PEAK_MULTIPLIER);
+pub(crate) const PEAK_HOURS: PricingSchedule =
+    PricingSchedule::new(PEAK_WINDOWS, PEAK_MULTIPLIER).weekdays_only();
 
 const PEAK_WINDOWS: &[PricingWindow] = &[PricingWindow::hours(1, 4), PricingWindow::hours(6, 10)];
 const PEAK_MULTIPLIER: f64 = 2.0;
@@ -127,7 +129,11 @@ impl From<BalanceResponse> for ProviderUsage {
                 }
             })
             .collect();
-        ProviderUsage { plan: None, limits }
+        ProviderUsage {
+            plan: None,
+            limits,
+            by_model_today: vec![],
+        }
     }
 }
 
@@ -143,7 +149,10 @@ impl DeepSeek {
         let pool = KeyPool::resolve("deepseek", CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
-            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(pool.current()))),
+            auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
+                "deepseek",
+                pool.current(),
+            )?)),
             key_pool: Some(pool),
             system_prefix: None,
         })
@@ -220,7 +229,7 @@ impl Provider for DeepSeek {
             Ok(self
                 .key_pool
                 .as_ref()
-                .is_some_and(|p| p.rotate_auth(&self.auth, ResolvedAuth::bearer)))
+                .is_some_and(|p| p.rotate_bearer(&self.auth)))
         })
     }
 }
@@ -260,8 +269,8 @@ mod tests {
 
     const V4: &str = "deepseek-v4-pro";
     const R1: &str = "deepseek-reasoner";
-    /// The hours and the surcharge as the pricing page states them.
-    const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC";
+    /// The hours, days and surcharge as the pricing page states them.
+    const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC, Mon-Fri";
 
     /// `PEAK_HOURS` only reaches a bill through the manifest, and a schedule
     /// that never got hooked up looks exactly like off-peak all day. The

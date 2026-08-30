@@ -10,7 +10,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * `code_execution` tool - uses [monty](https://github.com/pydantic/monty) to run an interpreter that has all other tools available as async functions. Maki uses it to filter / summarize / transform / pipe data to other tools as input, without it ever reaching and polluting the context window. Sandbox limited by time & memory.
 * `task` tool - when delegating work to subagents, the AI chooses whether to run weak / medium / strong model of used provider. Think haiku / sonnet / opus.
 * System prompt, tool descriptions, and tool examples are all concise, I've made sure not to bloat your context.
-* Uses [rtk](https://github.com/rtk-ai/rtk) if you have it installed, disable with `--no-rtk`. Saves ~50% of bash output tokens. Remember bash is just 12% of total token usage, so 6% is nice, but saving on reads (65% of total) by using `index` gave me more benefit. I think I'll do bash output filtering like this myself in a future release.
+* Uses [rtk](https://github.com/rtk-ai/rtk) if you have it installed, disable with `maki.setup({ agent = { rtk = false } })` in your `init.lua`. Saves ~50% of bash output tokens. Remember bash is just 12% of total token usage, so 6% is nice, but saving on reads (65% of total) by using `index` gave me more benefit. I think I'll do bash output filtering like this myself in a future release.
 
 ### User experience
 
@@ -29,6 +29,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * 26 of the most popular themes.
 * Resume sessions.
 * Skills & MCPs.
+* Opt-in [OpenTelemetry](https://maki.sh/docs/telemetry/) export, same format as Claude Code's.
 * Plan mode.
 * Run bash commands using `!`, or `!!` if you want maki to not know about it.
 * `/cd` to change dir.
@@ -48,6 +49,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
 * Synthetic - `SYNTHETIC_API_KEY`.
+* Regolo - `REGOLO_API_KEY`. EU-hosted open-weight models.
 * TensorX - `TENSORX_API_KEY`.
 * OpenCode Zen - `OPENCODE_API_KEY`, or the free `public` key for zero-cost models. Models from the models.dev catalog.
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
@@ -137,8 +139,12 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 
 More info at the [official docs](https://maki.sh/docs).
 
+## Community
+
+[![Discord](https://img.shields.io/discord/1543246528876126218?logo=discord&logoColor=white&label=discord&color=5865F2)](https://discord.gg/dEBhANTbX)
+
 ## Example config
 
 [tontinton/makiconf](https://github.com/tontinton/makiconf) - includes a [semble](https://github.com/MinishLab/semble) tool (Lua code) for semantic code search, and an [ast-grep](https://ast-grep.github.io) MCP server for AST-based search and replace.
 
-> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. Some parts of the code are not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded, and can easily be refactor if needed nowadays.
+> DISCLAIMER: >90% of code in maki was written by maki, guided by humans. Some parts of the code are not as good as what I would've made in the artisanal hand-made style. But it's also not slop / vibe coded, and can easily be refactored if needed nowadays.

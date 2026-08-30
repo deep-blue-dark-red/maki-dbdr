@@ -20,7 +20,8 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
 use maki_config::ModelPolicy;
-use maki_lua::EventHandle;
+use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
+use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::id::SessionRef;
@@ -224,7 +225,29 @@ pub fn run(
     let mut cost = None;
     let mut stop_reason: Option<DoneReason> = None;
 
+    let snapshot = HeadlessSnapshot::default();
+    snapshot.install(
+        &lua_handle,
+        HeadlessMeta {
+            id: session_id.to_string(),
+            cwd: cwd.clone(),
+            model: model.spec(),
+        },
+        // `maki -p` always runs the agent in build mode
+        // (`headless::spawn` hardcodes `AgentMode::Build`).
+        || MODE_BUILD,
+    );
+
     while let Ok(envelope) = smol::block_on(event_rx.recv_async()) {
+        // Folded in first, so a plugin handling `TurnEnd` finds the finished
+        // totals when it calls `maki.session.read()`.
+        snapshot.observe(&envelope);
+        maki_lua::agent_autocmd::dispatch(
+            &lua_handle,
+            &session_id,
+            &envelope,
+            envelope.subagent.is_some(),
+        );
         let Envelope {
             ref event,
             ref subagent,
@@ -245,8 +268,8 @@ pub fn run(
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
-            | AgentEvent::AutoCompacting
-            | AgentEvent::CompactionDone
+            | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::SubagentHistory { .. }
@@ -309,9 +332,14 @@ pub fn run(
                 usage: u,
                 num_turns: turns,
                 reason,
+                cost: dcost,
+                ..
             } => {
                 num_turns = *turns;
                 usage = *u;
+                // The agent's own ledger also counts compaction spend, which
+                // summing the turns misses.
+                cost = (*dcost).or(cost);
                 stop_reason = Some(*reason);
                 break;
             }
@@ -328,6 +356,7 @@ pub fn run(
         })
         .await;
     });
+    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
 
     let duration_ms = start.elapsed().as_millis();
     // Zero on an unpriced model, which is what its turns reported too.

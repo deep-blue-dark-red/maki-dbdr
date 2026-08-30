@@ -18,6 +18,7 @@ mod highlight;
 pub use highlight::highlight_ansi;
 pub mod image;
 mod markdown;
+pub use markdown::text_to_lines;
 mod render_worker;
 pub mod repaint;
 mod selection;
@@ -27,6 +28,7 @@ mod text_buffer;
 mod theme;
 pub use theme::BUNDLED_THEMES;
 pub mod update;
+pub mod wrap;
 
 mod agent;
 mod event_loop;

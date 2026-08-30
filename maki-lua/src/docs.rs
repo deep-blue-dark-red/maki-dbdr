@@ -53,6 +53,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
     use crate::api;
     vec![
         &api::util::setup::DOCS,
+        &api::pack::DOCS,
         &api::tool::DOCS,
         &api::autocmd::DOCS,
         &api::slot::DOCS,
@@ -75,6 +76,7 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::model::DOCS,
         &api::net::DOCS,
         &api::session::DOCS,
+        &api::task::DOCS,
         &api::text::DOCS,
         &api::treesitter::DOCS,
         &api::treesitter::language::DOCS,
@@ -156,11 +158,23 @@ mod tests {
                 .insert(key);
         }
 
+        // Documented here but attached by the runtime rather than by
+        // `create_maki_global`, so the table built for this test has none of
+        // it. `setup` is attached only when a config store is present.
+        const RUNTIME_ATTACHED: [&str; 1] = ["setup"];
+
         for (name, mut expected) in documented {
+            if RUNTIME_ATTACHED
+                .iter()
+                .any(|only| name == format!("maki.{only}"))
+            {
+                continue;
+            }
             let actual = table_keys(&resolve_table(&maki, name));
             if name == "maki" {
-                // Documented here, but injected later by the runtime.
-                expected.remove("setup");
+                for only in RUNTIME_ATTACHED {
+                    expected.remove(only);
+                }
             }
             let expected: BTreeSet<String> = expected.iter().map(|s| s.to_string()).collect();
             assert_eq!(

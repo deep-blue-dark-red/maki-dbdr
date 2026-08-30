@@ -541,9 +541,16 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
-    let config = load_effective_config(&host, no_plugins, &cwd)?;
+    let (config, warnings) = super::load_plugins(
+        &mut host,
+        no_plugins,
+        super::BuiltinFailure::Fatal,
+        maki_lua::Interaction::None,
+        |host, names, warnings| load_effective_config(host, no_plugins, &cwd, names, warnings),
+    )?;
+    super::report_warnings(warnings);
 
     smol::block_on(fetch_all_models(
         &config.provider.model_policy,
@@ -560,11 +567,19 @@ pub fn models(no_plugins: bool, no_jit: bool) -> Result<()> {
     Ok(())
 }
 
-fn load_effective_config(host: &PluginHost, no_plugins: bool, cwd: &Path) -> Result<Config> {
-    host.load_init_files_or_skip(no_plugins, cwd)
-        .context("load init.lua files")?
+fn load_effective_config(
+    host: &PluginHost,
+    no_plugins: bool,
+    cwd: &Path,
+    names: &super::KnownNames<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<Config> {
+    let raw_config = host
+        .load_init_files_or_skip(no_plugins, cwd, warnings)
+        .context("load init.lua files")?;
+    raw_config
         .unwrap_or_default()
-        .into_config(false)
+        .into_config(&names(host)?)
         .context("invalid config")
 }
 
@@ -575,18 +590,18 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool) -> Result<()> {
     let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
         .context("initialize lua plugin host")?;
 
-    let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")?;
-    config.permissions = load_permissions(&cwd);
-
-    host.load_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    let (_, warnings) = super::load_plugins(
+        &mut host,
+        no_plugins,
+        super::BuiltinFailure::Fatal,
+        maki_lua::Interaction::None,
+        |host, names, warnings| {
+            let mut config = load_effective_config(host, no_plugins, &cwd, names, warnings)?;
+            config.permissions = load_permissions(&cwd);
+            Ok(config)
+        },
+    )?;
+    super::report_warnings(warnings);
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -672,21 +687,21 @@ pub fn prompt(
     let reg = ToolRegistry::global_arc();
     let mut host =
         PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let raw_config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?;
-    let config = raw_config
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")?;
-    host.load_builtins(&config.plugins)
-        .context("load builtin plugins")?;
+    let (config, warnings) = super::load_plugins(
+        &mut host,
+        no_plugins,
+        super::BuiltinFailure::Fatal,
+        maki_lua::Interaction::None,
+        |host, names, warnings| load_effective_config(host, no_plugins, &cwd, names, warnings),
+    )?;
+    super::report_warnings(warnings);
 
     if tools {
         let ctx = DescriptionContext {
             filter: &ToolFilter::All,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         let defs = reg.definitions(&vars, &ctx, true);
         if names {

@@ -8,13 +8,15 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bitflags::bitflags;
+use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
 use crate::{BufferSnapshot, ToolOutput};
 
+use super::hook::ToolHook;
 use super::{DescriptionContext, ToolContext};
 
 bitflags! {
@@ -25,6 +27,10 @@ bitflags! {
         const GENERAL_SUB  = 0b0000_0100;
         const INTERPRETER  = 0b0000_1000;
         const WORKFLOW     = 0b0001_0000;
+        /// Every audience a model speaks from, and none of the ones a sandbox
+        /// calls from: the default for a tool whose owner never opted into
+        /// being called by a script.
+        const MODEL = Self::MAIN.bits() | Self::RESEARCH_SUB.bits() | Self::GENERAL_SUB.bits();
     }
 }
 
@@ -226,6 +232,12 @@ pub trait Tool: Send + Sync + 'static {
     fn tool_kind(&self) -> Option<&str> {
         None
     }
+    /// The plugin permission a rule pre-approving this tool requires. `None`
+    /// means the tool is never permission checked, so a rule naming it would
+    /// never be consulted.
+    fn required_permission(&self) -> Option<Permission> {
+        None
+    }
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError>;
 }
 
@@ -249,7 +261,15 @@ impl RegisteredTool {
 /// Lock-free reads via `ArcSwap`, writes swap in a new snapshot atomically.
 pub struct ToolRegistry {
     tools: ArcSwap<Vec<RegisteredTool>>,
+    /// Whoever may rewrite or stop a call before and after it runs. One per
+    /// registry rather than one per tool, so a tool arriving from a new place
+    /// is hookable the day it lands.
+    hook: ArcSwapOption<Box<dyn ToolHook>>,
 }
+
+/// `ArcSwapOption` needs a sized payload, hence the `Box`. Auto-deref hides
+/// it at every call site.
+pub type InstalledHook = Arc<Box<dyn ToolHook>>;
 
 impl Default for ToolRegistry {
     fn default() -> Self {
@@ -267,7 +287,20 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: ArcSwap::from_pointee(Vec::new()),
+            hook: ArcSwapOption::empty(),
         }
+    }
+
+    /// Installed by the plugin host once its Lua thread is up. Last writer
+    /// wins, so a registry outliving the host that hooked it points at the
+    /// host that replaced it, never at the dead one.
+    pub fn set_hook(&self, hook: impl ToolHook) {
+        let boxed: Box<dyn ToolHook> = Box::new(hook);
+        self.hook.store(Some(Arc::new(boxed)));
+    }
+
+    pub fn hook(&self) -> Option<InstalledHook> {
+        self.hook.load_full()
     }
 
     /// The process-wide registry. Every tool in it comes from a Lua plugin
@@ -514,49 +547,10 @@ mod tests {
     use crate::template::Vars;
     use test_case::test_case;
 
-    struct MockTool {
-        name: String,
-        audience: ToolAudience,
-    }
-
-    struct MockInvocation;
-
-    impl ToolInvocation for MockInvocation {
-        fn start_header(&self) -> HeaderFuture {
-            HeaderFuture::Ready(HeaderResult::plain("mock".into()))
-        }
-        fn execute<'a>(self: Box<Self>, _ctx: &'a super::ToolContext) -> ExecFuture<'a> {
-            Box::pin(async { Ok(ToolOutput::Plain(String::new().into())).into() })
-        }
-    }
-
-    impl Tool for MockTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-            "mock tool".into()
-        }
-        fn schema(&self) -> Value {
-            json!({"type": "object", "properties": {}, "additionalProperties": false})
-        }
-        fn audience(&self) -> ToolAudience {
-            self.audience
-        }
-        fn parse(&self, _input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-            Ok(Box::new(MockInvocation))
-        }
-    }
+    use crate::tools::test_support::mock_tool;
 
     fn mock(name: &str) -> Arc<dyn Tool> {
-        mock_scoped(name, ToolAudience::all())
-    }
-
-    fn mock_scoped(name: &str, audience: ToolAudience) -> Arc<dyn Tool> {
-        Arc::new(MockTool {
-            name: name.to_owned(),
-            audience,
-        })
+        mock_tool(name, ToolAudience::all())
     }
 
     fn lua_source(plugin: &str) -> ToolSource {
@@ -591,6 +585,7 @@ mod tests {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow: false,
+            mcp: false,
         };
         let vars = Vars::new();
         let defs = reg.definitions(&vars, &ctx, false);
@@ -742,7 +737,7 @@ mod tests {
     fn definitions_excludes_wrong_audience() {
         let reg = ToolRegistry::new();
         reg.register(
-            mock_scoped("main_only_tool", ToolAudience::MAIN),
+            mock_tool("main_only_tool", ToolAudience::MAIN),
             lua_source("p"),
         )
         .unwrap();
@@ -755,6 +750,7 @@ mod tests {
                 filter: &filter,
                 audience,
                 workflow: false,
+                mcp: false,
             };
             reg.definitions(&vars, &ctx, false)
                 .as_array()

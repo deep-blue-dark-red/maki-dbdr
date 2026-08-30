@@ -33,7 +33,7 @@ impl App {
     pub fn view(&mut self, frame: &mut Frame) {
         let form_visible = self.permission_prompt.is_open() || self.plan_form_active();
         let layout = self.compute_layout(frame.area(), form_visible);
-        let render_chat = self.resolve_render_chat();
+        let render_chat = self.active_chat;
 
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
@@ -129,16 +129,6 @@ impl App {
         }
     }
 
-    fn resolve_render_chat(&self) -> usize {
-        if self.task_picker.is_open() {
-            self.task_picker
-                .selected_index()
-                .unwrap_or(self.active_chat)
-        } else {
-            self.active_chat
-        }
-    }
-
     fn render_background(&self, frame: &mut Frame) {
         let bg =
             Block::default().style(ratatui::style::Style::new().bg(theme::current().background));
@@ -228,10 +218,6 @@ impl App {
 
         if self.search_modal.is_open() {
             overlay_rect = self.search_modal.view(frame, layout.msg_area);
-        }
-
-        if self.task_picker.is_open() {
-            overlay_rect = self.task_picker.view(frame, full);
         }
 
         if self.file_picker.is_open() {
@@ -369,6 +355,7 @@ impl App {
             thinking_label: self.state.thinking.status_label(),
             fast: self.state.fast,
             workflow: self.state.workflow,
+            yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
             streaming_info,
             streaming_active: is_streaming,
@@ -446,8 +433,7 @@ impl App {
         };
 
         let sel = state.sel();
-        let scroll = self.scroll_offset(sel.zone);
-        if let Some(screen_sel) = sel.to_screen(scroll) {
+        if let Some(screen_sel) = self.screen_selection(sel, render_chat) {
             selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
         }
         if state.is_pending_copy() {
@@ -495,8 +481,6 @@ impl App {
             contexts.push(KeybindContext::QueueFocus);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
-        } else if self.task_picker.is_open() {
-            contexts.push(KeybindContext::TaskPicker);
         } else if self.theme_picker.is_open() {
             contexts.push(KeybindContext::ThemePicker);
         } else if self.model_picker.is_open() {

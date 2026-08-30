@@ -27,15 +27,18 @@ const REFERENCE_URL: &str = "/docs/lua-api/";
 fn permissions_section(anchored: bool) -> String {
     const TEMPLATE: &str = r#"## Permissions and plugin.toml{ANCHOR}
 
-Sensitive APIs are gated per plugin file; every gated function's entry in
-this reference names the permission it needs. The permissions are: {NAMES}.
-A gated call without its permission raises
-`permission denied: '<name>' not granted for this plugin`.
+Sensitive APIs are gated per plugin file, and every gated function's entry in
+this reference names the permission it needs. A gated call without its
+permission raises `permission denied: '<name>' not granted for this plugin`.
+
+{NAMES}
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
 
 ```toml
+min_maki_version = "0.4.12"
+
 [permissions]
 {KEYS}```
 
@@ -46,17 +49,33 @@ The rules:
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
 - Invalid TOML: everything denied, with a warning in the log.
+- A package, or a plugin maki ships, is read the other way round: a key it
+  does not name is not requested, so its `plugin.toml` lists everything it
+  uses. Only a `plugin.toml` you wrote yourself defaults to granted.
+- `min_maki_version` is optional and takes a plain semantic version as a lower
+  bound, so ranges do not work. When the field is invalid or the running
+  version is older, Maki skips the Lua in that directory and warns at startup
+  instead of failing. The same floor applies to an installed package, which is
+  skipped while the rest keep loading. `--no-plugins` still skips every user
+  plugin at once.
 "#;
-    let keys = Permission::ALL.map(Permission::manifest_key);
     let anchor = if anchored {
         format!(" {{#{PERMISSIONS_ANCHOR}}}")
     } else {
         String::new()
     };
+    let names = Permission::ALL
+        .iter()
+        .map(|p| format!("- `{}`: {}\n", p.manifest_key(), p.describes()))
+        .collect::<String>();
+    let keys = Permission::ALL
+        .iter()
+        .map(|p| format!("{} = true\n", p.manifest_key()))
+        .collect::<String>();
     TEMPLATE
         .replace("{ANCHOR}", &anchor)
-        .replace("{NAMES}", &keys.map(|k| format!("`{k}`")).join(", "))
-        .replace("{KEYS}", &keys.map(|k| format!("{k} = true\n")).concat())
+        .replace("{NAMES}", names.trim_end())
+        .replace("{KEYS}", &keys)
 }
 
 const GUIDE: &str = r#"# Writing maki plugins
@@ -304,7 +323,8 @@ pub fn guide_page() -> String {
         "## Permissions and plugin.toml\n\n\
          Sensitive APIs are gated per plugin file, and a plugin without a\n\
          `plugin.toml` next to it gets nothing. The gates and the file format are\n\
-         in [the reference]({REFERENCE_URL}#{PERMISSIONS_ANCHOR})."
+         in [the reference]({REFERENCE_URL}#{PERMISSIONS_ANCHOR}). Set\n\
+         `min_maki_version` there when a plugin needs a newer Maki Lua API."
     );
     format!(
         "{}\n## Full API reference\n\n\

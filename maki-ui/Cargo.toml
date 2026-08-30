@@ -56,3 +56,11 @@ criterion = { workspace = true }
 [[bench]]
 name = "splash"
 harness = false
+
+[[bench]]
+name = "wrap"
+harness = false
+
+[[bench]]
+name = "reflow"
+harness = false

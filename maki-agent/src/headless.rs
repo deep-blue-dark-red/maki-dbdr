@@ -20,13 +20,11 @@ use crate::cancel::{CancelMap, CancelToken};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedSlots;
 use crate::template;
-use crate::tools::{
-    DescriptionContext, FileReadTracker, LocalTools, ToolAudience, ToolFilter, ToolRegistry,
-};
+use crate::tools::{FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolRegistry};
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, Envelope,
-    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, SessionMailbox, ToolOutput,
-    ToolOutputLines,
+    EventSender, ImageSource, McpHandle, McpSession, PermissionsConfig, RunLedger, SessionMailbox,
+    ToolOutput, ToolOutputLines,
 };
 
 type StoredSession = Session<Message, TokenUsage, ToolOutput>;
@@ -99,24 +97,28 @@ pub struct HeadlessHandle {
 struct AgentSetup {
     vars: template::Vars,
     instructions: agent::Instructions,
-    tools: Value,
+    tools: RequestTools,
 }
 
+/// Takes the handle rather than a second `bool`: two adjacent flags is one
+/// silent swap away from a session that describes tools it cannot call.
 fn setup(
     model: &Model,
     config: &AgentConfig,
     excluded_tools: &[&'static str],
     workflow: bool,
+    mcp: Option<&McpHandle>,
 ) -> AgentSetup {
     let vars = template::env_vars();
     let instructions = agent::load_instructions(&vars.apply("{cwd}"));
-    let tools = tool_definitions(
+    let tools = RequestTools::build(
+        ToolRegistry::global(),
         &vars,
         model,
         config,
         excluded_tools,
         workflow,
-        ToolRegistry::global(),
+        mcp.is_some(),
     );
 
     AgentSetup {
@@ -124,25 +126,6 @@ fn setup(
         instructions,
         tools,
     }
-}
-
-/// Base definitions only. MCP definitions are injected per request by
-/// `Agent::request_tools`; storing them here would freeze the catalog.
-fn tool_definitions(
-    vars: &template::Vars,
-    model: &Model,
-    config: &AgentConfig,
-    excluded_tools: &[&'static str],
-    workflow: bool,
-    registry: &ToolRegistry,
-) -> Value {
-    let filter = ToolFilter::from_config(config, model, excluded_tools);
-    let ctx = DescriptionContext {
-        filter: &filter,
-        audience: ToolAudience::MAIN,
-        workflow,
-    };
-    registry.definitions(vars, &ctx, model.supports_tool_examples())
 }
 
 /// Names advertised to SDK clients: base tools plus what the first request
@@ -167,6 +150,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        params.mcp_handle.as_ref(),
     );
 
     let system = agent::build_system_prompt(
@@ -178,7 +162,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
     );
 
     let mcp = params.mcp_handle.clone().map(|h| McpSession::new(h, &[]));
-    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
 
@@ -224,6 +208,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    ledger: Arc::new(RunLedger::default()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
                     model_policy: Arc::clone(&params.model_policy),
@@ -318,13 +303,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
         &params.config,
         &params.excluded_tools,
         params.workflow,
+        params.mcp_handle.as_ref(),
     );
 
     let mcp = params
         .mcp_handle
         .clone()
         .map(|h| McpSession::new(h, &params.initial_history));
-    let tool_names = advertised_tool_names(&tools, mcp.as_ref());
+    let tool_names = advertised_tool_names(tools.definitions(), mcp.as_ref());
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
@@ -342,14 +328,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
     let mailbox = SessionMailbox::register(session_id);
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
+    let mut permissions_config = params.permissions_config;
+    permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new(
-        params.permissions_config,
+        permissions_config,
         params.initial_wd,
         Arc::clone(&params.plugin_rules),
     ));
-    if params.yolo {
-        permissions.toggle_yolo();
-    }
 
     let answer_rx = Arc::new(Mutex::new(answer_rx));
     let file_tracker = FileReadTracker::fresh();
@@ -405,13 +390,14 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                     match provider::from_model_async(&mut new_model, params.timeouts).await {
                         Ok(p) => {
                             provider = Arc::from(p);
-                            tools = tool_definitions(
+                            tools = RequestTools::build(
+                                ToolRegistry::global(),
                                 &vars,
                                 &new_model,
                                 &params.config,
                                 &params.excluded_tools,
                                 params.workflow,
-                                ToolRegistry::global(),
+                                mcp.is_some(),
                             );
                             model = new_model;
                         }
@@ -455,6 +441,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
                         subagent_cancels: Arc::new(CancelMap::new()),
+                        ledger: Arc::new(RunLedger::default()),
                         registry: Arc::clone(ToolRegistry::global_arc()),
                         audience: ToolAudience::MAIN,
                         model_policy: Arc::clone(&params.model_policy),
@@ -617,7 +604,8 @@ mod tests {
     #[test]
     fn advertised_names_show_tool_search_not_deferred_tools() {
         let base = serde_json::json!([{"name": "read"}]);
-        let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+        let mcp =
+            crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
         let names = advertised_tool_names(&base, Some(&mcp));
         assert_eq!(
             names,

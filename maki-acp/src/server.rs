@@ -21,9 +21,9 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
 use maki_agent::permissions::PermissionAnswer;
-use maki_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
+use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource};
+use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
@@ -35,7 +35,7 @@ use serde_json::Value;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
-use crate::{AcpParams, elicitation, methods, permissions, translate};
+use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
@@ -75,6 +75,7 @@ struct Server {
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
     session: Option<SessionState>,
+    on_session_end: Option<SessionEndHook>,
 }
 
 impl Server {
@@ -108,6 +109,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         session: None,
+        on_session_end: params.on_session_end.clone(),
     };
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
@@ -122,6 +124,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
+    close_session(&mut server, SessionEndReason::Shutdown).await;
     drop(server);
     writer_task.await;
     reader_task.await.context("read stdin")?;
@@ -254,7 +257,7 @@ async fn new_session(
     params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
-    close_session(srv).await;
+    close_session(srv, SessionEndReason::Replaced).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let cwd = req.cwd.clone();
     let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
@@ -281,7 +284,7 @@ async fn load_session(
         .parse()
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
-    close_session(srv).await;
+    close_session(srv, SessionEndReason::Replaced).await;
     let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
@@ -383,8 +386,10 @@ fn ask_client(
 /// Shadows the Lua `question` tool: sends `elicitation/create` to the client
 /// and blocks the tool call until the form comes back. Serializes on the same
 /// answer channel as permissions, so at most one ask is in flight.
-fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalToolFn {
-    local_tool(move |input, ctx| {
+fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalTool {
+    // The audience the Lua `question` tool carries: shadowing a tool must not
+    // widen who may call it.
+    local_tool(ToolAudience::MAIN, move |input, ctx| {
         let out_tx = out_tx.clone();
         let pending = Arc::clone(&pending);
         Box::pin(async move {
@@ -483,10 +488,13 @@ async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
 
 /// Stop the old session before the next one starts, so two generations of the
 /// same MCP servers never fight over a port or a lock file.
-async fn close_session(srv: &mut Server) {
+async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     let Some(state) = srv.session.take() else {
         return;
     };
+    if let Some(cb) = &srv.on_session_end {
+        cb(state.handle.session_id.id(), reason).await;
+    }
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
     if let Some(id) = state.pending.lock().unwrap().prompt.take() {
@@ -908,6 +916,7 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            on_session_end: None,
             session: Some(SessionState {
                 handle,
                 mcp: None,
@@ -920,6 +929,27 @@ mod tests {
             }),
         };
         (server, answer_rx, out_rx)
+    }
+
+    #[test]
+    fn close_session_awaits_the_session_end_hook() {
+        let (mut srv, ..) = server_with_ask(AskKind::Permission);
+        let ended = srv.session.as_ref().unwrap().handle.session_id.id();
+        let (ended_tx, ended_rx) = flume::bounded(1);
+        srv.on_session_end = Some(Arc::new(move |id, reason| {
+            let ended_tx = ended_tx.clone();
+            Box::pin(async move {
+                let _ = ended_tx.send((id, reason));
+            })
+        }));
+
+        smol::block_on(close_session(&mut srv, SessionEndReason::Replaced));
+
+        assert_eq!(
+            ended_rx.try_recv().ok(),
+            Some((ended, SessionEndReason::Replaced))
+        );
+        assert!(srv.session.is_none(), "close must take the session");
     }
 
     #[test]

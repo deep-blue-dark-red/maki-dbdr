@@ -104,7 +104,7 @@ end
 
 local function rtk_rewrite(command, ctx)
   local config = ctx:config()
-  if config and config.no_rtk then
+  if config and not config.rtk then
     return nil
   end
 
@@ -271,6 +271,7 @@ maki.api.register_tool({
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
+  permission = "run",
   permission_scopes = function(input)
     local command = input.command
     if not command or command:match("^%s*$") then

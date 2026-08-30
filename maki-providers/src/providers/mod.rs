@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,6 +8,7 @@ use futures_lite::io::AsyncBufRead;
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
+use serde_json::Value;
 use tracing::debug;
 
 use crate::AgentError;
@@ -27,12 +29,19 @@ pub(crate) mod openai;
 pub(crate) mod openai_compat;
 pub mod opencode;
 pub(crate) mod openrouter;
+pub(crate) mod regolo;
 pub(crate) mod synthetic;
 pub(crate) mod tensorx;
 pub(crate) mod xai;
 pub(crate) mod zai;
 
 const LOW_SPEED_BYTES_PER_SEC: u32 = 1;
+const UNMAPPED_SSE_ERROR_STATUS: u16 = 400;
+const AUTHORIZATION_HEADER: &str = "authorization";
+
+fn bearer_value(api_key: &str) -> String {
+    format!("Bearer {api_key}")
+}
 
 pub(crate) fn user_agent() -> &'static str {
     concat!(
@@ -64,13 +73,87 @@ impl Default for Timeouts {
 pub struct ResolvedAuth {
     pub base_url: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// Header names that came from `[<slug>.headers]`. They win over anything
+    /// the provider sets afterwards, so a key rotation cannot drop a gateway
+    /// credential that replaced the built-in auth header.
+    config_headers: Vec<String>,
 }
 
 impl ResolvedAuth {
-    pub fn bearer(api_key: &str) -> Self {
-        Self {
+    /// The only way to build auth, so every provider picks up
+    /// `[<slug>.headers]` from `providers.toml`. Skipping it would silently
+    /// ignore the user's config, which is why there is no slug-less
+    /// constructor outside of tests.
+    pub fn new(slug: &str, headers: Vec<(String, String)>) -> Result<Self, AgentError> {
+        let mut auth = Self {
             base_url: None,
-            headers: vec![("authorization".into(), format!("Bearer {api_key}"))],
+            headers,
+            config_headers: Vec::new(),
+        };
+        if let Some(def) = maki_config::providers::ProvidersConfig::load().get(slug) {
+            auth.apply_config_headers(slug, &def.headers)?;
+        }
+        Ok(auth)
+    }
+
+    /// Fold `[<slug>.headers]` in, expanding `${VAR}` from the environment. An
+    /// unset or empty variable fails the whole provider (see
+    /// `maki_config::expand_env`), matching the MCP path.
+    fn apply_config_headers(
+        &mut self,
+        slug: &str,
+        headers: &BTreeMap<String, String>,
+    ) -> Result<(), AgentError> {
+        for (name, value) in headers {
+            let expanded = maki_config::expand_env(value).map_err(|var| {
+                AgentError::Config {
+                    message: format!(
+                        "provider '{slug}' header '{name}': environment variable '{var}' is unset or empty"
+                    ),
+                }
+            })?;
+            self.set_header(name, expanded);
+            self.config_headers.push(name.clone());
+        }
+        Ok(())
+    }
+
+    pub fn bearer(slug: &str, api_key: &str) -> Result<Self, AgentError> {
+        Self::new(
+            slug,
+            vec![(AUTHORIZATION_HEADER.into(), bearer_value(api_key))],
+        )
+    }
+
+    pub fn with_base_url(mut self, base_url: Option<String>) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    /// Set the header carrying the API key, unless `[<slug>.headers]` already
+    /// owns that name: the config value is the one the gateway expects.
+    fn set_key_header(&mut self, name: &str, value: String) {
+        if self
+            .config_headers
+            .iter()
+            .any(|configured| configured.eq_ignore_ascii_case(name))
+        {
+            return;
+        }
+        self.set_header(name, value);
+    }
+
+    /// Replace a same-name header (case-insensitive) instead of appending a
+    /// second one: `Builder::header` appends, so a configured `Authorization`
+    /// next to the built-in bearer would send two credentials.
+    fn set_header(&mut self, name: &str, value: String) {
+        match self
+            .headers
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            Some(slot) => slot.1 = value,
+            None => self.headers.push((name.to_string(), value)),
         }
     }
 
@@ -79,6 +162,15 @@ impl ResolvedAuth {
         self.headers.iter().fold(builder, |b, (key, value)| {
             b.header(key.as_str(), value.as_str())
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(base_url: Option<String>, headers: Vec<(String, String)>) -> Self {
+        Self {
+            base_url,
+            headers,
+            config_headers: Vec::new(),
+        }
     }
 }
 
@@ -121,22 +213,35 @@ pub(crate) struct SseErrorPayload {
 pub(crate) struct SseErrorDetail {
     #[serde(default)]
     pub r#type: String,
+    /// Providers send this as a string, a number or `null`, and rejecting any one of those shapes
+    /// throws away the whole error.
+    #[serde(default)]
+    pub code: Value,
     pub message: String,
+}
+
+/// A streamed error rides inside a plain 200 response, so this tag is the only clue we get about
+/// what went wrong and whether waiting will help.
+pub(crate) fn sse_error_status(tag: &str) -> Option<u16> {
+    Some(match tag {
+        "overloaded_error" | "server_is_overloaded" => 529,
+        "service_unavailable_error" => 503,
+        "api_error" | "server_error" => 500,
+        "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
+        "request_too_large" => 413,
+        "not_found_error" => 404,
+        "permission_error" => 403,
+        "billing_error" | "insufficient_quota" => 402,
+        "authentication_error" | "invalid_api_key" => 401,
+        _ => return None,
+    })
 }
 
 impl SseErrorPayload {
     pub fn into_agent_error(self) -> AgentError {
-        let status = match self.error.r#type.as_str() {
-            "overloaded_error" => 529,
-            "api_error" | "server_error" => 500,
-            "rate_limit_error" | "rate_limit_exceeded" | "tokens" => 429,
-            "request_too_large" => 413,
-            "not_found_error" => 404,
-            "permission_error" => 403,
-            "billing_error" | "insufficient_quota" => 402,
-            "authentication_error" | "invalid_api_key" => 401,
-            _ => 400,
-        };
+        let status = sse_error_status(self.error.code.as_str().unwrap_or_default())
+            .or_else(|| sse_error_status(&self.error.r#type))
+            .unwrap_or(UNMAPPED_SSE_ERROR_STATUS);
         AgentError::Api {
             status,
             message: self.error.message,
@@ -345,28 +450,25 @@ impl KeyPool {
         true
     }
 
-    pub fn rotate_auth(
+    /// Rotate to the next key and refresh only the header carrying it, so the
+    /// resolved `base_url` and any `[<slug>.headers]` survive the rotation.
+    pub fn rotate_key_header(
         &self,
         auth: &Mutex<ResolvedAuth>,
-        build: impl FnOnce(&str) -> ResolvedAuth,
+        name: &str,
+        build: impl FnOnce(&str) -> String,
     ) -> bool {
         if !self.rotate() {
             return false;
         }
-        *auth.lock().unwrap() = build(self.current());
+        auth.lock()
+            .unwrap()
+            .set_key_header(name, build(self.current()));
         true
     }
 
-    pub fn rotate_headers(
-        &self,
-        auth: &Mutex<ResolvedAuth>,
-        build: impl FnOnce(&str) -> Vec<(String, String)>,
-    ) -> bool {
-        if !self.rotate() {
-            return false;
-        }
-        auth.lock().unwrap().headers = build(self.current());
-        true
+    pub fn rotate_bearer(&self, auth: &Mutex<ResolvedAuth>) -> bool {
+        self.rotate_key_header(auth, AUTHORIZATION_HEADER, bearer_value)
     }
 
     pub fn len(&self) -> usize {
@@ -379,6 +481,30 @@ mod tests {
     use super::*;
     use futures_lite::io::AsyncBufReadExt;
     use test_case::test_case;
+
+    const ERROR_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
+    const PARSE_FAILED: &str = "SSE error payload should deserialize";
+
+    // Codex only admits the overload in `code`, and anything we cannot place has to stay a plain
+    // 400 so a user mistake is not retried forever: https://github.com/tontinton/maki/issues/777
+    #[test_case(r#""type":"service_unavailable_error","code":"server_is_overloaded""#, 529, true  ; "code_beats_type")]
+    #[test_case(r#""type":"service_unavailable_error""#,                               503, true  ; "absent_code")]
+    #[test_case(r#""type":"service_unavailable_error","code":null"#,                   503, true  ; "null_code")]
+    #[test_case(r#""type":"rate_limit_error","code":429"#,                             429, true  ; "numeric_code")]
+    #[test_case(r#""type":"invalid_request_error","code":"invalid_value""#,            400, false ; "unknown_tags")]
+    fn sse_error_payload_status(tags: &str, status: u16, retryable: bool) {
+        let payload: SseErrorPayload = serde_json::from_str(&format!(
+            r#"{{"error":{{{tags},"message":"{ERROR_MESSAGE}"}}}}"#
+        ))
+        .expect(PARSE_FAILED);
+        let err = payload.into_agent_error();
+
+        assert_eq!(
+            err.to_string(),
+            format!("API error ({status}): {ERROR_MESSAGE}")
+        );
+        assert_eq!(err.is_retryable(), retryable);
+    }
 
     #[test_case("a b", "a%20b" ; "space")]
     #[test_case("a:b", "a%3Ab" ; "colon")]
@@ -483,5 +609,115 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{result:?}");
         assert!(msg.contains(&env_var) || msg.contains(&slug));
+    }
+
+    const TEST_SLUG: &str = "gateway";
+    const GATEWAY_HEADER: &str = "CF-Access-Client-Id";
+    const GATEWAY_ID: &str = "client-id";
+    const GATEWAY_URL: &str = "https://gw.internal/v1";
+    const GATEWAY_CRED: &str = "Basic gateway-cred";
+
+    fn config_headers(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn header_value(auth: &ResolvedAuth, name: &str) -> Option<String> {
+        auth.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    fn test_bearer(key: &str) -> ResolvedAuth {
+        ResolvedAuth::for_test(None, vec![(AUTHORIZATION_HEADER.into(), bearer_value(key))])
+    }
+
+    #[test]
+    fn config_headers_append_unknown_and_replace_same_name() {
+        let mut auth = test_bearer("sk-1");
+        auth.apply_config_headers(
+            TEST_SLUG,
+            &config_headers(&[
+                (GATEWAY_HEADER, GATEWAY_ID),
+                // Case differs from the built-in header on purpose: appending
+                // instead of replacing would send two credentials.
+                ("Authorization", "Basic other"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(auth.headers.len(), 2);
+        assert_eq!(
+            header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
+            Some("Basic other")
+        );
+        assert_eq!(
+            header_value(&auth, GATEWAY_HEADER).as_deref(),
+            Some(GATEWAY_ID)
+        );
+    }
+
+    #[test]
+    fn config_headers_unset_var_names_slug_header_and_var() {
+        let var = format!("MAKI_TEST_GATEWAY_UNSET_{}", fastrand::u32(..));
+        let mut auth = test_bearer("sk-1");
+        let err = auth
+            .apply_config_headers(
+                TEST_SLUG,
+                &config_headers(&[(GATEWAY_HEADER, &format!("${{{var}}}"))]),
+            )
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(TEST_SLUG), "got: {msg}");
+        assert!(msg.contains(GATEWAY_HEADER), "got: {msg}");
+        assert!(msg.contains(&var), "got: {msg}");
+    }
+
+    #[test]
+    fn rotate_bearer_keeps_base_url_and_config_headers() {
+        let pool = KeyPool::from_keys(vec!["sk-1".into(), "sk-2".into()]);
+        let mut auth = test_bearer(pool.current());
+        auth.base_url = Some(GATEWAY_URL.into());
+        auth.apply_config_headers(TEST_SLUG, &config_headers(&[(GATEWAY_HEADER, GATEWAY_ID)]))
+            .unwrap();
+
+        let auth = Mutex::new(auth);
+        assert!(pool.rotate_bearer(&auth));
+
+        let auth = auth.lock().unwrap();
+        assert_eq!(auth.base_url.as_deref(), Some(GATEWAY_URL));
+        assert_eq!(
+            header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
+            Some("Bearer sk-2")
+        );
+        assert_eq!(
+            header_value(&auth, GATEWAY_HEADER).as_deref(),
+            Some(GATEWAY_ID)
+        );
+    }
+
+    #[test]
+    fn rotate_bearer_keeps_a_configured_auth_header() {
+        let pool = KeyPool::from_keys(vec!["sk-1".into(), "sk-2".into()]);
+        let mut auth = test_bearer(pool.current());
+        auth.apply_config_headers(
+            TEST_SLUG,
+            &config_headers(&[("Authorization", GATEWAY_CRED)]),
+        )
+        .unwrap();
+
+        let auth = Mutex::new(auth);
+        assert!(pool.rotate_bearer(&auth));
+
+        // The gateway credential replaced the built-in bearer, so rotating the
+        // key must not put `Bearer sk-2` back and lock the user out.
+        let auth = auth.lock().unwrap();
+        assert_eq!(auth.headers.len(), 1);
+        assert_eq!(
+            header_value(&auth, AUTHORIZATION_HEADER).as_deref(),
+            Some(GATEWAY_CRED)
+        );
     }
 }

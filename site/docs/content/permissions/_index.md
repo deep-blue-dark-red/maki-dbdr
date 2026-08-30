@@ -14,9 +14,13 @@ Rules come from four layers, combined for resolution:
 1. **Session rules**, set during the current session (in-memory only)
 2. **Config rules**, loaded from TOML permission files
 3. **Builtin rules**, the hardcoded defaults
-4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/lua-api/#maki-api-register_permission_rule)
+4. **Plugin rules**, declared by plugins via [`maki.api.register_permission_rule`](/docs/lua-api/#maki-api-register_permission_rule)
 
 Any matching deny blocks the tool. No exceptions, so a config deny always beats a plugin allow.
+
+A [`tool.<name>.input` hook](/docs/hooks/) runs before any of this. Rules are
+resolved against the call as the hook left it, so what the prompt shows you is
+what runs.
 
 ## Check Flow
 
@@ -37,7 +41,7 @@ plan file write?    ── yes ──►  runs
 default: prompt / allow / deny
 ```
 
-Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow, and MCP tools are blocked entirely. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
+Deny rules are checked across all layers before anything else, so a deny cannot be bypassed by YOLO or the plan-file auto-allow. In plan mode, writes to any path other than the plan file are rejected before this flow; this applies to the file-write tools only. All other tools, including MCP tools, follow the check flow below as usual. `default` resolves per-tool first, then global; the built-in default is `"prompt"`.
 
 ## Builtin Defaults
 
@@ -48,7 +52,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `write` | `<cwd>/**` | Outside cwd requires permission |
 | `edit` | `<cwd>/**` | Outside cwd requires permission |
 | `multiedit` | `<cwd>/**` | Outside cwd requires permission |
-| `edit_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
+| `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `task` | `*` | Subagent spawning always allowed |
 
@@ -171,7 +175,7 @@ For MCP tools, both allow and deny decisions generalize to `*` (the entire tool)
 
 ## YOLO Mode
 
-To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. Tools that never declare permission scopes are unaffected (they never prompted).
+To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. Explicit deny rules still apply. The status bar shows `[yolo]` while it is on, and `/yolo` is stored with the session, so a resume comes back the same way. `--yolo` only sets the starting value for sessions you never toggled. Tools that never declare permission scopes are unaffected (they never prompted).
 
 To start in YOLO mode every time:
 
@@ -197,7 +201,13 @@ Brace groups `{ ... }` and control flow (`if`, `for`, …) are segmented when po
 
 ## Plugin Permissions
 
-Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+Lua plugins have a separate, unrelated gate. A `plugin.toml` manifest next to the Lua file controls which gated `maki.*` APIs it may call. No manifest means every gated call is denied, including for your own `init.lua`. The [Lua API reference](/docs/lua-api/#plugin-permissions) documents the manifest and lists every permission.
+
+## Network Addresses
+
+`webfetch`, `websearch` and every plugin that calls `maki.net` go through one guard. A request to a private, loopback or link-local address is refused, and so is a redirect that lands on one. The model picks these URLs, so a page it reads could otherwise talk it into fetching `http://169.254.169.254/` or an admin panel on your LAN.
+
+To reach a service on your own machine or network, list it in [`net.allowed_private_hosts`](/docs/configuration/#net). An allowed host also keeps plain `http://` instead of being upgraded to `https://`, since a service on your LAN rarely has a certificate.
 
 ## Session Persistence
 

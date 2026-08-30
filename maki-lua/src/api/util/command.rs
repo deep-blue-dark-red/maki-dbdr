@@ -1,7 +1,8 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::SharedBuf;
@@ -408,11 +409,36 @@ pub enum SessionRequest {
     List { global: bool },
     Live,
     Current,
-    New { prompt: Option<String>, focus: bool },
-    Prompt { id: Option<String>, text: String },
+    /// UI-mode fallback for `maki.session.read` when no snapshot slot is
+    /// installed — the UI resolves the id and returns a `session_snapshot_json`
+    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
+    /// so `read` doesn't need a UI.
+    Read {
+        id: Option<String>,
+    },
+    New {
+        prompt: Option<String>,
+        focus: bool,
+    },
+    Prompt {
+        id: Option<String>,
+        text: String,
+    },
+    Focus {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    SetTitle {
+        id: String,
+        title: String,
+    },
+}
+
+pub enum TaskRequest {
+    List,
     Focus { id: String },
-    Delete { id: String },
-    SetTitle { id: String, title: String },
 }
 
 pub enum ModelRequest {
@@ -431,8 +457,8 @@ pub type UiReply = Result<serde_json::Value, String>;
 /// UI; `maki.fn.winsaveview` is what puts it in Vim's 1-based shape.
 /// `auto_scroll` is true while the transcript follows streaming output.
 pub struct WinView {
-    pub scroll_top: u16,
-    pub line_count: u16,
+    pub scroll_top: u32,
+    pub line_count: u32,
     pub height: u16,
     pub auto_scroll: bool,
 }
@@ -444,7 +470,6 @@ pub struct WinView {
 pub enum BuiltinAction {
     FilePicker,
     Search,
-    Tasks,
     Help,
     PlanToggle,
     PlanEditor,
@@ -464,6 +489,7 @@ pub enum UiAction {
         cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
+    SetWindowTitle(String),
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
@@ -476,11 +502,15 @@ pub enum UiAction {
         req: ModelRequest,
         reply_tx: flume::Sender<UiReply>,
     },
+    Task {
+        req: TaskRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
     WinSaveView {
         reply_tx: flume::Sender<WinView>,
     },
     WinRestView {
-        scroll_top: u16,
+        scroll_top: u32,
     },
     Builtin(BuiltinAction),
     /// `reply_tx` answers whether {cmdline} resolved to a known command, not
@@ -493,18 +523,73 @@ pub enum UiAction {
     },
 }
 
-/// Hand an action to the UI event loop. A full or closed channel means the
-/// same thing as a missing sender: nobody is there to run it.
+/// Whether an event loop is draining `UiAction`. The channel cannot answer
+/// that, because the runtime keeps a receiver of its own alive for the whole
+/// process and `try_send` would go on succeeding long after the loop that
+/// sends the replies is gone.
+#[derive(Clone)]
+pub struct UiAttachment(Arc<AtomicBool>);
+
+impl Default for UiAttachment {
+    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
+    /// sender at all, so the bit only ever describes a loop that went away.
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl UiAttachment {
+    /// Called by every event loop generation, so the UI comes back after a
+    /// `/reload` rebuilt the stack around the same handles.
+    pub fn attach(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn detach(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+
+    fn is_attached(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+// Lives on the Lua thread so `ui_send` can consult it without threading a
+// handle through every `#[ctx]` sender.
+thread_local! {
+    static UI_ATTACHMENT: RefCell<Option<UiAttachment>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn install_ui_attachment(attachment: UiAttachment) {
+    UI_ATTACHMENT.with_borrow_mut(|slot| *slot = Some(attachment));
+}
+
+/// A thread with no handle installed (unit tests, embedders driving Lua
+/// themselves) counts as attached: only a host that detached knows better.
+fn ui_attached() -> bool {
+    UI_ATTACHMENT.with_borrow(|slot| slot.as_ref().is_none_or(UiAttachment::is_attached))
+}
+
+/// Hand an action to the UI event loop. A detached UI, a full or closed
+/// channel and a missing sender all mean the same thing: nobody is there to
+/// run it.
 pub(crate) fn ui_send(
     tx: Option<&flume::Sender<UiAction>>,
     action: UiAction,
 ) -> Result<(), &'static str> {
+    if !ui_attached() {
+        return Err(NO_UI_ERR);
+    }
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
 /// Send an action carrying a reply channel and await the answer. Only
 /// works from a callback: the loop drains `UiAction` between frames, so a
 /// call at config load time would wait forever.
+///
+/// No deadline on purpose: the loop legitimately stops answering for a long
+/// time (`open_editor` holds it for as long as the editor is up). Teardown
+/// detaches the UI instead, which fails the send outright.
 pub(crate) async fn ui_roundtrip<T>(
     tx: Option<&flume::Sender<UiAction>>,
     action: impl FnOnce(flume::Sender<T>) -> UiAction,
@@ -594,6 +679,30 @@ mod tests {
         assert_eq!(reader.load().generation, 1);
         writer.publish(vec![]);
         assert_eq!(reader.load().generation, 2);
+    }
+
+    /// The loop's receiver is a clone and the runtime keeps another one for
+    /// the whole process, so the channel never disconnects: without the bit a
+    /// roundtrip would park on a reply nobody is left to send.
+    #[test]
+    fn ui_roundtrip_fails_once_the_loop_detaches() {
+        let (tx, rx) = flume::unbounded();
+        let attachment = UiAttachment::default();
+        install_ui_attachment(attachment.clone());
+
+        attachment.detach();
+        let detached = smol::block_on(ui_roundtrip(Some(&tx), |reply_tx| UiAction::WinSaveView {
+            reply_tx,
+        }));
+        assert_eq!(detached.err(), Some(NO_UI_ERR));
+        assert!(
+            !rx.is_disconnected(),
+            "the send has to fail on the bit, not on the channel"
+        );
+
+        // `/reload` builds a new loop around the same handles.
+        attachment.attach();
+        assert!(ui_send(Some(&tx), UiAction::WinRestView { scroll_top: 0 }).is_ok());
     }
 
     #[test_case(Dimension::Abs(42), 200 => 42 ; "abs_ignores_total")]

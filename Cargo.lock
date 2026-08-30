@@ -1503,6 +1503,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2716,6 +2726,7 @@ dependencies = [
  "maki-storage",
  "serde",
  "serde_json",
+ "strum 0.27.2",
  "tempfile",
  "test-case",
  "thiserror 2.0.18",
@@ -2796,14 +2807,18 @@ dependencies = [
  "maki-interpreter",
  "maki-lua-macro",
  "maki-markdown",
+ "maki-pack",
  "maki-providers",
  "maki-storage",
  "mlua",
  "pin-project-lite",
  "regex",
  "rustix",
+ "semver",
+ "serde",
  "serde_json",
  "serde_yaml",
+ "shell-words",
  "smol",
  "strum 0.27.2",
  "tempfile",
@@ -2845,6 +2860,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tree-sitter-zig",
  "unicode-width",
+ "url",
 ]
 
 [[package]]
@@ -2862,6 +2878,7 @@ version = "0.4.12"
 dependencies = [
  "fastrand",
  "maki-highlight",
+ "syntect",
  "test-case",
  "unicode-width",
 ]
@@ -2879,6 +2896,20 @@ dependencies = [
  "maki-config",
  "serde_json",
  "smol",
+ "test-case",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "maki-pack"
+version = "0.4.12"
+dependencies = [
+ "fs4",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
  "test-case",
  "thiserror 2.0.18",
  "tracing",

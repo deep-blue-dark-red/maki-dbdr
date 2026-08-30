@@ -5,21 +5,44 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use maki_agent::ToolOutput;
+use maki_agent::template::Vars;
 use maki_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolContext,
-    ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource, timeout_annotation,
+    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
+    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    timeout_annotation,
 };
-use maki_config::{AlwaysThinking, Effect, PluginsConfig, ToolKey, ToolOutputLines};
-use maki_lua::{PluginError, PluginHost, WARM_TOOL_CAP};
+use maki_config::{
+    AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig, ToolKey,
+    ToolOutputLines,
+};
+use maki_lua::{
+    MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING,
+    SessionEndReason, WARM_TOOL_CAP,
+};
+use maki_providers::Model;
 use maki_storage::id::SessionRef;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
+const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
+const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const FLOORED_PACKAGE: &str = "future_pack";
+const SIBLING_PACKAGE: &str = "sibling_pack";
+const MALFORMED_FLOOR: &str = "min_maki_version = 12\n";
+const SHADOWED_TOOL: &str = "skill";
+const REPLACEMENT_PLUGIN: &str = "my_skill";
+const REPLACEMENT_DESC: &str = "took the builtin name over";
+const PERMISSION_KEYED_TOOL: &str = "task";
+const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
+const PLAIN_TOOL: &str = "plain_helper";
+const FILE_WRITE_TOOLS_DRIFT: &str = "fs_write tool declarations drifted from FILE_WRITE_TOOLS, update the const or the \
+     register_tool declaration";
+const MEMORY_RULES_DROPPED: &str = "memory pre-approved tools nobody had registered yet, so it must load after the plugins owning them";
 
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
 /// a native stub stands in for one.
@@ -63,10 +86,13 @@ fn fresh_registry() -> Arc<ToolRegistry> {
 }
 
 fn builtins_host() -> (Arc<ToolRegistry>, PluginHost) {
+    builtins_host_with(&PluginsConfig::from_plugins(HashMap::new()))
+}
+
+fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
-        .unwrap();
+    host.load_builtins(config).unwrap();
     (reg, host)
 }
 
@@ -144,14 +170,17 @@ const UNKNOWN_AUD_SRC: &str =
     r#"name = "bad_aud", description = "test", audiences = { "wurkflow" }"#;
 const STRING_EXAMPLES_SRC: &str = r#"name = "ex_bad", description = "test", examples = "[]""#;
 const TIMEOUT_FIELD_NOT_IN_SCHEMA_SRC: &str = r#"name = "to_bad", description = "test", start_annotation = { field = "timeout", kind = "timeout" }"#;
-const SCOPE_MISSING_FIELD_SRC: &str =
-    r#"name = "bad_scope", description = "test", permission_scopes = "nonexistent""#;
-const SCOPE_NON_STRING_FIELD_SRC: &str =
-    r#"name = "bad_scope", description = "test", permission_scopes = "count""#;
+const SCOPE_MISSING_FIELD_SRC: &str = r#"name = "bad_scope", description = "test", permission = "fs_write", permission_scopes = "nonexistent""#;
+const SCOPE_NON_STRING_FIELD_SRC: &str = r#"name = "bad_scope", description = "test", permission = "fs_write", permission_scopes = "count""#;
 const OLD_SCOPE_KEY_SRC: &str =
     r#"name = "old_key", description = "test", permission_scope = "url""#;
 const WRONG_TYPE_SCOPES_SRC: &str =
-    r#"name = "num_scope", description = "test", permission_scopes = 42"#;
+    r#"name = "num_scope", description = "test", permission = "fs_write", permission_scopes = 42"#;
+const SCOPES_WITHOUT_PERMISSION_SRC: &str =
+    r#"name = "no_perm", description = "test", permission_scopes = "url""#;
+const PERMISSION_WITHOUT_SCOPES_SRC: &str =
+    r#"name = "no_scopes", description = "test", permission = "fs_write""#;
+const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -325,12 +354,23 @@ fn unload_round_trip() {
 const PERMISSION_RULE_SRC: &str =
     r#"maki.api.register_permission_rule({ tool = "edit", scope = "/tmp/x/**" })"#;
 const NO_RULE_SRC: &str = "local _ = 1";
+/// A rule can only name a registered tool, and it reads the permission it needs
+/// off that tool, so the rule tests have to provide one.
+const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "test edit tool",
+    schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+    permission = "fs_write",
+    permission_scopes = "path",
+    handler = function() return "" end,
+})"#;
 
 #[test]
 fn permission_rule_lands_in_store_and_unload_clears() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_plugin", PERMISSION_RULE_SRC)
         .unwrap();
     let rules = host.plugin_rules().snapshot();
@@ -348,6 +388,7 @@ fn permission_rule_failed_load_leaves_store_empty() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     let src = format!("{PERMISSION_RULE_SRC}\nerror('boom after rule')");
     let err = host
         .load_source("perm_broken", &src)
@@ -361,6 +402,7 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
 
+    host.load_source("tool_owner", EDIT_TOOL_SRC).unwrap();
     host.load_source("perm_a", PERMISSION_RULE_SRC).unwrap();
     host.load_source(
         "perm_b",
@@ -377,6 +419,100 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
     assert_eq!(rules[0].effect, Effect::Deny);
 }
 
+const TOOL_PERMISSION_NOT_GRANTED: &str = "which this plugin was not granted";
+/// No `permission_scopes`, so the permission manager never consults it and a
+/// rule naming it could only ever do nothing.
+const UNCHECKED_EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "unchecked",
+    schema = { type = "object", properties = {} },
+    handler = function() return "" end,
+})"#;
+
+/// A package is the only entry point that runs lua under a permission set the
+/// plugin did not pick for itself.
+fn load_package_with(
+    host: &PluginHost,
+    src: &str,
+    permissions: maki_lua::PluginPermissions,
+) -> Result<(), PluginError> {
+    let pkg = package_dir(&[("plugin.lua", src)]);
+    host.load_package("pack", pkg.path(), permissions, Default::default())
+}
+
+/// An allow is delegation, so it survives only when the plugin holds the
+/// permission the named tool exposes and that tool is one the permission
+/// manager would ever consult. When it does not survive it costs the rule and
+/// not the plugin: the call simply prompts as it would have without it.
+#[test_case::test_case(EDIT_TOOL_SRC, true => 1 ; "granted_plugin_pre_approves_a_checked_tool")]
+#[test_case::test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
+#[test_case::test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
+#[test_case::test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
+fn allow_rule_survives_only_when_delegated(owner_src: &str, granted: bool) -> usize {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("tool_owner", owner_src).unwrap();
+
+    let permissions = if granted {
+        maki_lua::PluginPermissions::trusted()
+    } else {
+        maki_lua::PluginPermissions::denied()
+    };
+    load_package_with(&host, PERMISSION_RULE_SRC, permissions)
+        .expect("a rule that does not hold up must not fail the load");
+    host.plugin_rules().snapshot().len()
+}
+
+/// A deny only ever takes authority away, so nothing about it is checked: not
+/// the permission, not the blanket scope, not even whether the tool exists.
+#[test]
+fn deny_rule_is_never_filtered() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    load_package_with(
+        &host,
+        r#"maki.api.register_permission_rule({ tool = "edit", scope = "*", effect = "deny" })"#,
+        maki_lua::PluginPermissions::denied(),
+    )
+    .unwrap();
+
+    let rules = host.plugin_rules().snapshot();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].effect, Effect::Deny);
+}
+
+/// The delegation rule from the other side: shipping a tool is itself a use of
+/// the permission that tool exposes.
+#[test]
+fn register_tool_cannot_expose_a_permission_it_lacks() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    let err = load_package_with(&host, EDIT_TOOL_SRC, maki_lua::PluginPermissions::denied())
+        .expect_err("a package granted nothing must not ship an fs_write tool");
+    assert!(
+        err.to_string().contains(TOOL_PERMISSION_NOT_GRANTED),
+        "got: {err}"
+    );
+}
+
+/// Rules resolve when the load commits, not while the chunks run, so a plugin
+/// can pre-approve a tool it ships itself whichever line comes first.
+#[test]
+fn permission_rule_can_name_a_tool_the_same_plugin_registers() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+
+    host.load_source(
+        "self_owner",
+        &format!("{PERMISSION_RULE_SRC}\n{EDIT_TOOL_SRC}"),
+    )
+    .unwrap();
+
+    assert_eq!(host.plugin_rules().snapshot().len(), 1);
+}
+
 #[test_case::test_case(r#"{ tool = "srv.tool", scope = "/x/**" }"#, "only native tools are allowed" ; "mcp_tool")]
 #[test_case::test_case(r#"{ tool = "mcp:srv", scope = "/x/**" }"#, "invalid tool name" ; "invalid_tool_chars")]
 #[test_case::test_case(r#"{ tool = "*", scope = "/x/**" }"#, "only native tools are allowed" ; "wildcard_tool")]
@@ -385,6 +521,10 @@ fn reload_clears_stale_rules_of_that_plugin_only() {
 #[test_case::test_case(r#"{ tool = "edit", scope = "" }"#, "'scope' must be non-empty" ; "empty_scope")]
 #[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", effect = "maybe" }"#, "invalid effect 'maybe'" ; "bad_effect")]
 #[test_case::test_case(r#"{ tool = "edit", scope = "/x/**", bogus = 1 }"#, "unknown key 'bogus'" ; "unknown_key")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "*" }"#, "matches every scope" ; "star_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "**" }"#, "matches every scope" ; "double_star_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/*" }"#, "matches every scope" ; "root_star_scope")]
+#[test_case::test_case(r#"{ tool = "edit", scope = "/**" }"#, "matches every scope" ; "root_double_star_scope")]
 fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -408,6 +548,9 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(SCOPE_NON_STRING_FIELD_SRC, NON_STRING_FIELD_SCHEMA, INVALID_PERMISSION_SCOPE_ERR ; "permission_scopes_non_string_field")]
 #[test_case::test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
 #[test_case::test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
+#[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
+#[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
+#[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -435,6 +578,7 @@ fn permission_scopes_valid_string_field_accepted() {
             name = "ok_scope",
             description = "test",
             schema = {STRING_FIELD_SCHEMA},
+            permission = "net",
             permission_scopes = "url",
             handler = function() return "" end
         }})"#,
@@ -1050,6 +1194,75 @@ greet.setup()
     assert_eq!(reg.names().len(), 1);
 }
 
+/// An incompatible `plugin.toml` must cost that directory its Lua, not the
+/// whole startup: `load_init_files` keeps going and reports a warning.
+#[test]
+fn incompatible_plugin_warns_instead_of_aborting_startup() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let maki_dir = tmp.path().join(".maki");
+    std::fs::create_dir_all(&maki_dir).unwrap();
+    let running = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let required = format!("{}.0.0", running.major + 1);
+    std::fs::write(
+        maki_dir.join("plugin.toml"),
+        format!("min_maki_version = {required:?}\n"),
+    )
+    .unwrap();
+    std::fs::write(maki_dir.join("init.lua"), ECHO_PLUGIN).unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut warnings = Vec::new();
+    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
+        .expect("an incompatible plugin must not abort startup");
+
+    assert!(!reg.has("echo_"));
+    let warning = warnings
+        .iter()
+        .find(|w| w.contains(SKIPPED_PLUGIN_WARNING))
+        .unwrap_or_else(|| panic!("no skip warning in {warnings:?}"));
+    assert!(warning.contains(&required), "{warning}");
+}
+
+/// An `init.lua` registers tools on the same name-keyed permission model a
+/// package does, and it is the path a plugin under the lua directory is loaded
+/// from, so a name carrying maki's builtin defaults has to be reported here too.
+#[test_case::test_case(PERMISSION_KEYED_TOOL, 1 ; "permission_keyed_name_warns")]
+#[test_case::test_case(PLAIN_TOOL, 0 ; "ordinary_name_is_quiet")]
+fn init_file_taking_a_permission_keyed_tool_name_warns(tool: &str, expected: usize) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let maki_dir = tmp.path().join(".maki");
+    std::fs::create_dir_all(&maki_dir).unwrap();
+    std::fs::write(
+        maki_dir.join("init.lua"),
+        format!(
+            r#"maki.api.register_tool({{
+            name = "{tool}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "" end
+        }})"#
+        ),
+    )
+    .unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut warnings = Vec::new();
+    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
+        .expect("init.lua must load");
+
+    assert!(reg.has(tool));
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains(PERMISSION_NAME_WARNING) && w.contains(tool))
+            .count(),
+        expected,
+        "got: {warnings:?}"
+    );
+}
+
 #[test]
 fn require_caches_modules() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1094,6 +1307,125 @@ fn require_sandbox_escape_blocked() {
         msg.contains("sandbox") || msg.contains("outside"),
         "got: {msg}"
     );
+}
+
+/// Neovim resolves `lua/foo/init.lua` as well as `lua/foo.lua`, and an
+/// external package laid out the Neovim way relies on it.
+#[test]
+fn require_resolves_directory_init_form() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mod_dir = tmp.path().join("lua").join("pkg");
+    std::fs::create_dir_all(&mod_dir).unwrap();
+
+    std::fs::write(mod_dir.join("init.lua"), "return { value = 7 }\n").unwrap();
+
+    std::fs::write(
+        tmp.path().join("init.lua"),
+        r#"
+local pkg = require("pkg")
+assert(pkg.value == 7, "expected lua/pkg/init.lua to resolve")
+"#,
+    )
+    .unwrap();
+
+    let init_path = tmp.path().join("init.lua");
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
+}
+
+/// `<mod>.lua` wins over `<mod>/init.lua`, matching Neovim's order.
+#[test]
+fn require_prefers_flat_module_over_directory_init() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(lua_dir.join("pkg")).unwrap();
+
+    std::fs::write(lua_dir.join("pkg.lua"), "return { which = \"flat\" }\n").unwrap();
+    std::fs::write(
+        lua_dir.join("pkg").join("init.lua"),
+        "return { which = \"dir\" }\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        tmp.path().join("init.lua"),
+        r#"
+local pkg = require("pkg")
+assert(pkg.which == "flat", "expected pkg.lua to win, got " .. tostring(pkg.which))
+"#,
+    )
+    .unwrap();
+
+    let init_path = tmp.path().join("init.lua");
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_plugin_file(&init_path).unwrap();
+}
+
+/// A git repository can commit a symlink, so the lexical `..` check is not
+/// enough on its own: the resolved path has to be re-checked.
+#[cfg(unix)]
+#[test]
+fn require_symlink_out_of_package_blocked() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let lua_dir = tmp.path().join("lua");
+    std::fs::create_dir_all(&lua_dir).unwrap();
+
+    let outside = tmp.path().join("outside.lua");
+    std::fs::write(&outside, "return { secret = true }\n").unwrap();
+    std::os::unix::fs::symlink(&outside, lua_dir.join("leak.lua")).unwrap();
+
+    std::fs::write(tmp.path().join("init.lua"), "require(\"leak\")\n").unwrap();
+
+    let init_path = tmp.path().join("init.lua");
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_plugin_file(&init_path)
+        .expect_err("symlink pointing out of the package must not load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("sandbox") || msg.contains("outside"),
+        "got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn global_init_can_require_a_symlinked_module() {
+    let config = tempfile::TempDir::new().unwrap();
+    let modules = config.path().join("lua");
+    std::fs::create_dir_all(&modules).unwrap();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let target = elsewhere.path().join("shared.lua");
+    std::fs::write(&target, "return { value = 42 }\n").unwrap();
+    std::os::unix::fs::symlink(&target, modules.join("shared.lua")).unwrap();
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let _ = host
+        .send_global_init_lua(
+            "assert(require('shared').value == 42)".to_owned(),
+            Some(config.path().to_path_buf()),
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn global_init_can_use_a_symlinked_lua_directory() {
+    let config = tempfile::TempDir::new().unwrap();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    std::fs::write(elsewhere.path().join("shared.lua"), "return true\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), config.path().join("lua")).unwrap();
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let _ = host
+        .send_global_init_lua(
+            "assert(require('shared'))".to_owned(),
+            Some(config.path().to_path_buf()),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -1977,7 +2309,7 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
-            owner = "plugin",
+            scope = "plugin",
             on_stdout = function(_, line) output = line end,
             on_exit = function(_, code) exit_code = tostring(code) end,
         }})
@@ -2023,7 +2355,7 @@ fn unloading_plugin_kills_its_jobs() {
     let pid_path = dir.path().join("job.pid");
     let src = format!(
         r#"maki.fn.jobstart("printf %s $$ > '{}'; exec sleep 30", {{
-            owner = "plugin",
+            scope = "plugin",
         }})"#,
         pid_path.display()
     );
@@ -2058,6 +2390,753 @@ fn unloading_plugin_kills_its_jobs() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The shell exits at once and leaves `sleep` holding the pipe, so the direct
+/// child dies long before the job does. Reaping it there gives the pid back to
+/// the kernel and turns every later kill into a no-op.
+#[cfg(unix)]
+#[test]
+fn unloading_plugin_kills_a_job_whose_shell_already_exited() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("group.pid");
+    let src = format!(
+        r#"maki.fn.jobstart("sleep 30 & printf %s $$ > '{}'", {{
+            scope = "plugin",
+        }})"#,
+        pid_path.display()
+    );
+    host.load_source("plugin_job", &src).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break Pid::from_raw(pid).unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "plugin job did not publish its process group"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    host.unload("plugin_job").unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backgrounded process survived unload"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn jobinfo_and_joblist_see_live_plugin_jobs() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_listed_job",
+    description = "starts a plugin job for inspect",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("printf 'hello-tail\n'; exec sleep 30", {{
+            scope = "plugin",
+            tail = 8,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "inspect_listed_job",
+    description = "jobinfo and joblist for the live job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local info = maki.fn.jobinfo(job_id)
+        if not info then return "missing" end
+        local listed = false
+        for _, row in ipairs(maki.fn.joblist()) do
+            if row.id == job_id then listed = true end
+        end
+        return table.concat({{
+            info.status,
+            info.command,
+            tostring(listed),
+            table.concat(info.stdout_lines, ","),
+        }}, "|")
+    end,
+}})
+maki.api.register_tool({{
+    name = "stop_listed_job",
+    description = "stop the inspect job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        maki.fn.jobstop(job_id)
+        return "stopped"
+    end,
+}})
+"#
+    );
+    host.load_source("job_inspect", &src).unwrap();
+    let _id = exec_tool(&reg, "start_listed_job", json!({})).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let state = loop {
+        let state = exec_tool(&reg, "inspect_listed_job", json!({})).unwrap();
+        if state.starts_with("running|") && state.contains("hello-tail") {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "jobinfo never saw the live job: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        state.contains("|true|"),
+        "joblist should include the live job, got {state}"
+    );
+
+    exec_tool(&reg, "stop_listed_job", json!({})).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_owned_job_survives_plugin_reload() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("job.pid");
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "start_session_job",
+    description = "starts a session-owned job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return tostring(id)
+    end,
+}})
+"#,
+        pid = pid_path.display(),
+        sid = sid,
+    );
+    host.load_source("session_job", &src).unwrap();
+    let id = exec_tool(&reg, "start_session_job", json!({})).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session job did not publish its process id"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let pid = Pid::from_raw(pid).unwrap();
+    assert!(test_kill_process_group(pid).is_ok());
+
+    host.unload("session_job").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        test_kill_process_group(pid).is_ok(),
+        "session-owned job must survive plugin unload"
+    );
+
+    let inspect = format!(
+        r#"
+maki.api.register_tool({{
+    name = "inspect_session_job",
+    description = "lists session jobs after reload",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local info = maki.fn.jobinfo({id})
+        if not info then return "missing" end
+        return info.status .. ":" .. tostring(info.pid)
+    end,
+}})
+"#
+    );
+    host.load_source("session_job", &inspect).unwrap();
+    let state = exec_tool(&reg, "inspect_session_job", json!({})).unwrap();
+    assert!(
+        state.starts_with("running:"),
+        "reloaded plugin should see the live session job, got {state}"
+    );
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "end_session must kill the session job"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn jobattach_re_arms_session_jobs_a_reload_dropped() {
+    const EXIT_CODE: i32 = 3;
+    const ATTACHED: &str = "attached";
+    const NOT_FOUND: &str = "job: not found";
+    // Status of the doomed job, whether ticks arrived, and the codes seen.
+    const BEFORE_ATTACH: &str = "exited|false|";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let starter = format!(
+        r#"
+maki.api.register_tool({{
+    name = "start_jobs",
+    description = "starts a chatty session job and one that dies at once",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ticker = maki.fn.jobstart("while true; do echo tick; sleep 0.05; done", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        local doomed = maki.fn.jobstart("exit {EXIT_CODE}", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return ticker .. " " .. doomed
+    end,
+}})
+"#
+    );
+    host.load_source("ticker", &starter).unwrap();
+    let ids = exec_tool(&reg, "start_jobs", json!({})).unwrap();
+    let (ticker, doomed) = ids.split_once(' ').expect("two job ids");
+
+    let reattach = format!(
+        r#"
+local ticks, exits = 0, {{}}
+maki.api.register_tool({{
+    name = "attach_jobs",
+    description = "re-arms the jobs the reload detached",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, err = maki.fn.jobattach({ticker}, {{
+            on_stdout = function() ticks = ticks + 1 end,
+        }})
+        if not ok then return err end
+        ok, err = maki.fn.jobattach({doomed}, {{
+            on_exit = function(_, code) exits[#exits + 1] = code end,
+        }})
+        return ok and "{ATTACHED}" or err
+    end,
+}})
+maki.api.register_tool({{
+    name = "report",
+    description = "what the re-armed callbacks have seen",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local info = maki.fn.jobinfo({doomed})
+        return (info and info.status or "missing")
+            .. "|" .. tostring(ticks > 0)
+            .. "|" .. table.concat(exits, ",")
+    end,
+}})
+"#
+    );
+    host.load_source("ticker", &reattach).unwrap();
+    poll_until("the doomed job never reported its exit", || {
+        (exec_tool(&reg, "report", json!({})).unwrap() == BEFORE_ATTACH).then_some(())
+    });
+    assert_eq!(exec_tool(&reg, "attach_jobs", json!({})).unwrap(), ATTACHED);
+
+    let expected = format!("exited|true|{EXIT_CODE}");
+    poll_until("the re-armed callbacks never fired", || {
+        (exec_tool(&reg, "report", json!({})).unwrap() == expected).then_some(())
+    });
+
+    let spy = format!(
+        r#"
+maki.api.register_tool({{
+    name = "spy_attach",
+    description = "attaches to another plugin's job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, err = maki.fn.jobattach({ticker}, {{ on_stdout = function() end }})
+        return ok and "{ATTACHED}" or err
+    end,
+}})
+"#
+    );
+    host.load_source("spy", &spy).unwrap();
+    assert_eq!(exec_tool(&reg, "spy_attach", json!({})).unwrap(), NOT_FOUND);
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+}
+
+#[cfg(unix)]
+#[test]
+fn argv_jobs_and_stream_redirects() {
+    const LITERAL_ARG: &str = "a; echo pwned $(id)";
+    const REDIRECT_ERR: &str = "mutually exclusive";
+    const FIELDS_ERR: &str = "handler must return the streams and the error, separated by |";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("job.log");
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "argv_and_redirect",
+    description = "argv spawning plus stdout redirect",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local seen = {{}}
+        maki.fn.jobwait(maki.fn.jobstart({{ "echo", "{LITERAL_ARG}" }}, {{
+            scope = "plugin",
+            on_stdout = function(_, line) seen[#seen + 1] = line end,
+        }}))
+
+        local redirected = maki.fn.jobwait(maki.fn.jobstart({{ "echo", "to-file" }}, {{
+            scope = "plugin",
+            stdout = "{log}",
+        }}))
+        local quiet = maki.fn.jobwait(
+            maki.fn.jobstart("echo dropped", {{ scope = "plugin", stdout = false }})
+        )
+
+        local _, err = pcall(maki.fn.jobstart, "echo both", {{
+            scope = "plugin",
+            stdout = "{log}",
+            on_stdout = function() end,
+        }})
+
+        return table.concat({{
+            table.concat(seen, ","),
+            redirected.stdout,
+            quiet.stdout,
+            tostring(err),
+        }}, "|")
+    end,
+}})
+"#,
+        log = log.display(),
+    );
+    host.load_source("argv_jobs", &src).unwrap();
+
+    let out = exec_tool(&reg, "argv_and_redirect", json!({})).unwrap();
+    let (streams, conflict) = out
+        .rsplit_once('|')
+        .unwrap_or_else(|| panic!("{FIELDS_ERR}"));
+    assert_eq!(
+        streams,
+        format!("{LITERAL_ARG}||"),
+        "argv must reach the program with no shell in between, and a stream sent to a file or dropped must not be captured too"
+    );
+    assert!(
+        conflict.contains(REDIRECT_ERR),
+        "redirect plus on_stdout must be refused, got {conflict}"
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "to-file\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn jobwait_on_an_exited_job_reports_whether_its_tail_is_complete() {
+    const WHOLE: &str = "one\ntwo:false";
+    const CLIPPED: &str = "two:true";
+    const DISCARDED: &str = ":true";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_twice",
+    description = "the tail three exited session jobs read back",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        -- The first wait parks until the exit and fills the tail, the second
+        -- one answers from that tail, which is the path under test.
+        local function tail_of(opts)
+            opts.scope = {{ session = "{sid}" }}
+            local id = maki.fn.jobstart("echo one; echo two", opts)
+            maki.fn.jobwait(id)
+            local got = maki.fn.jobwait(id)
+            return got.stdout .. ":" .. tostring(got.truncated)
+        end
+        return table.concat({{
+            tail_of({{ tail = 8 }}),
+            tail_of({{ tail = 1 }}),
+            tail_of({{ stdout = false }}),
+        }}, "|")
+    end,
+}})
+"#
+    );
+    host.load_source("chatty", &src).unwrap();
+
+    assert_eq!(
+        exec_tool(&reg, "wait_twice", json!({})).unwrap(),
+        format!("{WHOLE}|{CLIPPED}|{DISCARDED}"),
+        "a tail that held everything is not truncated, an empty one we never filled is"
+    );
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+}
+
+/// `run` on its own is enough to start a job, but pointing a stream at a path
+/// is a write, so it costs `fs_write` too.
+#[test]
+fn stream_redirect_to_a_path_needs_fs_write() {
+    const REDIRECT_TOOL: &str = "redirect_deny";
+    let mut perms = maki_lua::PluginPermissions::denied();
+    perms.set(maki_lua::Permission::Run, true);
+    let src = perm_tool_src(
+        REDIRECT_TOOL,
+        r#"local _, err = pcall(maki.fn.jobstart, "echo hi", { scope = "plugin", stdout = "/tmp/maki-never-written.log" })
+                return tostring(err)"#,
+    );
+
+    let result = exec_tool_with_perms(perms, &src, REDIRECT_TOOL, json!({})).unwrap();
+
+    assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
+    assert!(result.contains("fs_write"), "got: {result}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_job_name_survives_a_reload_and_blocks_a_second_live_job() {
+    const JOB_NAME: &str = "log-tail";
+    const DUPLICATE_ERR: &str = "already held by live job";
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "start_named",
+    description = "starts a named session job twice",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local opts = {{ scope = {{ session = "{sid}" }}, name = "{JOB_NAME}" }}
+        local id = maki.fn.jobstart("exec sleep 30", opts)
+        local _, err = pcall(maki.fn.jobstart, "exec sleep 30", opts)
+        return tostring(id) .. "|" .. tostring(err)
+    end,
+}})
+"#
+    );
+    host.load_source("named", &src).unwrap();
+    let started = exec_tool(&reg, "start_named", json!({})).unwrap();
+    let (id, dup_err) = started.split_once('|').expect("id and duplicate error");
+    assert!(
+        dup_err.contains(DUPLICATE_ERR),
+        "a second live job under the same name must be refused, got {dup_err}"
+    );
+
+    let rediscover = format!(
+        r#"
+maki.api.register_tool({{
+    name = "find_named",
+    description = "finds the surviving job by name",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function() return tostring(maki.fn.jobfind("{JOB_NAME}")) end,
+}})
+"#
+    );
+    host.load_source("named", &rediscover).unwrap();
+    assert_eq!(
+        exec_tool(&reg, "find_named", json!({})).unwrap(),
+        id,
+        "a name must survive the reload that dropped the callbacks"
+    );
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_end_handler_sees_jobs_before_they_are_reaped() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = maki_storage::id::MakiId::generate();
+    let _mailbox = maki_agent::SessionMailbox::register(session);
+    let sid = session.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("job.pid");
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "start_order_job",
+    description = "starts a session-owned job",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("printf %s $$ > '{pid}'; exec sleep 30", {{
+            scope = {{ session = "{sid}" }},
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "probe_order_job",
+    description = "reports what the SessionEnd handler saw",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return seen or "not-yet"
+    end,
+}})
+maki.api.create_autocmd("SessionEnd", {{
+    callback = function(ev)
+        if tostring(ev.data and ev.data.session_id) ~= "{sid}" then return end
+        local ok, info = pcall(maki.fn.jobinfo, job_id)
+        if not ok then
+            seen = "err:" .. tostring(info)
+            return
+        end
+        seen = info and (info.status .. ":" .. tostring(info.pid)) or "missing"
+    end,
+}})
+local seen
+"#,
+        pid = pid_path.display(),
+        sid = sid,
+    );
+    host.load_source("order_probe", &src).unwrap();
+    exec_tool(&reg, "start_order_job", json!({})).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_path)
+            .unwrap_or_default()
+            .parse::<i32>()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session job did not publish its process id"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let pid = Pid::from_raw(pid).unwrap();
+    assert!(test_kill_process_group(pid).is_ok());
+
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+
+    // `end_sessions_blocking` only answers once the handlers ran and the jobs
+    // were reaped, so what the handler saw is settled by now.
+    let seen = exec_tool(&reg, "probe_order_job", json!({})).unwrap();
+    assert!(
+        seen.starts_with("running:"),
+        "SessionEnd handler should see the live job, got {seen}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while test_kill_process_group(pid).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "end_session must reap the job after dispatching SessionEnd"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn autocmd_task_jobs_die_with_their_own_callback() {
+    let (reg, host) = builtins_host();
+    const GONE: &str = "gone";
+    let src = format!(
+        r#"
+local job
+seen = "unset"
+maki.api.create_autocmd("ProbeIsolation", {{
+    callback = function()
+        job = maki.fn.jobstart("sleep 30")
+    end,
+}})
+maki.api.create_autocmd("ProbeIsolation", {{
+    callback = function()
+        local info = job and maki.fn.jobinfo(job) or nil
+        seen = info and ("alive:" .. info.status) or "{GONE}"
+    end,
+}})
+maki.api.register_tool({{
+    name = "probe_isolation",
+    description = "reports what the second handler saw",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return seen
+    end,
+}})
+"#
+    );
+    host.load_source("isolation_probe", &src).unwrap();
+
+    host.event_handle()
+        .fire_autocmd("ProbeIsolation", json!({}));
+
+    // FireAutocmd and CallTool queue on the same channel and dispatch is
+    // awaited in order, so the second handler has already run here. A shared
+    // batch scope would report the first handler's job as alive.
+    assert_eq!(exec_tool(&reg, "probe_isolation", json!({})).unwrap(), GONE);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_end_autocmds_may_suspend() {
+    let (reg, host) = builtins_host();
+
+    let dir = std::env::temp_dir().join(format!("maki-sessionend-suspend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("marker.txt");
+    std::fs::write(&marker, "x").unwrap();
+
+    const RM_FAILED: &str = "err:";
+    let src = format!(
+        r#"
+local rm_result
+maki.api.create_autocmd("SessionEnd", {{
+    callback = function(ev)
+        local ok, res = pcall(maki.fs.rm, ev.data.dir, {{ recursive = true, force = true }})
+        rm_result = ok and "ok" or "{RM_FAILED}" .. tostring(res)
+    end,
+}})
+maki.api.register_tool({{
+    name = "rm_probe",
+    description = "reports what the SessionEnd handler saw",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return rm_result or "unset"
+    end,
+}})
+"#,
+    );
+    host.load_source("sessionend_suspend", &src).unwrap();
+
+    host.event_handle()
+        .fire_autocmd("SessionEnd", json!({ "dir": dir.display().to_string() }));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let seen = loop {
+        match exec_tool(&reg, "rm_probe", json!({})) {
+            Ok(seen) if seen != "unset" => break seen,
+            _ if std::time::Instant::now() < deadline => {}
+            other => panic!("SessionEnd probe never settled: {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(seen, "ok", "fs.rm must not die on a yield boundary");
+    assert!(!marker.exists(), "fs.rm should have removed the tree");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn jobwait_streams_events_to_suspending_callbacks() {
+    let (reg, host) = builtins_host();
+
+    let dir = std::env::temp_dir().join(format!("maki-jobwait-suspend-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta = dir.join("meta.json");
+
+    let session = maki_storage::id::MakiId::generate();
+    // The process must still run when wait_suspending_job calls jobwait:
+    // an already-exited job answers from its snapshot without delivering
+    // on_exit, which would make the assertion below race the event pump.
+    const EXIT_CB_FAILED: &str = "exit_cb_failed";
+    let src = format!(
+        r#"
+local job_id
+local exit_cb_result
+maki.api.register_tool({{
+    name = "start_suspending_job",
+    description = "starts a session-owned job whose on_exit writes a file",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("sleep 2", {{
+            scope = {{ session = "{session}" }},
+            on_exit = function(_, code)
+                local ok, res = pcall(maki.fs.atomic_write, "{}", tostring(code))
+                exit_cb_result = ok and "ok" or "{EXIT_CB_FAILED}:" .. tostring(res)
+            end,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_suspending_job",
+    description = "waits like monitor_wait does",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        return "exit:" .. tostring(res and res.exit_code) .. "|exit_cb:" .. tostring(exit_cb_result)
+    end,
+}})
+"#,
+        meta.display(),
+    );
+    host.load_source("jobwait_suspend", &src).unwrap();
+
+    exec_tool(&reg, "start_suspending_job", json!({})).unwrap();
+    let waited = exec_tool(&reg, "wait_suspending_job", json!({})).unwrap();
+    assert_eq!(
+        waited, "exit:0|exit_cb:ok",
+        "jobwait must report the exit and on_exit must survive suspending fs calls"
+    );
+    assert!(
+        std::path::Path::new(&meta).exists(),
+        "on_exit should have written the meta file"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -2106,6 +3185,78 @@ fn setup_happy_path() {
         .unwrap();
     let raw = raw.expect("expected Some(RawConfig)");
     assert_eq!(raw.agent.max_output_lines, Some(3000));
+}
+
+#[test]
+fn project_init_cannot_declare_global_packages() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let error = host
+        .send_run_init_lua(
+            r#"maki.pack.add({ "https://example.com/demo" })"#.to_owned(),
+            "project/init.lua".to_owned(),
+            None,
+        )
+        .expect_err("project config must not change global packages");
+
+    assert!(
+        error.to_string().contains(GLOBAL_PACK_ONLY_ERR),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn a_named_config_cannot_change_global_packages() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let error = host
+        .send_run_init_lua(
+            r#"maki.pack.add({ "https://example.com/demo" })"#.to_owned(),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .expect_err("only the global config may change packages");
+
+    assert!(
+        error.to_string().contains(GLOBAL_PACK_ONLY_ERR),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn global_init_can_declare_managed_packages() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let _ = host
+        .send_global_init_lua(
+            r#"maki.pack.add({ "https://example.com/demo" })"#.to_owned(),
+            None,
+        )
+        .unwrap();
+
+    let declared = host.declared_packages().unwrap();
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].spec.name, "demo");
+}
+
+#[test]
+fn project_init_can_activate_an_installed_global_package() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let _ = host
+        .send_run_init_lua(
+            r#"maki.packadd("demo")"#.to_owned(),
+            "project/init.lua".to_owned(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        host.seal_pack_ops().unwrap(),
+        [maki_lua::PackOp::Activate {
+            name: "demo".to_owned()
+        }]
+    );
 }
 
 #[test_case::test_case(
@@ -2434,12 +3585,12 @@ fn builtin_opts_flow_from_setup_plugins() {
 
 #[test_case::test_case(
     serde_json::json!({}),
-    &["edit", "multiedit"], &["edit_lines", "insert_lines"]
-    ; "multiedit_on_others_opt_in"
+    &["edit", "multiedit", "edit_lines"], &["insert_lines"]
+    ; "defaults_on_insert_lines_opt_in"
 )]
 #[test_case::test_case(
-    serde_json::json!({ "multiedit": false, "edit_lines": true }),
-    &["edit", "edit_lines"], &["multiedit", "insert_lines"]
+    serde_json::json!({ "multiedit": false, "edit_lines": false, "insert_lines": true }),
+    &["edit", "insert_lines"], &["multiedit", "edit_lines"]
     ; "toggles_flip_sub_tools"
 )]
 fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[&str]) {
@@ -2448,6 +3599,7 @@ fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[
     let config = PluginsConfig {
         enabled: true,
         names: vec!["edit".to_owned()],
+        packages: Vec::new(),
         opts: HashMap::from([("edit".to_owned(), json_obj(opts))]),
     };
     host.load_builtins(&config).unwrap();
@@ -2457,6 +3609,64 @@ fn edit_sub_tools_follow_edit_opts(opts: serde_json::Value, on: &[&str], off: &[
     for tool in off {
         assert!(reg.get(tool).is_none(), "{tool} should not be registered");
     }
+}
+
+/// Every bundled plugin with the edit sub-tools switched on, so the tool set
+/// matches what a user who enabled everything would see.
+fn whole_bundle() -> (Arc<ToolRegistry>, PluginHost) {
+    let mut config = PluginsConfig::from_plugins(HashMap::new());
+    config.opts.insert(
+        "edit".to_owned(),
+        EDIT_SUB_TOOLS
+            .iter()
+            .map(|name| (name.to_string(), serde_json::Value::Bool(true)))
+            .collect(),
+    );
+    builtins_host_with(&config)
+}
+
+/// Pins `FILE_WRITE_TOOLS` to the actual `permission = "fs_write"`
+/// declarations, so a new fs_write tool cannot quietly slip past the file
+/// write policies keyed off that list (plan mode, cwd allow rules).
+#[test]
+fn fs_write_tools_match_file_write_tools() {
+    let (reg, _host) = whole_bundle();
+
+    let snapshot = reg.iter();
+    let mut declared: Vec<&str> = snapshot
+        .iter()
+        .filter(|t| t.tool.required_permission() == Some(Permission::FsWrite))
+        .map(|t| t.name())
+        .collect();
+    declared.sort_unstable();
+    let mut expected: Vec<&str> = FILE_WRITE_TOOLS.to_vec();
+    expected.sort_unstable();
+
+    assert_eq!(declared, expected, "{FILE_WRITE_TOOLS_DRIFT}");
+}
+
+/// `memory` pre-approves the file-write tools for the notes directory it owns,
+/// and a rule can only name a registered tool. That turns `BUNDLED_PLUGINS`
+/// order into load order: put `memory` above the plugins owning those tools
+/// and its rules vanish with only a log line to show for it.
+#[test]
+fn builtins_load_in_an_order_that_keeps_every_plugin_rule() {
+    let (_reg, host) = whole_bundle();
+
+    let rules = host.plugin_rules().snapshot();
+    let allowed: Vec<&str> = rules
+        .iter()
+        .filter(|rule| rule.effect == Effect::Allow)
+        .filter_map(|rule| match &rule.tool {
+            ToolKey::Native(name) => Some(name.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let dropped: Vec<&&str> = FILE_WRITE_TOOLS
+        .iter()
+        .filter(|tool| !allowed.contains(tool))
+        .collect();
+    assert!(dropped.is_empty(), "{MEMORY_RULES_DROPPED}: {dropped:?}");
 }
 
 #[test]
@@ -2473,23 +3683,26 @@ fn undeclared_opts_fail_the_load() {
     assert!(err.to_string().contains(UNDECLARED_OPTS_ERR), "got: {err}");
 }
 
+/// A disabled package keeps its options in `opts` but leaves `packages`, which
+/// is exactly the shape `into_config` produces. Treating that as an unknown
+/// name stopped maki from booting over options it was already ignoring, and
+/// only for packages: a disabled builtin in the same state just warned.
 #[test]
-fn opts_for_unknown_plugin_fail_load_builtins() {
+fn opts_for_a_disabled_package_do_not_stop_the_load() {
     let reg = fresh_registry();
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    let mut config = PluginsConfig::from_plugins(HashMap::new());
-    config.opts.insert(
-        "bsah".to_owned(),
-        json_obj(serde_json::json!({ "timeout_secs": 5 })),
-    );
-    let err = host
-        .load_builtins(&config)
-        .expect_err("load_builtins should fail");
-    assert!(
-        err.to_string()
-            .contains("plugins.bsah sets options (timeout_secs)"),
-        "got: {err}"
-    );
+    let config = PluginsConfig {
+        enabled: true,
+        names: vec!["grep".to_owned()],
+        packages: Vec::new(),
+        opts: HashMap::from([(
+            "my_pack".to_owned(),
+            json_obj(serde_json::json!({ "timeout_secs": 5 })),
+        )]),
+    };
+    host.load_builtins(&config)
+        .expect("a disabled package must not stop the builtins from loading");
+    assert!(reg.get("grep").is_some(), "enabled plugin still loads");
 }
 
 #[test]
@@ -2507,6 +3720,69 @@ fn unknown_plugin_name_fails_load_builtins() {
     );
 }
 
+fn shadow_src() -> String {
+    format!(
+        r#"maki.api.register_tool({{
+            name = "{SHADOWED_TOOL}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "replaced" end
+        }})"#
+    )
+}
+
+/// Turning a builtin off used to copy its name into `agent.disabled_tools`,
+/// the name filter every request runs over the tool array, so a replacement
+/// could load and still stay invisible to the model. That is why this walks
+/// the whole path: init.lua, config, builtins, then the definitions a request
+/// is built from.
+#[test]
+fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let raw = host
+        .send_run_init_lua(
+            format!("maki.setup({{ plugins = {{ {SHADOWED_TOOL} = {{ enabled = false }} }} }})"),
+            "test_init.lua".to_owned(),
+            None,
+        )
+        .unwrap()
+        .expect("setup returns a config");
+    let config = raw.into_config(&[]).unwrap();
+    host.load_builtins(&config.plugins).unwrap();
+    host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect("a disabled builtin leaves its tool name free");
+
+    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let shadowed = defs
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .find(|def| def["name"] == SHADOWED_TOOL)
+        .expect("the replacement must reach the model, not just `maki prompt --tools`");
+    assert_eq!(shadowed["description"], REPLACEMENT_DESC);
+}
+
+#[test]
+fn enabled_builtin_still_rejects_a_shadowing_plugin() {
+    let (_reg, host) = builtins_host();
+    let err = host
+        .load_source(REPLACEMENT_PLUGIN, &shadow_src())
+        .expect_err("an enabled builtin owns its tool name");
+    assert!(
+        matches!(err, PluginError::NameConflict { .. }),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn disabled_plugin_opts_are_ignored_not_rejected() {
     let reg = fresh_registry();
@@ -2514,6 +3790,7 @@ fn disabled_plugin_opts_are_ignored_not_rejected() {
     let config = PluginsConfig {
         enabled: true,
         names: vec!["grep".to_owned()],
+        packages: Vec::new(),
         opts: HashMap::from([(
             "bash".to_owned(),
             json_obj(serde_json::json!({ "timeout_secs": 180 })),
@@ -2730,6 +4007,880 @@ fn reload_replaces_commands() {
     assert_eq!(snap.commands[0].name.as_ref(), "/v2");
 }
 
+/// Builds a package directory with the given `plugin/*.lua` files.
+fn package_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("plugin");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    for (name, source) in files {
+        std::fs::write(plugin_dir.join(name), source).unwrap();
+    }
+    tmp
+}
+
+#[test]
+fn package_loads_every_entrypoint_under_one_owner() {
+    let pkg = package_dir(&[
+        (
+            "01_first.lua",
+            r#"maki.api.register_command({ name = "/one", handler = function() end })"#,
+        ),
+        (
+            "02_second.lua",
+            r#"maki.api.register_command({ name = "/two", handler = function() end })"#,
+        ),
+    ]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_package(
+        "demo",
+        pkg.path(),
+        maki_lua::PluginPermissions::trusted(),
+        Default::default(),
+    )
+    .unwrap();
+
+    let snap = host.command_reader().load();
+    let mut names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+    names.sort();
+    assert_eq!(names, vec!["/one", "/two"]);
+    assert!(
+        snap.commands.iter().all(|c| c.plugin.as_ref() == "demo"),
+        "every entrypoint must register under the package owner"
+    );
+}
+
+/// One environment across the chunks, so an earlier file can set something up
+/// for a later one. This is why the chunks are not separate loads.
+#[test]
+fn package_entrypoints_share_one_environment() {
+    let pkg = package_dir(&[
+        ("01_first.lua", "shared_value = 11\n"),
+        (
+            "02_second.lua",
+            r#"
+assert(shared_value == 11, "second chunk should see the first chunk's global")
+maki.api.register_command({ name = "/ok", handler = function() end })
+"#,
+        ),
+    ]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_package(
+        "shared",
+        pkg.path(),
+        maki_lua::PluginPermissions::trusted(),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(host.command_reader().load().commands.len(), 1);
+}
+
+/// A package commits or it does not. `drop_plugin_keys` alone would leave the
+/// keymap and the hint behind, so this is what proves the stronger unwind.
+#[test]
+fn package_failure_leaves_nothing_from_earlier_chunks() {
+    let pkg = package_dir(&[
+        (
+            "01_first.lua",
+            r#"
+maki.api.register_command({ name = "/ghost", handler = function() end })
+maki.keymap.set("n", "<C-g>", function() end, { desc = "ghost" })
+maki.api.register_tool({
+  name = "ghost_tool",
+  description = "should not survive",
+  schema = { type = "object", properties = {} },
+  handler = function() return "x" end,
+})
+"#,
+        ),
+        ("02_second.lua", r#"error("boom")"#),
+    ]);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_package(
+            "ghost",
+            pkg.path(),
+            maki_lua::PluginPermissions::trusted(),
+            Default::default(),
+        )
+        .expect_err("a failing chunk must fail the whole package");
+    assert!(err.to_string().contains("boom"), "got: {err}");
+
+    assert_eq!(
+        host.command_reader().load().commands.len(),
+        0,
+        "command from the first chunk survived a failed load"
+    );
+    assert_eq!(
+        host.keymap_reader().load().entries.len(),
+        0,
+        "keymap from the first chunk survived a failed load"
+    );
+    assert!(
+        !reg.has("ghost_tool"),
+        "tool from the first chunk survived a failed load"
+    );
+}
+
+#[test]
+fn package_failure_discards_its_packadd_requests() {
+    let site = site_with_two(
+        (
+            "broken_pack",
+            "maki.packadd('lazy_pack')\nerror('stop this package')",
+        ),
+        (
+            "lazy_pack",
+            r#"maki.api.register_command({ name = "/lazy", handler = function() end })"#,
+        ),
+    );
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    let failures = host.load_packages(&found.packages, &config);
+
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(
+        host.command_reader().load().commands.is_empty(),
+        "a failed package must not activate another package"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn package_entrypoint_symlink_escape_blocked() {
+    let pkg = package_dir(&[]);
+    // Deliberately in a different directory tree, so the link really leaves
+    // the package rather than pointing at a sibling inside it.
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let outside = elsewhere.path().join("outside.lua");
+    std::fs::write(&outside, "return {}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, pkg.path().join("plugin").join("leak.lua")).unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_package(
+            "leaky",
+            pkg.path(),
+            maki_lua::PluginPermissions::trusted(),
+            Default::default(),
+        )
+        .expect_err("an entrypoint linking out of the package must not load");
+    assert!(
+        matches!(err, PluginError::PackageEscape { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn package_without_entrypoints_errors() {
+    let pkg = package_dir(&[]);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_package(
+            "empty",
+            pkg.path(),
+            maki_lua::PluginPermissions::trusted(),
+            Default::default(),
+        )
+        .expect_err("a package with no entrypoint is a configuration error");
+    assert!(
+        matches!(err, PluginError::PackageEmpty { .. }),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn unreadable_entrypoint_directory_is_reported() {
+    let pkg = tempfile::TempDir::new().unwrap();
+    std::fs::write(pkg.path().join("plugin"), "not a directory").unwrap();
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let err = host
+        .load_package(
+            "unreadable",
+            pkg.path(),
+            maki_lua::PluginPermissions::trusted(),
+            Default::default(),
+        )
+        .expect_err("an unreadable entrypoint directory must not look empty");
+
+    assert!(matches!(err, PluginError::Io { .. }), "got: {err}");
+}
+
+/// Builds a site tree holding one package, the way a user cloning a repository
+/// into the package directory would.
+fn site_with_package(sub: &str, name: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = tmp.path().join("pack").join("vendor").join(sub).join(name);
+    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+    for (file, source) in files {
+        std::fs::write(dir.join("plugin").join(file), source).unwrap();
+    }
+    tmp
+}
+
+/// Permission decisions are keyed by tool name alone, so a package that takes
+/// a name maki's builtin defaults are written for inherits those defaults, and
+/// any "always allow" the user stored for the builtin. The load is allowed, the
+/// user is told, once for the package however many names it took.
+#[test_case::test_case(&[PERMISSION_KEYED_TOOL], 1 ; "permission_keyed_name_warns")]
+#[test_case::test_case(&[PERMISSION_KEYED_TOOL, OTHER_PERMISSION_KEYED_TOOL], 1 ; "two_names_warn_once")]
+#[test_case::test_case(&[PLAIN_TOOL], 0 ; "ordinary_name_is_quiet")]
+fn package_taking_a_permission_keyed_tool_name_warns(tools: &[&str], expected: usize) {
+    let source = tools
+        .iter()
+        .map(|tool| {
+            format!(
+                r#"maki.api.register_tool({{
+            name = "{tool}",
+            description = "{REPLACEMENT_DESC}",
+            schema = {MINIMAL_SCHEMA},
+            handler = function() return "" end
+        }})"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let site = site_with_package("start", "perm_pack", &[("init.lua", &source)]);
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+    let host = PluginHost::new(fresh_registry()).unwrap();
+
+    let warnings = host.load_packages(&found.packages, &config);
+
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|w| w.contains(PERMISSION_NAME_WARNING))
+            .count(),
+        expected,
+        "got: {warnings:?}"
+    );
+}
+
+/// The whole layer-1 path: find a package on disk, then load it.
+#[test]
+fn discovered_start_package_is_found_and_loaded() {
+    let site = site_with_package(
+        "start",
+        "demo_pack",
+        &[(
+            "init.lua",
+            r#"maki.api.register_command({ name = "/demo", handler = function() end })"#,
+        )],
+    );
+
+    let found = maki_lua::discover(site.path());
+    assert!(found.problems.is_empty(), "{:?}", found.problems);
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    assert!(host.load_packages(&found.packages, &config).is_empty());
+
+    let snap = host.command_reader().load();
+    assert_eq!(snap.commands.len(), 1);
+    assert_eq!(snap.commands[0].name.as_ref(), "/demo");
+    assert_eq!(snap.commands[0].plugin.as_ref(), "demo_pack");
+}
+
+#[test]
+fn custom_loader_runs_as_the_package_owner_with_spec_data() {
+    let package = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(package.path().join("lua")).unwrap();
+    std::fs::write(
+        package.path().join("lua").join("entry.lua"),
+        r#"
+return {
+  setup = function(command)
+    maki.api.register_command({ name = command, handler = function() end })
+    maki.api.register_tool({
+      name = "custom_state",
+      description = "Package state.",
+      schema = { type = "object", properties = {} },
+      audiences = { "main" },
+      handler = function()
+        return tostring(maki.pack.get({ "custom" })[1].active)
+      end,
+    })
+  end,
+}
+"#,
+    )
+    .unwrap();
+
+    let registry = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+    host.send_global_init_lua(
+        r#"
+maki.pack.add({
+  {
+    src = "https://example.com/custom",
+    name = "custom",
+    data = { module = "entry", command = "/custom" },
+  },
+}, {
+  load = function(package)
+    require(package.spec.data.module).setup(package.spec.data.command)
+  end,
+})
+"#
+        .to_owned(),
+        None,
+    )
+    .unwrap();
+    let declared = host.declared_packages().unwrap();
+    let packages = vec![maki_lua::DiscoveredPackage {
+        name: "custom".to_owned(),
+        dir: package.path().to_path_buf(),
+        eager: true,
+        requested: maki_lua::Requested::none(),
+        origin: maki_lua::Origin::Fetched {
+            src: "https://example.com/custom".to_owned(),
+        },
+        revision_guard: None,
+    }];
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &["custom".into()]);
+
+    let failures = host.load_declared_packages(&packages, &declared, &config);
+    assert!(failures.is_empty(), "got: {failures:?}");
+
+    let commands = host.command_reader().load();
+    assert_eq!(commands.commands.len(), 1);
+    assert_eq!(commands.commands[0].name.as_ref(), "/custom");
+    assert_eq!(commands.commands[0].plugin.as_ref(), "custom");
+    assert_eq!(
+        exec_tool(&registry, "custom_state", serde_json::json!({})).unwrap(),
+        "true"
+    );
+}
+
+#[test]
+fn managed_custom_loader_does_not_capture_a_manual_name_conflict() {
+    let site = site_with_package(
+        "start",
+        "manual",
+        &[(
+            "init.lua",
+            r#"maki.api.register_command({ name = "/manual", handler = function() end })"#,
+        )],
+    );
+    let packages = maki_lua::discover(site.path()).packages;
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.send_global_init_lua(
+        r#"
+maki.pack.add({
+  { src = "https://example.com/manual", name = "manual" },
+}, {
+  load = function() error("managed custom loader ran") end,
+})
+"#
+        .to_owned(),
+        None,
+    )
+    .unwrap();
+    let declared = host.declared_packages().unwrap();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &["manual".into()]);
+
+    let failures = host.load_declared_packages(&packages, &declared, &config);
+
+    assert!(failures.is_empty(), "got: {failures:?}");
+    let commands = host.command_reader().load();
+    assert_eq!(commands.commands.len(), 1);
+    assert_eq!(commands.commands[0].name.as_ref(), "/manual");
+}
+
+#[test]
+fn loaded_revision_lock_protects_modules_read_after_startup() {
+    const CURRENT: &str = "1111111111111111111111111111111111111111";
+    const STALE: &str = "2222222222222222222222222222222222222222";
+
+    let site = tempfile::TempDir::new().unwrap();
+    let stale_dir = maki_pack::paths::revision_dir(site.path(), "late_pack", STALE);
+    std::fs::create_dir_all(stale_dir.join("plugin")).unwrap();
+    std::fs::create_dir_all(stale_dir.join("lua")).unwrap();
+    std::fs::write(
+        stale_dir.join("plugin").join("init.lua"),
+        format!(
+            r#"
+maki.api.register_tool({{
+  name = "late_pack",
+  description = "Late module read.",
+  schema = {MINIMAL_SCHEMA},
+  audiences = {{ "main" }},
+  handler = function() return require("late").value end,
+}})
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        stale_dir.join("lua").join("late.lua"),
+        "return { value = 'late ok' }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(maki_pack::paths::revision_dir(
+        site.path(),
+        "late_pack",
+        CURRENT,
+    ))
+    .unwrap();
+    let mut lockfile = maki_pack::lockfile::Lockfile::default();
+    lockfile.record("late_pack", "https://example.com/late", CURRENT);
+    let revision_guard = Arc::new(
+        maki_pack::lock::Lock::acquire_shared(&maki_pack::paths::revision_lock(
+            site.path(),
+            "late_pack",
+            STALE,
+        ))
+        .unwrap(),
+    );
+    let packages = vec![maki_lua::DiscoveredPackage {
+        name: "late_pack".to_owned(),
+        dir: stale_dir.clone(),
+        eager: true,
+        requested: maki_lua::Requested::none(),
+        origin: maki_lua::Origin::Fetched {
+            src: "https://example.com/late".to_owned(),
+        },
+        revision_guard: Some(revision_guard),
+    }];
+    let config =
+        PluginsConfig::from_plugins_and_packages(Default::default(), &["late_pack".into()]);
+    let registry = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&registry)).unwrap();
+
+    assert!(host.load_packages(&packages, &config).is_empty());
+    drop(packages);
+    let manager = maki_pack::manager::Manager::new(site.path());
+    assert!(manager.prune(&lockfile).is_empty());
+    assert!(stale_dir.is_dir(), "a loaded revision must not be pruned");
+    assert_eq!(
+        exec_tool(&registry, "late_pack", serde_json::json!({})).unwrap(),
+        "late ok"
+    );
+
+    host.unload("late_pack").unwrap();
+    assert!(manager.prune(&lockfile).is_empty());
+    assert!(
+        !stale_dir.exists(),
+        "an unloaded stale revision can be pruned"
+    );
+}
+
+/// Builtins must still load when a package is installed. Packages once shared
+/// the builtin name list, which made `load_builtins` reject every one of them
+/// by name and fail startup outright.
+#[test]
+fn installed_package_does_not_break_builtin_loading() {
+    let site = site_with_package(
+        "start",
+        "demo_pack",
+        &[(
+            "init.lua",
+            r#"maki.api.register_command({ name = "/demo", handler = function() end })"#,
+        )],
+    );
+
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&config)
+        .expect("an installed package must not stop the builtins from loading");
+    assert!(host.load_packages(&found.packages, &config).is_empty());
+
+    assert!(reg.has("grep"), "builtin tools should still be registered");
+    let names: Vec<String> = host
+        .command_reader()
+        .load()
+        .commands
+        .iter()
+        .map(|c| c.name.to_string())
+        .collect();
+    assert!(names.iter().any(|n| n == "/demo"), "got: {names:?}");
+}
+
+/// Options for an installed package must reach the package, not be rejected as
+/// options for a plugin that does not exist.
+#[test]
+fn installed_package_may_take_options() {
+    let site = site_with_package(
+        "start",
+        "opt_pack",
+        &[(
+            "init.lua",
+            r#"
+local opts = maki.api.register_options({
+  depth = { type = "integer", desc = "Depth." },
+})
+if opts.depth == 3 then
+  maki.api.register_command({ name = "/depth", handler = function() end })
+end
+"#,
+        )],
+    );
+    let found = maki_lua::discover(site.path());
+
+    let mut plugins: HashMap<String, maki_config::PluginFileConfig> = HashMap::new();
+    let mut cfg = maki_config::PluginFileConfig::default();
+    cfg.opts.insert("depth".to_owned(), serde_json::json!(3));
+    plugins.insert("opt_pack".to_owned(), cfg);
+
+    let config = PluginsConfig::from_plugins_and_packages(plugins, &["opt_pack".to_owned()]);
+
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_builtins(&config)
+        .expect("package options must not be rejected as unknown plugin options");
+    assert!(host.load_packages(&found.packages, &config).is_empty());
+
+    assert!(
+        host.command_reader()
+            .load()
+            .commands
+            .iter()
+            .any(|command| command.name.as_ref() == "/depth")
+    );
+}
+
+/// If `lua/` itself links out of the package, its target must not become the
+/// sandbox root; otherwise everything under that target would be requireable.
+#[cfg(unix)]
+#[test]
+fn symlinked_lua_directory_is_not_used_as_the_module_root() {
+    let pkg = package_dir(&[("init.lua", r#"require("escaped")"#)]);
+
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    std::fs::write(elsewhere.path().join("escaped.lua"), "return {}\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), pkg.path().join("lua")).unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_package(
+            "linky",
+            pkg.path(),
+            maki_lua::PluginPermissions::trusted(),
+            Default::default(),
+        )
+        .expect_err("a lua/ directory pointing out of the package must not resolve modules");
+    assert!(err.to_string().contains("module not found"), "got: {err}");
+}
+
+/// An `opt/` package waits to be activated, so startup alone must not run it.
+#[test]
+fn discovered_opt_package_is_not_loaded_at_startup() {
+    let site = site_with_package(
+        "opt",
+        "lazy_pack",
+        &[(
+            "init.lua",
+            r#"maki.api.register_command({ name = "/lazy", handler = function() end })"#,
+        )],
+    );
+
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    assert!(host.load_packages(&found.packages, &config).is_empty());
+
+    assert_eq!(host.command_reader().load().commands.len(), 0);
+}
+
+/// Adds one `start` and one `opt` package to a site tree.
+fn site_with_two(start: (&str, &str), opt: (&str, &str)) -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().unwrap();
+    for (sub, name, source) in [("start", start.0, start.1), ("opt", opt.0, opt.1)] {
+        let dir = tmp.path().join("pack").join("vendor").join(sub).join(name);
+        std::fs::create_dir_all(dir.join("plugin")).unwrap();
+        std::fs::write(dir.join("plugin").join("init.lua"), source).unwrap();
+    }
+    tmp
+}
+
+fn discovered_config(found: &maki_lua::Discovery) -> (Vec<String>, PluginsConfig) {
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+    (names, config)
+}
+
+/// The whole startup order: load what starts eagerly, then apply whatever
+/// those loads recorded. `maki.packadd` only takes effect at the second step.
+fn activate_all(
+    host: &PluginHost,
+    found: &maki_lua::Discovery,
+    config: &PluginsConfig,
+) -> Vec<String> {
+    host.load_packages(&found.packages, config)
+}
+
+/// `maki.packadd` is the activation path for an `opt/` package. A `start`
+/// package that calls it must get the named package loaded in the same
+/// startup, not the next one, or its registrations never appear.
+#[test]
+fn packadd_from_a_start_package_activates_an_opt_package() {
+    let site = site_with_two(
+        ("waker_pack", r#"maki.packadd("lazy_pack")"#),
+        (
+            "lazy_pack",
+            r#"maki.api.register_command({ name = "/lazy", handler = function() end })"#,
+        ),
+    );
+
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let failures = activate_all(&host, &found, &config);
+    assert!(failures.is_empty(), "got: {failures:?}");
+
+    let snap = host.command_reader().load();
+    assert_eq!(
+        snap.commands.len(),
+        1,
+        "the activated package must have registered its command"
+    );
+    assert_eq!(snap.commands[0].name.as_ref(), "/lazy");
+}
+
+/// `maki.packadd` is on the maki table for every plugin, but only the startup
+/// drain reads what it records. A call after that drain would sit in the queue
+/// for the rest of the session with no error and no log, so it is refused.
+#[test]
+fn packadd_after_startup_reports_rather_than_queueing() {
+    let site = site_with_two(("waker_pack", ""), ("lazy_pack", ""));
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    assert!(
+        host.load_packages(&found.packages, &config).is_empty(),
+        "the start package must load"
+    );
+
+    let err = host
+        .load_source("late_plugin", r#"maki.packadd("lazy_pack")"#)
+        .expect_err("packadd must report once the startup drain is over");
+    assert!(
+        err.to_string().contains("already been loaded"),
+        "got: {err}"
+    );
+}
+
+/// A name that matches no installed package is reported. Doing nothing would
+/// leave the user with a package that never loads and no reason why.
+#[test]
+fn packadd_reports_a_name_that_is_not_installed() {
+    let site = site_with_two(
+        ("waker_pack", r#"maki.packadd("absent_pack")"#),
+        ("lazy_pack", ""),
+    );
+
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let failures = activate_all(&host, &found, &config);
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(failures[0].contains("absent_pack"), "got: {failures:?}");
+}
+
+/// A package the config disabled stays disabled. `packadd` must not be a way
+/// around `plugins.<name>.enabled = false`.
+#[test]
+fn packadd_cannot_activate_a_disabled_package() {
+    let site = site_with_two(
+        ("waker_pack", r#"maki.packadd("lazy_pack")"#),
+        (
+            "lazy_pack",
+            r#"maki.api.register_command({ name = "/lazy", handler = function() end })"#,
+        ),
+    );
+
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let mut plugins: HashMap<String, maki_config::PluginFileConfig> = HashMap::new();
+    plugins.insert(
+        "lazy_pack".to_owned(),
+        maki_config::PluginFileConfig {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    );
+    let config = PluginsConfig::from_plugins_and_packages(plugins, &names);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let failures = activate_all(&host, &found, &config);
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert_eq!(
+        host.command_reader().load().commands.len(),
+        0,
+        "a disabled package must not register anything"
+    );
+}
+
+/// A package that asks for nothing gets nothing. Without a `plugin.toml` the
+/// guarded APIs must refuse, so a downloaded package cannot reach the network
+/// or the environment just by being installed.
+#[test]
+fn package_without_manifest_cannot_use_guarded_apis() {
+    let site = site_with_package(
+        "start",
+        "greedy_pack",
+        &[(
+            "init.lua",
+            r#"
+local ok = pcall(function() return maki.env.config_dir() end)
+maki.api.register_command({
+  name = ok and "/allowed" or "/denied",
+  handler = function() end,
+})
+"#,
+        )],
+    );
+
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    assert!(host.load_packages(&found.packages, &config).is_empty());
+
+    let snap = host.command_reader().load();
+    assert_eq!(snap.commands.len(), 1);
+    assert_eq!(
+        snap.commands[0].name.as_ref(),
+        "/denied",
+        "a package requesting nothing must not reach maki.env"
+    );
+}
+
+/// The manifest is what a manual install is granted, so a package that asks
+/// for `fs_read` gets it without any further approval.
+#[test]
+fn manual_package_is_granted_what_its_manifest_requests() {
+    let site = site_with_package(
+        "start",
+        "asking_pack",
+        &[(
+            "init.lua",
+            r#"
+local ok = pcall(function() return maki.env.config_dir() end)
+maki.api.register_command({
+  name = ok and "/allowed" or "/denied",
+  handler = function() end,
+})
+"#,
+        )],
+    );
+    let pkg_dir = site
+        .path()
+        .join("pack")
+        .join("vendor")
+        .join("start")
+        .join("asking_pack");
+    std::fs::write(
+        pkg_dir.join("plugin.toml"),
+        "[permissions]\nfs_read = true\n",
+    )
+    .unwrap();
+
+    let found = maki_lua::discover(site.path());
+    let names: Vec<String> = found.packages.iter().map(|p| p.name.clone()).collect();
+    let config = PluginsConfig::from_plugins_and_packages(Default::default(), &names);
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    assert!(host.load_packages(&found.packages, &config).is_empty());
+
+    let snap = host.command_reader().load();
+    assert_eq!(snap.commands[0].name.as_ref(), "/allowed");
+}
+
+/// The manifest body and the fragment the warning has to name.
+fn floor_above_running_version() -> (String, String) {
+    let running = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+    let required = format!("{}.0.0", running.major + 1);
+    (format!("min_maki_version = {required:?}\n"), required)
+}
+
+fn malformed_floor() -> (String, String) {
+    (MALFORMED_FLOOR.to_owned(), FLOORED_PACKAGE.to_owned())
+}
+
+/// The version floor covers installed packages, not just `init.lua`: a package
+/// asking for a newer Maki is skipped with a warning, registers nothing, and
+/// leaves the packages loading beside it alone.
+#[test_case::test_case(floor_above_running_version ; "required version is newer")]
+#[test_case::test_case(malformed_floor ; "required version is not a string")]
+fn incompatible_package_is_skipped_and_its_sibling_still_loads(floor: fn() -> (String, String)) {
+    let (manifest, expected) = floor();
+    let site = site_with_package(
+        "start",
+        FLOORED_PACKAGE,
+        &[(
+            "init.lua",
+            r#"
+maki.api.register_command({ name = "/future", handler = function() end })
+maki.api.register_tool({
+  name = "future_tool",
+  description = "must never register",
+  schema = { type = "object", properties = {} },
+  handler = function() return "x" end,
+})
+"#,
+        )],
+    );
+    let start = site.path().join("pack").join("vendor").join("start");
+    std::fs::write(start.join(FLOORED_PACKAGE).join("plugin.toml"), manifest).unwrap();
+    let sibling = start.join(SIBLING_PACKAGE).join("plugin");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(
+        sibling.join("init.lua"),
+        r#"maki.api.register_command({ name = "/sibling", handler = function() end })"#,
+    )
+    .unwrap();
+
+    let found = maki_lua::discover(site.path());
+    let (_, config) = discovered_config(&found);
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let failures = host.load_packages(&found.packages, &config);
+
+    let warning = failures
+        .iter()
+        .find(|w| w.contains(SKIPPED_PLUGIN_WARNING))
+        .unwrap_or_else(|| panic!("no skip warning in {failures:?}"));
+    assert!(warning.contains(&expected), "{warning}");
+    assert_eq!(failures.len(), 1, "got: {failures:?}");
+    assert!(!reg.has("future_tool"));
+
+    let snap = host.command_reader().load();
+    let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
+    assert_eq!(names, vec!["/sibling"]);
+}
+
 #[test]
 fn unload_clears_commands() {
     let reg = fresh_registry();
@@ -2745,16 +4896,16 @@ fn unload_clears_commands() {
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
 
+/// `/tasks` and `/sessions` used to be Rust commands. The plugins that took
+/// them over have to keep the names, or the palette quietly loses a row.
 #[test]
-fn sessions_plugin_registers_commands() {
+fn builtin_plugins_register_their_commands() {
     let (_reg, host) = builtins_host();
     let snap = host.command_reader().load();
     let names: Vec<&str> = snap.commands.iter().map(|c| c.name.as_ref()).collect();
-    assert!(
-        names.contains(&"/sessions"),
-        "missing /sessions in {names:?}"
-    );
-    assert!(names.contains(&"/rename"), "missing /rename in {names:?}");
+    for command in BUILTIN_COMMANDS {
+        assert!(names.contains(command), "missing {command} in {names:?}");
+    }
 }
 
 #[test]
@@ -2904,7 +5055,7 @@ fn cancelled_bash_keeps_streamed_output_as_partial() {
         ctx.cancel = token;
         // The rtk probe costs up to two 2s job waits before the command even
         // starts: pointless here, and a flake risk under load.
-        ctx.config.no_rtk = true;
+        ctx.config.rtk = false;
         let input = json!({ "command": BASH_PARTIAL_CMD });
         result_tx
             .send(exec_with_ctx(&reg, "bash", input, &ctx))
@@ -3150,46 +5301,36 @@ fn user_plugin_with_fs_read_can_read_but_not_write() {
     assert!(result.contains("write=false"), "got: {result}");
 }
 
-#[test]
-fn builtin_plugin_has_all_permissions() {
+/// Locating maki's own directories, or a program on `$PATH`, answers where a
+/// file lives and never what the environment holds. `fs_read` is what these
+/// cost, and it is also what they need, so `env` stays the key to the process
+/// environment alone.
+#[test_case::test_case("maki.env.state_dir()" ; "state_dir")]
+#[test_case::test_case(r#"maki.fn.executable("ls")"# ; "executable")]
+fn location_queries_cost_fs_read(call: &str) {
+    const TOOL: &str = "location_test";
     let src = perm_tool_src(
-        "trusted_test",
-        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
-                local env_ok = pcall(function() maki.env.state_dir() end)
-                return "cwd=" .. tostring(cwd_ok) .. ",env=" .. tostring(env_ok)"#,
+        TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() {call} end)
+                return tostring(ok) .. ":" .. tostring(err)"#
+        ),
     );
-    let result = exec_tool_with_perms(
-        maki_lua::PluginPermissions::trusted(),
-        &src,
-        "trusted_test",
-        serde_json::json!({}),
-    )
-    .unwrap();
-    assert!(result.contains("cwd=true"), "got: {result}");
-    assert!(result.contains("env=true"), "got: {result}");
-}
 
-#[test]
-fn env_permission_guards_uv_and_env() {
-    let src = perm_tool_src(
-        "env_guard_test",
-        r#"local cwd_ok = pcall(function() maki.uv.cwd() end)
-                local home_ok = pcall(function() maki.uv.os_homedir() end)
-                local env_ok = pcall(function() maki.env.state_dir() end)
-                local exec_ok = pcall(function() maki.fn.executable("ls") end)
-                return "cwd=" .. tostring(cwd_ok) .. ",home=" .. tostring(home_ok) .. ",env=" .. tostring(env_ok) .. ",exec=" .. tostring(exec_ok)"#,
-    );
-    let result = exec_tool_with_perms(
+    let mut fs_read = maki_lua::PluginPermissions::denied();
+    fs_read.set(maki_lua::Permission::FsRead, true);
+    let granted = exec_tool_with_perms(fs_read, &src, TOOL, serde_json::json!({})).unwrap();
+    assert!(granted.starts_with("true"), "got: {granted}");
+
+    let refused = exec_tool_with_perms(
         maki_lua::PluginPermissions::denied(),
         &src,
-        "env_guard_test",
+        TOOL,
         serde_json::json!({}),
     )
     .unwrap();
-    assert!(result.contains("cwd=false"), "got: {result}");
-    assert!(result.contains("home=false"), "got: {result}");
-    assert!(result.contains("env=false"), "got: {result}");
-    assert!(result.contains("exec=false"), "got: {result}");
+    assert!(refused.contains(PERMISSION_DENIED_MSG), "got: {refused}");
+    assert!(refused.contains("fs_read"), "got: {refused}");
 }
 
 const PATH_FIELD_SCHEMA: &str = r#"{
@@ -3586,6 +5727,57 @@ fn interpreter_tools_gather_resolves_parallel_batch() {
     host.load_source("interp_gather_plugin", &src).unwrap();
     let out = exec_tool(&reg, "interp_gather", serde_json::json!({})).unwrap();
     assert_eq!(out, "A|B");
+}
+
+const NESTED_DEPTH_TOOL: &str = "nested_depth";
+const NESTED_DEPTH_BOTTOM: &str = "bottom";
+const NESTED_DEPTH_WEDGED: &str =
+    "nested call chain never replied: the in-flight gate charged a slot per level";
+const NESTED_DEPTH_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "nested_depth",
+    description = "dispatches itself one level deeper",
+    schema = {
+        type = "object",
+        properties = { depth = { type = "integer" } },
+        required = { "depth" },
+    },
+    audiences = { "main" },
+    handler = function(input, ctx)
+        if input.depth == 0 then return "bottom" end
+        local out, err = maki.agent.call_tool(ctx, "nested_depth", { depth = input.depth - 1 })
+        if err then return { llm_output = err, is_error = true } end
+        return out
+    end,
+})
+"#;
+
+/// Every level stays parked on its child, so a slot per level wedges the gate
+/// for good once the chain is longer than the cap. A nested call rides its
+/// caller's slot instead, which leaves the depth up to the callers.
+#[test]
+fn nested_calls_run_deeper_than_the_inflight_cap() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("nested_depth_plugin", NESTED_DEPTH_PLUGIN)
+        .unwrap();
+
+    let (done_tx, done_rx) = flume::bounded(1);
+    let worker_reg = Arc::clone(&reg);
+    std::thread::spawn(move || {
+        let out = exec_tool_in(
+            &worker_reg,
+            NESTED_DEPTH_TOOL,
+            json!({ "depth": MAX_INFLIGHT_TOOLS + 1 }),
+            Some(Arc::clone(&worker_reg)),
+        );
+        let _ = done_tx.send(out);
+    });
+
+    let out = poll_until(NESTED_DEPTH_WEDGED, || done_rx.try_recv().ok());
+
+    assert_eq!(out, Ok(NESTED_DEPTH_BOTTOM.to_owned()));
+    drop(host);
 }
 
 #[test]
@@ -4237,4 +6429,175 @@ mod read_tool_required_params {
             "offset beyond file should return empty, got: {out}"
         );
     }
+}
+
+#[test]
+fn jobwait_reentrant_self_wait_in_on_exit() {
+    let (reg, host) = builtins_host();
+    let session = maki_storage::id::MakiId::generate();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_self_wait_job",
+    description = "session job whose on_exit reenters jobwait on itself",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("sleep 1", {{
+            scope = {{ session = "{session}" }},
+            on_exit = function(id, code)
+                local ok, res = pcall(maki.fn.jobwait, id, 2000)
+                if not ok then
+                    error("self-wait errored: " .. tostring(res))
+                end
+                if res == nil then
+                    error("self-wait timed out")
+                end
+                if res.exit_code ~= code then
+                    error("self-wait code mismatch")
+                end
+            end,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_self_wait_job",
+    description = "outer wait like monitor_wait",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        if res == nil then
+            return {{ llm_output = "error: outer wait timed out", is_error = true }}
+        end
+        return "exit:" .. tostring(res.exit_code)
+    end,
+}})
+"#
+    );
+    host.load_source("selfwait", &src).unwrap();
+
+    exec_tool(&reg, "start_self_wait_job", json!({})).unwrap();
+    let out = exec_tool(&reg, "wait_self_wait_job", json!({})).unwrap();
+    assert_eq!(
+        out, "exit:0",
+        "reentrant self-wait must not poison the outer wait"
+    );
+    let after = exec_tool(&reg, "wait_self_wait_job", json!({})).unwrap();
+    assert!(
+        after.starts_with("exit:"),
+        "VM must stay usable, got: {after}"
+    );
+}
+
+#[test]
+fn jobwait_returns_after_session_end_kill() {
+    let (reg, host) = builtins_host();
+    let session = maki_storage::id::MakiId::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let parked_path = dir.path().join("parked");
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "wait_long_job",
+    description = "parks in jobwait until the session ends",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        -- jobwait checks the job's output channel out of the store, so only
+        -- a parked jobwait can run this callback. The marker is proof the
+        -- wait is really parked, where a sleep would just be a guess.
+        local id = maki.fn.jobstart("echo parked; exec sleep 30", {{
+            scope = {{ session = "{session}" }},
+            on_stdout = function() maki.fs.write("{parked}", "parked") end,
+        }})
+        local ok, res = pcall(maki.fn.jobwait, id, 25000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        if res == nil then
+            return {{ llm_output = "error: jobwait timed out", is_error = true }}
+        end
+        return "exit:" .. tostring(res.exit_code)
+    end,
+}})
+"#,
+        parked = parked_path.display(),
+    );
+    host.load_source("endkill", &src).unwrap();
+
+    let reg2 = Arc::clone(&reg);
+    let wait_handle =
+        std::thread::spawn(move || exec_tool(&reg2, "wait_long_job", json!({})).unwrap());
+    poll_until("jobwait never parked", || {
+        parked_path.exists().then_some(())
+    });
+    host.event_handle()
+        .end_sessions_blocking([session], SessionEndReason::Shutdown);
+    let out = wait_handle.join().expect("wait thread must not panic");
+    assert!(
+        out.starts_with("exit:"),
+        "parked jobwait must collect the exit of the killed job, got: {out}"
+    );
+}
+
+#[test]
+fn jobwait_callback_error_still_delivers_exit() {
+    let (reg, host) = builtins_host();
+    let session = maki_storage::id::MakiId::generate();
+    let src = format!(
+        r#"
+local job_id
+maki.api.register_tool({{
+    name = "start_boom_job",
+    description = "job whose on_stdout raises",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        job_id = maki.fn.jobstart("echo one; echo two; echo three", {{
+            scope = {{ session = "{session}" }},
+            on_stdout = function(_, line)
+                if line == "two" then
+                    error("boom on stdout")
+                end
+            end,
+        }})
+        return tostring(job_id)
+    end,
+}})
+maki.api.register_tool({{
+    name = "wait_boom_job",
+    description = "waits past the failing callback",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        local ok, res = pcall(maki.fn.jobwait, job_id, 10000)
+        if not ok then
+            return {{ llm_output = "error: " .. tostring(res), is_error = true }}
+        end
+        if res == nil then
+            return {{ llm_output = "error: timed out", is_error = true }}
+        end
+                return "exit:" .. tostring(res.exit_code) .. "|stdout:" .. tostring(res.stdout)
+    end,
+}})
+"#
+    );
+    host.load_source("boomjob", &src).unwrap();
+    exec_tool(&reg, "start_boom_job", json!({})).unwrap();
+    let out = exec_tool(&reg, "wait_boom_job", json!({})).unwrap();
+    assert!(
+        out.starts_with("exit:0"),
+        "a failing on_stdout must not swallow the exit, got: {out}"
+    );
+    let again = exec_tool(&reg, "wait_boom_job", json!({})).unwrap();
+    assert!(
+        again.starts_with("exit:"),
+        "VM must stay usable, got: {again}"
+    );
 }
