@@ -1,4 +1,4 @@
-# maki-mcp fork features
+# maki-dbdr fork features
 
 This file is the source of truth for what the fork adds on top of upstream maki.
 Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.

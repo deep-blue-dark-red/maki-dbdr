@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use std::time::Instant;
 
-pub(crate) const LOGO: &str = "maki (mcp fork)";
+pub(crate) const LOGO: &str = "maki (dbdr-fork)";
 const TAGLINE: &str = "the efficient coder";
 const UPDATE_HINT: &str = " run maki update to get v";
 const HELP_SEGMENTS: &[(&str, bool)] = &[

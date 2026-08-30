@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify that all maki-mcp fork features survived the last merge.
+# Verify that all maki-dbdr fork features survived the last merge.
 # Run after every `git merge upstream/main`.
 # Exits 0 if all checks pass, 1 if any fail.
 

@@ -340,7 +340,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    // ── maki-dbdr fork tests ───────────────────────────────────────────────────────
 
     #[test]
     fn test_resolved_export_path_cwd() {

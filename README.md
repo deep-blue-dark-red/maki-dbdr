@@ -101,19 +101,19 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 
 ### macOS / Linux: tagged release
 
-Download the archive for your platform from the [tagged releases](https://github.com/deep-blue-dark-red/maki-mcp/releases). The release workflow publishes:
+Download the archive for your platform from the [tagged releases](https://github.com/deep-blue-dark-red/maki-dbdr/releases). The release workflow publishes:
 
 * macOS Intel: `x86_64-apple-darwin`
 * macOS Apple Silicon: `aarch64-apple-darwin`
 * Linux x86_64: `x86_64-unknown-linux-musl`
 * Linux ARM64: `aarch64-unknown-linux-musl`
 
-For example, this installs the Apple Silicon build of `v0.4.12-mcp.1` into `~/.local/bin`:
+For example, this installs the Apple Silicon build of `v0.4.12-dbdr` into `~/.local/bin`:
 
 ```sh
-VERSION=v0.4.12-mcp.1
+VERSION=v0.4.12-dbdr
 TARGET=aarch64-apple-darwin
-curl -fL "https://github.com/deep-blue-dark-red/maki-mcp/releases/download/${VERSION}/maki-${VERSION}-${TARGET}.tar.gz" -o maki.tar.gz
+curl -fL "https://github.com/deep-blue-dark-red/maki-dbdr/releases/download/${VERSION}/maki-${VERSION}-${TARGET}.tar.gz" -o maki.tar.gz
 tar -xzf maki.tar.gz
 install -Dm755 maki ~/.local/bin/maki
 ```
@@ -123,8 +123,8 @@ Replace `TARGET` with the archive for your platform.
 ### Build from source
 
 ```sh
-git clone https://github.com/deep-blue-dark-red/maki-mcp.git
-cd maki-mcp
+git clone https://github.com/deep-blue-dark-red/maki-dbdr.git
+cd maki-dbdr
 cargo build --release
 sudo cp target/release/maki /usr/local/bin/maki
 ```

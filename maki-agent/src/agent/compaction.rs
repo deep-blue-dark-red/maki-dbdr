@@ -1118,7 +1118,7 @@ mod tests {
         );
     }
 
-    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    // ── maki-dbdr fork tests ───────────────────────────────────────────────────────
     #[test]
     fn compact_appends_length_constraint_to_system_prompt() {
         smol::block_on(async {

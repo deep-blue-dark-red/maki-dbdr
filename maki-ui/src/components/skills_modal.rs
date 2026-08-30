@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(desc, "does some things");
     }
 
-    // ── maki-mcp fork tests ───────────────────────────────────────────────────────
+    // ── maki-dbdr fork tests ───────────────────────────────────────────────────────
     #[test]
     fn test_find_project_ancestors_stops_at_git() {
         let temp = tempfile::TempDir::new().unwrap();

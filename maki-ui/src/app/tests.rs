@@ -1440,8 +1440,8 @@ fn overlay_blocks_ctrl_shortcuts(setup: fn(&mut App)) {
 fn splash_logo_shows_fork_branch() {
     assert_eq!(
         crate::splash::LOGO,
-        "maki (mcp fork)",
-        "logo should be 'maki (mcp fork)' on the maki-mcp branch"
+        "maki (dbdr-fork)",
+        "logo should be 'maki (dbdr-fork)' on the maki-dbdr branch"
     );
 }
 
@@ -4508,7 +4508,7 @@ fn goto_command_with_turn_number() {
     assert!(app.status_bar.flash_text().is_none());
 }
 
-// ── maki-mcp fork tests ───────────────────────────────────────────────────────
+// ── maki-dbdr fork tests ───────────────────────────────────────────────────────
 
 #[test]
 fn export_command_opens_picker() {
