@@ -2,6 +2,17 @@
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
+## Fork features
+
+This fork adds:
+
+* Interactive settings, export, goto, skills, plugins, checkpoint, rewind, and rename workflows.
+* A flat `user.config` file, configurable keybindings, richer session listings, and user-editable system prompts.
+* Token and duration statistics, API wire logging with the `mlog` viewer, and TensorX provider support.
+* Kanagawa, Rose Pine, and daltonized themes, plus fork-specific benchmarks and agent tests.
+
+See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation details.
+
 ## Features
 
 ### Context efficiency
