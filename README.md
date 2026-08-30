@@ -11,7 +11,7 @@ This fork adds:
 * Skills Manager for choosing which skills enter the system prompt. `create-skill` ships by default.
 * Plugin Manager for selecting Lua plugins on new sessions, including the `create-plugin` plugin.
 * Major render-performance improvements, measured at under 3% of one M4 core while idle.
-* Dynamic Claude Code-inspired status-bar rendering without spinners, optional Pi-inspired session rates (`PP/s`, `TG/s`, and `CR/s`), and improved thinking-mode display and formatting.
+* Dynamic Claude Code-inspired status-bar rendering without spinners, optional Pi-inspired session rates (`PP/s`, `TG/s`, and `CR/s`), thinking-mode display formatting, optimized Markdown performance, and throttled rendering in unfocused mode.
 * Export to Markdown or clipboard Markdown, `@` file selection, configurable keybindings, and Claude-style two-tone pending-task indicators.
 * Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary.
 * `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
