@@ -6,10 +6,27 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 This fork adds:
 
-* Interactive settings, export, goto, skills, plugins, checkpoint, rewind, and rename workflows.
-* A flat `user.config` file, configurable keybindings, richer session listings, and user-editable system prompts.
-* Token and duration statistics, API wire logging with the `mlog` viewer, and TensorX provider support.
-* Kanagawa, Rose Pine, and daltonized themes, plus fork-specific benchmarks and agent tests.
+* `/stats` with per-API usage, tool-call and duration tracking, cache-hit/miss transactions, and itemized per-call cost.
+* Strict OpenRouter provider pinning so models with multiple providers keep warm prompt caches.
+* Skills Manager for choosing which skills enter the system prompt. `create-skill` ships by default.
+* Plugin Manager for selecting Lua plugins on new sessions, including the `create-plugin` plugin.
+* Major render-performance improvements, measured at under 3% of one M4 core while idle.
+* Export to Markdown or clipboard Markdown, `@` file selection, configurable keybindings, and Claude-style two-tone pending-task indicators.
+* Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary.
+* `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
+* `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
+
+### Skills Manager
+
+![Skills Manager](./screenshots/skills-manager.png)
+
+Choose skill folders, enable or exclude individual skills, and create new skills from the TUI.
+
+### Plugin Manager
+
+![Plugin Manager](./screenshots/plugin-manager.png)
+
+Enable or disable Lua plugins for new sessions, and inspect each plugin's source and status.
 
 See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation details.
 
