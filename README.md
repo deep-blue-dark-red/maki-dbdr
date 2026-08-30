@@ -87,63 +87,35 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 
 ## Installation
 
-### Linux / macOS
+### macOS / Linux: tagged release
+
+Download the archive for your platform from the [tagged releases](https://github.com/deep-blue-dark-red/maki-mcp/releases). The release workflow publishes:
+
+* macOS Intel: `x86_64-apple-darwin`
+* macOS Apple Silicon: `aarch64-apple-darwin`
+* Linux x86_64: `x86_64-unknown-linux-musl`
+* Linux ARM64: `aarch64-unknown-linux-musl`
+
+For example, this installs the Apple Silicon build of `v0.4.12-mcp.1` into `~/.local/bin`:
 
 ```sh
-# Download and read the script first (don't blindly trust shell scripts).
-curl -fsSL https://maki.sh/install.sh -o install.sh
-cat install.sh
-
-# Then run.
-chmod +x install.sh && sh install.sh
+VERSION=v0.4.12-mcp.1
+TARGET=aarch64-apple-darwin
+curl -fL "https://github.com/deep-blue-dark-red/maki-mcp/releases/download/${VERSION}/maki-${VERSION}-${TARGET}.tar.gz" -o maki.tar.gz
+tar -xzf maki.tar.gz
+install -Dm755 maki ~/.local/bin/maki
 ```
 
-One-liner:
+Replace `TARGET` with the archive for your platform.
+
+### Build from source
 
 ```sh
-curl -fsSL https://maki.sh/install.sh | sh
+git clone https://github.com/deep-blue-dark-red/maki-mcp.git
+cd maki-mcp
+cargo build --release
+sudo cp target/release/maki /usr/local/bin/maki
 ```
-
-Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
-
-### Windows (PowerShell)
-
-```powershell
-# Download and read the script first (don't blindly trust remote scripts).
-irm https://maki.sh/install.ps1 -OutFile install.ps1
-Get-Content install.ps1
-
-# Then run.
-.\install.ps1
-```
-
-One-liner:
-
-```powershell
-irm https://maki.sh/install.ps1 | iex
-```
-
-### Windows (Git Bash)
-
-```sh
-curl -fsSL https://maki.sh/install.sh | sh
-```
-
-Both install to `%LOCALAPPDATA%\maki` and add it to your user PATH. Override with `MAKI_INSTALL_DIR` / `$env:MAKI_INSTALL_DIR`.
-
-### Living on the edge (main branch)
-
-```sh
-cargo install --locked --git https://github.com/tontinton/maki.git maki
-```
-
-### With Nix
-
-```sh
-nix run github:tontinton/maki
-```
-
-Or download a pre-built binary from [GitHub Releases](https://github.com/tontinton/maki/releases/latest).
 
 ## ACP
 
