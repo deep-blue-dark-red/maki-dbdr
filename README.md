@@ -20,7 +20,7 @@ This fork adds:
 
 This fork maintains maki/main's feature parity and merges from main often, typically every tagged release.
 
-Q: why a fork and not a PR? Easier, more control.
+Q: why a fork (and not a PR?) Libertarian leanings; forks are better. Feel free to fork.
 
 ### Render changes
 
