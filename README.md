@@ -2,7 +2,7 @@
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
-## Maki-dbdr Fork Features
+## maki-dbdr Fork Features
 
 This fork adds:
 
@@ -10,15 +10,21 @@ This fork adds:
 * Strict OpenRouter provider pinning so models with multiple providers keep warm prompt caches.
 * Skills Manager for choosing which skills enter the system prompt. `create-skill` ships by default.
 * Plugin Manager for selecting Lua plugins on new sessions, including the `create-plugin` plugin.
-* Major render-performance improvements, measured at under 3% of one M4 core while idle.
+* Render performance optimizations and main-loop polling optimizations. 
 * Dynamic Claude Code-inspired status-bar rendering without spinners, optional Pi-inspired session rates (`PP/s`, `TG/s`, and `CR/s`), thinking-mode display formatting, optimized Markdown performance, and throttled rendering in unfocused mode.
-* Export to Markdown or clipboard Markdown, `@` file selection, configurable keybindings, and Claude-style two-tone pending-task indicators.
-* Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary.
+* `/export` Export to Markdown, session-name and date file to folder or clipboard. Same with json. `@` fuzzy file selection, configurable keybindings (ghostty style, `~/.config/maki/user.config`), and Claude-style two-tone pending-task indicators.
+* Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary. 
 * `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
-* An optimized default system prompt, benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks.
+* Menu-consistency. New items `/q` / `quit`  maps to main's  `/exit`, and `/resume` maps to  `/session`.
+* Benchmarked optimized default system prompt, replacing the maki-main default; We on GLM 5.2, the Qwen 3.6 family and Deepseek V4 family on SWE and DeepSWE (public portions). 
+   - The default maki system prompt is 1. not editable, hidden, and while is carefully handwritten and well-meaning prompt, scores poorly: it confuses models from its structure. Note e.g. 'index' tool is rarely used with it.
+   - We used model guidance (Fable, Qwen GLM) then then benchmarked various suggestions across the two benchmarks and picked the best scoring average. We did a similar approach to compaction prompt.
+   - You can edit your system-prompt effortlessly from `/system_prompt` (in $EDITOR), its not hidden in code now. 
+   
+This fork maintains maki/main's feature parity and merges from main often, typically every tagged release.
 
-This fork maintains maki/main's feature parity and merges from main often; often main catches up or implements something this fork has materialy already done; we merge towards main in such cases.
+Q: why a fork (and not a PR?) Libertarian leanings; forks are better. Feel free to fork.
 
 ### Render changes
 
@@ -28,21 +34,25 @@ This fork maintains maki/main's feature parity and merges from main often; often
 
 ![Per-call API statistics](./screenshots/stats.png)
 
-Inspect every turn, request, tool duration, cache hit, provider, token rate, and itemized cost.
+Inspect every API call and tool use duration, metadata, whether there was a cache hit, who the provider was, PP/s and TG/s statistics and itemized cost for the current session.
 
-### Skills Manager
+### Skills Manager `/skills`
 
 ![Skills Manager](./screenshots/skills-manager.png)
 
 Choose skill folders, enable or exclude individual skills, and create new skills from the TUI.
+Skill Testing Architecture: See `SKILL_TESTING.md` detailing the built-in lua skill-tester; this is always invoked when the create-skill is used to generate and install a new skill.
 
-### Plugin Manager
+### Plugin Manager `/plugins`
 
 ![Plugin Manager](./screenshots/plugin-manager.png)
 
 Enable or disable Lua plugins for new sessions, and inspect each plugin's source and status.
 
 See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation details.
+
+---
+# Maki 
 
 ## Features
 
