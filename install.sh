@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="tontinton/maki"
+REPO="deep-blue-dark-red/maki-dbdr"
 BINARY="maki"
 
 github_curl() {

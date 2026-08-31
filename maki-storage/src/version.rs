@@ -6,7 +6,7 @@ use isahc::config::{Configurable, VersionNegotiation};
 use isahc::{AsyncReadResponseExt, ReadResponseExt, Request};
 
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
-const RELEASES_URL: &str = "https://api.github.com/repos/tontinton/maki/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/deep-blue-dark-red/maki-dbdr/releases/latest";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
