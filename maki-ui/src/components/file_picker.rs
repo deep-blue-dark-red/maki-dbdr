@@ -805,11 +805,11 @@ mod tests {
         inject_file(&picker, MAIN_PATH);
         done_tx.send(Walk::Listed).unwrap();
 
-        let deadline = Instant::now() + CONVERGE_TIMEOUT;
-        while picker.tick() != (Dirty::NO, None) {
-            assert!(Instant::now() < deadline, "the picker never stopped");
-            std::thread::yield_now();
-        }
+        // A quiet tick alone is not settled: nucleo's worker can lag the main
+        // thread, reporting no changes while still matching. Wait for the walk
+        // to end AND the matcher to go idle before demanding stillness.
+        tick_until(&mut picker, |s| s.walk != Walk::Running && !s.matching)
+            .expect("the picker never settled");
 
         assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
         assert_eq!(picker.cadence(), Cadence::IDLE);
