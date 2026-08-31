@@ -37,6 +37,7 @@ Inspect every turn, request, tool duration, cache hit, provider, token rate, and
 ![Skills Manager](./screenshots/skills-manager.png)
 
 Choose skill folders, enable or exclude individual skills, and create new skills from the TUI.
+Skill Testing Architecture: [SKILL_TESTING.md] overviews the lua skill-tester that is invoked when the. skill-creator  is used to make a new skill; all new skills are tested by the current agent. 
 
 ### Plugin Manager
 
