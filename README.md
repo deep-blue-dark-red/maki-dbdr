@@ -18,7 +18,7 @@ This fork adds:
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
 * Menu-consistency. New items `/q` / `quit`  maps to main's  `/exit`, and `/resume` maps to  `/session`.
 * Benchmarked optimized default system prompt, replacing the maki-main default; We on GLM 5.2, the Qwen 3.6 family and Deepseek V4 family on SWE and DeepSWE (public portions). 
-   - The default maki system prompt is 1. not editable, hidden, and while is carefully handwritten and well-meaning prompt, scores poorly by confuses models from its structure. Note e.g. 'index' is rarely used.
+   - The default maki system prompt is 1. not editable, hidden, and while is carefully handwritten and well-meaning prompt, scores poorly: it confuses models from its structure. Note e.g. 'index' tool is rarely used with it.
    - We used model guidance (Fable, Qwen GLM) then then benchmarked various suggestions across the two benchmarks and picked the best scoring average. We did a similar approach to compaction prompt.
    - You can edit your system-prompt effortlessly from /system_prompt, its not hidden in code now. 
    
