@@ -661,6 +661,20 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    /// `set_known_models` replaces a provider's whole discovery list, so every
+    /// test that seeds `ollama` writes to the same slot. Without serialising
+    /// them, one test's models replace another's between its seed and its
+    /// assert, and whichever lost the race fails.
+    static OLLAMA_DISCOVERY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn ollama_discovery_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A test that fails while holding the lock poisons it; the rest should
+        // still run serialised rather than all fail behind it.
+        OLLAMA_DISCOVERY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
         ModelPolicy::new(
             &allowed
@@ -1096,6 +1110,8 @@ mod tests {
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
 
+        let _guard = ollama_discovery_lock();
+
         let model_id = "test-discovered-context-window-model";
         let expected_window: u32 = 131_072;
 
@@ -1168,6 +1184,7 @@ mod tests {
     #[test_case(Some(PAID_PRICING),       false ; "priced_is_not_free")]
     #[test_case(None,                     false ; "unknown_price_is_not_free")]
     fn discovered_pricing_decides_free(pricing: Option<ModelPricing>, expected: bool) {
+        let _guard = ollama_discovery_lock();
         let model_id = "test-discovered-free-model";
         model_registry::set_known_models(
             "ollama",

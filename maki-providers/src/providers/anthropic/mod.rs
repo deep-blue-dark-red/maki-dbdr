@@ -456,9 +456,10 @@ impl Provider for Anthropic {
 
     fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
         Box::pin(async {
-            Ok(self.key_pool.as_ref().is_some_and(|p| {
-                p.rotate_key_header(&self.auth, API_KEY_HEADER, str::to_string)
-            }))
+            Ok(self
+                .key_pool
+                .as_ref()
+                .is_some_and(|p| p.rotate_key_header(&self.auth, API_KEY_HEADER, str::to_string)))
         })
     }
 

@@ -640,6 +640,7 @@ mod tests {
 
     #[test]
     fn provider_for_slug_unknown_returns_error() {
+        let _guard = crate::providers::catalog::catalog_test_lock();
         let tmp = tempfile::tempdir().unwrap();
         crate::providers::catalog::warm_empty_catalog_for_tests(maki_storage::StateDir::from_path(
             tmp.path().to_path_buf(),

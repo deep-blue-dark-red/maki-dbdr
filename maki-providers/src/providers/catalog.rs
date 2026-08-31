@@ -793,14 +793,36 @@ impl Provider for CatalogProvider {
     }
 }
 
+/// Serialises a seeding test's write against every other seeder, so the
+/// catalog it installed is still the one in place when it asserts.
+#[cfg(test)]
+static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take this in any test that seeds the catalog, and hold it across the
+/// assertions that read it back.
+#[cfg(test)]
+pub(crate) fn catalog_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A test that fails while holding the lock poisons it; the rest should
+    // still run serialised rather than all fail behind it.
+    CATALOG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub(crate) fn seed_catalog_for_tests(index: schema::CatalogIndex, state_dir: StateDir) {
-    let _ = SHARED_CATALOG.set(Mutex::new(CatalogData::from_index(
-        index,
-        false,
-        &state_dir,
-        std::collections::HashSet::new(),
-    )));
+    let data = CatalogData::from_index(index, false, &state_dir, std::collections::HashSet::new());
+    // `SHARED_CATALOG` is a `OnceLock`, so `set` only ever succeeded for the
+    // first test to seed; every later one silently kept that test's catalog
+    // and asserted against the wrong models. Replacing the contents works no
+    // matter who got there first.
+    let slot = SHARED_CATALOG.get_or_init(|| {
+        Mutex::new(CatalogData::from_index(
+            HashMap::new(),
+            false,
+            &state_dir,
+            std::collections::HashSet::new(),
+        ))
+    });
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = data;
 }
 
 #[cfg(test)]
@@ -1477,6 +1499,7 @@ mod tests {
     #[test_case("free-model", true; "free_opencode_model_is_free")]
     #[test_case("paid-output-model", false; "free_input_paid_output_is_not_free")]
     fn model_is_free_uses_catalog_definition(model_id: &str, expected: bool) {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         let models = HashMap::from([
             (

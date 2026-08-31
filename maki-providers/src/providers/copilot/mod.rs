@@ -617,11 +617,9 @@ impl Copilot {
         if let Some(info) = reasoning_info {
             apply_responses_reasoning(&mut body, thinking, model, &effort_dialect(&info));
         }
-        let resolved = super::ResolvedAuth::new(
-            SLUG,
-            copilot_headers(&auth, Some("conversation-agent")),
-        )?
-        .with_base_url(Some(auth.endpoint.clone()));
+        let resolved =
+            super::ResolvedAuth::new(SLUG, copilot_headers(&auth, Some("conversation-agent")))?
+                .with_base_url(Some(auth.endpoint.clone()));
         responses::do_stream(
             &self.client,
             model,
