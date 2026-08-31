@@ -36,14 +36,14 @@ Q: why a fork (and not a PR?) Libertarian leanings; forks are better. Feel free 
 
 Inspect every API call and tool use duration, metadata, whether there was a cache hit, who the provider was, PP/s and TG/s statistics and itemized cost for the current session.
 
-### Skills Manager
+### Skills Manager `/skills`
 
 ![Skills Manager](./screenshots/skills-manager.png)
 
 Choose skill folders, enable or exclude individual skills, and create new skills from the TUI.
 Skill Testing Architecture: See `SKILL_TESTING.md` detailing the built-in lua skill-tester; this is always invoked when the create-skill is used to generate and install a new skill.
 
-### Plugin Manager
+### Plugin Manager `/plugins`
 
 ![Plugin Manager](./screenshots/plugin-manager.png)
 
