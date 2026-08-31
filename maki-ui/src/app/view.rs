@@ -480,6 +480,8 @@ impl App {
             contexts.push(KeybindContext::FormInput);
         } else if self.queue.focus().is_some() {
             contexts.push(KeybindContext::QueueFocus);
+        } else if self.task_picker.is_open() {
+            contexts.push(KeybindContext::TaskPicker);
         } else if self.rewind_picker.is_open() {
             contexts.push(KeybindContext::RewindPicker);
         } else if self.theme_picker.is_open() {

@@ -442,6 +442,9 @@ mod tests {
         use maki_agent::ToolOutput;
         use std::sync::Arc;
 
+        // Swaps the process-global palette, so it has to hold every reader out.
+        let _guard = theme::test_write_lock();
+
         let output = Arc::new(ToolOutput::ReadCode {
             path: "f.rs".into(),
             start_line: 1,

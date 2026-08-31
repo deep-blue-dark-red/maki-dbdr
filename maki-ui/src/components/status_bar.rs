@@ -612,6 +612,7 @@ mod tests {
             last_turn_stats: None,
             show_token_stats: false,
             cache_miss_warning: None,
+            yolo: false,
         };
         terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
         crate::components::buffer_text(terminal.backend().buffer())

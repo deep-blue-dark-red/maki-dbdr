@@ -13,13 +13,19 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+C` | Quit / clear input |
-| `Ctrl+H` | Show keybindings |
-| `Ctrl+F` | Search messages |
-| `Ctrl+S` | File picker |
-| `Ctrl+O` | Open plan in editor |
-| `Ctrl+T` | Toggle plan panel |
-| `Ctrl+M` | Model picker |
+| configurable | Quit / clear input |
+| configurable | Show keybindings |
+| configurable | Next / previous task chat |
+| configurable | Search messages |
+| configurable | File picker |
+| configurable | Toggle verbose mode |
+| configurable | Open sessions list |
+| configurable | Switch to next session |
+| configurable | Switch to previous session |
+| configurable | Open plan in editor |
+| configurable | Toggle plan panel |
+| configurable | Open tasks |
+| configurable | Model picker |
 
 ## Editing
 
@@ -29,24 +35,24 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | `Shift+Enter` / `Ctrl+Enter` / `Ctrl+J` / `Alt+Enter` | Newline |
 | `Tab` | Toggle mode |
 | `/command` | Open command palette |
-| `Ctrl+W` | Delete word backward |
+| configurable | Delete word backward |
 | `Alt+←` / `Alt+→` | Move word left / right |
-| `Ctrl+A` | Jump to start of line |
+| configurable | Jump to start of line |
 | `Home` / `End` | Jump to start/end of line |
-| `Ctrl+U` / `Ctrl+D` | Scroll half page up / down |
-| `Ctrl+E` | Jump to end of line |
-| `Ctrl+G` | Scroll to top |
-| `Ctrl+B` | Scroll to bottom |
-| `Ctrl+Q` | Pop queue |
+| configurable | Scroll half page up / down |
+| configurable | Jump to end of line |
+| configurable | Scroll to top |
+| configurable | Scroll to bottom |
+| configurable | Pop queue |
 | `Esc Esc` | Rewind |
-| `Alt+O` | Edit input in external editor |
+| configurable | Edit input in external editor |
 
 ### macOS-specific
 
 | Key | Action |
 |-----|--------|
 | `Ctrl+Del` / `⌥Del` | Delete word forward |
-| `Ctrl+K` | Delete to end of line |
+| configurable | Delete to end of line |
 
 ## While Streaming
 
@@ -100,7 +106,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Task Picker, Rewind Picker, Goto Picker, Theme Picker, Settings Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 

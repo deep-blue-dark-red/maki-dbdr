@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 21 built-in tools in this reference (19 on by default, 2 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 22 built-in tools in this reference (21 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -71,7 +71,7 @@ Prefer this over edit when making multiple changes to the same file.
 | `edits` | array | yes | Array of edit operations to apply sequentially |
 | `path` | string | yes | Absolute path to the file |
 
-### `edit_lines` <span class="badge badge-optin">opt-in</span> {#edit_lines}
+### `edit_lines` {#edit_lines}
 
 Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
 
@@ -142,7 +142,7 @@ Run independent tool calls in parallel (1-25). Not for dependent or output-filte
 
 ### `code_execution` {#code_execution}
 
-Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency via asyncio.gather. Libs: re, asyncio, sys, os, json. No imports, no network. 30s default timeout.
+Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. No imports, no network. 30s default timeout.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -202,9 +202,9 @@ Load a task-specific playbook by name.
 |-----------|------|----------|-------------|
 | `name` | string | no | Skill name; omit to list available skills |
 
-### `skill_test` *(lua plugin)*
+### `skill_test` {#skill_test}
 
-Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings.
+Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings. Failures include elapsed time, exit code, and captured stderr/stdout tails; per-test `timeout_ms` overrides the 60s default.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

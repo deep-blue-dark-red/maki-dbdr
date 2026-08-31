@@ -623,6 +623,10 @@ mod tests {
     /// screen for the rest of the session.
     #[test]
     fn the_code_memo_follows_the_theme_and_ignores_the_width() {
+        // Installs themes outright, so it has to hold every reader out: a
+        // swap landing between two of the reads below repaints the palette
+        // underneath them.
+        let _guard = theme::test_write_lock();
         const WIDTHS: [u16; 3] = [NARROW_WIDTH, TEST_WIDTH, WIDE_WIDTH];
         theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
         let under_a = WIDTHS.map(render_code);

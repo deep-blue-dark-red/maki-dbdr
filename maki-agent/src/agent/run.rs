@@ -15,13 +15,13 @@ use super::history::{History, sanitize_cancelled_history};
 use super::instructions::LoadedInstructions;
 use super::streaming::{StreamError, estimate_input_tokens, json_byte_len, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
+use crate::RunLedger;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::tools::{
     Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
 };
-use crate::RunLedger;
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
@@ -450,7 +450,12 @@ impl<'h> Agent<'h> {
         self.emit_turn_complete(&response, cost, &self.turn_state.turns[turn_idx])?;
         let usage = response.usage;
         self.total_usage += usage;
-        self.ledger.add(usage, cost, self.model.list_cost(&usage, self.opts.clamped(&self.model).fast));
+        self.ledger.add(
+            usage,
+            cost,
+            self.model
+                .list_cost(&usage, self.opts.clamped(&self.model).fast),
+        );
         self.context_size = usage.total_input();
 
         if has_tools {
@@ -986,7 +991,11 @@ mod tests {
                 history,
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
-                tools: RequestTools::assembled(serde_json::json!([]), &AgentConfig::default(), &default_model()),
+                tools: RequestTools::assembled(
+                    serde_json::json!([]),
+                    &AgentConfig::default(),
+                    &default_model(),
+                ),
             },
         );
         (agent, event_rx)
@@ -1160,7 +1169,7 @@ mod tests {
             let captured = Arc::clone(&provider.captured_tools);
             let mut history = History::new(Vec::new());
             let (agent, _event_rx) = make_agent(provider, &mut history);
-            let mut agent = agent.with_mcp(Some(crate::mcp::stub_session(&[(
+            let mut agent = agent.with_mcp(Some(crate::mcp::test_support::stub_session(&[(
                 "srv.fetch_issue",
                 "Fetch a GitHub issue",
             )])));

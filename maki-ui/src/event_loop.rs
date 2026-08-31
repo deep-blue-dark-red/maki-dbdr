@@ -23,12 +23,10 @@ use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use maki_config::{ModelPolicy, UiConfig};
-use maki_lua::session_snapshot::{
-    MODE_BUILD, MODE_PLAN, SessionQueueSnapshot, SessionSnapshot,
-};
+use maki_lua::session_snapshot::{MODE_BUILD, MODE_PLAN, SessionQueueSnapshot, SessionSnapshot};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
-    TaskRequest, UiAction, UiReply,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionEndReason,
+    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -97,6 +95,7 @@ pub struct EventLoopParams {
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
 }
@@ -390,6 +389,7 @@ pub(crate) struct EventLoop<'t> {
     warn_rx: flume::Receiver<String>,
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
+    ui_attachment: UiAttachment,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -502,9 +502,13 @@ impl<'t> EventLoop<'t> {
             keymap_reader,
             hint_reader,
             ui_action_rx,
+            ui_attachment,
             lua_event_handle,
             model_policy,
         } = params;
+        // A `/reload` generation inherits the handles of the one before it,
+        // so every loop has to claim the UI back for itself.
+        ui_attachment.attach();
 
         // Apply the config theme before the warmup thread spawns, or warmup
         // could bake the syntax palette from the old theme. Only the
@@ -596,6 +600,7 @@ impl<'t> EventLoop<'t> {
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             ui_action_rx,
+            ui_attachment,
             _model_fetch_task: bg.task,
         })
     }
@@ -1635,6 +1640,22 @@ impl<'t> EventLoop<'t> {
             elapsed
         };
         let exit = self.sessions[self.focused].app.exit_request;
+        // The loop already stopped draining `UiAction`, so say so before the
+        // handlers run. Dropping the receiver does not, since the Lua runtime
+        // holds one of its own, and a handler touching the UI would then park
+        // until the shared deadline, taking every later tab's `SessionEnd`
+        // down with it.
+        self.ui_attachment.detach();
+        // `/reload` hands these same sessions to the next generation, so
+        // their handlers must not hear that the process is quitting.
+        let reason = match exit {
+            ExitRequest::Reload => SessionEndReason::Reload,
+            _ => SessionEndReason::Shutdown,
+        };
+        self.ctx
+            .lua_event_handle
+            .end_sessions_blocking(self.sessions.iter().map(SessionRuntime::id), reason);
+        let session_end_ms = lap();
         if let Some(ref h) = self.ctx.mcp_handle {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
@@ -1669,6 +1690,7 @@ impl<'t> EventLoop<'t> {
         }
         let storage_drain_ms = lap();
         info!(
+            session_end_ms,
             kill_mcp_ms,
             save_sessions_ms,
             join_agents_ms,
@@ -1729,6 +1751,10 @@ mod tests {
     fn done_event() -> AgentEvent {
         AgentEvent::Done {
             usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
             num_turns: 1,
             reason: DoneReason::EndTurn,
         }

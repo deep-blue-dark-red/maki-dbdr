@@ -6,9 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::Sender;
 use maki_config::ToolKey;
-use maki_providers::{
-    AgentError, ContentBlock, Message, Role, StopReason, TokenUsage, add_cost,
-};
+use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage, add_cost};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;

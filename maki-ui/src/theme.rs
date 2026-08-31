@@ -146,14 +146,6 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
         toml: include_str!("themes/carbonfox.toml"),
     },
     ThemeEntry {
-        name: "dark_daltonized",
-        toml: include_str!("themes/dark_daltonized.toml"),
-    },
-    ThemeEntry {
-        name: "dark_daltonized_v2",
-        toml: include_str!("themes/dark_daltonized_v2.toml"),
-    },
-    ThemeEntry {
         name: "catppuccin_frappe",
         toml: include_str!("themes/catppuccin_frappe.toml"),
     },
@@ -172,6 +164,10 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     ThemeEntry {
         name: "dark_daltonized",
         toml: include_str!("themes/dark_daltonized.toml"),
+    },
+    ThemeEntry {
+        name: "dark_daltonized_v2",
+        toml: include_str!("themes/dark_daltonized_v2.toml"),
     },
     ThemeEntry {
         name: "dracula",

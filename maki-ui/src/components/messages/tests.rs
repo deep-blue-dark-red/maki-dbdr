@@ -727,8 +727,8 @@ fn win_view_clamps_a_restored_offset_past_the_end() {
     panel.restore_scroll(u16::MAX, true);
 
     let view = panel.win_view();
-    assert_eq!(view.scroll_top, panel.max_scroll());
-    assert_eq!(view.line_count, LINES);
+    assert_eq!(view.scroll_top, u32::from(panel.max_scroll()));
+    assert_eq!(view.line_count, u32::from(LINES));
     assert_eq!(view.height, HEIGHT);
     assert!(view.auto_scroll);
 }
@@ -2273,6 +2273,8 @@ fn drain_highlight_worker(panel: &mut MessagesPanel) {
 /// straight back in with no test to catch it.
 #[test]
 fn theme_switch_repaints_highlighted_code() {
+    // Swaps the process-global palette, so it has to hold every reader out.
+    let _guard = theme::test_write_lock();
     theme::set(theme::load_by_name("dracula").unwrap());
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_start(start("t1", "read"));

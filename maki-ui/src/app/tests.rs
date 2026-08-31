@@ -29,6 +29,7 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RESEARCH_NAME: &str = "research";
 const TASK_ID: &str = "task1";
 const SUB_TOOL_ID: &str = "sub_t1";
 const TOOL_OUTPUT_LINE: &str = "hello from the subagent";
@@ -161,6 +162,25 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
         subagent: None,
         run_id,
     }))
+}
+
+pub(crate) fn end_turn(app: &mut App) {
+    app.update(done_event());
+}
+
+pub(crate) fn start_subagent(app: &mut App, id: &str, name: &str) {
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "x".into() },
+        id,
+        Some(name),
+    ));
+}
+
+pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
+    app.update(agent_msg(AgentEvent::SubagentHistory {
+        tool_use_id: id.into(),
+        messages: vec![],
+    }));
 }
 
 fn done() -> AgentEvent {
@@ -606,12 +626,12 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     app.update(Msg::Key(key(KeyCode::Enter)))
 }
 
-fn cancel_app(app: &mut App) {
+pub(crate) fn cancel_app(app: &mut App) {
     app.last_esc = Some(Instant::now());
     app.update(Msg::Key(key(KeyCode::Esc)));
 }
 
-fn error_app(app: &mut App) {
+pub(crate) fn error_app(app: &mut App) {
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
@@ -1181,7 +1201,7 @@ fn cancel_resets_all_chats_and_indices() {
     assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
-fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
+pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         id: id.into(),
         tool: "task".into(),
@@ -1261,13 +1281,9 @@ fn streaming_app() -> App {
     app
 }
 
-fn app_with_subagent_id(id: &str) -> App {
+pub(crate) fn app_with_subagent_id(id: &str) -> App {
     let mut app = streaming_app();
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "x".into() },
-        id,
-        Some("research"),
-    ));
+    start_subagent(&mut app, id, RESEARCH_NAME);
     app
 }
 

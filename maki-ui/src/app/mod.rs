@@ -1961,7 +1961,8 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::new(
+        let mut chat = Chat::subagent(
+            id,
             subagent.name.clone(),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),

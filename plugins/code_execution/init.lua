@@ -49,6 +49,14 @@ async def gather(*calls):
     return results
 ]]):format(ERROR_PREFIX)
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
+-- MCP names and schemas already sit in the tool array (or the tool_search
+-- catalog), so point at those instead of repeating them here.
+local MCP_NOTE =
+  "\nMCP tools are callable too, with the arguments their definitions declare. Hyphens become underscores (`srv__get-docs` is `srv__get_docs`).\n"
+local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
+-- `alias` covers hyphens; what is left is a name no substitution can fix, like
+-- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
+local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local WORKFLOW_TOOLS_NOTE =
   "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
@@ -160,7 +168,7 @@ local function interpreter_tools(tools, audience, workflow)
     for _, a in ipairs(t.audiences) do
       aud[a] = true
     end
-    if t.enabled and aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
+    if aud[audience] and (aud.interpreter or (workflow and aud.workflow)) then
       t.workflow_only = not aud.interpreter
       out[#out + 1] = t
     end
@@ -226,6 +234,9 @@ local function describe(dctx)
   if has_workflow_only then
     parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
   end
+  if dctx.mcp then
+    parts[#parts + 1] = MCP_NOTE
+  end
   return table.concat(parts)
 end
 
@@ -276,12 +287,28 @@ local function handler(input, ctx)
     ctx:finish(cut(reason))
   end)
 
+  -- Registry, MCP and host tools in one list, already filtered by
+  -- `disabled_tools`, each entry carrying the audience of the tool a call to
+  -- that name would really reach.
+  local callable, callable_err = maki.agent.callable_tools(ctx)
+  if callable_err then
+    return { llm_output = CALLABLE_TOOLS_ERR .. callable_err, is_error = true }
+  end
+
   local tools = {}
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools({ config = config }), ctx:audience(), ctx:workflow())) do
-    local name = t.name
-    local call_opts = t.workflow_only and {} or { timeout = timeout }
-    tools[name] = function(tool_input)
-      return maki.agent.call_tool(ctx, name, tool_input, call_opts)
+  for _, t in ipairs(interpreter_tools(callable, ctx:audience(), ctx:workflow())) do
+    local bind, name = t.alias or t.name, t.name
+    if bind:match(PY_IDENTIFIER) then
+      tools[bind] = function(tool_input)
+        if t.workflow_only then
+          return maki.agent.call_tool(ctx, name, tool_input, {})
+        end
+        -- The script clock stops while a tool call is awaited, so an explicit
+        -- longer timeout on the call has to win over the script budget.
+        local explicit = type(tool_input) == "table" and tonumber(tool_input.timeout) or nil
+        local deadline = math.max(timeout, explicit or 0)
+        return maki.agent.call_tool(ctx, name, tool_input, { timeout = deadline })
+      end
     end
   end
 

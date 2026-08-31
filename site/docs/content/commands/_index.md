@@ -17,8 +17,9 @@ Type `/` in the input box to open the command palette.
 | `/checkpoint` | Insert a summary checkpoint without discarding history |
 | `/new` | Start a new session |
 | `/help` | Show keybindings |
+| `/tasks` | Show subagent tasks and jump between their transcripts |
 | `/usage` | Show token usage breakdown |
-| `/queue` | Remove items from queue |
+| `/stats` | Show per-turn stats for this session |
 | `/queue` | Remove items from queue |
 | `/model` | Switch model |
 | `/theme` | Switch color theme |

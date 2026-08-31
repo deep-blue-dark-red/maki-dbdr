@@ -248,7 +248,9 @@ end
 -- Collapse whitespace and keep only the last n chars, for inline diagnostics.
 local function tail_oneline(s, n)
   s = (s or ""):gsub("%s+", " ")
-  if #s <= n then return s end
+  if #s <= n then
+    return s
+  end
   return "…" .. s:sub(-n)
 end
 
@@ -257,10 +259,12 @@ end
 local function run_one_test(maki_bin, skill_body, tc)
   local cmd = maki_bin
     .. " --print --yolo --output-format json"
-    .. " --append-system-prompt " .. shell_quote(skill_body)
-    .. " --no-plugins"  -- don't load plugins in the subprocess; plain LLM response
+    .. " --append-system-prompt "
+    .. shell_quote(skill_body)
+    .. " --no-plugins" -- don't load plugins in the subprocess; plain LLM response
     .. " --max-turns 1"
-    .. " " .. shell_quote(tc.prompt)
+    .. " "
+    .. shell_quote(tc.prompt)
 
   local stdout_parts, stderr_parts = {}, {}
   local done = false
@@ -279,7 +283,7 @@ local function run_one_test(maki_bin, skill_body, tc)
     end,
   })
 
-  local deadline = tonumber(tc.timeout_ms) or 60000  -- per-test override, default 60s
+  local deadline = tonumber(tc.timeout_ms) or 60000 -- per-test override, default 60s
   local t0 = os.time()
   local waited = maki.fn.jobwait(id, deadline)
   local elapsed = os.time() - t0
@@ -288,35 +292,45 @@ local function run_one_test(maki_bin, skill_body, tc)
 
   if not waited or not done then
     maki.fn.jobstop(id)
-    return nil, string.format(
-      "timeout after %ds (subprocess killed before exit) | stderr: %s | stdout: %s",
-      math.floor(deadline / 1000),
-      tail_oneline(stderr_s, 300),
-      tail_oneline(stdout_s, 300)
-    ), elapsed
+    return nil,
+      string.format(
+        "timeout after %ds (subprocess killed before exit) | stderr: %s | stdout: %s",
+        math.floor(deadline / 1000),
+        tail_oneline(stderr_s, 300),
+        tail_oneline(stdout_s, 300)
+      ),
+      elapsed
   end
 
   local raw = stdout_s
   local data, parse_err = maki.json.decode(raw)
   if not data then
-    return nil, string.format(
-      "json parse failed after %ds (exit_code=%s): %s | stderr: %s | stdout: %s",
-      elapsed, tostring(exit_code), tostring(parse_err),
-      tail_oneline(stderr_s, 300),
-      tail_oneline(raw, 300)
-    ), elapsed
+    return nil,
+      string.format(
+        "json parse failed after %ds (exit_code=%s): %s | stderr: %s | stdout: %s",
+        elapsed,
+        tostring(exit_code),
+        tostring(parse_err),
+        tail_oneline(stderr_s, 300),
+        tail_oneline(raw, 300)
+      ),
+      elapsed
   end
 
   if data.is_error then
-    return nil, string.format(
-      "maki error after %ds (exit_code=%s): %s | stderr: %s",
-      elapsed, tostring(exit_code), (data.result or "unknown"),
-      tail_oneline(stderr_s, 300)
-    ), elapsed
+    return nil,
+      string.format(
+        "maki error after %ds (exit_code=%s): %s | stderr: %s",
+        elapsed,
+        tostring(exit_code),
+        (data.result or "unknown"),
+        tail_oneline(stderr_s, 300)
+      ),
+      elapsed
   end
 
   local text = data.result or ""
-  local tl   = text:lower()
+  local tl = text:lower()
 
   local failures = {}
   for _, pat in ipairs(tc.expect_contains or {}) do
@@ -339,106 +353,123 @@ local function find_maki_bin()
   local result = maki.fn.jobwait(id, 2000)
   if result and result.exit_code == 0 then
     local p = (result.stdout or ""):match("^%s*(.-)%s*$")
-    if p ~= "" then return p end
+    if p ~= "" then
+      return p
+    end
   end
   -- Fall back to the release build next to the repo root.
   local cwd = maki.uv.cwd() or "."
   for _, ancestor in ipairs({ cwd, unpack(maki.fs.parents(cwd)) }) do
     local candidate = maki.fs.joinpath(ancestor, "target/release/maki")
-    if maki.fs.metadata(candidate) then return candidate end
+    if maki.fs.metadata(candidate) then
+      return candidate
+    end
     local git = maki.fs.joinpath(ancestor, ".git")
-    if maki.fs.metadata(git) then break end
+    if maki.fs.metadata(git) then
+      break
+    end
   end
   return "maki"
 end
 
 if has_project_skills() then
-maki.api.register_tool({
-  name        = "skill_test",
-  kind        = "fetch",
-  description = "Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings. Failures include elapsed time, exit code, and captured stderr/stdout tails; per-test `timeout_ms` overrides the 60s default.",
+  maki.api.register_tool({
+    name = "skill_test",
+    kind = "fetch",
+    description = "Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings. Failures include elapsed time, exit code, and captured stderr/stdout tails; per-test `timeout_ms` overrides the 60s default.",
 
-  schema = {
-    type = "object",
-    properties = {
-      skill = { type = "string", description = "Skill name to test", required = true },
+    schema = {
+      type = "object",
+      properties = {
+        skill = { type = "string", description = "Skill name to test", required = true },
+      },
     },
-  },
-  permission_scopes = "skill",
+    permission = "run",
+    permission_scopes = "skill",
 
-  header = function(input)
-    return "skill_test: " .. (input.skill or "?")
-  end,
+    header = function(input)
+      return "skill_test: " .. (input.skill or "?")
+    end,
 
-  handler = function(input, ctx)
-    local skill_name = input.skill
-    if not skill_name then return "error: skill is required" end
-
-    local skills = discover_skills()
-    local skill  = skills[skill_name]
-    if not skill then
-      return NOT_FOUND .. skill_name .. build_skill_list(skills)
-    end
-
-    local raw = maki.fs.read(skill.location)
-    if not raw then return "error: cannot read " .. skill.location end
-    local fm, body = parse_frontmatter(raw)
-
-    local tests = fm and fm.tests
-    if not tests or #tests == 0 then
-      return "no tests defined in " .. skill.location
-        .. "\n\nAdd a `tests:` array to the SKILL.md frontmatter:\n\n"
-        .. "```yaml\ntests:\n  - prompt: \"...\"\n    expect_contains:\n      - \"...\"\n```"
-    end
-
-    local maki_bin = find_maki_bin()
-    local results  = {}
-    local n_pass   = 0
-
-    for i, tc in ipairs(tests) do
-      local res, err, elapsed = run_one_test(maki_bin, body, tc)
-      if err then
-        results[#results + 1] = { i = i, prompt = tc.prompt or "?", err = err, elapsed = elapsed }
-      elseif res.passed then
-        n_pass = n_pass + 1
-        results[#results + 1] = { i = i, prompt = tc.prompt, passed = true, elapsed = res.elapsed }
-      else
-        results[#results + 1] = {
-          i = i, prompt = tc.prompt,
-          passed = false, failures = res.failures, response = res.response, elapsed = res.elapsed,
-        }
+    handler = function(input, ctx)
+      local skill_name = input.skill
+      if not skill_name then
+        return "error: skill is required"
       end
-    end
 
-    local total   = #tests
-    local summary = string.format("## %s: %d/%d passed\n", skill_name, n_pass, total)
-    local lines   = { summary }
-
-    for _, r in ipairs(results) do
-      if r.err then
-        lines[#lines + 1] = string.format(
-          "**[%d] ERROR** (%ds) — %s\n```\n%s\n```\n",
-          r.i, r.elapsed or -1, r.prompt, r.err
-        )
-      elseif r.passed then
-        lines[#lines + 1] = string.format("**[%d] PASS** (%ds) — %s\n", r.i, r.elapsed or -1, r.prompt)
-      else
-        local fl = table.concat(r.failures, "\n- ")
-        lines[#lines + 1] = string.format(
-          "**[%d] FAIL** (%ds) — %s\n- %s\n\nFull response:\n```\n%s\n```\n",
-          r.i, r.elapsed or -1, r.prompt, fl,
-          (r.response or ""):sub(1, 800)
-        )
+      local skills = discover_skills()
+      local skill = skills[skill_name]
+      if not skill then
+        return NOT_FOUND .. skill_name .. build_skill_list(skills)
       end
-    end
 
-    local out = table.concat(lines, "\n")
+      local raw = maki.fs.read(skill.location)
+      if not raw then
+        return "error: cannot read " .. skill.location
+      end
+      local fm, body = parse_frontmatter(raw)
 
-    return {
-      llm_output = out,
-      body       = ToolView.restore(out, { max_lines = 40, keep = "head" }),
-      is_error   = (n_pass < total),
-    }
-  end,
-})
+      local tests = fm and fm.tests
+      if not tests or #tests == 0 then
+        return "no tests defined in "
+          .. skill.location
+          .. "\n\nAdd a `tests:` array to the SKILL.md frontmatter:\n\n"
+          .. '```yaml\ntests:\n  - prompt: "..."\n    expect_contains:\n      - "..."\n```'
+      end
+
+      local maki_bin = find_maki_bin()
+      local results = {}
+      local n_pass = 0
+
+      for i, tc in ipairs(tests) do
+        local res, err, elapsed = run_one_test(maki_bin, body, tc)
+        if err then
+          results[#results + 1] = { i = i, prompt = tc.prompt or "?", err = err, elapsed = elapsed }
+        elseif res.passed then
+          n_pass = n_pass + 1
+          results[#results + 1] = { i = i, prompt = tc.prompt, passed = true, elapsed = res.elapsed }
+        else
+          results[#results + 1] = {
+            i = i,
+            prompt = tc.prompt,
+            passed = false,
+            failures = res.failures,
+            response = res.response,
+            elapsed = res.elapsed,
+          }
+        end
+      end
+
+      local total = #tests
+      local summary = string.format("## %s: %d/%d passed\n", skill_name, n_pass, total)
+      local lines = { summary }
+
+      for _, r in ipairs(results) do
+        if r.err then
+          lines[#lines + 1] =
+            string.format("**[%d] ERROR** (%ds) — %s\n```\n%s\n```\n", r.i, r.elapsed or -1, r.prompt, r.err)
+        elseif r.passed then
+          lines[#lines + 1] = string.format("**[%d] PASS** (%ds) — %s\n", r.i, r.elapsed or -1, r.prompt)
+        else
+          local fl = table.concat(r.failures, "\n- ")
+          lines[#lines + 1] = string.format(
+            "**[%d] FAIL** (%ds) — %s\n- %s\n\nFull response:\n```\n%s\n```\n",
+            r.i,
+            r.elapsed or -1,
+            r.prompt,
+            fl,
+            (r.response or ""):sub(1, 800)
+          )
+        end
+      end
+
+      local out = table.concat(lines, "\n")
+
+      return {
+        llm_output = out,
+        body = ToolView.restore(out, { max_lines = 40, keep = "head" }),
+        is_error = (n_pass < total),
+      }
+    end,
+  })
 end

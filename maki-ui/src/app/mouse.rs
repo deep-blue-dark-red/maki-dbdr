@@ -1,9 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::clipboard::CopyResult;
-use crate::selection::{
-    self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone,
-};
+use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 

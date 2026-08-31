@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_int;
 use std::future::Future;
 use std::panic::catch_unwind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::ptr;
 use std::rc::Rc;
@@ -15,16 +15,16 @@ use std::time::{Duration, Instant};
 use event_listener::Event;
 
 use include_dir::Dir;
+use maki_agent::SessionEndReason;
 use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
-use maki_agent::SessionEndReason;
-use maki_storage::id::MakiId;
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_storage::id::MakiId;
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
     ffi,
@@ -39,20 +39,21 @@ use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
-use crate::api::slot::{LayeredTools, SlotStore, host_slot_name, run_host_chain};
+use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission,
 };
 use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
-use crate::api::util::command::{LuaCommandReader, LuaCommandWriter, UiAction};
+use crate::api::util::command::{
+    LuaCommandReader, LuaCommandWriter, UiAction, UiAttachment, install_ui_attachment,
+};
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::LuaCtx;
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
-use crate::hook::SlotHook;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -63,7 +64,7 @@ const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
 const HANDLER_TIMEOUT_MSG: &str = "timeout";
-const MAX_INFLIGHT_TOOLS: usize = 64;
+pub const MAX_INFLIGHT_TOOLS: usize = 64;
 /// Log a tool call's gate wait when it exceeds this. Gate waits mean the
 /// concurrent-tool cap is hit, which only happens under heavy parallelism;
 /// below the threshold the wait is too small to matter for diagnosis.
@@ -137,6 +138,89 @@ pub struct EndSession {
     pub wait: Option<(Instant, flume::Sender<()>)>,
 }
 
+/// One source file of a plugin.
+///
+/// A bundled plugin has exactly one. An external package has one per
+/// `plugin/*.lua`, and they share a single owner and a single environment, so
+/// what one registers the next can see.
+#[derive(Debug)]
+pub struct LoadChunk {
+    /// Names the chunk in Lua errors, so a failure points at the file the user
+    /// wrote rather than at the package.
+    pub name: String,
+    pub source: String,
+}
+
+impl LoadChunk {
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+        }
+    }
+}
+
+/// Everything a load needs besides the code itself.
+///
+/// One value rather than a row of positional arguments: it travels unchanged
+/// from the caller through the request channel into the runtime, and the two
+/// package-only fields would otherwise be `None, false` at every other site.
+#[derive(Clone)]
+pub struct LoadContext {
+    pub plugin_dir: Option<PathBuf>,
+    pub permissions: PluginPermissions,
+    pub opts: PluginOpts,
+    /// Shared lock on the revision directory being loaded, held until the
+    /// owner is dropped so a prune cannot delete code that is still running.
+    /// `None` for anything that is not a managed package checkout.
+    pub revision_guard: Option<Arc<maki_pack::lock::Lock>>,
+    /// Whether this owner is a package, which is what `pack.get` reports as
+    /// active.
+    pub package: bool,
+}
+
+impl LoadContext {
+    /// A load with no package behind it: a builtin, a config file, or a
+    /// single plugin file.
+    pub fn plain(plugin_dir: Option<PathBuf>, permissions: PluginPermissions) -> Self {
+        Self {
+            plugin_dir,
+            permissions,
+            opts: PluginOpts::default(),
+            revision_guard: None,
+            package: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigScope {
+    Global,
+    Project,
+    Named(String),
+}
+
+impl ConfigScope {
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Self::Global => "global/init.lua",
+            Self::Project => "project/init.lua",
+            Self::Named(name) => name,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConfigLoad<'a> {
+    store: &'a ConfigStore,
+    scope: &'a ConfigScope,
+}
+
+enum PluginLoad<'a> {
+    Chunks(&'a [LoadChunk]),
+    Function { function: Function, argument: Table },
+}
+
 /// One firing of a host-owned slot, as the call being filtered described it.
 pub(crate) struct HookRun {
     pub slot: String,
@@ -170,12 +254,22 @@ pub enum Request {
     },
     /// Fire `SessionEnd` for one session, then reap the jobs it owned.
     EndSession(EndSession),
+    /// Takes the package operations Lua recorded, leaving the queue empty.
+    TakePackOps {
+        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
+    },
+    /// Closes the queue and hands over whatever is still in it.
+    ///
+    /// Both halves in one message on purpose: a Lua task can record an
+    /// activation between a read and a separate close, and closing without
+    /// taking would strand it in a queue nobody reads again.
+    SealPackOps {
+        reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
+    },
     LoadSource {
         name: Arc<str>,
-        source: String,
-        plugin_dir: Option<PathBuf>,
-        permissions: PluginPermissions,
-        opts: PluginOpts,
+        chunks: Vec<LoadChunk>,
+        context: LoadContext,
         reply: flume::Sender<LoadResult>,
     },
     CallTool {
@@ -212,7 +306,7 @@ pub enum Request {
     },
     RunInitLua {
         source: String,
-        source_name: String,
+        scope: ConfigScope,
         plugin_dir: Option<PathBuf>,
         reply: flume::Sender<Result<Option<RawConfig>, PluginError>>,
     },
@@ -229,6 +323,16 @@ pub enum Request {
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
+    },
+    /// Packages `init.lua` declared. Read after the init files have run, since
+    /// that is when the declared set is complete.
+    CollectPackages {
+        reply: flume::Sender<Vec<crate::api::pack::Declared>>,
+    },
+    RunPackLoader {
+        declared: crate::api::pack::Declared,
+        context: LoadContext,
+        reply: flume::Sender<LoadResult>,
     },
     Shutdown,
     RestoreToolAsync {
@@ -609,9 +713,75 @@ fn queue_codegen(queue: &CodegenQueue, func: &Function) {
     }
 }
 
+/// Runs `f` against the package declarations `init.lua` built up.
+///
+/// Every reader goes through here: the store is app data behind a mutex, and
+/// each site that spelled that lookup out by hand was another place to get the
+/// missing-store case or the poisoned lock wrong.
+fn with_packs<R: Default>(
+    lua: &Lua,
+    f: impl FnOnce(&mut crate::api::pack::PackDeclarations) -> R,
+) -> R {
+    let Some(store) = lua.app_data_ref::<crate::api::pack::PackStore>() else {
+        return R::default();
+    };
+    let mut declarations = store.lock().expect("pack declarations");
+    f(&mut declarations)
+}
+
+fn module_io_error(modname: &str, path: &Path, error: &std::io::Error) -> mlua::Error {
+    mlua::Error::runtime(format!(
+        "require '{modname}': cannot read {}: {error}",
+        path.display()
+    ))
+}
+
+fn sandbox_escape(modname: &str) -> mlua::Error {
+    mlua::Error::runtime(format!("require: '{modname}' outside sandbox"))
+}
+
+/// The directory `require` searches.
+///
+/// `dir` is always resolved, so every later comparison sees one spelling. A
+/// config file's `lua/` is the user's own tree and is searched as given; a
+/// package is downloaded, and git carries symlinks, so a package root is
+/// `sandboxed` and every hit under it must still resolve inside `dir`.
+struct RequireRoot {
+    dir: PathBuf,
+    sandboxed: bool,
+}
+
+impl RequireRoot {
+    fn trusted(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            sandboxed: false,
+        }
+    }
+
+    fn sandboxed(plugin_dir: &Path) -> Option<Self> {
+        let dir = plugin_dir.join("lua").canonicalize().ok()?;
+        let root = plugin_dir
+            .canonicalize()
+            .unwrap_or_else(|_| plugin_dir.to_path_buf());
+        if !dir.starts_with(&root) {
+            tracing::warn!(
+                plugin_dir = %plugin_dir.display(),
+                resolved = %dir.display(),
+                "plugin lua dir escapes the plugin; require() searches nothing"
+            );
+            return None;
+        }
+        Some(Self {
+            dir,
+            sandboxed: true,
+        })
+    }
+}
+
 struct ModuleLoader {
     bundled: BundledModules,
-    lua_dir: Option<PathBuf>,
+    require_root: Option<RequireRoot>,
     env: Table,
     codegen: CodegenQueue,
     loaded: Table,
@@ -622,9 +792,10 @@ impl ModuleLoader {
     /// Bundled modules are tried first, so a plugin cannot shadow
     /// `maki.truncate` and friends with a file of its own.
     fn plugin_source(&self, rel_path: &str, modname: &str) -> Result<Option<String>, mlua::Error> {
-        let Some(dir) = self.lua_dir.as_ref() else {
+        let Some(root) = self.require_root.as_ref() else {
             return Ok(None);
         };
+        let dir = &root.dir;
         let normalized = dir
             .join(rel_path)
             .components()
@@ -639,11 +810,28 @@ impl ModuleLoader {
                 acc
             });
         if !normalized.starts_with(dir) {
-            return Err(mlua::Error::runtime(format!(
-                "require: '{modname}' outside sandbox"
-            )));
+            return Err(sandbox_escape(modname));
         }
-        Ok(std::fs::read_to_string(&normalized).ok())
+        // External packages are downloaded, and git carries symlinks, so the
+        // lexical fold above is not enough: a link inside the package can still
+        // point out of it. Resolve the real path and re-check.
+        //
+        // Only an absent file is a miss. An unreadable one, a symlink loop, or
+        // a file that is not UTF-8 is reported, because reporting it as
+        // "module not found" sends the user looking for a name they can see.
+        let resolved = match std::fs::canonicalize(&normalized) {
+            Ok(resolved) => resolved,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(module_io_error(modname, &normalized, &e)),
+        };
+        if root.sandboxed && !resolved.starts_with(dir) {
+            return Err(sandbox_escape(modname));
+        }
+        match std::fs::read_to_string(&resolved) {
+            Ok(source) => Ok(Some(source)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(module_io_error(modname, &resolved, &e)),
+        }
     }
 
     fn bind(&self, chunk: Chunk<'_>, modname: &str) -> Result<Function, mlua::Error> {
@@ -656,21 +844,36 @@ impl ModuleLoader {
     /// Bundled modules load as bytecode from the shared cache. Plugin files
     /// load as source, so Luau reports syntax errors against the file the user
     /// wrote.
+    ///
+    /// Both forms Neovim accepts are tried, `<mod>.lua` before
+    /// `<mod>/init.lua`. Every bundled candidate is tried before any plugin
+    /// file, so a package still cannot shadow a bundled module.
     fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
-        let rel_path = modname.replace('.', "/") + ".lua";
-        let func = match self.bundled.bytecode(&rel_path)? {
-            Some(bytecode) => self.bind(
-                lua.load(bytecode.as_slice()).set_mode(ChunkMode::Binary),
-                modname,
-            )?,
-            None => {
-                let Some(source) = self.plugin_source(&rel_path, modname)? else {
-                    return Err(mlua::Error::runtime(format!(
-                        "require '{modname}': module not found"
-                    )));
-                };
-                self.bind(lua.load(source.as_str()), modname)?
+        let base = modname.replace('.', "/");
+        let candidates = [format!("{base}.lua"), format!("{base}/init.lua")];
+
+        let mut func = None;
+        for rel_path in &candidates {
+            if let Some(bytecode) = self.bundled.bytecode(rel_path)? {
+                func = Some(self.bind(
+                    lua.load(bytecode.as_slice()).set_mode(ChunkMode::Binary),
+                    modname,
+                )?);
+                break;
             }
+        }
+        if func.is_none() {
+            for rel_path in &candidates {
+                if let Some(source) = self.plugin_source(rel_path, modname)? {
+                    func = Some(self.bind(lua.load(source.as_str()), modname)?);
+                    break;
+                }
+            }
+        }
+        let Some(func) = func else {
+            return Err(mlua::Error::runtime(format!(
+                "require '{modname}': module not found"
+            )));
         };
         queue_codegen(&self.codegen, &func);
         func.call(())
@@ -1515,6 +1718,10 @@ struct PluginOwner {
     /// What this load granted the plugin. Kept past the load so a slot layer
     /// can be weighed against the authority of each call it filters.
     permissions: PluginPermissions,
+    /// Shared lock on the revision directory this owner runs from, if any.
+    /// Held until the owner is dropped so a prune cannot delete code that is
+    /// still running.
+    revision_guard: Option<Arc<maki_pack::lock::Lock>>,
 }
 
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
@@ -1583,6 +1790,7 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
+        lua.set_app_data(crate::api::pack::PackStore::default());
         lua.set_app_data(AutocmdStore::default());
         let layered: Arc<LayeredTools> = Arc::default();
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
@@ -1664,10 +1872,11 @@ impl LuaRuntime {
             .unwrap_or(0)
     }
 
-    fn drop_plugin_keys(&mut self, name: &str) {
+    fn drop_plugin_keys(&mut self, name: &str) -> Option<Arc<maki_pack::lock::Lock>> {
         self.warm_tools.borrow_mut().clear();
         with_jobs(&self.lua, |store| {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
+            store.detach_plugin_callbacks(&self.lua, name);
         });
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
@@ -1678,7 +1887,9 @@ impl LuaRuntime {
         if let Some(mut store) = self.lua.app_data_mut::<SlotStore>() {
             store.clear_plugin(name);
         }
+        let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
+            revision_guard = owner.revision_guard;
             for (_, tk) in owner.tools {
                 if let Err(e) = self.lua.remove_registry_value(tk.handler) {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
@@ -1732,6 +1943,7 @@ impl LuaRuntime {
                 }
             }
         }
+        revision_guard
     }
 
     async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
@@ -1836,24 +2048,9 @@ impl LuaRuntime {
     }
 
     fn discard_pending(&mut self, tools: Vec<PendingTool>) {
-        for t in tools {
-            if let Err(e) = self.lua.remove_registry_value(t.handler_key) {
-                tracing::warn!(error = %e, "failed to drop lua handler key on rollback");
-            }
-            if let Some(sk) = t.header_key
-                && let Err(e) = self.lua.remove_registry_value(sk)
-            {
-                tracing::warn!(error = %e, "failed to drop lua header key on rollback");
-            }
-            if let Some(sk) = t.permission.and_then(|p| p.scopes.callback_key())
-                && let Err(e) = self.lua.remove_registry_value(sk)
-            {
-                tracing::warn!(error = %e, "failed to drop lua permission_scopes key on rollback");
-            }
-            if let Some(sk) = t.describe_key
-                && let Err(e) = self.lua.remove_registry_value(sk)
-            {
-                tracing::warn!(error = %e, "failed to drop lua describe key on rollback");
+        for key in tools.into_iter().flat_map(PendingTool::registry_keys) {
+            if let Err(e) = self.lua.remove_registry_value(key) {
+                tracing::warn!(error = %e, "failed to drop lua registry key on rollback");
             }
         }
     }
@@ -1861,7 +2058,7 @@ impl LuaRuntime {
     fn build_env(
         &self,
         maki: mlua::Table,
-        require_root: Option<PathBuf>,
+        require_root: Option<RequireRoot>,
     ) -> Result<mlua::Table, mlua::Error> {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
@@ -1882,11 +2079,11 @@ impl LuaRuntime {
     fn create_require_fn(
         &self,
         env: &mlua::Table,
-        require_root: Option<PathBuf>,
+        require_root: Option<RequireRoot>,
     ) -> Result<Function, mlua::Error> {
         let loader = ModuleLoader {
             bundled: self.bundled.clone(),
-            lua_dir: require_root.map(|r| r.canonicalize().unwrap_or(r)),
+            require_root,
             env: env.clone(),
             codegen: self.codegen_queue.clone(),
             loaded: self.lua.create_table()?,
@@ -1919,12 +2116,17 @@ impl LuaRuntime {
     async fn load_source(
         &mut self,
         name: Arc<str>,
-        source: &str,
-        plugin_dir: Option<PathBuf>,
-        permissions: &PluginPermissions,
-        opts: PluginOpts,
-        config_store: Option<&ConfigStore>,
+        load: PluginLoad<'_>,
+        context: LoadContext,
+        config: Option<ConfigLoad<'_>>,
     ) -> LoadResult {
+        let LoadContext {
+            plugin_dir,
+            permissions,
+            opts,
+            revision_guard,
+            package,
+        } = context;
         let map_err = |e: mlua::Error| PluginError::Lua {
             plugin: name.to_string(),
             source: e,
@@ -1940,48 +2142,78 @@ impl LuaRuntime {
         // Scoped to this load so a failed load simply drops its rules; only a
         // successful load commits them to the store.
         let pending_rules: PendingRules = Arc::default();
+        let pack_ops_checkpoint = with_packs(&self.lua, |packs| packs.pending.len());
 
-        let require_root = plugin_dir.as_ref().map(|d| d.join("lua"));
+        let require_root = plugin_dir.as_ref().and_then(|dir| match config {
+            Some(_) => Some(RequireRoot::trusted(dir.join("lua"))),
+            None => RequireRoot::sandboxed(dir),
+        });
         let maki = create_maki_global(
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
             Arc::clone(&name),
             self.ui_action_tx.clone(),
-            permissions,
+            &permissions,
             Arc::clone(&opts),
         )
         .map_err(&map_err)?;
 
-        if let Some(cs) = config_store {
-            let setup_fn = crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(cs))
-                .map_err(&map_err)?;
+        if let Some(config) = config {
+            let setup_fn =
+                crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(config.store))
+                    .map_err(&map_err)?;
             maki.set("setup", setup_fn).map_err(&map_err)?;
-        }
 
+            let pack = match config.scope {
+                ConfigScope::Global => crate::api::pack::create_pack_table(&self.lua),
+                _ => crate::api::pack::create_pack_read_table(&self.lua),
+            }
+            .map_err(&map_err)?;
+            maki.set("pack", pack).map_err(&map_err)?;
+        }
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
 
-        self.drop_plugin_keys(&name);
+        drop(self.drop_plugin_keys(&name));
 
-        let main_fn = self
-            .lua
-            .load(source)
-            .set_name(name.as_ref())
-            .set_environment(env)
-            .into_function();
-        let exec_result = match main_fn {
-            Ok(func) => {
-                queue_codegen(&self.codegen_queue, &func);
-                func.call_async::<()>(()).await
+        // Chunks run in order against one environment, so a later file sees
+        // what an earlier one registered. The first failure stops the rest.
+        let exec_result = match load {
+            PluginLoad::Chunks(chunks) => {
+                let mut result = Ok(());
+                for chunk in chunks {
+                    let main_fn = self
+                        .lua
+                        .load(chunk.source.as_str())
+                        .set_name(chunk.name.as_str())
+                        .set_environment(env.clone())
+                        .into_function();
+                    result = match main_fn {
+                        Ok(function) => {
+                            queue_codegen(&self.codegen_queue, &function);
+                            function.call_async::<()>(()).await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
             }
-            Err(e) => Err(e),
+            PluginLoad::Function { function, argument } => {
+                function.set_environment(env).map_err(&map_err)?;
+                queue_codegen(&self.codegen_queue, &function);
+                function.call_async::<()>(argument).await
+            }
         };
 
+        // Checked once, after the last chunk: an option that a later chunk
+        // reads must not be reported as unused by an earlier one.
         let exec_result = exec_result.and_then(|()| self.check_opts_consumed(&name, &opts));
         if let Err(e) = exec_result {
             let stale = self.drain_pending();
-            self.discard_pending(stale);
-            self.drop_plugin_keys(&name);
+            self.rollback_load(&name, stale, pack_ops_checkpoint);
             return Err(map_err(e));
         }
 
@@ -2017,7 +2249,7 @@ impl LuaRuntime {
             .collect();
 
         if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
-            self.discard_pending(pending);
+            self.rollback_load(&name, pending, pack_ops_checkpoint);
             return Err(match e {
                 RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
                     plugin: name.to_string(),
@@ -2045,23 +2277,38 @@ impl LuaRuntime {
         let rules = std::mem::take(&mut *pending_rules.lock().unwrap_or_else(|e| e.into_inner()));
         // After `replace_plugin` above, so a rule may name one of this very
         // load's tools; the registry it is weighed against is the committed one.
-        let rules = crate::api::tool::resolve_rules(&self.registry, &name, permissions, rules);
+        let rules = crate::api::tool::resolve_rules(&self.registry, &name, &permissions, rules);
         self.plugin_rules.replace(&name, rules);
         self.plugins.borrow_mut().insert(
-            name,
+            name.clone(),
             PluginOwner {
                 tools: keys,
                 permissions: permissions.clone(),
+                revision_guard,
             },
         );
+        if package {
+            with_packs(&self.lua, |packs| packs.active.insert(name.to_string()));
+        }
 
         Ok(())
+    }
+
+    /// Undoes a load that failed after its chunks ran: the tools it was about
+    /// to register, the package operations it queued, and the commands,
+    /// keymaps, hints and slots it published on the way.
+    fn rollback_load(&mut self, plugin: &str, pending: Vec<PendingTool>, pack_ops: usize) {
+        self.discard_pending(pending);
+        with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
+        self.clear_plugin(plugin);
     }
 
     fn clear_plugin(&mut self, plugin: &str) {
         self.registry.clear_plugin(plugin);
         self.plugin_rules.remove(plugin);
-        self.drop_plugin_keys(plugin);
+        let revision_guard = self.drop_plugin_keys(plugin);
+        with_packs(&self.lua, |packs| packs.active.remove(plugin));
+        drop(revision_guard);
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
             let keys = store.clear_plugin(plugin);
             let entries = store.snapshot_entries();
@@ -2131,18 +2378,19 @@ impl LuaRuntime {
     async fn run_init_lua(
         &mut self,
         source: &str,
-        source_name: &str,
+        scope: ConfigScope,
         plugin_dir: Option<PathBuf>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let config_store: ConfigStore = Arc::new(Mutex::new(None));
-        let perms = load_plugin_permissions(plugin_dir.as_deref());
+        let permissions = load_plugin_permissions(plugin_dir.as_deref());
         self.load_source(
-            Arc::from(source_name),
-            source,
-            plugin_dir,
-            &perms,
-            PluginOpts::default(),
-            Some(&config_store),
+            Arc::from(scope.label()),
+            PluginLoad::Chunks(&[LoadChunk::new(scope.label(), source)]),
+            LoadContext::plain(plugin_dir, permissions),
+            Some(ConfigLoad {
+                store: &config_store,
+                scope: &scope,
+            }),
         )
         .await?;
         Ok(config_store.lock().unwrap().take())
@@ -2223,9 +2471,9 @@ async fn compute_header(
 async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
     let (func, plugin_name) = {
         let plugins = plugins.borrow();
-        let (pname, tk) = plugins
-            .iter()
-            .find_map(|(pname, owner)| owner.tools.get(&*item.tool).map(|tk| (pname.clone(), tk)))?;
+        let (pname, tk) = plugins.iter().find_map(|(pname, owner)| {
+            owner.tools.get(&*item.tool).map(|tk| (pname.clone(), tk))
+        })?;
         let key = tk.restore.as_ref()?;
         (lua.registry_value::<Function>(key).ok()?, pname)
     };
@@ -2619,7 +2867,12 @@ fn run_describe(
 ) -> Option<String> {
     let func: Function = {
         let plugins_ref = plugins.borrow();
-        let key = plugins_ref.get(plugin)?.tools.get(tool)?.describe.as_ref()?;
+        let key = plugins_ref
+            .get(plugin)?
+            .tools
+            .get(tool)?
+            .describe
+            .as_ref()?;
         lua.registry_value(key).ok()?
     };
     let arg = match json_to_lua(lua, dctx) {
@@ -2881,6 +3134,7 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_attachment: UiAttachment,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -2898,6 +3152,8 @@ pub fn spawn(
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let ui_attachment = UiAttachment::default();
+    let ui_attachment_thread = ui_attachment.clone();
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
@@ -2905,6 +3161,7 @@ pub fn spawn(
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
         .spawn(move || {
+            install_ui_attachment(ui_attachment_thread);
             let mut rt = match LuaRuntime::new(
                 registry,
                 tx_clone,
@@ -3023,16 +3280,33 @@ pub fn spawn(
                             })
                             .detach();
                         }
+                        Request::TakePackOps { reply } => {
+                            let ops =
+                                with_packs(&rt.lua, |packs| std::mem::take(&mut packs.pending));
+                            let _ = reply.send(ops);
+                        }
+                        Request::SealPackOps { reply } => {
+                            let ops = with_packs(&rt.lua, |packs| {
+                                packs.drained = true;
+                                std::mem::take(&mut packs.pending)
+                            });
+                            let _ = reply.send(ops);
+                        }
                         Request::LoadSource {
                             name,
-                            source,
-                            plugin_dir,
-                            permissions,
-                            opts,
+                            chunks,
+                            context,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.load_source(Arc::clone(&name), &source, plugin_dir, &permissions, opts, None).await;
+                            let res = rt
+                                .load_source(
+                                    Arc::clone(&name),
+                                    PluginLoad::Chunks(&chunks),
+                                    context,
+                                    None,
+                                )
+                                .await;
                             let _ = reply.send(res);
                         }
                         Request::CallTool {
@@ -3100,7 +3374,19 @@ pub fn spawn(
                                         .and_then(|f| f.contents_utf8())
                                         .map(|s| s.to_owned());
                                     if let Some(src) = init {
-                                        rt.load_source(Arc::clone(&name), &src, None, &PluginPermissions::trusted(), PluginOpts::default(), None).await
+                                        rt.load_source(
+                                            Arc::clone(&name),
+                                            PluginLoad::Chunks(&[LoadChunk::new(
+                                                name.as_ref(),
+                                                src,
+                                            )]),
+                                            LoadContext::plain(
+                                                None,
+                                                PluginPermissions::trusted(),
+                                            ),
+                                            None,
+                                        )
+                                        .await
                                     } else {
                                         Err(PluginError::Lua {
                                             plugin: name.to_string(),
@@ -3170,12 +3456,12 @@ pub fn spawn(
                         }
                         Request::RunInitLua {
                             source,
-                            source_name,
+                            scope,
                             plugin_dir,
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
-                            let res = rt.run_init_lua(&source, &source_name, plugin_dir).await;
+                            let res = rt.run_init_lua(&source, scope, plugin_dir).await;
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
@@ -3184,6 +3470,64 @@ pub fn spawn(
                         }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
+                        }
+                        Request::CollectPackages { reply } => {
+                            let declared = with_packs(&rt.lua, |packs| packs.specs.clone());
+                            let _ = reply.send(declared);
+                        }
+                        Request::RunPackLoader {
+                            declared,
+                            context,
+                            reply,
+                        } => {
+                            drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
+                            let name = declared.spec.name.clone();
+                            let input = (|| {
+                                let crate::api::pack::LoadMode::Custom(loader) = &declared.load
+                                else {
+                                    return Err(mlua::Error::runtime(
+                                        "run_pack_loader: not a custom load",
+                                    ));
+                                };
+                                let function =
+                                    rt.lua.registry_value::<Function>(loader.as_ref())?;
+                                let argument = rt.lua.create_table()?;
+                                argument.set(
+                                    "spec",
+                                    crate::api::pack::spec_to_lua(
+                                        &rt.lua,
+                                        &declared.spec,
+                                        declared.data.as_ref(),
+                                    )?,
+                                )?;
+                                // The same directory the chunks would load
+                                // from, read back rather than passed twice.
+                                argument.set(
+                                    "path",
+                                    context
+                                        .plugin_dir
+                                        .as_ref()
+                                        .map(|dir| dir.display().to_string()),
+                                )?;
+                                Ok::<_, mlua::Error>((function, argument))
+                            })()
+                            .map_err(|source| PluginError::Lua {
+                                plugin: name.clone(),
+                                source,
+                            });
+                            let result = match input {
+                                Ok((function, argument)) => {
+                                    rt.load_source(
+                                        Arc::from(name.as_str()),
+                                        PluginLoad::Function { function, argument },
+                                        context,
+                                        None,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            let _ = reply.send(result);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
                             spawn_restore(&ex, &gate, &restores, &rt, item, event_tx);
@@ -3376,12 +3720,14 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         ui_action_rx,
+        ui_attachment,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::r#fn::JobSpec;
     use crate::api::tool::ToolCallReply;
     use futures_lite::future::poll_once;
     use maki_agent::cancel::CancelTrigger;
@@ -3461,10 +3807,10 @@ mod tests {
         let plugin_owner = JobOwner::Plugin(Arc::from("test-plugin"));
         with_jobs(&lua, |store| {
             store
-                .start(task_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(JobSpec::new(task_owner.clone(), "exit 0"))
                 .unwrap();
             store
-                .start(plugin_owner.clone(), "exit 0", None, None, None, None, None)
+                .start(JobSpec::new(plugin_owner.clone(), "exit 0"))
                 .unwrap();
         });
 
@@ -3941,8 +4287,8 @@ mod tests {
             .expect_err("a lapsed deadline must end a parked handler");
             assert!(err.to_string().contains(HANDLER_TIMEOUT_MSG));
 
-            until_abandoned(
-                std::future::ready(Ok(LuaValue::Boolean(true))),
+            let _ = until_abandoned(
+                std::future::ready(Ok::<LuaValue, mlua::Error>(LuaValue::Boolean(true))),
                 &task_handle(cancelled_token(), Some(Instant::now())),
             )
             .await
@@ -4362,7 +4708,7 @@ mod tests {
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
             with_jobs(&lua, |store| {
-                store.start(owner, DISPATCH_TEST_JOB, None, None, None, None, None)
+                store.start(JobSpec::new(owner, DISPATCH_TEST_JOB))
             })
             .unwrap();
             let (finish_tx, finish_rx) = flume::bounded(1);

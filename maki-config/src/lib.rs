@@ -382,12 +382,10 @@ impl RawConfig {
     /// merge between two of them.
     pub fn into_config(self, no_rtk: bool, packages: &[String]) -> Result<Config, ConfigError> {
         self.validate_plugin_tables(packages)?;
-        let disabled_tools: Vec<String> = self
-            .plugins
-            .iter()
-            .filter(|(_, cfg)| cfg.enabled == Some(false))
-            .map(|(name, _)| name.clone())
-            .collect();
+        // A disabled plugin never registers, so there is nothing for the name
+        // filter to hide. Seeding `disabled_tools` from it only hid a *user*
+        // plugin that legitimately claimed the freed name, so the config layer
+        // leaves the list to the CLI.
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
@@ -397,7 +395,7 @@ impl RawConfig {
                 .map(AlwaysThinking::resolve)
                 .transpose()?,
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
+            agent: AgentConfig::from_file(self.agent, no_rtk),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
@@ -613,6 +611,7 @@ pub struct AgentFileConfig {
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
+    pub rtk: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -628,7 +627,8 @@ impl AgentFileConfig {
             task_max_concurrent,
             compaction_instructions,
             post_compaction_instructions,
-            stale_read_check
+            stale_read_check,
+            rtk
         );
     }
 }
@@ -1246,8 +1246,11 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (task tool)")]
     pub task_max_concurrent: usize,
 
-    #[config(skip, default = false)]
-    pub no_rtk: bool,
+    #[config(
+        default = true,
+        desc = "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed"
+    )]
+    pub rtk: bool,
 
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
@@ -1255,14 +1258,18 @@ pub struct AgentConfig {
     #[config(skip, default = "Vec::new()")]
     pub allowed_tools: Vec<String>,
 
+    /// Only from the CLI's `--disallowed-tools`. A disabled plugin never
+    /// registers its tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
 }
 
 impl AgentConfig {
-    fn from_file(file: AgentFileConfig, no_rtk: bool, disabled_tools: Vec<String>) -> Self {
+    fn from_file(file: AgentFileConfig, no_rtk: bool) -> Self {
         Self {
-            no_rtk,
+            // The config field is the setting; `--no-rtk` is a per-run
+            // override that can only turn it off.
+            rtk: file.rtk.unwrap_or(true) && !no_rtk,
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
             max_continuation_turns: file
@@ -1278,7 +1285,7 @@ impl AgentConfig {
             stale_read_check: file.stale_read_check.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
-            disabled_tools,
+            disabled_tools: Vec::new(),
         }
     }
 }
@@ -2470,7 +2477,10 @@ mod tests {
     fn notifications_deserialize(value: &str, expected: NotificationMethod) {
         let raw: RawConfig =
             toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
-        assert_eq!(raw.into_config(false, &[]).unwrap().ui.notifications, expected);
+        assert_eq!(
+            raw.into_config(false, &[]).unwrap().ui.notifications,
+            expected
+        );
     }
 
     #[test]
@@ -2668,7 +2678,13 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(raw.into_config(false, &[]).unwrap().agent.task_max_concurrent, 3);
+        assert_eq!(
+            raw.into_config(false, &[])
+                .unwrap()
+                .agent
+                .task_max_concurrent,
+            3
+        );
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -2699,7 +2715,10 @@ mod tests {
             always_thinking: Some(AlwaysThinking::Mode("fast".into())),
             ..Default::default()
         };
-        let err = raw.into_config(false, &[]).err().expect("expected config error");
+        let err = raw
+            .into_config(false, &[])
+            .err()
+            .expect("expected config error");
         assert!(matches!(err, ConfigError::Thinking(_)));
     }
 

@@ -440,6 +440,8 @@ mod tests {
     /// so the streams have to be handed the new colours before they repaint.
     #[test]
     fn theme_switch_repaints_the_streams() {
+        // Swaps the process-global palette, so it has to hold every reader out.
+        let _guard = theme::test_write_lock();
         theme::set(theme::load_by_name(THEME_A).expect(THEME_A));
         let mut m = modal();
         answer_a_question(&mut m);

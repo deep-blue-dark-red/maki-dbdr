@@ -203,6 +203,12 @@ mod tests {
             cost: None,
             context_size: Some(context_size),
             context_window: WINDOW,
+            cache_miss: false,
+            upstream: None,
+            turn_id: 1,
+            duration_ms: None,
+            ttfb_ms: None,
+            api_error_count: 0,
         })))
     }
 

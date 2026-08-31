@@ -50,16 +50,9 @@ pub(crate) struct QueuedInput {
 
 pub(crate) enum QueueItem {
     Message(QueuedInput),
-    Compact {
-        run_id: u64,
-    },
-    Checkpoint {
-        run_id: u64,
-    },
-    Rename {
-        messages: Vec<Message>,
-        run_id: u64,
-    },
+    Compact { run_id: u64 },
+    Checkpoint { run_id: u64 },
+    Rename { messages: Vec<Message>, run_id: u64 },
 }
 
 impl QueueItem {

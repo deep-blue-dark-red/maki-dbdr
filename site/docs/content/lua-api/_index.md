@@ -1017,9 +1017,6 @@ available.
   - `except` (`string[]?`) exclude these tool names.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
-  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `true`.
-    Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
-    advertise MCP tools that the session has no way to call.
 
 **Returns:** (`table?`, `string?`) Array of tool definition tables, or `(nil, err)` on failure.
 
@@ -1142,9 +1139,7 @@ and tool set.
   - `local_tools` (`table?`) map of `name -> spec` for Lua-backed tools. Each spec
     requires `description` (string), `input_schema` (table), and
     `handler` (function). The handler receives the input table and must return
-    `(string)` or `(nil, err)`. Optional `audiences` (string[]) gates who may
-    call it, the same way `maki.api.register_tool` does. The default is the
-    model alone, so a script cannot reach it through `code_execution`.
+    `(string)` or `(nil, err)`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
   - `mcp` (`boolean?`) give the session access to MCP tools. Their
@@ -3279,7 +3274,7 @@ status. Reads the focused session, or the one you name in `session` when
 you act on a background tab.
 
 The returned table:
-```
+```text
 {
   id, cwd, model, mode = "build" | "plan",
   status = "idle" | "working" | "needs_input",
@@ -5527,9 +5522,9 @@ System and environment utilities, modelled after `vim.uv`.
 Provides access to the working directory, home directory, and environment
 variables. None of these functions throw.
 
-Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
-`os_getenv` reads the process environment, where secrets live, so it needs
-`env`.
+Filesystem location queries (`cwd`, `os_homedir`, `exepath`) need
+`fs_read`, while `os_getenv` reads the process environment, where
+secrets live, so it needs `env`.
 
 ```lua
 local home = maki.uv.os_homedir()
@@ -5574,6 +5569,29 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 ```lua
 local home = maki.uv.os_homedir() -- e.g. "/home/user"
+```
+
+---
+
+### `maki.uv.exepath()` {#maki-uv-exepath}
+
+```lua
+maki.uv.exepath()
+```
+
+Return the absolute path of the running maki executable. Like
+`vim.uv.exepath`. Useful for spawning maki itself from scripts or
+crontab lines, where `PATH` may not contain it.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Returns:** (`string?`) Executable path, or nil if it cannot be determined.
+
+**Example:**
+
+```lua
+local exe = maki.uv.exepath()
+if exe then print("running from: " .. exe) end
 ```
 
 ---

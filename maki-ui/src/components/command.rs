@@ -45,6 +45,11 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/tasks",
+        description: "Show subagent tasks and jump between their transcripts",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/usage",
         description: "Show token usage breakdown",
         max_args: 0,

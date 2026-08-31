@@ -172,21 +172,21 @@ impl TurnSnapshot {
         (fresh > 0).then(|| fresh as f64 * 1000.0 / ttfb as f64)
     }
 
-    /// Token generation, in tokens per second: output over the streaming
-    /// window, which is everything after the first byte. Prefill is charged
-    /// to [`prompt_rate`](Self::prompt_rate) instead, so a long prompt does
-    /// not drag this figure down with it.
+    /// Token generation, in tokens per second: output over the whole API
+    /// call, from request sent to end of stream. That period is the only one
+    /// that always contains the generation: time-to-first-byte marks when
+    /// the upstream first *delivered* a byte, not when it started decoding,
+    /// and some upstreams (seen on ~40% of OpenRouter's Z.AI turns) buffer
+    /// the whole completion and flush it as one final burst. Over such a
+    /// delivery window the rate reads as a 10k+ tok/s transfer speed, so the
+    /// full period is the denominator that survives every upstream's
+    /// streaming behavior — the true decode rate is at least this figure.
     ///
-    /// A turn with no time-to-first-byte has no streaming window to divide
-    /// by, and reports nothing rather than dividing by the whole API wait —
-    /// that figure is prefill and generation mixed together, which is not
-    /// what this column claims to be.
+    /// `None` when the turn has no API duration to divide by, or produced
+    /// nothing.
     pub fn gen_rate(&self) -> Option<f64> {
-        let streaming = self
-            .api_duration_ms?
-            .checked_sub(self.ttfb_ms?)
-            .filter(|&ms| ms > 0)?;
-        (self.output > 0).then(|| self.output as f64 * 1000.0 / streaming as f64)
+        let api = self.api_duration_ms.filter(|&ms| ms > 0)?;
+        (self.output > 0).then(|| self.output as f64 * 1000.0 / api as f64)
     }
 }
 
@@ -1368,30 +1368,35 @@ mod tests {
         assert_eq!(t.prompt_rate(), Some(5000.0));
     }
 
-    /// Generation is measured over the streaming window alone. Dividing the
-    /// output by the whole API duration would charge prefill to the
-    /// generation rate, making a long prompt look like a slow decoder.
+    /// The denominator is the whole API period — request sent to end of
+    /// stream — because time-to-first-byte marks the first *delivery*, not
+    /// the start of decoding, and buffered upstreams only deliver at the end.
+    /// Output over the full period is a floor that stays defined for both
+    /// streaming and burst-flushed turns.
     #[test]
-    fn gen_rate_excludes_the_prefill_wait() {
+    fn gen_rate_spans_the_whole_api_period() {
         let mut t = sample_turn(1);
         t.output = 340;
         t.ttfb_ms = Some(300);
         t.api_duration_ms = Some(1400);
-        // 340 tokens over the 1.1s that streamed, not the full 1.4s.
-        assert_eq!(t.gen_rate(), Some(340.0 * 1000.0 / 1100.0));
+        // 340 tokens over the full 1.4s API call, not the 1.1s after the
+        // first byte.
+        assert_eq!(t.gen_rate(), Some(340.0 * 1000.0 / 1400.0));
+
+        // A burst-flushed turn gets a floor instead of a 17k tok/s transfer
+        // speed: everything arrived in the last 8ms of a 7.8s request.
+        let mut t = sample_turn(1);
+        t.output = 133;
+        t.ttfb_ms = Some(7822);
+        t.api_duration_ms = Some(7830);
+        assert_eq!(t.gen_rate(), Some(133.0 * 1000.0 / 7830.0));
     }
 
-    #[test_case(None,       Some(1400), 340 ; "no ttfb")]
-    #[test_case(Some(300),  None,       340 ; "no api duration")]
-    #[test_case(Some(1400), Some(1400), 340 ; "nothing streamed after the first byte")]
-    #[test_case(Some(300),  Some(1400), 0   ; "no output")]
-    fn gen_rate_is_absent_when_it_cannot_be_measured(
-        ttfb_ms: Option<u64>,
-        api_duration_ms: Option<u64>,
-        output: u32,
-    ) {
+    #[test_case(None,      340 ; "no api duration")]
+    #[test_case(Some(0),   340 ; "zero api duration")]
+    #[test_case(Some(1400), 0  ; "no output")]
+    fn gen_rate_is_absent_when_it_cannot_be_measured(api_duration_ms: Option<u64>, output: u32) {
         let mut t = sample_turn(1);
-        t.ttfb_ms = ttfb_ms;
         t.api_duration_ms = api_duration_ms;
         t.output = output;
         assert_eq!(t.gen_rate(), None);
@@ -1432,14 +1437,14 @@ mod tests {
     fn turn_row_shows_both_rates() {
         let theme = theme::current();
         // input 1200, cache_creation 0, ttfb 300ms -> 4.0k/s prefill.
-        // output 340 over (1400 - 300)ms -> 309/s generation.
+        // output 340 over the 1.4s API call -> 243/s generation.
         let text: String = turn_row(&sample_turn(1), &theme)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
         assert!(text.contains("4.0k"), "got: {text:?}");
-        assert!(text.contains("309"), "got: {text:?}");
+        assert!(text.contains("243"), "got: {text:?}");
     }
 
     /// maki pins each model to whichever upstream answered last, so the

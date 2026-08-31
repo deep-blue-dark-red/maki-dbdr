@@ -65,7 +65,7 @@ local function json_pretty(val, depth)
   depth = depth or 0
   local t = type(val)
   if t == "string" then
-    local escaped = val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+    local escaped = val:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
     return '"' .. escaped .. '"'
   elseif t == "number" then
     return tostring(val)
@@ -80,7 +80,9 @@ local function json_pretty(val, depth)
     local is_array = false
     if n > 0 then
       local count = 0
-      for _ in pairs(val) do count = count + 1 end
+      for _ in pairs(val) do
+        count = count + 1
+      end
       is_array = (count == n)
     end
     if is_array then
@@ -92,15 +94,21 @@ local function json_pretty(val, depth)
     else
       local parts = {}
       local keys = {}
-      for k in pairs(val) do keys[#keys + 1] = k end
-      table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+      for k in pairs(val) do
+        keys[#keys + 1] = k
+      end
+      table.sort(keys, function(a, b)
+        return tostring(a) < tostring(b)
+      end)
       for _, k in ipairs(keys) do
         local v = val[k]
         if v ~= nil then
           parts[#parts + 1] = inner .. '"' .. tostring(k) .. '": ' .. json_pretty(v, depth + 1)
         end
       end
-      if #parts == 0 then return "{}" end
+      if #parts == 0 then
+        return "{}"
+      end
       return "{\n" .. table.concat(parts, ",\n") .. "\n" .. pad .. "}"
     end
   end

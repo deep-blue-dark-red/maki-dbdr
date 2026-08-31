@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,10 +11,128 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{CallOrigin, LocalToolFn, ToolContext, truncate_bytes};
+use crate::tools::{CallOrigin, LocalToolFn, ToolAudience, ToolContext, truncate_bytes};
 use crate::types::ToolResultParts;
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
+
+/// One callable name, as dispatch would route it.
+pub struct Callable {
+    /// The name to dispatch. Always the real name, never an alias.
+    pub name: String,
+    /// A name a host that binds tools as identifiers can use, set only when
+    /// `name` is not one already (MCP servers publish `srv__get-docs`). Call
+    /// `name`, bind `alias`.
+    pub alias: Option<String>,
+    pub source: &'static str,
+    /// The audience of whatever will run, not of whatever shares its name.
+    pub audience: ToolAudience,
+    /// Registry tools only. MCP and host tools publish their schema to the
+    /// model in the request's tool array, so repeating it here would buy an
+    /// allocation per call and nothing else.
+    pub schema: Option<Value>,
+}
+
+/// Every name this context can dispatch, deduplicated in dispatch's own
+/// precedence, so an entry always describes the tool that a call to that name
+/// would actually reach.
+///
+/// Filtered by the same filter that built the request's tool array, so a name
+/// the model never saw is not one a script can reach either. What is left is
+/// the caller's own policy, read off `audience` (a sandbox wants
+/// `INTERPRETER`).
+///
+/// Recompute per call: MCP republishes its index whenever a server comes or goes.
+pub fn callable(ctx: &ToolContext) -> Vec<Callable> {
+    let filter = &ctx.tool_filter;
+    let mut out: Vec<Callable> = Vec::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+    // A name belongs to the first source dispatch would reach, claimed before
+    // any filter runs: a registry tool this audience may not call still owns its
+    // name, or MCP would publish a way around it.
+    let mut claim = |name: &str, audience: ToolAudience| {
+        let first = claimed.insert(name.to_owned());
+        first && audience.contains(ctx.audience)
+    };
+    let entry_of = |name: &str, source, audience, schema| Callable {
+        name: name.to_owned(),
+        alias: None,
+        source,
+        audience,
+        schema,
+    };
+
+    let mut local: Vec<(&String, &crate::tools::LocalTool)> = ctx.local_tools.iter().collect();
+    local.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, tool) in local {
+        if claim(name, tool.audience) {
+            out.push(entry_of(name, SOURCE_LOCAL, tool.audience, None));
+        }
+    }
+    for entry in ctx.registry.iter().iter() {
+        let audience = entry.tool.audience();
+        if !claim(entry.name(), audience) || !filter.matches(entry.name()) {
+            continue;
+        }
+        out.push(entry_of(
+            entry.name(),
+            SOURCE_NATIVE,
+            audience,
+            Some(entry.tool.schema()),
+        ));
+    }
+    if let Some(mcp) = ctx.mcp.as_ref() {
+        let mut names = mcp.wire_names();
+        names.push(TOOL_SEARCH_TOOL_NAME.to_owned());
+        names.sort();
+        for name in names {
+            // MCP has no audience system: a server is reachable or it is not,
+            // and a session holding one already offers its tools to the model.
+            if claim(&name, ToolAudience::all()) {
+                out.push(entry_of(&name, SOURCE_MCP, ToolAudience::all(), None));
+            }
+        }
+    }
+    assign_aliases(&mut out);
+    out
+}
+
+/// Fills in `alias` for names an identifier cannot hold. A collision (a server
+/// publishing both `get-docs` and `get_docs`) leaves both aliases unset rather
+/// than pointing one name at the other's tool.
+fn assign_aliases(tools: &mut [Callable]) {
+    let aliases: Vec<Option<String>> = tools.iter().map(|t| identifier_alias(&t.name)).collect();
+    let mut claims: HashMap<String, usize> = HashMap::new();
+    for claimant in tools
+        .iter()
+        .map(|t| t.name.clone())
+        .chain(aliases.iter().flatten().cloned())
+    {
+        *claims.entry(claimant).or_default() += 1;
+    }
+    // An alias always claims itself once, and never its own name, or
+    // `identifier_alias` would have declined it. A second claim is therefore
+    // another tool's name or alias, and then neither of them may have it.
+    for (tool, alias) in tools.iter_mut().zip(aliases) {
+        if alias.as_deref().is_some_and(|a| claims[a] == 1) {
+            tool.alias = alias;
+        }
+    }
+}
+
+fn identifier_alias(name: &str) -> Option<String> {
+    let is_body = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // A leading digit is not something substitution can fix without inventing a
+    // character the model never saw.
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    name.chars().any(|c| !is_body(c)).then(|| {
+        name.chars()
+            .map(|c| if is_body(c) { c } else { '_' })
+            .collect()
+    })
+}
 
 #[derive(Clone, Copy)]
 pub enum Emit {
@@ -45,6 +163,7 @@ impl<H: Hasher> std::io::Write for HashWriter<'_, H> {
 
 const SOURCE_NATIVE: &str = "native";
 const SOURCE_LOCAL: &str = "local";
+const SOURCE_MCP: &str = "mcp";
 const SOURCE_UNKNOWN: &str = "unknown";
 /// A name that still carries one means the MCP server behind it is gone.
 const MCP_NAME_SEPARATOR: &str = "__";
@@ -660,7 +779,7 @@ async fn dispatch_mcp(
     let tool_id = ctx
         .mcp
         .as_ref()
-        .map(|m| m.interned_name(tool_name))
+        .and_then(|m| m.resolve(tool_name))
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     execute_mcp_tool(ctx, id, tool_id, tool_name, input).await
 }
@@ -677,7 +796,7 @@ mod tests {
     use super::*;
     use crate::AgentMode;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
-    use crate::tools::registry::ToolSource;
+    use crate::tools::registry::{ToolAudience, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
 
     fn recent_calls(entries: &[(&str, Value)]) -> RecentCalls {
@@ -710,7 +829,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(
             name.to_owned(),
-            crate::tools::local_tool(move |input, _ctx| {
+            crate::tools::local_tool(ToolAudience::MAIN, move |input, _ctx| {
                 let result = f(&input);
                 Box::pin(async move { result })
             }),
@@ -781,7 +900,7 @@ mod tests {
             let mut map = std::collections::HashMap::new();
             map.insert(
                 "local_echo".to_owned(),
-                crate::tools::local_tool(|input, _ctx| {
+                crate::tools::local_tool(ToolAudience::MAIN, |input, _ctx| {
                     let out = input.to_string();
                     Box::pin(async move { Ok(out) })
                 }),
@@ -816,7 +935,10 @@ mod tests {
     #[test]
     fn tool_search_routes_and_loads_matches() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "Fetch a GitHub issue")]);
+            let mcp = crate::mcp::test_support::stub_session(&[(
+                "srv.fetch_issue",
+                "Fetch a GitHub issue",
+            )]);
             let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             let done = run(
                 ToolRegistry::global(),
@@ -845,7 +967,7 @@ mod tests {
     #[test_case(serde_json::json!({}) ; "missing_query")]
     fn tool_search_bad_query_is_error_event(input: Value) {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
+            let mcp = crate::mcp::test_support::stub_session(&[("srv.tool", "")]);
             let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             let done = run(
                 ToolRegistry::global(),
@@ -865,7 +987,7 @@ mod tests {
     #[test]
     fn calling_deferred_mcp_tool_marks_it_loaded() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
+            let mcp = crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "")]);
             let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
             ctx.mcp = Some(mcp.clone());
             let done = run(
@@ -893,7 +1015,7 @@ mod tests {
     #[test]
     fn denied_mcp_call_does_not_load_definition() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.fetch_issue", "")]);
+            let mcp = crate::mcp::test_support::stub_session(&[("srv.fetch_issue", "")]);
             let deny_cfg = PermissionsConfig {
                 rules: vec![PermissionRule {
                     tool: ToolKey::parse("srv.fetch_issue").unwrap(),
@@ -943,7 +1065,7 @@ mod tests {
     #[test]
     fn local_tool_named_tool_search_shadows_mcp_search() {
         smol::block_on(async {
-            let mcp = crate::mcp::stub_session(&[("srv.tool", "")]);
+            let mcp = crate::mcp::test_support::stub_session(&[("srv.tool", "")]);
             let ctx = local_ctx(TOOL_SEARCH_TOOL_NAME, |_| Ok("local wins".into()));
             let done = run(
                 ToolRegistry::global(),

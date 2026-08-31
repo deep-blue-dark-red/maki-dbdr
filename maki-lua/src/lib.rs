@@ -1,5 +1,5 @@
-mod api;
 pub mod agent_autocmd;
+mod api;
 pub mod docs;
 pub mod docs_render;
 mod error;
@@ -12,24 +12,26 @@ mod runtime;
 pub mod session_snapshot;
 
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
+pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
+pub use api::pack::{Declared, PackOp};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
-    Split, TaskRequest, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
+    Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
-pub use loader::{EventHandle, PluginHost, bundled_plugins};
-pub use api::net::set_allowed_private_hosts;
-pub use api::pack::{Declared, PackOp};
+pub use loader::{
+    EventHandle, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING, bundled_plugins,
+};
 pub use maki_agent::SessionEndReason;
 pub use pack::{
     DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, discover,
     discover_installed, install_declared, lockfile_path, sanitize_message, site_dir,
 };
-pub use plugin_permissions::{Permission, PluginPermissions};
-pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
+pub use plugin_permissions::{Permission, PluginPermissions, Requested};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
@@ -38,6 +40,7 @@ pub mod test_support {
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
+    pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 

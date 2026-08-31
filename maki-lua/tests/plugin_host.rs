@@ -3748,7 +3748,7 @@ fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
         )
         .unwrap()
         .expect("setup returns a config");
-    let config = raw.into_config(&[]).unwrap();
+    let config = raw.into_config(false, &[]).unwrap();
     host.load_builtins(&config.plugins).unwrap();
     host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
         .expect("a disabled builtin leaves its tool name free");

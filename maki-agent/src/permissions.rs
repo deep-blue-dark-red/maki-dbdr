@@ -731,7 +731,7 @@ fn normalize_scope_prefix(path: &str) -> PathBuf {
 /// smuggle in the everything rule this refuses.
 pub fn is_universal_scope(pattern: &str) -> bool {
     match pattern.strip_suffix("/**") {
-        Some(prefix) => is_root(&normalize_scope_prefix(prefix)),
+        Some(prefix) => universal_prefix_root(prefix),
         None => {
             let stem = pattern.trim_end_matches('*');
             stem.len() < pattern.len() && matches!(stem, "" | "/")
@@ -741,6 +741,15 @@ pub fn is_universal_scope(pattern: &str) -> bool {
 
 fn is_root(path: &Path) -> bool {
     path.parent().is_none()
+}
+
+/// The root decision for a `/**` prefix, settled lexically: `..` collapses
+/// before any symlink is followed, so `/tmp/../**` reads as the root it
+/// spells rather than the sibling the symlinks park it in. This is the
+/// conservative answer for the everything-rule refusal, and it keeps
+/// [`scope_matches`] and [`is_universal_scope`] in agreement.
+fn universal_prefix_root(prefix: &str) -> bool {
+    is_root(&maki_storage::paths::normalize_path(Path::new(prefix)))
 }
 
 /// Glob matcher for permission scopes. The boundary suffixes (`/**`, `" *"`)
@@ -756,7 +765,7 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         let norm_prefix = normalize_scope_prefix(prefix);
         // A root prefix covers every scope, bash commands included. Those are
         // not paths, so a plain prefix test would miss them.
-        if is_root(&norm_prefix) {
+        if universal_prefix_root(prefix) {
             return true;
         }
         let norm_value = normalize_scope_prefix(value);
