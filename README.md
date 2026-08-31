@@ -52,7 +52,7 @@ Enable or disable Lua plugins for new sessions, and inspect each plugin's source
 See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation details.
 
 ---
-# Maki features
+# Maki 
 
 ## Features
 
