@@ -38,7 +38,7 @@ use super::tensorx::TensorX;
 use super::xai::Xai;
 use super::zai::Zai;
 
-const INFO_TIMEOUT: Duration = Duration::from_secs(5);
+const INFO_TIMEOUT: Duration = Duration::from_secs(15);
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const PROVIDERS_DIR: &str = "providers";
 const SCRIPT_CACHE_FILE: &str = "provider-scripts.json";

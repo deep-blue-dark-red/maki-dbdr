@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use maki_storage::version::{self, VersionError};
 use maki_storage::{StateDir, StorageError};
 
-const INSTALL_SCRIPT_URL: &str = "https://raw.githubusercontent.com/deep-blue-dark-red/maki-dbdr/main/install.sh";
+const INSTALL_SCRIPT_URL: &str =
+    "https://raw.githubusercontent.com/deep-blue-dark-red/maki-dbdr/main/install.sh";
 const BACKUP_FILENAME: &str = "maki_backup";
 const INSTALL_DIR_ENV: &str = "MAKI_INSTALL_DIR";
 
