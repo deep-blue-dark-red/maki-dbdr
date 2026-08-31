@@ -16,7 +16,9 @@ This fork adds:
 * Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary.
 * `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
-* An optimized default system prompt, benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks.
+* Menu-consistency with most TUI: `/q` / `quit`  maps to main's peculiar `/exit`, and `/resume` maps to  `/session`. 
+* Optimized, lean default system prompt. Benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks. The default maki ships with is carefully handwritten but confuses models and isnt good; note 'index' isnt used often. 
+We used model guidance then then benchmarked alternatives. We did similarly with the compaction prompt. Well meaning human written prompts are often suboptimal and by benchmarks do you know what works. 
 
 This fork maintains maki/main's feature parity and merges from main often, typically every tagged release.
 
