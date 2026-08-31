@@ -2,7 +2,7 @@
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
-## Fork features
+## Maki-dbdr Fork Features
 
 This fork adds:
 
@@ -17,6 +17,8 @@ This fork adds:
 * `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
 * An optimized default system prompt, benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks.
+
+This fork maintains maki/main's feature parity and merges from main often; often main catches up or implements something this fork has materialy already done; we merge towards main in such cases.
 
 ### Render changes
 
