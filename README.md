@@ -2,7 +2,7 @@
 
 An AI coding agent optimized for minimal use of context tokens, while providing a great user experience.
 
-## Maki-dbdr Fork Features
+## maki-dbdr Fork Features
 
 This fork adds:
 
@@ -30,14 +30,14 @@ Q: why a fork (and not a PR?) Libertarian leanings; forks are better. Feel free 
 
 ![Per-call API statistics](./screenshots/stats.png)
 
-Inspect every turn, request, tool duration, cache hit, provider, token rate, and itemized cost.
+Inspect every API call and tool use duration, metadata, whether there was a cache hit, who the provider was, PP/s and TG/s statistics and itemized cost for the current session.
 
 ### Skills Manager
 
 ![Skills Manager](./screenshots/skills-manager.png)
 
 Choose skill folders, enable or exclude individual skills, and create new skills from the TUI.
-Skill Testing Architecture: [SKILL_TESTING.md] overviews the lua skill-tester that is invoked when the. skill-creator  is used to make a new skill; all new skills are tested by the current agent. 
+Skill Testing Architecture: See `SKILL_TESTING.md` detailing the built-in lua skill-tester; this is always invoked when the create-skill is used to generate and install a new skill.
 
 ### Plugin Manager
 
