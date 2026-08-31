@@ -12,14 +12,16 @@ This fork adds:
 * Plugin Manager for selecting Lua plugins on new sessions, including the `create-plugin` plugin.
 * Render performance optimizations and main-loop polling optimizations. 
 * Dynamic Claude Code-inspired status-bar rendering without spinners, optional Pi-inspired session rates (`PP/s`, `TG/s`, and `CR/s`), thinking-mode display formatting, optimized Markdown performance, and throttled rendering in unfocused mode.
-* Export to Markdown or clipboard Markdown, `@` file selection, configurable keybindings, and Claude-style two-tone pending-task indicators.
-* Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary.
+* `/export` Export to Markdown, session-name and date file to folder or clipboard. Same with json. `@` fuzzy file selection, configurable keybindings (ghostty style, `~/.config/maki/user.config`), and Claude-style two-tone pending-task indicators.
+* Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary. 
 * `/system_prompt` in `$EDITOR`, `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
-* Menu-consistency with most TUI: `/q` / `quit`  maps to main's peculiar `/exit`, and `/resume` maps to  `/session`. 
-* Optimized, lean default system prompt. Benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks. The default maki ships with is carefully handwritten but confuses models and isnt good; note 'index' isnt used often. 
-We used model guidance then then benchmarked alternatives. We did similarly with the compaction prompt. Well meaning human written prompts are often suboptimal and by benchmarks do you know what works. 
-
+* Menu-consistency. New items `/q` / `quit`  maps to main's  `/exit`, and `/resume` maps to  `/session`.
+* Benchmarked optimized default system prompt, replacing the maki-main default; We on GLM 5.2, the Qwen 3.6 family and Deepseek V4 family on SWE and DeepSWE (public portions). 
+   - The default maki system prompt is 1. not editable, hidden, and while is carefully handwritten and well-meaning prompt, scores poorly by confuses models from its structure. Note e.g. 'index' is rarely used.
+   - We used model guidance (Fable, Qwen GLM) then then benchmarked various suggestions across the two benchmarks and picked the best scoring average. We did a similar approach to compaction prompt.
+   - You can edit your system-prompt effortlessly from /system_prompt, its not hidden in code now. 
+   
 This fork maintains maki/main's feature parity and merges from main often, typically every tagged release.
 
 Q: why a fork (and not a PR?) Libertarian leanings; forks are better. Feel free to fork.
