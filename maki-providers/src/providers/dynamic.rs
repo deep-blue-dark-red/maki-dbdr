@@ -1113,7 +1113,7 @@ esac
     fn discover_accepts_all_bases(base: &str, expected: ProviderKind) {
         let tmp = TempDir::new().unwrap();
         let info = format!(r#"{{"display_name": "Test", "base": "{base}", "has_auth": false}}"#);
-        write_script(tmp.path(), "custom-test", &info);
+        write_script(tmp.path(), &format!("custom-test-{base}"), &info);
         let providers = discover_in(tmp.path());
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].base, expected);
