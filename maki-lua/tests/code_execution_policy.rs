@@ -3,7 +3,7 @@
 //! sees is exactly what the interpreter can call.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use maki_agent::AgentMode;
 use maki_agent::mcp::test_support::stub_session;
@@ -126,9 +126,15 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost) {
 }
 
 /// `maki.agent.tools` describes the process-wide registry, so the fixtures have
-/// to land there. Safe: nextest runs each test in its own process.
-fn setup_global() -> (Arc<ToolRegistry>, PluginHost) {
-    setup_with(Arc::clone(ToolRegistry::global_arc()))
+/// to land there. The lock keeps the two cases of the only global test from
+/// racing each other: parallel cases would otherwise resolve a fixture owned
+/// by a host the other case already dropped ("plugin host shutting down").
+static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+
+fn setup_global() -> (Arc<ToolRegistry>, PluginHost, MutexGuard<'static, ()>) {
+    let guard = GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (reg, host) = setup_with(Arc::clone(ToolRegistry::global_arc()));
+    (reg, host, guard)
 }
 
 fn describe(
@@ -313,7 +319,7 @@ fn with_mcp(qualified: &'static str) -> impl FnOnce(&mut ToolContext) {
 #[test_case::test_case(true ; "session_keeps_mcp")]
 #[test_case::test_case(false ; "session_drops_mcp")]
 fn agent_tools_describes_mcp_only_when_the_session_keeps_it(enabled: bool) {
-    let (reg, _host) = setup_global();
+    let (reg, _host, _guard) = setup_global();
     let ctx = shaped_ctx(&reg, with_mcp(MCP_TOOL_QUALIFIED));
     let desc = run_tool(
         &reg,
