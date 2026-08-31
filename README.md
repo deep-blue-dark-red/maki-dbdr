@@ -18,7 +18,9 @@ This fork adds:
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
 * An optimized default system prompt, benchmarked against the original across GLM 5.2, GLM 5.3, and the Qwen 3.8 family on SWE and DeepSWE benchmarks.
 
-This fork maintains maki/main's feature parity and merges from main often; often main catches up or implements something this fork has materialy already done; we merge towards main in such cases.
+This fork maintains maki/main's feature parity and merges from main often, typically every tagged release.
+
+Q: why a fork and not a PR? Easier, more control.
 
 ### Render changes
 
