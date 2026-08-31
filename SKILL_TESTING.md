@@ -102,7 +102,16 @@ Usage from within maki:
 use skill_test to test the create-plugin skill
 ```
 
-The tool uses `maki.fn.jobwait` to block the Lua handler until all subprocesses complete (60s timeout per test). It sets `is_error = true` in its output when any test fails, so the agent can surface the failure clearly.
+The tool uses `maki.fn.jobwait` to block the Lua handler until all subprocesses complete (60s timeout per test, overridable per test case via `timeout_ms`). It sets `is_error = true` in its output when any test fails, so the agent can surface the failure clearly.
+
+Failure diagnostics: ERROR results include elapsed time, exit code (when the process exited), and one-line tails of captured stderr/stdout, so a timeout or crash shows *why* (e.g. provider 429s, config errors) instead of a bare `timeout after 60s`. FAIL results include the first 800 chars of the full LLM response. Tests may set `timeout_ms`:
+
+```yaml
+tests:
+  - prompt: "..."
+    timeout_ms: 120000   # optional; default 60000
+    expect_contains: ["..."]
+```
 
 The tool finds the maki binary by scanning for `target/release/maki` up the directory tree from cwd, falling back to `maki` on PATH.
 

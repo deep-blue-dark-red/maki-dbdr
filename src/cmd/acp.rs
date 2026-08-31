@@ -31,7 +31,7 @@ pub fn run(model_arg: Option<String>, yolo: bool, no_plugins: bool, no_jit: bool
                 .load_init_files_or_skip(no_plugins, &cwd, warnings)
                 .context("load init.lua files")?
                 .unwrap_or_default()
-                .into_config(&names(host)?)
+                .into_config(false, &names(host)?)
                 .context("invalid config")?;
             config.permissions = load_permissions(&cwd);
 

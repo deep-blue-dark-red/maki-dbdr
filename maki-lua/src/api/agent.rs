@@ -14,7 +14,7 @@ use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
 use maki_agent::tools::{
-    Deadline, DescriptionContext, FileReadTracker, LocalToolFn, LocalTools, ToolAudience,
+    Deadline, DescriptionContext, FileReadTracker, LocalTool, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive,
 };
 use maki_agent::{
@@ -261,6 +261,9 @@ async fn tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>, opts: Table) -> LuaResu
         filter: &filter,
         audience,
         workflow,
+        // What this session can actually reach, so a description that varies on
+        // MCP describes the caller rather than a hypothetical.
+        mcp: agent.mcp.is_some(),
     };
     // Base definitions only: the session injects MCP definitions per
     // request, so baking them into a tools array would freeze the catalog.
@@ -436,7 +439,7 @@ async fn session(
         None => JsonValue::Array(vec![]),
     };
 
-    let mut local_map: HashMap<String, LocalToolFn> = HashMap::new();
+    let mut local_map: HashMap<String, LocalTool> = HashMap::new();
     if let Some(tbl) = local_tools_tbl {
         let defs = tools_json.as_array_mut().expect("checked above");
         for pair in tbl.pairs::<String, Table>() {
@@ -459,7 +462,7 @@ async fn session(
             let weak = lua.weak();
             local_map.insert(
                 name,
-                maki_agent::tools::local_tool(move |input, _ctx| {
+                maki_agent::tools::local_tool(audience, move |input, _ctx| {
                     let result = call_local_tool(&weak, &handler, &input);
                     Box::pin(async move { result })
                 }),
@@ -537,6 +540,7 @@ async fn session(
             registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
             audience,
             model_policy: Arc::clone(&agent_ctx.model_policy),
+            ledger: maki_agent::RunLedger::child(&agent_ctx.ledger),
         },
         system: system.unwrap_or_default(),
         tools: tools_json,
@@ -782,7 +786,11 @@ async fn prompt(
             history: &mut s.history,
             system: s.system.clone(),
             event_tx: s.sub_event_tx.clone(),
-            tools: s.tools.clone(),
+            tools: maki_agent::tools::RequestTools::assembled(
+                s.tools.clone(),
+                &s.params.config,
+                &s.params.model,
+            ),
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))
@@ -1002,6 +1010,10 @@ mod tests {
             },
             AgentEvent::Done {
                 usage: DONE_USAGE,
+                cost: None,
+                list_cost: None,
+                context_size: 0,
+                context_window: 0,
                 num_turns: 2,
                 reason: DoneReason::EndTurn,
             },

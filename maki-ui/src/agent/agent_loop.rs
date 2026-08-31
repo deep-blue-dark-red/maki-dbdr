@@ -24,7 +24,7 @@ use tracing::error;
 
 use super::ModelSlot;
 use super::cancel_map::RunCancelMap;
-use super::shared_queue::{QueueItem, QueueReceiver};
+use super::shared_queue::{QueueItem, QueueReceiver, QueuedInput};
 
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
@@ -130,13 +130,13 @@ impl AgentLoop {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
 
         let result = match entry {
-            QueueItem::Message {
+            QueueItem::Message(QueuedInput {
                 text,
                 image_count,
                 input,
                 displayed,
                 ..
-            } => {
+            }) => {
                 if !displayed {
                     let _ = event_tx.send(AgentEvent::QueueItemConsumed { text, image_count });
                 }
@@ -288,12 +288,17 @@ impl AgentLoop {
                 registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.model_policy),
+                ledger: Arc::new(maki_agent::RunLedger::default()),
             },
             AgentRunParams {
                 history: &mut self.history,
                 system,
                 event_tx,
-                tools: self.tools.clone(),
+                tools: maki_agent::tools::RequestTools::assembled(
+                    self.tools.clone(),
+                    &self.config,
+                    &slot.model,
+                ),
             },
         )
         .with_loaded_instructions(self.instructions.loaded.clone())
@@ -327,6 +332,7 @@ impl AgentLoop {
             filter: &filter,
             audience: ToolAudience::MAIN,
             workflow,
+            mcp: self.mcp.is_some(),
         };
         ToolRegistry::global().definitions(&self.vars, &ctx, examples)
     }

@@ -211,10 +211,27 @@ pub async fn compact(
         history.push(Message::synthetic(post.to_string()));
     }
 
+    // There is no running context gauge on the manual `/compact` path, so the
+    // summariser stands in for it: what it read is the size before, what it
+    // wrote is the size after.
+    let context_size_before = usage.total_input();
+    let context_size_after = usage.output;
+    event_tx.send(AgentEvent::CompactionDone {
+        context_size_before,
+        context_size_after,
+        context_window: model.context_window,
+    })?;
+
+    // `Compact` and not `EndTurn`, so a goal loop reading this sees
+    // housekeeping and does not treat it as a turn boundary.
     event_tx.send(AgentEvent::Done {
         usage,
+        cost: model.billed_cost(&usage, false),
+        list_cost: model.list_cost(&usage, false),
+        context_size: context_size_after,
+        context_window: model.context_window,
         num_turns: 1,
-        reason: DoneReason::EndTurn,
+        reason: DoneReason::Compact,
     })?;
 
     Ok(())
@@ -280,8 +297,14 @@ pub async fn checkpoint(
     )
     .await?;
 
+    // A checkpoint is append-only, so nothing leaves the context: what the
+    // summariser read plus what it appended is the size afterwards.
     event_tx.send(AgentEvent::Done {
         usage,
+        cost: model.billed_cost(&usage, false),
+        list_cost: model.list_cost(&usage, false),
+        context_size: usage.total_input().saturating_add(usage.output),
+        context_window: model.context_window,
         num_turns: 1,
         reason: DoneReason::EndTurn,
     })?;

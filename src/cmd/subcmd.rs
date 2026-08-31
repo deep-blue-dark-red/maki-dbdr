@@ -579,7 +579,7 @@ fn load_effective_config(
         .context("load init.lua files")?;
     raw_config
         .unwrap_or_default()
-        .into_config(&names(host)?)
+        .into_config(false, &names(host)?)
         .context("invalid config")
 }
 

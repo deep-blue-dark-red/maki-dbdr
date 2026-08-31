@@ -2,11 +2,13 @@ use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use flume::Sender;
 use maki_config::ToolKey;
-use maki_providers::{AgentError, ContentBlock, Message, Role, StopReason, TokenUsage};
+use maki_providers::{
+    AgentError, ContentBlock, Message, Role, StopReason, TokenUsage, add_cost,
+};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
@@ -566,6 +568,9 @@ pub enum DoneReason {
     MaxTokens,
     MaxTurns,
     Cancelled,
+    /// A manual `/compact` ended the run, but no user turn ended with it, so
+    /// a goal loop should not treat this as a turn boundary.
+    Compact,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -577,6 +582,29 @@ impl From<Option<StopReason>> for DoneReason {
             Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
         }
     }
+}
+
+/// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
+/// `Shutdown`, `Reload`, `Replaced`, and `Completed` tear the host down: no
+/// UI is left to talk to and every handler shares one grace period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
+#[strum(serialize_all = "snake_case")]
+pub enum SessionEndReason {
+    /// `/reset` cleared the transcript.
+    Reset,
+    /// Another session was loaded into this tab.
+    Load,
+    /// The tab was closed.
+    Delete,
+    /// The process is exiting.
+    Shutdown,
+    /// `/reload` is rebuilding the plugin host. The session carries on in the
+    /// next generation, so a handler cleaning up for good wants `Shutdown`.
+    Reload,
+    /// An ACP client started or loaded a session over this one.
+    Replaced,
+    /// A headless run finished.
+    Completed,
 }
 
 #[derive(Debug, Serialize)]
@@ -611,16 +639,29 @@ pub enum AgentEvent {
     QueueDrained,
     Done {
         usage: TokenUsage,
+        /// Billed cost for the whole run, `None` while nothing was priced.
+        cost: Option<f64>,
+        /// List-price reference cost, for subsidised models.
+        list_cost: Option<f64>,
+        context_size: u32,
+        context_window: u32,
         num_turns: u32,
         reason: DoneReason,
     },
-    AutoCompacting,
+    AutoCompacting {
+        context_size: u32,
+        context_window: u32,
+    },
     /// Emitted before a manual `/compact` or `/checkpoint` streams its summary,
     /// so the UI can label the resulting block. `checkpoint` selects the label.
     CompactionStart {
         checkpoint: bool,
     },
-    CompactionDone,
+    CompactionDone {
+        context_size_before: u32,
+        context_size_after: u32,
+        context_window: u32,
+    },
     /// Emitted by the rename subagent with the LLM-generated session title.
     RenameResult {
         title: String,
@@ -926,6 +967,57 @@ pub struct TurnCompleteEvent {
     /// Number of retried API errors before this turn's request ultimately
     /// succeeded.
     pub api_error_count: u32,
+}
+
+/// What one run spent, itself and everything it spawned.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunTotals {
+    pub usage: TokenUsage,
+    pub cost: Option<f64>,
+    pub list_cost: Option<f64>,
+}
+
+/// Spend accumulator for one run, chained to the run that spawned it.
+///
+/// A round is added where it was paid for and walks up the chain, so every
+/// ledger holds its own subtree: a subagent reports its own spend, and the
+/// turn that spawned it still gets billed for the whole fan-out. Several
+/// subagents run at once, hence the lock.
+#[derive(Debug, Default)]
+pub struct RunLedger {
+    totals: Mutex<RunTotals>,
+    parent: Option<Arc<RunLedger>>,
+}
+
+impl RunLedger {
+    pub fn child(parent: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self {
+            totals: Mutex::default(),
+            parent: Some(Arc::clone(parent)),
+        })
+    }
+
+    pub fn add(&self, usage: TokenUsage, cost: Option<f64>, list_cost: Option<f64>) {
+        {
+            let mut totals = self.locked();
+            totals.usage += usage;
+            add_cost(&mut totals.cost, cost);
+            add_cost(&mut totals.list_cost, list_cost);
+        }
+        if let Some(parent) = &self.parent {
+            parent.add(usage, cost, list_cost);
+        }
+    }
+
+    pub fn totals(&self) -> RunTotals {
+        *self.locked()
+    }
+
+    /// A poisoned lock only means another run panicked mid-update. The totals
+    /// are still sound, and dropping a session's accounting over it is worse.
+    fn locked(&self) -> MutexGuard<'_, RunTotals> {
+        self.totals.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

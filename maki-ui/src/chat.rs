@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::app::tasks::{TaskOutcome, TaskStatus};
+
 use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
@@ -52,7 +54,8 @@ pub struct Chat {
     pub model_id: Option<String>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
-    finished: bool,
+    finish: Option<(TaskOutcome, usize)>,
+    task_id: Option<Arc<str>>,
 }
 
 impl Chat {
@@ -64,8 +67,29 @@ impl Chat {
             model_id: None,
             pending_turn_usage: None,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
-            finished: false,
+            finish: None,
+            task_id: None,
         }
+    }
+
+    pub(crate) fn subagent(
+        task_id: &str,
+        name: String,
+        ui_config: UiConfig,
+        lua_event_handle: maki_lua::EventHandle,
+    ) -> Self {
+        Self {
+            task_id: Some(Arc::from(task_id)),
+            ..Self::new(name, ui_config, lua_event_handle)
+        }
+    }
+
+    pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
+        self.task_id.as_ref()
+    }
+
+    pub(crate) fn task_status(&self) -> TaskStatus {
+        self.finish.map(|(outcome, _)| outcome).into()
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -111,7 +135,7 @@ impl Chat {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
                 }
             }
-            AgentEvent::AutoCompacting => {
+            AgentEvent::AutoCompacting { .. } => {
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
@@ -121,7 +145,7 @@ impl Chat {
             AgentEvent::CompactionStart { checkpoint } => {
                 self.messages_panel.begin_compaction(checkpoint);
             }
-            AgentEvent::CompactionDone => {
+            AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
             AgentEvent::QueueItemConsumed { text, image_count } => {
@@ -298,18 +322,27 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
-    pub fn mark_finished(&mut self, role: DisplayRole, text: &str) {
-        if self.finished {
+    /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
+    /// only ever grows one ending, but a caller who knows more than the one who
+    /// got here first rewrites it in place. See [`TaskOutcome::refines`].
+    pub(crate) fn mark_finished(&mut self, outcome: TaskOutcome, text: &str) {
+        if let Some((previous, bubble)) = self.finish {
+            if outcome.refines(previous) {
+                self.finish = Some((outcome, bubble));
+                self.messages_panel
+                    .replace(bubble, DisplayMessage::new(outcome.role(), text.into()));
+            }
             return;
         }
-        self.finished = true;
         self.messages_panel.flush();
-        self.messages_panel
-            .push(DisplayMessage::new(role, text.into()));
+        let bubble = self
+            .messages_panel
+            .push(DisplayMessage::new(outcome.role(), text.into()));
+        self.finish = Some((outcome, bubble));
     }
 
     pub fn is_finished(&self) -> bool {
-        self.finished
+        self.finish.is_some()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -1065,7 +1098,13 @@ mod tests {
             maki_lua::EventHandle::disconnected_for_test(),
         );
 
-        chat.handle_event(AgentEvent::AutoCompacting, None);
+        chat.handle_event(
+            AgentEvent::AutoCompacting {
+                context_size: 0,
+                context_window: 0,
+            },
+            None,
+        );
         assert_eq!(chat.message_count(), 1);
 
         chat.handle_event(
@@ -1083,7 +1122,14 @@ mod tests {
         assert!(!chat.streaming_text_is_empty());
         assert!(!chat.streaming_thinking_is_empty());
 
-        chat.handle_event(AgentEvent::CompactionDone, None);
+        chat.handle_event(
+            AgentEvent::CompactionDone {
+                context_size_before: 0,
+                context_size_after: 0,
+                context_window: 0,
+            },
+            None,
+        );
         assert!(chat.streaming_text_is_empty());
         assert!(chat.streaming_thinking_is_empty());
         assert_eq!(chat.message_count(), 3);

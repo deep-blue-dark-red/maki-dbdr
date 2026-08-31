@@ -88,7 +88,9 @@ impl StreamingCache {
             return false;
         }
         let text = maki_markdown::render::truncate_long_lines_at(visible, STREAMING_MAX_LINE_BYTES);
-        let semantic = renderer.render(text.as_ref(), width, theme_gen);
+        // The renderer drops its own per-block highlighter state when the
+        // theme moves, so `theme_gen` is only the cache key's business here.
+        let semantic = renderer.render(text.as_ref(), width);
         self.lines = paint_semantic(
             &semantic,
             paint.prefix,

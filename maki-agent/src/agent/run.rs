@@ -18,7 +18,10 @@ use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{Deadline, FileReadTracker, LocalTools, ToolAudience, ToolContext};
+use crate::tools::{
+    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
+};
+use crate::RunLedger;
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
@@ -76,13 +79,14 @@ pub struct AgentParams {
     pub registry: Arc<crate::tools::ToolRegistry>,
     pub audience: ToolAudience,
     pub model_policy: Arc<ModelPolicy>,
+    pub ledger: Arc<RunLedger>,
 }
 
 pub struct AgentRunParams<'h> {
     pub history: &'h mut History,
     pub system: String,
     pub event_tx: EventSender,
-    pub tools: Value,
+    pub tools: RequestTools,
 }
 
 pub struct Agent<'h> {
@@ -91,7 +95,7 @@ pub struct Agent<'h> {
     history: &'h mut History,
     system: String,
     event_tx: EventSender,
-    tools: Value,
+    tools: RequestTools,
     mode: AgentMode,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
@@ -121,6 +125,7 @@ pub struct Agent<'h> {
     local_tools: LocalTools,
     turn_state: super::turn_state::TurnState,
     model_policy: Arc<ModelPolicy>,
+    ledger: Arc<RunLedger>,
 }
 
 impl<'h> Agent<'h> {
@@ -161,6 +166,7 @@ impl<'h> Agent<'h> {
             local_tools: LocalTools::default(),
             turn_state: super::turn_state::TurnState::new(),
             model_policy: params.model_policy,
+            ledger: params.ledger,
         }
     }
 
@@ -285,16 +291,14 @@ impl<'h> Agent<'h> {
     }
 
     /// `self.tools` holds base tools only; the MCP part is recomputed here
-    /// every turn so `tool_search` loads and late-connecting servers take
-    /// effect on the next request.
     fn request_tools(&self) -> Cow<'_, Value> {
-        match &self.mcp {
-            Some(mcp) => {
-                let mut tools = self.tools.clone();
+        match self.mcp {
+            Some(ref mcp) => {
+                let mut tools = self.tools.definitions().clone();
                 mcp.extend_tools(&mut tools);
                 Cow::Owned(tools)
             }
-            None => Cow::Borrowed(&self.tools),
+            None => Cow::Borrowed(self.tools.definitions()),
         }
     }
 
@@ -446,6 +450,7 @@ impl<'h> Agent<'h> {
         self.emit_turn_complete(&response, cost, &self.turn_state.turns[turn_idx])?;
         let usage = response.usage;
         self.total_usage += usage;
+        self.ledger.add(usage, cost, self.model.list_cost(&usage, self.opts.clamped(&self.model).fast));
         self.context_size = usage.total_input();
 
         if has_tools {
@@ -545,15 +550,20 @@ impl<'h> Agent<'h> {
     }
 
     fn emit_done(&self, reason: DoneReason) -> Result<(), AgentError> {
+        let totals = self.ledger.totals();
         info!(
             self.num_turns,
-            total_input = self.total_usage.input,
-            total_output = self.total_usage.output,
+            total_input = totals.usage.input,
+            total_output = totals.usage.output,
             %reason,
             "agent run completed"
         );
         self.event_tx.send(AgentEvent::Done {
-            usage: self.total_usage,
+            usage: totals.usage,
+            cost: totals.cost,
+            list_cost: totals.list_cost,
+            context_size: self.context_size,
+            context_window: self.model.context_window,
             num_turns: self.num_turns,
             reason,
         })
@@ -629,6 +639,8 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
+            tool_filter: Arc::clone(self.tools.filter()),
+            ledger: Arc::clone(&self.ledger),
         }
     }
 
@@ -646,19 +658,23 @@ impl<'h> Agent<'h> {
             return Ok(false);
         }
         info!(context_size = self.context_size, "auto-compacting");
-        self.event_tx.send(AgentEvent::AutoCompacting)?;
+        self.event_tx.send(AgentEvent::AutoCompacting {
+            context_size: self.context_size,
+            context_window: self.model.context_window,
+        })?;
         self.do_compact().await?;
         Ok(true)
     }
 
     async fn do_compact(&mut self) -> Result<(), AgentError> {
+        let context_size_before = self.context_size;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
             self.timeouts,
             &self.model_policy,
         );
-        self.total_usage += compaction::compact_history(
+        let compaction_usage = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -668,8 +684,25 @@ impl<'h> Agent<'h> {
             &self.config,
         )
         .await?;
+        self.total_usage += compaction_usage;
+        // The summariser can be a different model, so price this with
+        // `compact_model` and not `self.model`.
+        let fast = self.opts.clamped(&compact_model).fast;
+        self.ledger.add(
+            compaction_usage,
+            compact_model.billed_cost(&compaction_usage, fast),
+            compact_model.list_cost(&compaction_usage, fast),
+        );
+        // The summary the model just wrote is all the next call will see, so
+        // its output count is the new gauge.
+        let context_size_after = compaction_usage.output;
+        self.context_size = context_size_after;
         self.rollback_len = self.history.len();
-        self.event_tx.send(AgentEvent::CompactionDone)?;
+        self.event_tx.send(AgentEvent::CompactionDone {
+            context_size_before,
+            context_size_after,
+            context_window: self.model.context_window,
+        })?;
         self.history
             .push(Message::synthetic(compaction::continue_message(
                 &self.config,
@@ -684,7 +717,7 @@ impl<'h> Agent<'h> {
             self.timeouts,
             &self.model_policy,
         );
-        self.total_usage += compaction::checkpoint_history(
+        let checkpoint_usage = compaction::checkpoint_history(
             &*provider,
             &model,
             self.history,
@@ -693,6 +726,13 @@ impl<'h> Agent<'h> {
             None,
         )
         .await?;
+        self.total_usage += checkpoint_usage;
+        let fast = self.opts.clamped(&model).fast;
+        self.ledger.add(
+            checkpoint_usage,
+            model.billed_cost(&checkpoint_usage, fast),
+            model.list_cost(&checkpoint_usage, fast),
+        );
         Ok(())
     }
 
@@ -940,12 +980,13 @@ mod tests {
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::new(ModelPolicy::default()),
+                ledger: Arc::new(RunLedger::default()),
             },
             AgentRunParams {
                 history,
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
-                tools: serde_json::json!([]),
+                tools: RequestTools::assembled(serde_json::json!([]), &AgentConfig::default(), &default_model()),
             },
         );
         (agent, event_rx)
@@ -1267,7 +1308,7 @@ mod tests {
             assert_eq!(
                 has_event(&drain_events(&event_rx), |e| matches!(
                     e,
-                    AgentEvent::AutoCompacting
+                    AgentEvent::AutoCompacting { .. }
                 )),
                 expected,
             );

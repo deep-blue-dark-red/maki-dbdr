@@ -12,6 +12,7 @@ mod queue;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
+pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod view;
@@ -23,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::AppSession;
+use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
@@ -379,7 +381,7 @@ impl App {
             plugins_modal: PluginsModal::new(),
             skills_modal: SkillsModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(typewriter),
+            btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
@@ -1545,7 +1547,7 @@ impl App {
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
-        self.finish_subagents(DisplayRole::Error, CANCELLED_TEXT);
+        self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.clear();
         self.shell.cancel_all();
         for chat in &mut self.chats {
@@ -1575,7 +1577,7 @@ impl App {
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(DisplayRole::Error, CANCELLED_TEXT);
+        self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(&tool_use_id);
 
         vec![Action::CancelSubagent { tool_use_id }]
@@ -1634,7 +1636,7 @@ impl App {
             // Workflow sessions use synthetic ids that no ToolDone will match,
             // so we finish them here on SubagentHistory.
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
-                self.chats[sub_idx].mark_finished(DisplayRole::Done, DONE_TEXT);
+                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
             self.sync_task_picker();
             self.state
@@ -1681,12 +1683,12 @@ impl App {
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
             if let Some(&sub_idx) = self.chat_index.get(&e.id) {
-                let (role, text) = if e.is_error {
-                    (DisplayRole::Error, ERROR_TEXT)
+                let (outcome, text) = if e.is_error {
+                    (TaskOutcome::Error, ERROR_TEXT)
                 } else {
-                    (DisplayRole::Done, DONE_TEXT)
+                    (TaskOutcome::Done, DONE_TEXT)
                 };
-                self.chats[sub_idx].mark_finished(role, text);
+                self.chats[sub_idx].mark_finished(outcome, text);
             }
             self.sync_task_picker();
         }
@@ -2441,15 +2443,15 @@ impl App {
         ])
     }
 
-    fn finish_subagents(&mut self, role: DisplayRole, text: &str) {
-        self.retain_resolved_subagents(role, text);
+    fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
+        self.retain_resolved_subagents(outcome, text);
         self.chat_index.clear();
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
-        self.retain_resolved_subagents(DisplayRole::Error, ERROR_TEXT);
+        self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {
             chat.fail_in_progress_with_message(message.into());
@@ -2460,12 +2462,12 @@ impl App {
     /// Marks unfinished subagent chats as ended and drops them from
     /// `chat_index`, so the session records only the children that really
     /// completed.
-    fn retain_resolved_subagents(&mut self, role: DisplayRole, text: &str) {
+    fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.chat_index.retain(|_, &mut sub_idx| {
             if self.chats[sub_idx].is_finished() {
                 true
             } else {
-                self.chats[sub_idx].mark_finished(role.clone(), text);
+                self.chats[sub_idx].mark_finished(outcome, text);
                 false
             }
         });

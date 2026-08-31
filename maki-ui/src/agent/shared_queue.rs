@@ -36,18 +36,20 @@ impl From<Submission> for QueuedMessage {
     }
 }
 
+pub(crate) struct QueuedInput {
+    pub(crate) text: String,
+    pub(crate) image_count: usize,
+    pub(crate) input: AgentInput,
+    pub(crate) run_id: u64,
+    /// `true` when the UI already drew the bubble (immediate dispatch).
+    /// The agent then skips `QueueItemConsumed` so we don't draw it twice.
+    /// `false` when the user typed while the agent was busy: the UI waits
+    /// for `QueueItemConsumed` before drawing.
+    pub(crate) displayed: bool,
+}
+
 pub(crate) enum QueueItem {
-    Message {
-        text: String,
-        image_count: usize,
-        input: AgentInput,
-        run_id: u64,
-        /// `true` when the UI already drew the bubble (immediate dispatch).
-        /// The agent then skips `QueueItemConsumed` so we don't draw it twice.
-        /// `false` when the user typed while the agent was busy: the UI waits
-        /// for `QueueItemConsumed` before drawing.
-        displayed: bool,
-    },
+    Message(QueuedInput),
     Compact {
         run_id: u64,
     },
@@ -63,7 +65,7 @@ pub(crate) enum QueueItem {
 impl QueueItem {
     pub(crate) fn run_id(&self) -> u64 {
         match self {
-            Self::Message { run_id, .. }
+            Self::Message(QueuedInput { run_id, .. })
             | Self::Compact { run_id }
             | Self::Checkpoint { run_id }
             | Self::Rename { run_id, .. } => *run_id,
@@ -72,8 +74,8 @@ impl QueueItem {
 
     fn as_queue_entry(&self) -> QueueEntry<'static> {
         match self {
-            Self::Message { text, .. } => QueueEntry {
-                text: Cow::Owned(text.clone()),
+            Self::Message(m) => QueueEntry {
+                text: Cow::Owned(m.text.clone()),
                 color: theme::current().foreground,
             },
             Self::Compact { .. } => QueueEntry {
@@ -102,7 +104,9 @@ impl QueueItem {
 
     fn into_extracted_command(self) -> ExtractedCommand {
         match self {
-            Self::Message { input, run_id, .. } => ExtractedCommand::Interrupt(input, run_id),
+            Self::Message(QueuedInput { input, run_id, .. }) => {
+                ExtractedCommand::Interrupt(input, run_id)
+            }
             Self::Compact { run_id } => ExtractedCommand::Compact(run_id),
             Self::Checkpoint { run_id } => ExtractedCommand::Checkpoint(run_id),
             Self::Rename { .. } => unreachable!("Rename is not dispatched via interrupt source"),
@@ -114,7 +118,7 @@ impl QueueItem {
     /// which used to make the bubble hop up by one frame.
     fn visible_in_panel(&self) -> bool {
         match self {
-            Self::Message { displayed, .. } => !displayed,
+            Self::Message(QueuedInput { displayed, .. }) => !displayed,
             Self::Compact { .. } | Self::Checkpoint { .. } | Self::Rename { .. } => true,
         }
     }
@@ -175,7 +179,7 @@ impl QueueSender {
             .iter()
             .filter(|item| item.visible_in_panel())
             .filter_map(|item| match item {
-                QueueItem::Message { text, .. } => Some(text.clone()),
+                QueueItem::Message(m) => Some(m.text.clone()),
                 QueueItem::Compact { .. }
                 | QueueItem::Checkpoint { .. }
                 | QueueItem::Rename { .. } => None,
@@ -234,7 +238,7 @@ mod tests {
     use test_case::test_case;
 
     fn msg(displayed: bool) -> QueueItem {
-        QueueItem::Message {
+        QueueItem::Message(QueuedInput {
             text: "t".into(),
             image_count: 0,
             input: AgentInput {
@@ -249,7 +253,7 @@ mod tests {
             },
             run_id: 0,
             displayed,
-        }
+        })
     }
 
     #[test_case(msg(false),                       true  ; "deferred_message_visible")]

@@ -9,6 +9,7 @@ use maki_storage::paths;
 use maki_storage::sessions::{StoredThinking, ThinkingParseError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use strum::VariantArray;
 use thiserror::Error;
 use tracing::warn;
 
@@ -89,6 +90,73 @@ pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+
+/// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
+/// the package approval store, and named on every guarded `maki.*` function.
+///
+/// It lives here rather than in `maki-lua` so the tool layer can name the
+/// permission a tool exposes without pulling in the lua runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, VariantArray)]
+pub enum Permission {
+    FsRead,
+    FsWrite,
+    Net,
+    Run,
+    Env,
+}
+
+impl Permission {
+    /// Derived from the enum, because reading a manifest, rendering the docs
+    /// and sizing a permission set all walk this, and a hand-written list is
+    /// the one place a new variant gets forgotten.
+    pub const ALL: &'static [Permission] = <Permission as VariantArray>::VARIANTS;
+
+    /// A permission set is an array this long, indexed by `Permission as
+    /// usize`, which is the position in [`Permission::ALL`] since both follow
+    /// declaration order.
+    pub const COUNT: usize = Permission::ALL.len();
+
+    /// Parses the name used in `plugin.toml` and in the approval store.
+    ///
+    /// Both use one spelling on purpose. If an approval were recorded under a
+    /// different name from the request, `intersect` would silently never
+    /// match, and every managed package would run with nothing granted.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Permission::ALL
+            .iter()
+            .copied()
+            .find(|p| p.manifest_key() == key)
+    }
+
+    pub const fn manifest_key(self) -> &'static str {
+        match self {
+            Permission::FsRead => "fs_read",
+            Permission::FsWrite => "fs_write",
+            Permission::Net => "net",
+            Permission::Run => "run",
+            Permission::Env => "env",
+        }
+    }
+
+    /// What the permission covers, in the words the reference renders. The
+    /// boundaries live here so there is one answer to "which guard does this
+    /// function belong under".
+    pub const fn describes(self) -> &'static str {
+        match self {
+            Permission::FsRead => "reading files, and locating the directories maki keeps them in",
+            Permission::FsWrite => "creating, changing, and removing files",
+            Permission::Net => "outbound network requests",
+            Permission::Run => "starting processes",
+            Permission::Env => "reading the process environment, where secrets live",
+        }
+    }
+}
+
+impl std::fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.manifest_key())
+    }
+}
 
 pub fn expand_env(value: &str) -> Result<String, String> {
     let mut out = String::with_capacity(value.len());
@@ -274,6 +342,7 @@ pub struct RawConfig {
     pub agent: AgentFileConfig,
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
+    pub net: NetFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
     /// Renamed to `plugins`; kept so old configs fail with a pointer to the
@@ -295,6 +364,7 @@ impl RawConfig {
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
+        self.net.merge(overlay.net);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -306,8 +376,12 @@ impl RawConfig {
         self.tools.extend(overlay.tools);
     }
 
-    pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
-        self.validate_plugin_tables()?;
+    /// `packages` are the external package names discovery found. They are
+    /// passed in rather than stored, because an installed package is host
+    /// state: it is not written in any config file and must not survive a
+    /// merge between two of them.
+    pub fn into_config(self, no_rtk: bool, packages: &[String]) -> Result<Config, ConfigError> {
+        self.validate_plugin_tables(packages)?;
         let disabled_tools: Vec<String> = self
             .plugins
             .iter()
@@ -326,15 +400,16 @@ impl RawConfig {
             agent: AgentConfig::from_file(self.agent, no_rtk, disabled_tools),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
+            net: NetConfig::from_file(self.net),
             telemetry: self.telemetry,
             permissions: PermissionsConfig::default(),
-            plugins: PluginsConfig::from_plugins(self.plugins),
+            plugins: PluginsConfig::from_plugins_and_packages(self.plugins, packages),
         })
     }
 
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
     /// old config, so fail loudly instead of letting it silently drift.
-    fn validate_plugin_tables(&self) -> Result<(), ConfigError> {
+    fn validate_plugin_tables(&self, packages: &[String]) -> Result<(), ConfigError> {
         if !self.tools.is_empty() {
             return Err(ConfigError::RenamedToolsTable);
         }
@@ -346,13 +421,16 @@ impl RawConfig {
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
+            let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
+            valid.extend(packages.iter().map(String::as_str));
+            valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
                 plugin: plugin.clone(),
-                valid: DEFAULT_BUILTINS.join(", "),
+                valid: valid.join(", "),
             });
         }
         Ok(())
@@ -578,6 +656,41 @@ impl ProviderFileConfig {
             low_speed_timeout_secs,
             stream_timeout_secs
         );
+    }
+}
+
+#[derive(Deserialize, Default, Debug)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetFileConfig {
+    pub allowed_private_hosts: Option<Vec<String>>,
+}
+
+impl NetFileConfig {
+    fn merge(&mut self, overlay: NetFileConfig) {
+        merge_option!(self, overlay, allowed_private_hosts);
+    }
+}
+
+/// Outbound network policy, consulted before any plugin-initiated request
+/// goes through. The model picks the URL, so private and metadata addresses
+/// are refused unless the user named the host here.
+#[derive(Debug, Clone, ConfigSection)]
+#[config(section = "net")]
+pub struct NetConfig {
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Hosts allowed to resolve to a private or loopback address, as `host`, `host:port`, or a CIDR range. Plain `http://` is kept for them instead of being upgraded to `https://`"
+    )]
+    pub allowed_private_hosts: Vec<String>,
+}
+
+impl NetConfig {
+    fn from_file(f: NetFileConfig) -> Self {
+        Self {
+            allowed_private_hosts: f.allowed_private_hosts.unwrap_or_default(),
+        }
     }
 }
 
@@ -882,6 +995,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
+    pub net: NetConfig,
     pub telemetry: TelemetryConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
@@ -1547,6 +1661,8 @@ impl TelemetryConfig {
 pub struct PluginsConfig {
     pub enabled: bool,
     pub names: Vec<String>,
+    /// Enabled external packages.
+    pub packages: Vec<String>,
     /// Per-plugin option tables, without `enabled`. Each plugin validates its
     /// own via `maki.api.register_options` at load time.
     pub opts: HashMap<String, JsonMap<String, JsonValue>>,
@@ -1554,16 +1670,37 @@ pub struct PluginsConfig {
 
 impl PluginsConfig {
     pub fn from_plugins(plugins: HashMap<String, PluginFileConfig>) -> Self {
+        Self::from_plugins_and_packages(plugins, &[])
+    }
+
+    /// Installed packages default to enabled like Neovim `start/` packages.
+    pub fn from_plugins_and_packages(
+        plugins: HashMap<String, PluginFileConfig>,
+        packages: &[String],
+    ) -> Self {
+        let enabled = |name: &String| plugins.get(name).and_then(|t| t.enabled).unwrap_or(true);
+
         let mut all: Vec<String> = DEFAULT_BUILTINS
             .iter()
-            .filter(|name| plugins.get(**name).and_then(|t| t.enabled).unwrap_or(true))
-            .map(|s| s.to_string())
+            .map(|s| (*s).to_owned())
+            .filter(|name| enabled(name))
             .collect();
+
+        let mut enabled_packages: Vec<String> = packages
+            .iter()
+            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()))
+            .filter(|name| enabled(name))
+            .cloned()
+            .collect();
+        enabled_packages.sort();
+        enabled_packages.dedup();
 
         let mut extra: Vec<&String> = plugins
             .iter()
             .filter(|(name, cfg)| {
-                !DEFAULT_BUILTINS.contains(&name.as_str()) && cfg.enabled.unwrap_or(false)
+                !DEFAULT_BUILTINS.contains(&name.as_str())
+                    && !packages.contains(name)
+                    && cfg.enabled.unwrap_or(false)
             })
             .map(|(name, _)| name)
             .collect();
@@ -1579,6 +1716,7 @@ impl PluginsConfig {
         Self {
             enabled: true,
             names: all,
+            packages: enabled_packages,
             opts,
         }
     }
@@ -2311,7 +2449,7 @@ mod tests {
 
     #[test]
     fn empty_config_returns_defaults() {
-        let config = RawConfig::default().into_config(false).unwrap();
+        let config = RawConfig::default().into_config(false, &[]).unwrap();
         assert!(config.ui.splash_animation);
         assert_eq!(config.ui.notifications, NotificationMethod::Auto);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
@@ -2332,7 +2470,7 @@ mod tests {
     fn notifications_deserialize(value: &str, expected: NotificationMethod) {
         let raw: RawConfig =
             toml::from_str(&format!("[ui]\nnotifications = \"{value}\"\n")).unwrap();
-        assert_eq!(raw.into_config(false).unwrap().ui.notifications, expected);
+        assert_eq!(raw.into_config(false, &[]).unwrap().ui.notifications, expected);
     }
 
     #[test]
@@ -2350,7 +2488,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert_eq!(config.agent.max_output_lines, 5000);
         assert_eq!(config.agent.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
@@ -2417,7 +2555,7 @@ mod tests {
             ..Default::default()
         });
 
-        let provider = global.into_config(false).unwrap().provider;
+        let provider = global.into_config(false, &[]).unwrap().provider;
         assert!(provider.allowed_models.is_empty());
         assert_eq!(provider.excluded_models, ["*/*-preview"]);
         assert!(provider.model_policy.allows("openai/gpt-5"));
@@ -2434,7 +2572,7 @@ mod tests {
             },
             ..Default::default()
         }
-        .into_config(false)
+        .into_config(false, &[])
         .unwrap();
         let policy = &config.provider.model_policy;
 
@@ -2450,7 +2588,7 @@ mod tests {
             },
             ..Default::default()
         }
-        .into_config(false)
+        .into_config(false, &[])
         .unwrap();
         assert!(exclude_only.provider.model_policy.allows("openai/gpt-5"));
         assert!(
@@ -2470,7 +2608,7 @@ mod tests {
             },
             ..Default::default()
         }
-        .into_config(false);
+        .into_config(false, &[]);
 
         assert!(matches!(
             result,
@@ -2505,19 +2643,19 @@ mod tests {
 
     #[test]
     fn always_workflow_resolves_default_and_set() {
-        let defaults = RawConfig::default().into_config(false).unwrap();
+        let defaults = RawConfig::default().into_config(false, &[]).unwrap();
         assert!(!defaults.always_workflow, "absent resolves to false");
 
         let raw = RawConfig {
             always_workflow: Some(true),
             ..Default::default()
         };
-        assert!(raw.into_config(false).unwrap().always_workflow);
+        assert!(raw.into_config(false, &[]).unwrap().always_workflow);
     }
 
     #[test]
     fn task_max_concurrent_resolves_default_and_set() {
-        let defaults = RawConfig::default().into_config(false).unwrap();
+        let defaults = RawConfig::default().into_config(false, &[]).unwrap();
         assert_eq!(
             defaults.agent.task_max_concurrent,
             DEFAULT_TASK_MAX_CONCURRENT
@@ -2530,7 +2668,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(raw.into_config(false).unwrap().agent.task_max_concurrent, 3);
+        assert_eq!(raw.into_config(false, &[]).unwrap().agent.task_max_concurrent, 3);
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -2544,14 +2682,14 @@ mod tests {
 
     #[test]
     fn into_config_resolves_always_thinking() {
-        let defaults = RawConfig::default().into_config(false).unwrap();
+        let defaults = RawConfig::default().into_config(false, &[]).unwrap();
         assert!(defaults.always_thinking.is_none());
 
         let raw = RawConfig {
             always_thinking: Some(AlwaysThinking::Mode("8192".into())),
             ..Default::default()
         };
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert_eq!(
             config.always_thinking,
             Some(StoredThinking::Budget { tokens: 8192 })
@@ -2561,7 +2699,7 @@ mod tests {
             always_thinking: Some(AlwaysThinking::Mode("fast".into())),
             ..Default::default()
         };
-        let err = raw.into_config(false).err().expect("expected config error");
+        let err = raw.into_config(false, &[]).err().expect("expected config error");
         assert!(matches!(err, ConfigError::Thinking(_)));
     }
 
@@ -2594,7 +2732,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert_eq!(config.ui.tool_output_lines.bash, 20);
         assert_eq!(config.ui.tool_output_lines.read, 20);
         assert_eq!(
@@ -2618,6 +2756,7 @@ mod tests {
             agent: AgentConfig::default(),
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
+            net: NetConfig::default(),
             telemetry: TelemetryConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
@@ -3019,14 +3158,14 @@ mod tests {
     #[test]
     fn show_thinking_missing_defaults_true() {
         let raw: RawConfig = toml::from_str("").unwrap();
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert!(config.ui.show_thinking);
     }
 
     #[test]
     fn max_input_lines_defaults_and_deserializes() {
         let raw: RawConfig = toml::from_str("").unwrap();
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert_eq!(config.ui.max_input_lines, DEFAULT_MAX_INPUT_LINES);
 
         let raw: RawConfig = toml::from_str("[ui]\nmax_input_lines = 5\n").unwrap();
@@ -3072,7 +3211,7 @@ mod tests {
             "[plugins.bash]\ntimeout_secs = 180\n[plugins.websearch]\nenabled = false\n",
         )
         .unwrap();
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert!(config.plugins.names.contains(&"bash".to_string()));
         assert!(!config.plugins.names.contains(&"websearch".to_string()));
         assert!(
@@ -3183,7 +3322,7 @@ mod tests {
     fn removed_sub_tool_tables_error() {
         for &tool in EDIT_SUB_TOOLS {
             let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
-            let Err(err) = raw.into_config(false) else {
+            let Err(err) = raw.into_config(false, &[]) else {
                 panic!("plugins.{tool} should be rejected");
             };
             let msg = err.to_string();
@@ -3199,7 +3338,7 @@ mod tests {
     #[test_case("search_result_limit = 50" ; "opts_only")]
     fn unknown_plugin_name_errors(body: &str) {
         let raw: RawConfig = toml::from_str(&format!("[plugins.gerp]\n{body}\n")).unwrap();
-        let Err(err) = raw.into_config(false) else {
+        let Err(err) = raw.into_config(false, &[]) else {
             panic!("plugins.gerp should be rejected");
         };
         let msg = err.to_string();
@@ -3213,7 +3352,7 @@ mod tests {
     fn disabled_plugin_keeps_opts_but_not_load_entry() {
         let raw: RawConfig =
             toml::from_str("[plugins.bash]\nenabled = false\ntimeout_secs = 180\n").unwrap();
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert!(!config.plugins.names.contains(&"bash".to_string()));
         assert_eq!(
             config.plugins.opts["bash"]["timeout_secs"],
@@ -3225,7 +3364,7 @@ mod tests {
     #[test]
     fn renamed_tools_table_errors() {
         let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
-        let Err(err) = raw.into_config(false) else {
+        let Err(err) = raw.into_config(false, &[]) else {
             panic!("old tools table should be rejected");
         };
         assert!(
@@ -3238,7 +3377,7 @@ mod tests {
     fn edit_sub_tool_toggles_flow_as_edit_opts() {
         let raw: RawConfig =
             toml::from_str("[plugins.edit]\nmultiedit = false\nedit_lines = true\n").unwrap();
-        let config = raw.into_config(false).unwrap();
+        let config = raw.into_config(false, &[]).unwrap();
         assert_eq!(
             config.plugins.opts["edit"]["multiedit"],
             serde_json::json!(false)

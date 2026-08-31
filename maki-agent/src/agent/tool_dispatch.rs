@@ -11,7 +11,7 @@ use tracing::{debug, error, warn};
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::registry::{ToolInvocation, ToolRegistry};
-use crate::tools::{LocalToolFn, ToolContext, truncate_bytes};
+use crate::tools::{CallOrigin, LocalToolFn, ToolContext, truncate_bytes};
 use crate::types::ToolResultParts;
 use crate::{AgentError, AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::ToolKey;
@@ -133,7 +133,7 @@ async fn run_inner(
     // the interpreter bridge); streamed names are canonicalized in streaming.rs.
     let name = super::streaming::canonical_tool_name(name);
     if let Some(local) = ctx.local_tools.get(name) {
-        return run_local_tool(local, id, name, input, ctx, emit).await;
+        return run_local_tool(&local.handler, id, name, input, ctx, emit).await;
     }
     let entry = registry.get(name);
     // LLM providers send tool names in wire format (server__tool) but our
@@ -149,7 +149,7 @@ async fn run_inner(
     let tool_id: Arc<str> = entry
         .as_ref()
         .map(|e| Arc::from(e.tool.name()))
-        .or_else(|| mcp.map(|m| m.interned_name(mcp_lookup)))
+        .or_else(|| mcp.and_then(|m| m.resolve(mcp_lookup)))
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     let started = Instant::now();
 
@@ -248,7 +248,7 @@ async fn run_inner(
         }
     } else if let Some(mcp) = mcp.filter(|_| name == TOOL_SEARCH_TOOL_NAME) {
         run_tool_search(mcp, id, input, ctx, emit)
-    } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
+    } else if mcp.is_some_and(|m| m.resolve(mcp_lookup).is_some()) {
         emit_raw_start(
             ctx,
             emit,
@@ -303,7 +303,7 @@ fn run_tool_search(
     let tool_id: Arc<str> = Arc::from(TOOL_SEARCH_TOOL_NAME);
     let query = input["query"].as_str().unwrap_or_default();
     emit_raw_start(ctx, emit, &id, &tool_id, query.to_owned(), input);
-    let (output, is_error) = match mcp.search_tools(query) {
+    let (output, is_error) = match mcp.search_tools(query, CallOrigin::Model) {
         Ok(out) => (out, false),
         Err(e) => (e, true),
     };
@@ -432,7 +432,7 @@ async fn execute_mcp_tool(
 
     // A permitted call to a deferred tool counts as loading it, so its full
     // definition joins the next request; a denied call must not load anything.
-    mcp.mark_loaded(tool_name);
+    mcp.mark_loaded(tool_name, CallOrigin::Model);
     match mcp.call_tool(tool_name, input).await {
         Ok(text) => done(text, false),
         Err(e) => done(e.to_string(), true),

@@ -406,7 +406,7 @@ impl InputBox {
 
         if max_scroll > 0 {
             let inner = area.inner(ratatui::layout::Margin::new(0, 1));
-            render_vertical_scrollbar(frame, inner, total_vl, self.scroll_y);
+            render_vertical_scrollbar(frame, inner, total_vl.into(), self.scroll_y.into());
         }
     }
 

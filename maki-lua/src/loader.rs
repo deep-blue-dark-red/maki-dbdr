@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::PluginRuleStore;
@@ -15,10 +15,13 @@ use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::util::command::{HintReader, LuaCommandReader, UiAction};
 use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
-use crate::runtime::{self, ClickFallback, LuaThread, Request, RestoreItem};
+use crate::runtime::{self, ClickFallback, EndSession, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
+use maki_agent::SessionEndReason;
+use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 
 pub(crate) struct BundledPlugin {
     pub(crate) name: &'static str,
@@ -97,6 +100,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
     },
     BundledPlugin {
+        name: "cronjob",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/cronjob"),
+    },
+    BundledPlugin {
         name: "view_image",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
     },
@@ -109,6 +116,13 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
 ];
+
+/// Every bundled name, not just the default-enabled ones. An external package
+/// sharing an owner name with any of them would let one package's unload tear
+/// down the other's registrations.
+pub(crate) fn is_bundled(name: &str) -> bool {
+    BUNDLED_PLUGINS.iter().any(|p| p.name == name)
+}
 
 pub(crate) fn lib_dir() -> &'static Dir<'static> {
     &BUNDLED_PLUGINS
@@ -205,16 +219,30 @@ impl PluginHost {
         Ok(host)
     }
 
-    pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
+    pub fn load_init_files(
+        &self,
+        cwd: &Path,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
         let mut merged: Option<RawConfig> = None;
 
         for global_dir in maki_config::global_config_dirs() {
-            self.run_init_file(&global_dir.join("init.lua"), "global/init.lua", &mut merged)?;
+            self.run_init_file(
+                &global_dir.join("init.lua"),
+                "global/init.lua",
+                &mut merged,
+                warnings,
+            )?;
             if merged.is_some() {
                 break;
             }
         }
-        self.run_init_file(&cwd.join(".maki/init.lua"), "project/init.lua", &mut merged)?;
+        self.run_init_file(
+            &cwd.join(".maki/init.lua"),
+            "project/init.lua",
+            &mut merged,
+            warnings,
+        )?;
 
         Ok(merged)
     }
@@ -226,11 +254,12 @@ impl PluginHost {
         &self,
         no_plugins: bool,
         cwd: &Path,
+        warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
         if no_plugins {
             return Ok(None);
         }
-        self.load_init_files(cwd)
+        self.load_init_files(cwd, warnings)
     }
 
     fn run_init_file(
@@ -238,6 +267,7 @@ impl PluginHost {
         path: &Path,
         label: &str,
         merged: &mut Option<RawConfig>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), PluginError> {
         if !path.is_file() {
             return Ok(());
@@ -247,6 +277,16 @@ impl PluginHost {
             source: e,
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
+        // A floor this build cannot meet skips the file with a warning rather
+        // than failing the run: one stale `min_maki_version` must not take the
+        // whole session down.
+        if let Err(e) = crate::plugin_permissions::check_plugin_compatibility(
+            label,
+            plugin_dir.as_deref(),
+        ) {
+            warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
+            return Ok(());
+        }
         if let Some(raw) = self.send_run_init_lua(source, label.to_owned(), plugin_dir)? {
             match merged {
                 Some(existing) => existing.merge(raw),
@@ -572,6 +612,84 @@ impl EventHandle {
         }
     }
 
+    /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
+    /// then return. Call from every session-end path so a Lua monitor can
+    /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].
+    ///
+    /// Nothing waits here, so handlers get no deadline and the UI is still
+    /// there to answer them.
+    pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
+        let _ = self.tx.try_send(Request::EndSession(EndSession {
+            session,
+            reason,
+            wait: None,
+        }));
+    }
+
+    /// [`Self::end_session`] for process exit: block until the handlers ran
+    /// and the jobs were reaped, so the `Shutdown` that follows on the
+    /// priority lane cannot skip ahead of them.
+    ///
+    /// Every session is queued first and the deadline is shared, so quitting
+    /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
+    pub fn end_sessions_blocking(
+        &self,
+        sessions: impl IntoIterator<Item = MakiId>,
+        reason: SessionEndReason,
+    ) {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let waits: Vec<_> = sessions
+            .into_iter()
+            .filter_map(|session| {
+                Some((session, self.send_end_session(session, reason, deadline)?))
+            })
+            .collect();
+        for (session, reply_rx) in waits {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if reply_rx.recv_timeout(left).is_err() {
+                tracing::warn!(
+                    session = %session,
+                    "SessionEnd did not finish within timeout, continuing teardown"
+                );
+            }
+        }
+    }
+
+    /// [`Self::end_sessions_blocking`] parked on a spare thread. ACP calls
+    /// this from its executor, where blocking would freeze stdin for the
+    /// whole grace period.
+    pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
+        let handle = self.clone();
+        smol::unblock(move || handle.end_sessions_blocking([session], reason)).await;
+    }
+
+    fn send_end_session(
+        &self,
+        session: MakiId,
+        reason: SessionEndReason,
+        deadline: Instant,
+    ) -> Option<flume::Receiver<()>> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send(Request::EndSession(EndSession {
+                session,
+                reason,
+                wait: Some((deadline, reply_tx)),
+            }))
+            .ok()?;
+        Some(reply_rx)
+    }
+
+    /// Headless drivers install their own provider so `maki.session.read` has
+    /// something to answer with instead of "no interactive UI attached". The UI
+    /// leaves the slot empty and answers through its event loop, which owns the
+    /// live session runtimes.
+    pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
+        let _ = self
+            .tx
+            .try_send(Request::InstallSessionSnapshot { provider });
+    }
+
     pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),
@@ -872,14 +990,14 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
 
         let skipped = host
-            .load_init_files_or_skip(true, dir.path())
+            .load_init_files_or_skip(true, dir.path(), &mut Vec::new())
             .expect("no-plugins skips broken init.lua");
         assert!(
             skipped.is_none(),
             "--no-plugins must skip user init.lua entirely"
         );
 
-        let ran = host.load_init_files_or_skip(false, dir.path());
+        let ran = host.load_init_files_or_skip(false, dir.path(), &mut Vec::new());
         assert!(
             ran.is_err(),
             "without --no-plugins the broken init.lua must surface as an error"

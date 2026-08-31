@@ -433,7 +433,8 @@ impl App {
         };
 
         let sel = state.sel();
-        if let Some(screen_sel) = self.screen_selection(sel, render_chat) {
+        let scroll = self.scroll_offset(sel.zone);
+        if let Some(screen_sel) = sel.to_screen(scroll) {
             selection::apply_highlight(frame.buffer_mut(), sel.highlight_area(), &screen_sel);
         }
         if state.is_pending_copy() {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use syntect::highlighting::{
@@ -17,6 +18,13 @@ type Rgb = (u8, u8, u8);
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<ThemeState>> = OnceLock::new();
 static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
+static THEME_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Bumped on every actual theme change, so caches keyed on it can tell a
+/// re-render under the same theme from one under a new one.
+pub fn theme_generation() -> u64 {
+    THEME_GENERATION.load(Ordering::Relaxed)
+}
 
 /// The active theme plus its derived syntect highlighter.
 ///
@@ -67,6 +75,7 @@ pub fn set_theme(theme: Theme) {
         return;
     }
     *state = ThemeState::new(theme);
+    THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn theme() -> &'static Theme {

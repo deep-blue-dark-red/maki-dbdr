@@ -145,8 +145,23 @@ impl MessagesPanel {
         self.restore_event_tx = event_tx;
     }
 
-    pub fn push(&mut self, msg: DisplayMessage) {
+    /// Hands back the index of the message, which [`Self::replace`] needs to
+    /// correct it later.
+    pub fn push(&mut self, msg: DisplayMessage) -> usize {
         self.messages.push(msg);
+        self.messages.len() - 1
+    }
+
+    /// Drops the whole segment cache, so keep it for one-off corrections and
+    /// never for streaming. Marking the message stale is not enough: only the
+    /// segments the viewport reaches get reflowed, so a fix above it would
+    /// keep painting the old bubble.
+    pub fn replace(&mut self, index: usize, msg: DisplayMessage) {
+        let Some(slot) = self.messages.get_mut(index) else {
+            return;
+        };
+        *slot = msg;
+        self.cache.clear();
     }
 
     pub fn load_messages(&mut self, mut msgs: Vec<DisplayMessage>) {
@@ -923,7 +938,7 @@ impl MessagesPanel {
         }
 
         if total_lines > area.height {
-            render_vertical_scrollbar(frame, area, total_lines, self.scroll_top);
+            render_vertical_scrollbar(frame, area, total_lines.into(), self.scroll_top.into());
         }
     }
 
@@ -940,8 +955,8 @@ impl MessagesPanel {
     /// against the current line count.
     pub fn win_view(&self) -> WinView {
         WinView {
-            scroll_top: self.scroll_top.min(self.max_scroll()),
-            line_count: self.last_total_lines,
+            scroll_top: self.scroll_top.min(self.max_scroll()).into(),
+            line_count: self.last_total_lines.into(),
             height: self.viewport_height,
             auto_scroll: self.auto_scroll,
         }

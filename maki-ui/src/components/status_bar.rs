@@ -20,6 +20,8 @@ const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
+const YOLO_LABEL: &str = " [yolo]";
+const YOLO_DIM_FACTOR: f32 = 0.5;
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -73,6 +75,7 @@ pub struct StatusBarContext<'a> {
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
+    pub yolo: bool,
     pub restoring: bool,
     pub streaming_info: Option<StreamingInfo>,
     pub streaming_active: bool,
@@ -278,6 +281,16 @@ impl StatusBar {
         }
 
         let mut right_spans = Vec::new();
+
+        // An error takes the whole bar over. The label saying the agent
+        // approves everything has to survive that, so it is pushed before the
+        // error check rather than inside the non-error arm.
+        if ctx.yolo {
+            right_spans.push(Span::styled(
+                YOLO_LABEL,
+                theme::dim_style(theme::current().error, YOLO_DIM_FACTOR),
+            ));
+        }
 
         if !matches!(ctx.status, Status::Error { .. }) {
             let pct = if ctx.stats.context_window > 0 {

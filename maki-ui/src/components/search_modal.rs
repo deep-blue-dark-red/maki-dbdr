@@ -2,7 +2,6 @@ use std::cmp::Reverse;
 
 use crate::components::Overlay;
 use crate::components::keybindings::key;
-use crate::components::messages::ScrollPos;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::text_buffer::TextBuffer;
@@ -35,7 +34,7 @@ pub enum SearchAction {
     Consumed,
     Navigate,
     Select(usize),
-    Close(Option<(ScrollPos, bool)>),
+    Close(Option<(u16, bool)>),
 }
 
 pub struct SearchModal {
@@ -45,7 +44,7 @@ pub struct SearchModal {
     scroll_offset: usize,
     viewport_height: usize,
     open: bool,
-    saved_scroll: Option<(ScrollPos, bool)>,
+    saved_scroll: Option<(u16, bool)>,
     matcher: Matcher,
 }
 
@@ -63,10 +62,10 @@ impl SearchModal {
         }
     }
 
-    pub fn open(&mut self, scroll: ScrollPos, auto_scroll: bool) {
+    pub fn open(&mut self, scroll_top: u16, auto_scroll: bool) {
         self.reset();
         self.open = true;
-        self.saved_scroll = Some((scroll, auto_scroll));
+        self.saved_scroll = Some((scroll_top, auto_scroll));
     }
 
     pub fn close(&mut self) {
@@ -366,7 +365,7 @@ mod tests {
 
     fn modal_with_query(query: &str, texts: &[&str]) -> SearchModal {
         let mut modal = SearchModal::new();
-        modal.open(ScrollPos::default(), true);
+        modal.open(0, true);
         modal.search = TextBuffer::new(query.into());
         modal.update_matches(texts);
         modal

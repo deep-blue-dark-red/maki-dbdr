@@ -80,6 +80,13 @@ pub(crate) fn hint_line<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<
     Line::from(spans)
 }
 
+pub(crate) fn visual_line_count(text_len: usize, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    text_len.div_ceil(width).max(1)
+}
+
 pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
     if delta > 0 {
         offset.saturating_sub(delta as u16)
@@ -470,6 +477,14 @@ mod tests {
             SNAPSHOT_GEN + 1
         };
         msg.snapshot_is_stale(current_gen)
+    }
+
+    #[test_case(0, 80, 1 ; "empty_text")]
+    #[test_case(0, 0, 1 ; "zero_width")]
+    #[test_case(5, 5, 1 ; "exact_fit")]
+    #[test_case(6, 5, 2 ; "one_char_overflow")]
+    fn visual_line_count_cases(text_len: usize, width: usize, expected: usize) {
+        assert_eq!(visual_line_count(text_len, width), expected);
     }
 
     #[test_case(10, 3, 7   ; "scroll_up")]

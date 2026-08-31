@@ -44,6 +44,8 @@ pub enum PluginError {
     },
     #[error("no bundled plugin named \"{plugin}\" (enabled via plugins.{plugin})")]
     UnknownPlugin { plugin: String },
+    #[error("no bundled plugin named \"{plugin}\" to receive plugins.{plugin} options ({keys})")]
+    UnknownPluginOptions { plugin: String, keys: String },
     #[error("plugin host is not running")]
     HostDead,
     #[error("bundled plugin {plugin} has an unusable plugin.toml: {message}")]

@@ -82,13 +82,19 @@ fn discover_commands(disable: bool) -> Vec<CustomCommand> {
 }
 
 fn load_config(plugin_host: &PluginHost, cli: &Cli, cwd: &Path) -> Result<Config> {
+    // The TUI reports startup warnings through its own channel, so init-load
+    // warnings are collected here and surfaced with the rest.
+    let mut warnings = Vec::new();
     let raw_config = plugin_host
-        .load_init_files_or_skip(cli.no_plugins, cwd)
+        .load_init_files_or_skip(cli.no_plugins, cwd, &mut warnings)
         .context("load init.lua files")?;
+    for warning in warnings {
+        tracing::warn!("{warning}");
+    }
 
     let mut config = raw_config
         .unwrap_or_default()
-        .into_config(cli.no_rtk)
+        .into_config(cli.no_rtk, &[])
         .context("invalid config")?;
     config.permissions = load_permissions(cwd);
 
@@ -275,6 +281,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             workflow: stack.config.always_workflow,
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
+            lua_handle: stack.plugin_host.event_handle(),
         })
         .context("run sdk mode")?;
         return Ok(());

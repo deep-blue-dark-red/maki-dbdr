@@ -26,6 +26,21 @@ fn os_homedir(_lua: &Lua) -> LuaResult<Option<String>> {
     Ok(maki_storage::paths::home().and_then(|p| p.to_str().map(String::from)))
 }
 
+/// Return the absolute path of the running maki executable. Like
+/// `vim.uv.exepath`. Useful for spawning maki itself from scripts or
+/// crontab lines, where `PATH` may not contain it.
+///
+/// @return (string?) Executable path, or nil if it cannot be determined.
+/// @example
+/// local exe = maki.uv.exepath()
+/// if exe then print("running from: " .. exe) end
+#[lua_fn(guard = FsRead)]
+fn exepath(_lua: &Lua) -> LuaResult<Option<String>> {
+    Ok(std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from)))
+}
+
 /// Look up the environment variable {name}. Like `vim.uv.os_getenv`.
 /// Returns nil when the variable is not set.
 ///
@@ -44,14 +59,14 @@ lua_table! {
     /// Provides access to the working directory, home directory, and environment
     /// variables. None of these functions throw.
     ///
-    /// Filesystem location queries (`cwd`, `os_homedir`) need `fs_read`, while
-    /// `os_getenv` reads the process environment, where secrets live, so it needs
-    /// `env`.
+    /// Filesystem location queries (`cwd`, `os_homedir`, `exepath`) need
+    /// `fs_read`, while `os_getenv` reads the process environment, where
+    /// secrets live, so it needs `env`.
     ///
     /// ```lua
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), exepath(perms), os_getenv(perms),
     ]
 }

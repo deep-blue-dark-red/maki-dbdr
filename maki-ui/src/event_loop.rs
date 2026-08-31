@@ -23,9 +23,12 @@ use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use maki_config::{ModelPolicy, UiConfig};
+use maki_lua::session_snapshot::{
+    MODE_BUILD, MODE_PLAN, SessionQueueSnapshot, SessionSnapshot,
+};
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
-    UiAction, UiReply,
+    TaskRequest, UiAction, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -38,7 +41,10 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::AppSession;
-use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
+use crate::agent::{
+    AgentCommand, AgentHandles, ModelSlot,
+    shared_queue::{QueueItem, QueuedInput},
+};
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
@@ -843,11 +849,22 @@ impl<'t> EventLoop<'t> {
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
+            UiAction::SetWindowTitle(title) => {
+                if let Err(error) = terminal::set_window_title(&title) {
+                    warn!(%error, "failed to set window title");
+                }
+            }
+            UiAction::Task { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_task_request(req));
+            }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }
             UiAction::WinRestView { scroll_top } => {
-                self.focused_app().set_scroll_top(scroll_top);
+                // The Lua-facing view is u32; the transcript's own scroll is
+                // u16, so a restore past its range saturates to the bottom.
+                self.focused_app()
+                    .set_scroll_top(scroll_top.try_into().unwrap_or(u16::MAX));
             }
             UiAction::Builtin(action) => {
                 let actions = self.focused_app().run_builtin(action);
@@ -1044,6 +1061,13 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            SessionRequest::Read { id } => {
+                let reply = match self.resolve_session_index(id.as_deref()) {
+                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::New { prompt, focus } => {
                 let session = {
                     let slot = self.ctx.model_slot.load();
@@ -1101,6 +1125,52 @@ impl<'t> EventLoop<'t> {
 
     /// Lua acts on the focused session, the same target the model picker and
     /// `/thinking` write to.
+    fn handle_task_request(&mut self, req: TaskRequest) -> UiReply {
+        match req {
+            TaskRequest::List => Ok(json!(self.focused_app().tasks())),
+            TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+        }
+    }
+
+    /// No id means the focused session. A plugin holding the id of a tab that
+    /// has since closed gets `session not live` back, so it knows to stop.
+    fn resolve_session_index(&self, id: Option<&str>) -> Result<usize, String> {
+        let Some(id) = id else {
+            return Ok(self.focused);
+        };
+        let parsed = parse_session_id(id)?;
+        self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    }
+
+    /// The totals live on the session, so a plugin that reloads mid run keeps
+    /// the accounting it would lose by summing `TurnEnd` payloads itself.
+    fn session_snapshot_json(&self, idx: usize) -> serde_json::Value {
+        let rt = &self.sessions[idx];
+        let app = &rt.app;
+        let snapshot = SessionSnapshot {
+            id: rt.id().to_string(),
+            cwd: app.state.session.cwd.clone(),
+            title: Some(app.state.session.title.clone()),
+            model: app.state.model.spec(),
+            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+                MODE_PLAN
+            } else {
+                MODE_BUILD
+            },
+            status: SessionStatus::of(app).as_str(),
+            focused: idx == self.focused,
+            updated_at: app.state.session.updated_at,
+            queue: Some(SessionQueueSnapshot {
+                count: app.queue.text_messages().len(),
+            }),
+            usage: app.state.token_usage,
+            context_size: app.state.context_size,
+            context_window: app.state.model.context_window,
+            cost: app.state.cost,
+        };
+        json!(snapshot)
+    }
+
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
         match req {
             ModelRequest::Get => Ok(self.focused_app().model_state()),
@@ -1324,13 +1394,13 @@ impl<'t> EventLoop<'t> {
                 let mut input = *input;
                 prepend_preamble(&mut input.preamble, rt.app.shell.drain_results());
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Message {
+                rt.handles.queue.push(QueueItem::Message(QueuedInput {
                     text: input.message.clone(),
                     image_count: input.images.len(),
                     input,
                     run_id,
                     displayed: true,
-                });
+                }));
             }
             Action::CancelAgent { run_id } => {
                 let rt = &mut self.sessions[idx];

@@ -406,7 +406,9 @@ pub enum WinCommand {
 }
 
 pub enum SessionRequest {
-    List { global: bool },
+    List {
+        global: bool,
+    },
     Live,
     Current,
     /// UI-mode fallback for `maki.session.read` when no snapshot slot is
@@ -478,6 +480,7 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    Tasks,
 }
 
 pub enum UiAction {

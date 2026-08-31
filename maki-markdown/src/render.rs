@@ -208,7 +208,7 @@ impl RenderState<'_> {
     /// re-render at a new width into a lookup.
     fn code_segments(&mut self, lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
         if !self.incremental {
-            return maki_highlight::highlight_block(lang, code).as_ref().clone();
+            return maki_highlight::highlight_code(lang, code, "");
         }
         if self.code_idx >= self.highlighters.len() {
             self.highlighters.push(CodeHighlighter::new(lang));

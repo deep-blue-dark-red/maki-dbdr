@@ -249,6 +249,38 @@ system.md can brick startup.
 
 ---
 
+### 14. `plugins/skill/init.lua` — skill_test failure diagnostics
+
+The `skill_test` agent tool runs behavioral smoke tests from a SKILL.md `tests:`
+frontmatter (architecture in `SKILL_TESTING.md`). The fork hardened its failure
+reporting; `run_one_test()` must keep:
+
+- **stderr capture** — an `on_stderr` handler collects subprocess stderr into
+  `stderr_parts`; it is no longer dropped.
+- **Per-test `timeout_ms` override** — `local deadline = tonumber(tc.timeout_ms) or 60000`
+  (default 60s per test).
+- **Elapsed timing** — `os.time()` delta returned as `elapsed` on every result.
+- **Diagnostic tails on failure** — the `tail_oneline()` helper collapses
+  whitespace and keeps the last 300 chars; the timeout, JSON-parse and
+  `is_error` paths return elapsed time, exit code, stderr tail and stdout tail.
+  The old bare `return nil, "timeout after 60s"` must not come back.
+- **Report rendering** — ERROR rows render the diagnostics in a fenced block;
+  PASS/FAIL rows include duration; FAIL rows append the first 800 chars of the
+  LLM response.
+
+Plugins are embedded at compile time (`include_dir!`, see `maki-lua/src/loader.rs`),
+so Lua edits require `cargo build --release` to take effect. `find_maki_bin()`
+prefers `maki` on PATH over the repo build, so the installed binary must be
+refreshed too or the old plugin keeps running.
+
+Verify:
+```bash
+grep -n "on_stderr\|timeout_ms\|tail_oneline" plugins/skill/init.lua
+cargo test -p maki-lua --test spec skill_plugin_spec
+```
+
+---
+
 ## Known gaps (not regressions, but broken)
 
 - **`Ctrl+Shift+D` (delete current session) has no handler.** The bind is

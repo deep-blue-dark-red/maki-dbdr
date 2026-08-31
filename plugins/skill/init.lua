@@ -245,6 +245,13 @@ local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
+-- Collapse whitespace and keep only the last n chars, for inline diagnostics.
+local function tail_oneline(s, n)
+  s = (s or ""):gsub("%s+", " ")
+  if #s <= n then return s end
+  return "…" .. s:sub(-n)
+end
+
 -- Runs one test case by spawning `maki --print` as a subprocess.
 -- Uses maki's own credentials and model config — no separate API key needed.
 local function run_one_test(maki_bin, skill_body, tc)
@@ -255,13 +262,16 @@ local function run_one_test(maki_bin, skill_body, tc)
     .. " --max-turns 1"
     .. " " .. shell_quote(tc.prompt)
 
-  local stdout_parts = {}
+  local stdout_parts, stderr_parts = {}, {}
   local done = false
-  local exit_code = 0
+  local exit_code = nil
 
   local id = maki.fn.jobstart(cmd, {
     on_stdout = function(_, line)
       stdout_parts[#stdout_parts + 1] = line
+    end,
+    on_stderr = function(_, line)
+      stderr_parts[#stderr_parts + 1] = line
     end,
     on_exit = function(_, code)
       exit_code = code
@@ -269,21 +279,40 @@ local function run_one_test(maki_bin, skill_body, tc)
     end,
   })
 
-  local deadline = 60000  -- 60s per test
+  local deadline = tonumber(tc.timeout_ms) or 60000  -- per-test override, default 60s
+  local t0 = os.time()
   local waited = maki.fn.jobwait(id, deadline)
+  local elapsed = os.time() - t0
+  local stdout_s = table.concat(stdout_parts, "\n")
+  local stderr_s = table.concat(stderr_parts, "\n")
+
   if not waited or not done then
     maki.fn.jobstop(id)
-    return nil, "timeout after 60s"
+    return nil, string.format(
+      "timeout after %ds (subprocess killed before exit) | stderr: %s | stdout: %s",
+      math.floor(deadline / 1000),
+      tail_oneline(stderr_s, 300),
+      tail_oneline(stdout_s, 300)
+    ), elapsed
   end
 
-  local raw = table.concat(stdout_parts, "\n")
+  local raw = stdout_s
   local data, parse_err = maki.json.decode(raw)
   if not data then
-    return nil, "parse: " .. tostring(parse_err) .. " (raw: " .. raw:sub(1, 200) .. ")"
+    return nil, string.format(
+      "json parse failed after %ds (exit_code=%s): %s | stderr: %s | stdout: %s",
+      elapsed, tostring(exit_code), tostring(parse_err),
+      tail_oneline(stderr_s, 300),
+      tail_oneline(raw, 300)
+    ), elapsed
   end
 
   if data.is_error then
-    return nil, "maki error: " .. (data.result or "unknown")
+    return nil, string.format(
+      "maki error after %ds (exit_code=%s): %s | stderr: %s",
+      elapsed, tostring(exit_code), (data.result or "unknown"),
+      tail_oneline(stderr_s, 300)
+    ), elapsed
   end
 
   local text = data.result or ""
@@ -301,7 +330,7 @@ local function run_one_test(maki_bin, skill_body, tc)
     end
   end
 
-  return { passed = #failures == 0, failures = failures, response = text }
+  return { passed = #failures == 0, failures = failures, response = text, elapsed = elapsed }
 end
 
 local function find_maki_bin()
@@ -327,7 +356,7 @@ if has_project_skills() then
 maki.api.register_tool({
   name        = "skill_test",
   kind        = "fetch",
-  description = "Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings.",
+  description = "Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings. Failures include elapsed time, exit code, and captured stderr/stdout tails; per-test `timeout_ms` overrides the 60s default.",
 
   schema = {
     type = "object",
@@ -367,16 +396,16 @@ maki.api.register_tool({
     local n_pass   = 0
 
     for i, tc in ipairs(tests) do
-      local res, err = run_one_test(maki_bin, body, tc)
+      local res, err, elapsed = run_one_test(maki_bin, body, tc)
       if err then
-        results[#results + 1] = { i = i, prompt = tc.prompt or "?", err = err }
+        results[#results + 1] = { i = i, prompt = tc.prompt or "?", err = err, elapsed = elapsed }
       elseif res.passed then
         n_pass = n_pass + 1
-        results[#results + 1] = { i = i, prompt = tc.prompt, passed = true }
+        results[#results + 1] = { i = i, prompt = tc.prompt, passed = true, elapsed = res.elapsed }
       else
         results[#results + 1] = {
           i = i, prompt = tc.prompt,
-          passed = false, failures = res.failures, response = res.response,
+          passed = false, failures = res.failures, response = res.response, elapsed = res.elapsed,
         }
       end
     end
@@ -387,12 +416,19 @@ maki.api.register_tool({
 
     for _, r in ipairs(results) do
       if r.err then
-        lines[#lines + 1] = string.format("**[%d] ERROR** — %s\n`%s`\n", r.i, r.prompt, r.err)
+        lines[#lines + 1] = string.format(
+          "**[%d] ERROR** (%ds) — %s\n```\n%s\n```\n",
+          r.i, r.elapsed or -1, r.prompt, r.err
+        )
       elseif r.passed then
-        lines[#lines + 1] = string.format("**[%d] PASS** — %s\n", r.i, r.prompt)
+        lines[#lines + 1] = string.format("**[%d] PASS** (%ds) — %s\n", r.i, r.elapsed or -1, r.prompt)
       else
         local fl = table.concat(r.failures, "\n- ")
-        lines[#lines + 1] = string.format("**[%d] FAIL** — %s\n- %s\n", r.i, r.prompt, fl)
+        lines[#lines + 1] = string.format(
+          "**[%d] FAIL** (%ds) — %s\n- %s\n\nFull response:\n```\n%s\n```\n",
+          r.i, r.elapsed or -1, r.prompt, fl,
+          (r.response or ""):sub(1, 800)
+        )
       end
     end
 

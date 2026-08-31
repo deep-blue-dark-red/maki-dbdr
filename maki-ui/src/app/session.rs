@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::app::tasks::TaskOutcome;
 use crate::components::DisplayRole;
 use crate::components::rewind_picker::{RewindEntry, display_msg_index_for_turn};
 use crate::components::settings_picker::UserSettings;
@@ -184,6 +185,7 @@ impl App {
             thinking: Some(state.thinking.into()),
             fast: state.fast,
             workflow: state.workflow,
+            yolo: self.permissions.persisted_yolo(),
         }
     }
 
@@ -279,7 +281,7 @@ impl App {
                     &self.ui_config.tool_output_lines,
                 );
                 chat.load_messages(display);
-                chat.mark_finished(DisplayRole::Done, DONE_TEXT);
+                chat.mark_finished(TaskOutcome::Unknown, DONE_TEXT);
                 self.fire_restore_items(items);
             }
             self.chats.push(chat);

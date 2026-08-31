@@ -29,7 +29,7 @@ pub use providers::update_api_log_symlink;
 pub use providers::xai::auth as xai_auth;
 pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_OMITTED_NOTE, ImageMediaType,
-    ImageSource, Message, MessageKind, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, Upstream, UsageLimit,
+    ImageSource, Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions,
+    Role, StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, Upstream, UsageLimit,
     adapt_images_for_model, dialect,
 };

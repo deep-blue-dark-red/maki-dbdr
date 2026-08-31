@@ -1,24 +1,36 @@
 mod api;
+pub mod agent_autocmd;
 pub mod docs;
 pub mod docs_render;
 mod error;
+mod hook;
 pub mod language;
 mod loader;
+mod pack;
 pub(crate) mod plugin_permissions;
 mod runtime;
+pub mod session_snapshot;
 
 pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
     HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
-    Split, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
+    Split, TaskRequest, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{EventHandle, PluginHost, bundled_plugins};
+pub use api::net::set_allowed_private_hosts;
+pub use api::pack::{Declared, PackOp};
+pub use maki_agent::SessionEndReason;
+pub use pack::{
+    DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, discover,
+    discover_installed, install_declared, lockfile_path, sanitize_message, site_dir,
+};
 pub use plugin_permissions::{Permission, PluginPermissions};
 pub use runtime::{KILL_GRACE, RestoreItem, WARM_TOOL_CAP};
+pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
     use crate::KeymapReader;
