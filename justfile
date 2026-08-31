@@ -12,7 +12,7 @@ run *ARGS:
     cargo run {{ARGS}}
 
 test *ARGS:
-    cargo nextest run --workspace {{ARGS}}
+    cargo test --workspace {{ARGS}}
 
 lint:
     cargo clippy --all --tests -- -D warnings
