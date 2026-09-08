@@ -232,7 +232,6 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.status_bar.clear_flash();
-        self.task_picker_original = None;
         self.last_esc = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();

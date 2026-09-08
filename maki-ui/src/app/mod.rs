@@ -36,7 +36,6 @@ use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
@@ -113,7 +112,6 @@ const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign eac
 /// Idle time after which a prompt cache is likely evicted by the provider.
 const CACHE_MISS_IDLE: Duration = Duration::from_secs(300);
 
-const TASK_DONE_DETAIL: &str = "✓ ";
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
 
@@ -122,25 +120,6 @@ const NOTIFICATION_PREVIEW_CHARS: usize = 200;
 /// error instead of ping-ponging with the Lua thread forever.
 pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
 pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
-
-#[derive(Clone)]
-pub(super) struct TaskEntry {
-    name: String,
-    finished: Option<bool>,
-    chat_index: usize,
-}
-
-impl PickerItem for TaskEntry {
-    fn label(&self) -> &str {
-        &self.name
-    }
-    fn detail(&self) -> Option<&str> {
-        matches!(self.finished, Some(true)).then_some(TASK_DONE_DETAIL)
-    }
-    fn is_spinning(&self) -> bool {
-        matches!(self.finished, Some(false))
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
@@ -232,8 +211,6 @@ pub struct App {
     pub(super) chat_index: HashMap<String, usize>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
-    pub(super) task_picker: ListPicker<TaskEntry>,
-    pub(super) task_picker_original: Option<usize>,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
@@ -368,8 +345,6 @@ impl App {
                 mcp_reader.clone(),
                 lua_command_reader,
             ),
-            task_picker: ListPicker::new(),
-            task_picker_original: None,
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
@@ -723,45 +698,11 @@ impl App {
             };
         }
         try_picker!(self.rewind_picker);
-        try_picker!(self.task_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
-    }
-
-    fn task_entries(&self) -> Vec<TaskEntry> {
-        self.chats
-            .iter()
-            .enumerate()
-            .map(|(chat_index, chat)| TaskEntry {
-                name: chat.name.clone(),
-                finished: (chat_index > 0).then_some(chat.is_finished()),
-                chat_index,
-            })
-            .collect()
-    }
-
-    fn open_tasks(&mut self) {
-        self.task_picker_original = Some(self.active_chat);
-        self.task_picker.open(self.task_entries(), " Tasks ");
-        self.task_picker.select(self.active_chat);
-    }
-
-    fn sync_task_picker(&mut self) {
-        if !self.task_picker.is_open() {
-            return;
-        }
-        let selected = self
-            .task_picker
-            .selected_item()
-            .map(|entry| entry.chat_index);
-        self.task_picker.replace_items(self.task_entries());
-        if let Some(chat_index) = selected {
-            self.task_picker
-                .select_item_by(|entry| entry.chat_index == chat_index);
-        }
     }
 
     fn handle_ctrl(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
@@ -782,9 +723,6 @@ impl App {
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
-        }
-        if key::TASKS.matches(key) {
-            return Some(self.run_builtin(BuiltinAction::Tasks));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();
@@ -1017,25 +955,6 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.task_picker.is_open() {
-            if key::TASKS.matches(key) {
-                self.task_picker.close();
-                return Some(vec![]);
-            }
-            return Some(match self.task_picker.handle_key(key) {
-                PickerAction::Consumed | PickerAction::Toggle(..) => vec![],
-                PickerAction::Select(entry) => {
-                    self.task_picker_original = None;
-                    self.active_chat = entry.chat_index;
-                    vec![]
-                }
-                PickerAction::Close => {
-                    self.active_chat = self.task_picker_original.take().unwrap_or(0);
-                    vec![]
-                }
-            });
-        }
-
         if self.rewind_picker.is_open() {
             return Some(match self.rewind_picker.handle_key(key) {
                 RewindPickerAction::Consumed => vec![],
@@ -1210,13 +1129,6 @@ impl App {
                 let top = self.chats[self.active_chat].scroll_top();
                 let auto = self.chats[self.active_chat].auto_scroll();
                 self.search_modal.open(top, auto);
-            }
-            BuiltinAction::Tasks => {
-                if self.task_picker.is_open() {
-                    self.task_picker.close();
-                } else {
-                    self.open_tasks();
-                }
             }
             BuiltinAction::Help => self.help_modal.toggle(),
             BuiltinAction::PlanToggle => {
@@ -1638,7 +1550,6 @@ impl App {
             if let Some(&sub_idx) = self.chat_index.get(tool_use_id.as_str()) {
                 self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
             }
-            self.sync_task_picker();
             self.state
                 .session_mut()
                 .set_subagent_messages(tool_use_id, messages);
@@ -1690,7 +1601,6 @@ impl App {
                 };
                 self.chats[sub_idx].mark_finished(outcome, text);
             }
-            self.sync_task_picker();
         }
 
         if let AgentEvent::Retry {
@@ -1973,7 +1883,6 @@ impl App {
             chat.push_user_message(prompt);
         }
         self.chats.push(chat);
-        self.sync_task_picker();
         self.sync_subagents();
         idx
     }
@@ -2019,10 +1928,6 @@ impl App {
         // The discard belongs to the typed path only: `run_cmdline` comes from
         // Lua and must leave whatever the user is halfway through writing.
         match cmd.name.as_str() {
-            "/tasks" => {
-                self.open_tasks();
-                vec![]
-            }
             "/compact" => {
                 if self.status == Status::Streaming {
                     self.queue_compact();
@@ -2307,7 +2212,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 19] {
+    fn overlays(&self) -> [&dyn Overlay; 18] {
         [
             &self.help_modal,
             &self.export_picker,
@@ -2319,7 +2224,6 @@ impl App {
             &self.float_mgr,
             &self.search_modal,
             &self.file_picker,
-            &self.task_picker,
             &self.rewind_picker,
             &self.goto_picker,
             &self.theme_picker,
@@ -2331,7 +2235,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
         [
             &mut self.help_modal,
             &mut self.export_picker,
@@ -2343,7 +2247,6 @@ impl App {
             &mut self.float_mgr,
             &mut self.search_modal,
             &mut self.file_picker,
-            &mut self.task_picker,
             &mut self.rewind_picker,
             &mut self.goto_picker,
             &mut self.theme_picker,
@@ -2457,7 +2360,6 @@ impl App {
         for chat in self.chats.iter_mut().skip(1) {
             chat.fail_in_progress_with_message(message.into());
         }
-        self.sync_task_picker();
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
@@ -2507,7 +2409,6 @@ impl App {
             };
         }
         try_picker!(self.file_picker);
-        try_picker!(self.task_picker);
         try_picker!(self.rewind_picker);
         try_picker!(self.goto_picker);
         try_picker!(self.theme_picker);

@@ -1166,7 +1166,6 @@ fn turn_complete_accumulates_usage_by_model() {
 #[test]
 fn cancel_resets_all_chats_and_indices() {
     let mut app = app_with_subagent();
-    open_tasks_picker(&mut app);
     app.update(subagent_msg(
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
             id: "sub_t1".into(),
@@ -1193,7 +1192,6 @@ fn cancel_resets_all_chats_and_indices() {
 
     let actions = app.handle_cancel();
     assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
-    assert!(!app.task_picker.is_open());
     assert_eq!(app.chats[0].in_progress_count(), 0);
     assert_eq!(app.chats[1].in_progress_count(), 0);
     assert!(app.chats[1].is_finished());
@@ -1258,22 +1256,6 @@ fn batch_subagent_done_marker(is_error: bool, expected_text: &str, expected_role
     assert_eq!(app.chats[1].last_message_role(), Some(expected_role));
 }
 
-fn open_tasks_picker(app: &mut App) {
-    for c in "/tasks".chars() {
-        app.update(Msg::Key(key(KeyCode::Char(c))));
-    }
-    app.update(Msg::Key(key(KeyCode::Enter)));
-}
-
-#[test]
-fn ctrl_x_toggles_tasks_picker() {
-    let mut app = test_app();
-    app.update(Msg::Key(kb::TASKS.to_key_event()));
-    assert!(app.task_picker.is_open());
-    app.update(Msg::Key(kb::TASKS.to_key_event()));
-    assert!(!app.task_picker.is_open());
-}
-
 fn streaming_app() -> App {
     let mut app = test_app();
     app.status = Status::Streaming;
@@ -1289,129 +1271,6 @@ pub(crate) fn app_with_subagent_id(id: &str) -> App {
 
 fn app_with_subagent() -> App {
     app_with_subagent_id(TASK_ID)
-}
-
-#[test]
-fn open_task_picker_refreshes_after_tool_done() {
-    let mut app = app_with_subagent();
-    open_tasks_picker(&mut app);
-    assert!(
-        app.task_picker
-            .selected_item()
-            .is_some_and(|entry| entry.chat_index == 0)
-    );
-
-    finish_subagent_task(&mut app, false);
-
-    assert!(app.task_picker.is_open());
-    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
-}
-
-#[test]
-fn open_task_picker_inserts_new_child_without_changing_selection() {
-    let mut app = app_with_subagent();
-    open_tasks_picker(&mut app);
-    app.update(Msg::Key(key(KeyCode::Down)));
-
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "new".into() },
-        "task2",
-        Some("build"),
-    ));
-
-    assert_eq!(app.task_picker.item(2).unwrap().name, "build");
-    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 1);
-}
-
-#[test]
-fn filtered_task_picker_enter_selects_entry_chat() {
-    let mut app = app_with_subagent_id("task1");
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "y".into() },
-        "task2",
-        Some("build"),
-    ));
-    open_tasks_picker(&mut app);
-    app.update(Msg::Key(key(KeyCode::Char('b'))));
-
-    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
-    app.update(Msg::Key(key(KeyCode::Enter)));
-
-    assert!(!app.task_picker.is_open());
-    assert_eq!(app.active_chat, 2);
-}
-
-#[test]
-fn filtered_task_picker_refresh_preserves_selected_chat_identity() {
-    let mut app = app_with_subagent_id("task1");
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "y".into() },
-        "task2",
-        Some("build"),
-    ));
-    open_tasks_picker(&mut app);
-    app.update(Msg::Key(key(KeyCode::Char('b'))));
-    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
-
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "z".into() },
-        "task3",
-        Some("benchmark"),
-    ));
-
-    assert!(app.task_picker.is_open());
-    assert_eq!(app.task_picker.selected_item().unwrap().chat_index, 2);
-}
-
-#[test]
-fn open_task_picker_refreshes_after_subagent_history() {
-    let mut app = app_with_subagent_id("session-abc");
-    open_tasks_picker(&mut app);
-
-    app.update(agent_msg(AgentEvent::SubagentHistory {
-        tool_use_id: "session-abc".into(),
-        messages: vec![],
-    }));
-
-    assert!(app.task_picker.is_open());
-    assert_eq!(app.task_picker.item(1).unwrap().finished, Some(true));
-}
-
-#[test]
-fn closed_task_picker_stays_closed_after_lifecycle_events() {
-    let mut app = app_with_subagent();
-    finish_subagent_task(&mut app, false);
-    app.update(subagent_msg(
-        AgentEvent::TextDelta { text: "new".into() },
-        "task2",
-        Some("build"),
-    ));
-    assert!(!app.task_picker.is_open());
-}
-
-#[test]
-fn picker_escape_restores_chat() {
-    let mut app = app_with_subagent();
-    assert_eq!(app.active_chat, 0);
-
-    open_tasks_picker(&mut app);
-    app.update(Msg::Key(key(KeyCode::Down)));
-    app.update(Msg::Key(key(KeyCode::Esc)));
-
-    assert!(!app.task_picker.is_open());
-    assert_eq!(app.active_chat, 0);
-}
-
-#[test]
-fn picker_enter_stays_at_navigated() {
-    let mut app = app_with_subagent();
-
-    open_tasks_picker(&mut app);
-    app.update(Msg::Key(key(KeyCode::Down)));
-    app.update(Msg::Key(key(KeyCode::Enter)));
-
-    assert!(!app.task_picker.is_open());
-    assert_eq!(app.active_chat, 1);
 }
 
 const OVERLAY_BLOCKED_KEYS: &[KeyEvent] = &[
@@ -1435,7 +1294,6 @@ fn focus_queue(app: &mut App) {
     app.queue.set_focus_at(0);
 }
 
-#[test_case(open_tasks_picker as fn(&mut App) ; "task_picker")]
 #[test_case(open_help                         ; "help_modal")]
 #[test_case(open_search                       ; "search_modal")]
 #[test_case(focus_queue                       ; "queue_focus")]
@@ -2344,12 +2202,6 @@ fn help_modal_consumes_keys_and_esc_closes() {
     ; "queue_focus"
 )]
 #[test_case(
-    |app: &mut App| { open_tasks_picker(app); },
-    &[KeybindContext::TaskPicker],
-    &[KeybindContext::Editing]
-    ; "task_picker"
-)]
-#[test_case(
     |app: &mut App| {
         app.state.session_mut().push_message(Message::user("test".into()));
         app.open_rewind_picker();
@@ -2728,6 +2580,33 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     );
 }
 
+/// `/tasks` is registered by a plugin, and the host must not shadow it with a
+/// builtin of its own: a hardcoded arm ahead of the plugin lookup silently
+/// routed the command to a picker that no longer exists.
+#[test]
+fn run_cmdline_reaches_plugin_command_the_host_also_names() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app_with_lua(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: "/tasks".into(),
+            description: "Browse and search tasks".into(),
+            plugin: "task".into(),
+            max_args: 0,
+        }]),
+    );
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.run_cmdline("/tasks", 0).unwrap();
+
+    assert_eq!(
+        probe.try_recv_command().map(|(name, _, _)| name),
+        Some("/tasks".to_string())
+    );
+}
+
 #[test]
 fn slash_noncommand_sends_as_prompt() {
     let mut app = test_app();
@@ -3100,11 +2979,6 @@ fn mcp_toggle_dispatches_action() {
     ; "consumed_by_plan_form"
 )]
 #[test_case(
-    |app: &mut App| { open_tasks_picker(app); },
-    ""
-    ; "routed_to_open_picker"
-)]
-#[test_case(
     |app: &mut App| { app.update(Msg::Key(kb::SEARCH.to_key_event())); },
     ""
     ; "routed_to_search_modal"
@@ -3337,14 +3211,12 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
         "model-c",
     ));
     finish_subagent(&mut app, "task3", false);
-    open_tasks_picker(&mut app);
 
     app.update(agent_msg(AgentEvent::Error {
         message: "boom".into(),
     }));
 
-    assert!(app.task_picker.is_open());
-    assert_eq!(app.task_picker.item(2).unwrap().finished, Some(true));
+    assert!(app.chats[2].is_finished());
     app.checkpoint();
     let saved: Vec<_> = app
         .state

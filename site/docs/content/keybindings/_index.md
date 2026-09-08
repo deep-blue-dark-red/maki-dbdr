@@ -106,7 +106,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 Child contexts inherit their parent's bindings and add their own.
 
-- **Pickers** is the base for: Task Picker, Rewind Picker, Goto Picker, Theme Picker, Settings Picker, Model Picker, Queue, Commands, Search, File Picker
+- **Pickers** is the base for: Rewind Picker, Goto Picker, Theme Picker, Settings Picker, Model Picker, Queue, Commands, Search, File Picker
 
 ## Overriding Keybindings
 

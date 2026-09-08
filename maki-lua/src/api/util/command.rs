@@ -480,7 +480,6 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
-    Tasks,
 }
 
 pub enum UiAction {

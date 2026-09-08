@@ -502,7 +502,6 @@ pub mod key {
         name: Some("edit_system_prompt"),
     };
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t', "plan_toggle");
-    pub const TASKS: Bind = ctrl_bind!('x', "tasks");
     pub const REFRESH: Bind = ctrl_bind!('r', "refresh");
     pub const SUSPEND: Bind = ctrl_bind!('z', "suspend");
     pub const DELETE: Bind = ctrl_bind!('d', "delete");
@@ -562,7 +561,6 @@ pub enum KeybindContext {
     Streaming,
     Picker,
     FormInput,
-    TaskPicker,
     RewindPicker,
     GotoPicker,
     ThemePicker,
@@ -582,7 +580,6 @@ impl KeybindContext {
             Self::Streaming => "While Streaming",
             Self::Picker => "Pickers",
             Self::FormInput => "Form",
-            Self::TaskPicker => "Task Picker",
             Self::RewindPicker => "Rewind Picker",
             Self::GotoPicker => "Goto Picker",
             Self::ThemePicker => "Theme Picker",
@@ -597,8 +594,7 @@ impl KeybindContext {
 
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
-            Self::TaskPicker
-            | Self::RewindPicker
+            Self::RewindPicker
             | Self::GotoPicker
             | Self::ThemePicker
             | Self::SettingsPicker
