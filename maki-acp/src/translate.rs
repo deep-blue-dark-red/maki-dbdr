@@ -824,7 +824,7 @@ mod tests {
                 output: 200,
                 cache_creation: 0,
                 cache_read: 50_000,
-                reasoning: 0,
+                ..Default::default()
             },
             model: "test-model".into(),
             cost,

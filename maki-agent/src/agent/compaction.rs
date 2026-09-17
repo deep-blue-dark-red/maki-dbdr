@@ -1086,7 +1086,7 @@ mod tests {
             output,
             cache_read,
             cache_creation,
-            reasoning: 0,
+            ..Default::default()
         };
         assert_eq!(
             is_overflow(usage.context_tokens(), &model, &AgentConfig::default()),

@@ -76,6 +76,7 @@ impl From<Usage> for TokenUsage {
             // Anthropic bills thinking inside `output_tokens` and never breaks
             // it out separately, so there is nothing to report here.
             reasoning: 0,
+            ..Default::default()
         }
     }
 }

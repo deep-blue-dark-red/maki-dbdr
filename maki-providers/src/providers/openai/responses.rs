@@ -549,6 +549,7 @@ fn parse_usage(u: &Value) -> TokenUsage {
         reasoning: u["output_tokens_details"]["reasoning_tokens"]
             .as_u64()
             .unwrap_or(0) as u32,
+        cost: None,
     }
 }
 

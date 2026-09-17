@@ -308,6 +308,10 @@ files). Decisions taken, so the next merge does not re-litigate them:
 Ported from upstream onto the fork's structures:
 
 - `ToolOutput::filterable_text_mut` + its test (upstream's output hooks need it).
+- Router-reported cost (`bdd5dfef`): `TokenUsage::cost` reads OpenRouter's
+  `usage.cost` and `billed_cost` prefers it, so a turn on a router is billed at
+  what the router charged instead of the table's rate for the model we asked
+  for. The pricing helper it displaced is now `TokenUsage::estimate`.
 - `InflightGate::acquire_before_abandoned`: a tool call still queued for a slot
   now ends its wait at cancel/deadline instead of parking until one frees.
 - `deliver_pending_job_events`: a finished task makes one bounded (256 event)

@@ -719,6 +719,7 @@ data: {\"type\":\"message_stop\"}\n";
                     cache_creation: 5,
                     cache_read: 8,
                     reasoning: 0,
+                    cost: None,
                 }
             );
             assert!(
