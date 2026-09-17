@@ -23,24 +23,29 @@ pub use api::util::command::{
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use loader::{
-    EventHandle, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING, bundled_plugins,
+    EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
+    bundled_plugins,
 };
 pub use maki_agent::SessionEndReason;
 pub use pack::{
-    DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin, discover,
-    discover_installed, install_declared, lockfile_path, sanitize_message, site_dir,
+    DeleteTarget, DiscoveredPackage, Discovery, InstallReport, Interaction, MANAGED_GROUP, Origin,
+    PackCommand, PackContext, PackPlan, PackPreparation, PackReport, PlannedOp, UpdateOptions,
+    UpdateTarget, apply_pack_plan, discover, discover_installed, install_declared, installed_names,
+    lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
-pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, WARM_TOOL_CAP};
+pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, RestoreReason, WARM_TOOL_CAP};
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
     use crate::KeymapReader;
+    use crate::SessionEndReason;
     use crate::api::keymap::{KeymapEntry, KeymapWriter};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
+    use maki_storage::id::MakiId;
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 
@@ -106,12 +111,34 @@ pub mod test_support {
             None
         }
 
+        /// Next queued restore item, skipping other requests.
+        pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::RestoreToolAsync { item, .. } = req {
+                    return Some(item);
+                }
+            }
+            None
+        }
+
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             use crate::runtime::Request;
             while let Ok(req) = self.0.try_recv() {
                 if let Request::FireAutocmd { event, data } = req {
                     return Some((event, data));
+                }
+            }
+            None
+        }
+
+        /// Next `SessionEnd` request as the session being left behind and why.
+        pub fn try_recv_end_session(&self) -> Option<(MakiId, SessionEndReason)> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::EndSession(end) = req {
+                    return Some((end.session, end.reason));
                 }
             }
             None

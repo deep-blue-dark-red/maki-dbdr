@@ -12,50 +12,68 @@ use agent_client_protocol_schema::{
     Notification, PromptRequest, PromptResponse, Request, RequestId, RequestPermissionRequest,
     RequestPermissionResponse, Response, SessionId, SessionModeId, SessionNotification,
     SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent, ToolCallId,
-    ToolCallUpdate, ToolCallUpdateFields,
+    SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use color_eyre::eyre::Context;
-use flume::{Receiver, Sender, WeakSender};
+use flume::{Sender, WeakSender};
 use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
-use maki_agent::permissions::PermissionAnswer;
+use maki_agent::permissions::{PermissionAnswer, TaggedAnswer};
 use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience, local_tool};
 use maki_agent::types::AgentEvent;
-use maki_agent::{AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason};
-use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy};
+use maki_agent::{
+    AgentInput, AgentMode, Envelope, ImageMediaType, ImageSource, SessionEndReason, SessionEvents,
+};
+use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
+use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
 use maki_providers::provider::{available_model_specs, fetch_all_models};
 use maki_providers::{Message, TokenUsage, add_cost, settle_session};
+use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::sessions::StoredTokenUsage;
 use serde::Serialize;
 use serde_json::Value;
+use smol::Task;
 use smol::io::AsyncBufReadExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
-/// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
+/// We advertise no auth methods, so there is no in-band `authenticate` the
+/// client could run mid-turn: the turn ends and the user re-logins out of band
+/// before prompting again.
+const AUTH_FAILED_MSG: &str =
+    "Authentication failed. Run `maki auth login`, then send the prompt again.";
+/// Turns already recorded were priced when they ran. `always_fast` is a live
+/// config value, so reading it here would reprice history the user paid for at
+/// standard rates. New turns still honour it.
 const RESTORED_FAST: bool = false;
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
 static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUEST_ID);
 
-/// What the client still owes us. `ask` is the one outstanding request that
-/// blocks a tool (permission or elicitation): there can only be one, because
-/// both wait on the agent's single answer channel.
+/// What the client still owes us. Every agent waits on its own answer channel,
+/// so a child's permission can be outstanding next to the main agent's.
 #[derive(Default)]
 struct Pending {
     prompt: Option<RequestId>,
-    ask: Option<(i64, AskKind)>,
+    asks: HashMap<i64, Ask>,
 }
 
-enum AskKind {
-    Permission,
+/// How to read the answer and who gets it. A subagent's permission carries the
+/// channel its own agent waits on, everything else answers the main agent.
+enum Ask {
+    /// `request_id` is the agent-side id of the ask the tool is parked on, not
+    /// the JSON-RPC id and not the client-facing tool call: the answer is
+    /// tagged with it so a waiter on any other ask refuses it.
+    Permission {
+        request_id: String,
+        answer_tx: Option<Sender<String>>,
+    },
     Elicitation,
 }
 
@@ -74,6 +92,7 @@ struct Server {
     model_specs: Vec<String>,
     model_policy: Arc<ModelPolicy>,
     client_elicits_form: bool,
+    defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
 }
@@ -108,6 +127,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         model_specs: available_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
+        defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
     };
@@ -258,17 +278,27 @@ async fn new_session(
 ) -> Result<AgentResponse, AcpError> {
     let req: NewSessionRequest = parse_params(raw)?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
-    let cwd = req.cwd.clone();
-    let (handle, pending) = spawn_session(srv, params, req.cwd, None, Vec::new(), mcp.clone());
-    maki_otel::emit::session_started(
-        maki_otel::emit::START_FRESH,
-        Some(handle.session_id.as_str()),
+    let project_config = trusted_project_config(
+        &req.cwd,
+        &params.storage,
+        params.trust_mode,
+        &params.trust_policy,
     );
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
+    let session_ref = start_session(
+        srv,
+        params,
+        req.cwd,
+        None,
+        InitialHistory::default(),
+        mcp,
+        project_config,
+        None,
+    );
+    maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(session_ref.as_str()));
     let spec = params.model.spec();
-    let resp = methods::new_session_response(handle.session_id.as_str())
+    let resp = methods::new_session_response(session_ref.as_str())
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
-    install_session(srv, handle, mcp, spec, pending, cwd, None);
     Ok(AgentResponse::NewSessionResponse(resp))
 }
 
@@ -285,29 +315,19 @@ async fn load_session(
         .map_err(|_| AcpError::resource_not_found(Some(req.session_id.0.to_string())))?;
     let mut restored = load_history(session_ref.id())?;
     close_session(srv, SessionEndReason::Replaced).await;
-    let mcp = start_mcp(&req.cwd, &req.mcp_servers).await;
+    let project_config = trusted_project_config(
+        &req.cwd,
+        &params.storage,
+        params.trust_mode,
+        &params.trust_policy,
+    );
+    let mcp = start_mcp(&req.cwd, &req.mcp_servers, project_config.clone()).await;
     let sid = SessionId::from(session_ref.to_string());
     let home = maki_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
     for update in translate::replay_history(&restored.history, replay_cwd, home.as_deref()) {
         session_update(&srv.out_tx, &sid, update);
     }
-    let cwd = req.cwd.clone();
-    let (handle, pending) = spawn_session(
-        srv,
-        params,
-        req.cwd,
-        Some(session_ref),
-        restored.history,
-        mcp.clone(),
-    );
-    maki_otel::emit::session_started(
-        maki_otel::emit::START_RESUME,
-        Some(handle.session_id.as_str()),
-    );
-    let spec = params.model.spec();
-    let resp = methods::load_session_response()
-        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
     let recorded_model = Model::from_spec(&restored.model).unwrap_or_else(|_| params.model.clone());
@@ -317,61 +337,109 @@ async fn load_session(
         &recorded_model,
         RESTORED_FAST,
     );
-    install_session(srv, handle, mcp, spec, pending, cwd, restored_cost);
+    let started = start_session(
+        srv,
+        params,
+        req.cwd,
+        Some(session_ref),
+        InitialHistory {
+            messages: restored.history,
+            context_size: restored.context_size,
+        },
+        mcp,
+        project_config,
+        restored_cost,
+    );
+    maki_otel::emit::session_started(maki_otel::emit::START_RESUME, Some(started.as_str()));
+    let spec = params.model.spec();
+    let resp = methods::load_session_response()
+        .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     Ok(AgentResponse::LoadSessionResponse(resp))
 }
 
-fn spawn_session(
-    srv: &Server,
+/// Spawns a session and installs it as the server's current one. Spawning
+/// alone is not a useful state: the event stream has exactly one reader, so it
+/// must be handed to the pump here rather than travel any further.
+#[allow(clippy::too_many_arguments)]
+fn start_session(
+    srv: &mut Server,
     params: &AcpParams,
     cwd: PathBuf,
     session_id: Option<SessionRef>,
-    history: Vec<Message>,
-    mcp_handle: Option<McpHandle>,
-) -> (InteractiveHandle, PendingState) {
+    initial: InitialHistory,
+    mcp: Option<McpHandle>,
+    project_config: ProjectConfig,
+    initial_cost: Option<f64>,
+) -> SessionRef {
     let pending = PendingState::default();
     // Without form elicitation the question tool would spin forever waiting
     // for a TUI that does not exist, so it is dropped and the model asks in
     // plain text instead.
     let (excluded_tools, local_tools) = if srv.client_elicits_form {
-        let tool = question_tool(srv.out_tx.clone(), Arc::clone(&pending));
+        let tool = question_tool(srv.out_tx.downgrade(), Arc::clone(&pending));
         let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
         (Vec::new(), map)
     } else {
         (vec![QUESTION_TOOL_NAME], LocalTools::default())
     };
-    let handle = headless::spawn_interactive(InteractiveParams {
+    // The ACP process cwd owns env, Lua, and application config, but the client
+    // picks the session cwd. So permissions, where a saved answer lands, and
+    // MCP config all follow the session's project, not ours.
+    let project_trusted = project_config.is_trusted();
+    let permissions_config = maki_config::load_permissions(&project_config);
+    let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
-        permissions_config: params.permissions_config.clone(),
+        permissions_config,
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),
         excluded_tools,
-        mcp_handle,
-        initial_wd: cwd,
+        mcp_handle: mcp.clone(),
+        initial_wd: cwd.clone(),
         session_id,
-        initial_history: history,
+        initial_history: initial.messages,
+        initial_context_size: initial.context_size,
         yolo: params.yolo,
         system_prompt_override: None,
         append_system_prompt: None,
-        workflow: false,
+        defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
+        project_config,
         local_tools,
     });
-    (handle, pending)
+    let session_ref = handle.session_id.clone();
+    start_event_pump(
+        events,
+        session_ref.clone(),
+        srv.out_tx.clone(),
+        Arc::clone(&pending),
+        handle.cancel_tx.clone(),
+        cwd,
+        maki_storage::paths::home(),
+        project_trusted,
+        initial_cost,
+    )
+    .detach();
+    srv.session = Some(SessionState {
+        handle,
+        mcp,
+        current_mode: AgentMode::Build,
+        current_model: params.model.spec(),
+        pending,
+    });
+    session_ref
 }
 
-/// Sends a request the client must answer and records it as the outstanding
-/// ask, registered before sending so the response can never race past us.
+/// Registers each ask before sending so a response cannot race past it.
 fn ask_client(
     out_tx: &Sender<Value>,
     pending: &PendingState,
-    kind: AskKind,
+    ask: Ask,
     request: AgentRequest,
 ) -> i64 {
     let id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    pending.lock().unwrap().ask = Some((id, kind));
+    pending.lock().unwrap().asks.insert(id, ask);
     send(
         out_tx,
         Request {
@@ -385,8 +453,11 @@ fn ask_client(
 
 /// Shadows the Lua `question` tool: sends `elicitation/create` to the client
 /// and blocks the tool call until the form comes back. Serializes on the same
-/// answer channel as permissions, so at most one ask is in flight.
-fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalTool {
+/// answer channel as main-agent permissions.
+/// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
+/// call parks and an idle VM never collects it. A strong clone here outlives
+/// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
+fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool {
     // The audience the Lua `question` tool carries: shadowing a tool must not
     // widen who may call it.
     local_tool(ToolAudience::MAIN, move |input, ctx| {
@@ -402,20 +473,17 @@ fn question_tool(out_tx: Sender<Value>, pending: PendingState) -> LocalTool {
             // scope pointing at a tool call the client never saw would get
             // the elicitation rejected or dropped.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
+            let out_tx = out_tx.upgrade().ok_or("connection closed")?;
             let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
             let guard = rx.lock().await;
             let request = AgentRequest::CreateElicitationRequest(request);
-            let id = ask_client(&out_tx, &pending, AskKind::Elicitation, request);
+            let id = ask_client(&out_tx, &pending, Ask::Elicitation, request);
             let response = ctx.cancel.race(guard.recv_async()).await;
             // Cleared while still holding the channel, so a stale id cannot
             // clobber whatever ask comes next.
-            let _ = pending
-                .lock()
-                .unwrap()
-                .ask
-                .take_if(|(ask_id, _)| *ask_id == id);
+            pending.lock().unwrap().asks.remove(&id);
             drop(guard);
 
             Ok(match response {
@@ -478,12 +546,44 @@ fn pairs<T>(items: &[T], split: impl Fn(&T) -> (&String, &String)) -> HashMap<St
 
 /// MCP is per session: the client picks the cwd and may inject its own servers.
 /// Returns as soon as the config is read, the first prompt waits for the tools.
-async fn start_mcp(cwd: &Path, servers: &[McpServer]) -> Option<McpHandle> {
-    let (handle, errors) = mcp::start_with_extra(cwd, injected_servers(servers)).await;
+async fn start_mcp(
+    cwd: &Path,
+    servers: &[McpServer],
+    project_config: ProjectConfig,
+) -> Option<McpHandle> {
+    let (handle, errors) =
+        mcp::start_with_extra(cwd, project_config, injected_servers(servers)).await;
     if !errors.is_empty() {
         warn!(%errors, "MCP config errors");
     }
     handle
+}
+
+fn trusted_project_config(
+    cwd: &Path,
+    storage: &StateDir,
+    mode: TrustMode,
+    policy: &TrustConfig,
+) -> ProjectConfig {
+    let mut decision = project::resolve(storage, cwd, mode);
+    let matched = decision
+        .state
+        .unanswered()
+        .and_then(|question| policy_grant(question, policy));
+    if let Some(pattern) = matched {
+        // ACP has no card, so policy is the only yes a cwd with no stored
+        // decision can get. Recorded like any other yes so `maki trust list`
+        // shows what this server trusted on the client's behalf. `unanswered`
+        // and not `question`: a recorded `Never` is a stored decision, and
+        // granting over it would wipe the rejection out of the store.
+        info!(%pattern, cwd = %cwd.display(), "ACP folder trusted by trust.paths policy");
+        decision = project::apply_answer(storage, decision, TrustAnswer::Trust);
+    }
+    // ACP never asks, so the restriction notice is part of what it reports.
+    for warning in decision.notices() {
+        warn!(%warning, "ACP project configuration trust warning");
+    }
+    decision.project_config
 }
 
 /// Stop the old session before the next one starts, so two generations of the
@@ -510,31 +610,13 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     }
 }
 
-fn install_session(
-    srv: &mut Server,
-    handle: InteractiveHandle,
-    mcp: Option<McpHandle>,
-    current_model: String,
-    pending: PendingState,
-    cwd: PathBuf,
-    initial_cost: Option<f64>,
-) {
-    start_event_pump(
-        handle.event_rx.clone(),
-        handle.session_id.clone(),
-        srv.out_tx.clone(),
-        Arc::clone(&pending),
-        cwd,
-        maki_storage::paths::home(),
-        initial_cost,
-    );
-    srv.session = Some(SessionState {
-        handle,
-        mcp,
-        current_mode: AgentMode::Build,
-        current_model,
-        pending,
-    });
+/// The transcript a session starts from, with the provider's own count for it.
+/// Paired so a resumed session cannot get its history while its gauge falls
+/// back to estimating that same history.
+#[derive(Default)]
+struct InitialHistory {
+    messages: Vec<Message>,
+    context_size: u32,
 }
 
 #[derive(Debug)]
@@ -543,6 +625,7 @@ struct Restored {
     /// Only set when the session recorded an absolute cwd.
     cwd: Option<PathBuf>,
     usage: TokenUsage,
+    context_size: u32,
     by_model: HashMap<String, StoredTokenUsage>,
     model: String,
 }
@@ -575,6 +658,7 @@ fn load_history_from(
     Ok(Restored {
         cwd: recorded,
         usage: session.token_usage,
+        context_size: session.meta.context_size,
         by_model: session.usage_by_model().clone(),
         model: session.model.clone(),
         history: session.take_messages(),
@@ -586,23 +670,22 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     let session = srv.session.as_ref().ok_or_else(no_session)?;
 
     let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput {
-        message,
-        mode: session.current_mode.clone(),
-        images,
-        preamble: Vec::new(),
-        thinking: Default::default(),
-        fast: false,
-        workflow: false,
-        prompt: None,
-    };
+    let input =
+        AgentInput::from_defaults(message, session.current_mode.clone(), images, srv.defaults);
 
+    // One outstanding id per session, checked and set under the same guard:
+    // `input_tx` is unbounded, so a second prompt would queue happily and
+    // overwrite the first id, leaving that request unanswered forever.
+    let mut pending = session.pending.lock().unwrap();
+    if pending.prompt.is_some() {
+        return Err(AcpError::new(-32603, "a prompt is already running"));
+    }
     session
         .handle
         .input_tx
         .send(input)
         .map_err(|_| AcpError::new(-32603, "session ended"))?;
-    session.pending.lock().unwrap().prompt = Some(id.clone());
+    pending.prompt = Some(id.clone());
     Ok(())
 }
 
@@ -660,9 +743,9 @@ fn handle_notification(srv: &Server, method: &str) {
     match method {
         "session/cancel" => {
             if let Some(session) = &srv.session {
-                // Any answer still in flight belongs to the cancelled turn, so
-                // forget its id and let it be dropped on arrival.
-                session.pending.lock().unwrap().ask = None;
+                // Every answer still in flight belongs to the cancelled turn,
+                // so forget the ids and let them be dropped on arrival.
+                session.pending.lock().unwrap().asks.clear();
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -672,30 +755,42 @@ fn handle_notification(srv: &Server, method: &str) {
 
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
-    let Some(id) = raw.get("id").and_then(Value::as_i64) else {
+    let id = raw.get("id").map(request_id).unwrap_or(RequestId::Null);
+    let ask = ask_id(&id).and_then(|id| session.pending.lock().unwrap().asks.remove(&id));
+    let Some(ask) = ask else {
+        warn!(%id, "response for an unknown request id");
         return;
     };
-    let ask = session
-        .pending
-        .lock()
-        .unwrap()
-        .ask
-        .take_if(|(ask_id, _)| *ask_id == id);
-    let Some((_, kind)) = ask else {
-        warn!(id, "response for an unknown request id");
-        return;
-    };
-    let answer = match kind {
-        AskKind::Permission => permission_answer(raw).encode(),
+    let (answer, answer_tx) = match &ask {
+        Ask::Permission {
+            request_id,
+            answer_tx,
+        } => (
+            TaggedAnswer::new(request_id.clone(), permission_answer(raw)).encode(),
+            answer_tx.as_ref(),
+        ),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
-        AskKind::Elicitation => raw
-            .get("result")
-            .cloned()
-            .unwrap_or(Value::Null)
-            .to_string(),
+        Ask::Elicitation => (
+            raw.get("result")
+                .cloned()
+                .unwrap_or(Value::Null)
+                .to_string(),
+            None,
+        ),
     };
-    let _ = session.handle.answer_tx.send(answer);
+    let _ = answer_tx.unwrap_or(&session.handle.answer_tx).send(answer);
+}
+
+/// Our asks go out with a numeric id, but JSON-RPC ids are `string | number`
+/// and a client may echo ours back as a string. Dropping such a response would
+/// park the waiting tool forever.
+fn ask_id(id: &RequestId) -> Option<i64> {
+    match id {
+        RequestId::Number(id) => Some(*id),
+        RequestId::Str(id) => id.parse().ok(),
+        RequestId::Null => None,
+    }
 }
 
 /// A response we cannot read still has to answer the agent, or the tool waits
@@ -719,10 +814,10 @@ fn extract_prompt_content(blocks: &[ContentBlock]) -> (String, Vec<ImageSource>)
             ContentBlock::Text(TextContent { text: t, .. }) => append(&mut text, t),
             ContentBlock::Image(ImageContent {
                 data, mime_type, ..
-            }) => images.push(ImageSource {
-                media_type: image_media_type(mime_type),
-                data: Arc::from(data.as_str()),
-            }),
+            }) => images.push(ImageSource::new(
+                image_media_type(mime_type),
+                Arc::from(data.as_str()),
+            )),
             ContentBlock::Resource(res) => {
                 if let EmbeddedResourceResource::TextResourceContents(trc) = &res.resource {
                     append(&mut text, &format!("--- {} ---\n{}", trc.uri, trc.text));
@@ -752,56 +847,125 @@ fn image_media_type(mime: &str) -> ImageMediaType {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_event_pump(
-    event_rx: Receiver<Envelope>,
+    mut events: SessionEvents,
     session_id: SessionRef,
     out_tx: Sender<Value>,
     pending: PendingState,
+    cancel_tx: Sender<()>,
     cwd: PathBuf,
     home: Option<PathBuf>,
+    project_trusted: bool,
     initial_cost: Option<f64>,
-) {
+) -> Task<()> {
     smol::spawn(async move {
         let sid = SessionId::from(session_id.to_string());
         let mut cost_total = initial_cost;
+        // A permission request only carries scopes, which are matching keys and
+        // not always paths, so the file context a client needs has to come from
+        // the tool call that asked for permission. Kept for the turn, like
+        // sdk_mode does: the history holds these inputs anyway.
+        let mut tool_inputs: HashMap<String, Value> = HashMap::new();
 
-        while let Ok(Envelope {
+        while let Some(Envelope {
             event, subagent, ..
-        }) = event_rx.recv_async().await
+        }) = events.next().await
         {
-            // Subagent stream events stay out of the transcript, but their
-            // turns still spend session money.
+            // A subagent's turn spends session money even though its events
+            // stay out of the transcript.
             if let AgentEvent::TurnComplete(tc) = &event {
                 add_cost(&mut cost_total, tc.cost);
             }
-            if subagent.is_some() {
-                continue;
-            }
 
             let update = match event {
+                AgentEvent::PermissionRequest { id, tool, scopes } => {
+                    let tool = tool.to_string();
+                    let scope = format!("{tool}: {}", scopes.join(", "));
+                    // The cache is keyed by the call that asked for permission,
+                    // so look it up before the remap below. A subagent is left
+                    // out on purpose: nothing makes a child's ids unique
+                    // against the parent's, and naming the wrong file in a
+                    // security prompt is worse than naming none.
+                    let raw_input = subagent.is_none().then(|| tool_inputs.get(&id)).flatten();
+                    // A child's own tool call never reached the client, nor
+                    // this cache, so its permission rides on the `task` call
+                    // the client can see, only the child's channel may take the
+                    // answer, and the title is all the dialog gets.
+                    let request_id = id.clone();
+                    let (id, title, answer_tx) = match subagent {
+                        Some(info) => {
+                            let Some(answer_tx) = info.answer_tx else {
+                                warn!(
+                                    subagent = info.name,
+                                    parent_tool_use_id = info.parent_tool_use_id,
+                                    tool_use_id = id,
+                                    scope,
+                                    "dropping subagent permission with no answer channel"
+                                );
+                                continue;
+                            };
+                            let title = format!("{}: {scope}", info.name);
+                            (info.parent_tool_use_id, title, Some(answer_tx))
+                        }
+                        None => (id, scope, None),
+                    };
+                    let request =
+                        AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
+                            sid.clone(),
+                            translate::permission_update(
+                                id,
+                                title,
+                                &tool,
+                                raw_input,
+                                &cwd,
+                                home.as_deref(),
+                            ),
+                            permissions::permission_options(project_trusted),
+                        ));
+                    ask_client(
+                        &out_tx,
+                        &pending,
+                        Ask::Permission {
+                            request_id,
+                            answer_tx,
+                        },
+                        request,
+                    );
+                    continue;
+                }
+                // A child's auth failure parks its own agent, and the parent is
+                // blocked on that child, so this runs before subagent events
+                // are dropped.
+                AgentEvent::AuthRequired => {
+                    tool_inputs.clear();
+                    if let Some(id) = finish_turn(&pending) {
+                        let error = AcpError::auth_required().data(json_str(&AUTH_FAILED_MSG));
+                        send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
+                    }
+                    // The agent waits for a re-authentication nothing in this
+                    // protocol can deliver, and it reads no further input until
+                    // that wait ends.
+                    let _ = cancel_tx.try_send(());
+                    continue;
+                }
+                _ if subagent.is_some() => continue,
                 AgentEvent::TextDelta { text } => translate::text_delta(&text),
                 AgentEvent::ThinkingDelta { text } => translate::thinking_delta(&text),
                 AgentEvent::ToolPending { id, name } => translate::tool_pending(&id, &name),
                 AgentEvent::ToolStart(event) => {
-                    translate::tool_start(&event, &cwd, home.as_deref())
+                    let update = translate::tool_start(&event, &cwd, home.as_deref());
+                    if let Some(raw_input) = event.raw_input {
+                        tool_inputs.insert(event.id, raw_input);
+                    }
+                    update
                 }
                 AgentEvent::ToolOutput { id, content } => translate::tool_output(&id, &content),
                 AgentEvent::ToolDone(event) => translate::tool_done(&event, &cwd, home.as_deref()),
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
-                AgentEvent::PermissionRequest { id, tool, scopes } => {
-                    let fields =
-                        ToolCallUpdateFields::new().title(format!("{tool}: {}", scopes.join(", ")));
-                    let request =
-                        AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
-                            sid.clone(),
-                            ToolCallUpdate::new(ToolCallId::from(id), fields),
-                            permissions::permission_options(),
-                        ));
-                    ask_client(&out_tx, &pending, AskKind::Permission, request);
-                    continue;
-                }
                 AgentEvent::Done { reason, .. } => {
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    tool_inputs.clear();
+                    if let Some(id) = finish_turn(&pending) {
                         let resp = PromptResponse::new(translate::map_done_reason(reason));
                         send(
                             &out_tx,
@@ -811,7 +975,11 @@ fn start_event_pump(
                     continue;
                 }
                 AgentEvent::Error { message } => {
-                    if let Some(id) = pending.lock().unwrap().prompt.take() {
+                    // A turn that dies on a provider 500 never reaches `Done`,
+                    // and the pump outlives the session, so without this the
+                    // whole file a `write` was carrying stays pinned forever.
+                    tool_inputs.clear();
+                    if let Some(id) = finish_turn(&pending) {
                         let error = AcpError::internal_error().data(Value::String(message));
                         send(&out_tx, Response::<AgentResponse>::new(id, Err(error)));
                     }
@@ -822,7 +990,16 @@ fn start_event_pump(
             session_update(&out_tx, &sid, update);
         }
     })
-    .detach();
+}
+
+/// Takes the client's outstanding `session/prompt`, if any. A turn only ends
+/// with nothing parked on an ask, so an ask still registered here belongs to a
+/// waiter that is already gone: it is dropped rather than left to sit in the
+/// map for the life of the session.
+fn finish_turn(pending: &PendingState) -> Option<RequestId> {
+    let mut pending = pending.lock().unwrap();
+    pending.asks.clear();
+    pending.prompt.take()
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
@@ -858,10 +1035,17 @@ fn json_str(e: &impl std::fmt::Display) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use maki_agent::permissions::PermissionManager;
+    use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
+    use maki_agent::tools::PermissionScopes;
+    use maki_agent::{
+        CancelToken, DoneReason, EventSender, SubagentInfo, ToolStartEvent, TurnCompleteEvent,
+    };
+    use maki_config::project::TrustQuestion;
+    use maki_config::{Effect, ToolKey, TrustFileConfig};
     use maki_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use maki_storage::StateDir;
     use maki_storage::sessions::Session;
+    use maki_storage::trusted_folders::{CanonicalFolder, TrustStatus, TrustedFolders};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -877,6 +1061,189 @@ mod tests {
     const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
+    /// Generous on purpose: the work under test is a few file reads, so any
+    /// wait near this long is the deadlock and not a slow machine.
+    const STDIN_DEADLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const DENY_SCOPE: &str = "acp-session-trust-boundary-test-deny";
+    const ALLOW_SCOPE: &str = "acp-session-trust-boundary-test-allow";
+    const POLICY_MATCH_GLOB: &str = "**";
+    const POLICY_MISS_GLOB: &str = "/nowhere/*";
+    const GATED_INIT_SOURCE: &str = "return {}";
+    /// The tool a later turn asks about. Nothing allows `bash` by default, so
+    /// an `Ok` here can only come from an answer that was applied.
+    const NEXT_TURN_TOOL: &str = "bash";
+    const NEXT_TURN_SCOPE: &str = "rm -rf /";
+    const NEXT_TURN_TOOL_USE_ID: &str = "toolu_next_turn";
+    const STALE_ALLOW: &str = "a stale answer must never allow the next turn's tool";
+
+    /// The client picks the session cwd, so that folder's stored trust decides
+    /// whether its `.maki` may widen permissions. Its deny rules need no trust:
+    /// a repository can only narrow what the agent may do.
+    #[test]
+    fn session_project_config_follows_stored_folder_trust() {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let maki_dir = project.path().join(".maki");
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::create_dir(&maki_dir).unwrap();
+        std::fs::write(
+            maki_dir.join("permissions.toml"),
+            format!("[bash]\ndeny = [\"{DENY_SCOPE}\"]\nallow = [\"{ALLOW_SCOPE}\"]\n"),
+        )
+        .unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let untrusted = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &TrustConfig::default(),
+        );
+        assert!(!untrusted.is_trusted());
+        let rules = maki_config::load_permissions(&untrusted).rules;
+        assert!(
+            rules
+                .iter()
+                .any(|rule| bash_rule(rule, DENY_SCOPE, Effect::Deny))
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.scope.as_deref() == Some(ALLOW_SCOPE))
+        );
+
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        project::grant(&storage, &TrustQuestion::for_folder(&folder)).unwrap();
+
+        let trusted = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &TrustConfig::default(),
+        );
+        assert!(trusted.is_trusted());
+        assert_eq!(
+            trusted.config_root(),
+            ProjectConfig::for_project(project.path()).config_root()
+        );
+        let rules = maki_config::load_permissions(&trusted).rules;
+        assert!(
+            rules
+                .iter()
+                .any(|rule| bash_rule(rule, DENY_SCOPE, Effect::Deny))
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| bash_rule(rule, ALLOW_SCOPE, Effect::Allow))
+        );
+    }
+
+    /// ACP resolves folder trust from its dispatch loop, on the same executor
+    /// that another thread is blocking on a whole stdin read. Reaching for
+    /// stdin on a path that can never ask a question parked the loop until the
+    /// client sent bytes it was only going to send after our answer, so the
+    /// first session hung forever.
+    #[test]
+    fn resolving_trust_without_a_prompt_does_not_wait_for_stdin() {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::create_dir(project.path().join(".maki")).unwrap();
+        std::fs::write(project.path().join(".maki/init.lua"), "return {}").unwrap();
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let cwd = project.path().to_path_buf();
+
+        let held = std::io::stdin().lock();
+        let (done_tx, done_rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            let config =
+                trusted_project_config(&cwd, &storage, TrustMode::Consult, &TrustConfig::default());
+            let _ = done_tx.send(config.is_trusted());
+        });
+
+        let finished = done_rx.recv_timeout(STDIN_DEADLOCK_TIMEOUT);
+        drop(held);
+        worker.join().unwrap();
+
+        assert_eq!(
+            finished,
+            Ok(false),
+            "a non-interactive trust resolution must not touch stdin"
+        );
+    }
+
+    /// A session cwd shipping one gated file, so a start there has a real
+    /// question for the policy to answer.
+    fn gated_project(project: &Path) {
+        std::fs::create_dir(project.join(".git")).unwrap();
+        std::fs::create_dir(project.join(".maki")).unwrap();
+        std::fs::write(project.join(".maki/init.lua"), GATED_INIT_SOURCE).unwrap();
+    }
+
+    fn trust_policy(pattern: &str) -> TrustConfig {
+        TrustConfig::from_file(TrustFileConfig {
+            paths: Some(vec![pattern.to_owned()]),
+            prompt: Some(false),
+        })
+        .expect("valid trust pattern")
+    }
+
+    /// The container image's global `init.lua` is the only thing that can
+    /// answer for an ACP run, and its answer has to reach the store: the next
+    /// start consults that alone, and `maki trust list` has to show it.
+    #[test_case(POLICY_MATCH_GLOB, true ; "a_matching_pattern_grants_without_asking")]
+    #[test_case(POLICY_MISS_GLOB, false ; "a_non_matching_pattern_leaves_the_folder_untrusted")]
+    fn policy_answers_a_session_cwd(pattern: &str, expected_trusted: bool) {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        gated_project(project.path());
+        let storage = StateDir::from_path(state.path().to_path_buf());
+
+        let config = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &trust_policy(pattern),
+        );
+
+        assert_eq!(config.is_trusted(), expected_trusted);
+        let recorded = project::resolve(&storage, project.path(), TrustMode::Consult);
+        assert_eq!(recorded.project_config.is_trusted(), expected_trusted);
+    }
+
+    /// A recorded `Never` is an answer, and `grant` replaces a rejection in the
+    /// store. A policy that overturned one would delete the decision the user
+    /// went out of their way to give, on every session the client opens.
+    #[test]
+    fn policy_does_not_overturn_a_recorded_rejection() {
+        let state = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        gated_project(project.path());
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let folder = CanonicalFolder::resolve(project.path()).unwrap();
+        project::deny(&storage, &TrustQuestion::for_folder(&folder)).unwrap();
+
+        let config = trusted_project_config(
+            project.path(),
+            &storage,
+            TrustMode::Consult,
+            &trust_policy(POLICY_MATCH_GLOB),
+        );
+
+        assert!(!config.is_trusted());
+        assert_eq!(
+            TrustedFolders::new(&storage).status(&folder).unwrap(),
+            TrustStatus::Rejected,
+            "the rejection must survive a matching policy"
+        );
+    }
+
+    fn bash_rule(rule: &maki_config::PermissionRule, scope: &str, effect: Effect) -> bool {
+        rule.tool == ToolKey::native("bash")
+            && rule.scope.as_deref() == Some(scope)
+            && rule.effect == effect
+    }
 
     fn allow_once(id: i64) -> Value {
         serde_json::json!({
@@ -893,11 +1260,10 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn server_with_ask(kind: AskKind) -> (Server, Receiver<String>, Receiver<Value>) {
+    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
         let handle = InteractiveHandle {
-            event_rx: flume::unbounded().1,
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
             answer_tx,
@@ -907,6 +1273,7 @@ mod tests {
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
+                ProjectConfig::for_project(Path::new("/project")),
                 Arc::default(),
             )),
             task: smol::spawn(async {}),
@@ -916,24 +1283,493 @@ mod tests {
             model_specs: Vec::new(),
             model_policy: Arc::new(ModelPolicy::default()),
             client_elicits_form: false,
+            defaults: SessionDefaults::default(),
             on_session_end: None,
             session: Some(SessionState {
                 handle,
                 mcp: None,
                 current_mode: AgentMode::Build,
                 current_model: String::new(),
-                pending: Arc::new(Mutex::new(Pending {
-                    prompt: None,
-                    ask: Some((ANSWERED_ID, kind)),
-                })),
+                pending: Arc::default(),
             }),
         };
         (server, answer_rx, out_rx)
     }
 
+    fn pending(srv: &Server) -> &PendingState {
+        &srv.session
+            .as_ref()
+            .expect("a session is installed")
+            .pending
+    }
+
+    fn permission_ask(answer_tx: Option<Sender<String>>) -> Ask {
+        Ask::Permission {
+            request_id: PARENT_TOOL_USE_ID.to_owned(),
+            answer_tx,
+        }
+    }
+
+    fn server_with_ask(ask: Ask) -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+        let (server, answer_rx, out_rx) = test_server();
+        pending(&server)
+            .lock()
+            .unwrap()
+            .asks
+            .insert(ANSWERED_ID, ask);
+        (server, answer_rx, out_rx)
+    }
+
+    const PUMP_CWD: &str = "/project";
+    const QUEUED_TEXT: &str = "queued before close";
+    const PROMPT_ID: i64 = 7;
+    const SUBAGENT_COST: f64 = 0.25;
+    const TURN_COST: f64 = 0.5;
+    const CONTEXT_WINDOW: u32 = 200_000;
+    const PARENT_TOOL_USE_ID: &str = "toolu_1";
+    const NEXT_PROMPT_ID: i64 = 8;
+    const PROMPT_TEXT: &str = "rename foo to bar";
+    /// A string id no ask can ever carry, since ours are minted as numbers.
+    const UNANSWERABLE_ID: &str = "not-an-id";
+    const SUBAGENT_NAME: &str = "task";
+    const CHILD_TOOL_USE_IDS: [&str; 2] = ["child_write_1", "child_write_2"];
+    const PERMISSION_TOOL: &str = "write";
+    const MAIN_PERMISSION_TITLE: &str = "write: /project";
+    const CHILD_PERMISSION_TITLE: &str = "task: write: /project";
+    const TURN_ERROR: &str = "provider returned 500";
+    /// One tool id arriving from two runs of the same session. `openai_compat`
+    /// mints unique ids now, but a provider can still repeat one, and the pump
+    /// has to keep the runs apart either way.
+    const COLLIDING_TOOL_USE_ID: &str = "maki_unnamed_0";
+    /// These cover cost and transcript plumbing, not the trust-scoped wording
+    /// of permission options.
+    const PUMP_TRUSTED: bool = true;
+    fn run_pump(srv: &Server, initial_cost: Option<f64>, feed: impl FnOnce(&EventSender)) {
+        let session = srv.session.as_ref().expect("a session is installed");
+        let (guard, events) = maki_agent::event_stream();
+        let pump = start_event_pump(
+            events,
+            session.handle.session_id.clone(),
+            srv.out_tx.clone(),
+            Arc::clone(&session.pending),
+            session.handle.cancel_tx.clone(),
+            PathBuf::from(PUMP_CWD),
+            None,
+            PUMP_TRUSTED,
+            initial_cost,
+        );
+        let sender = guard.sender(0);
+        feed(&sender);
+        drop(guard);
+        smol::block_on(pump);
+    }
+
+    fn prompt_request(srv: &Server) -> Value {
+        let session = srv.session.as_ref().expect("a session is installed");
+        serde_json::json!({
+            "params": {
+                "sessionId": session.handle.session_id.to_string(),
+                "prompt": [{ "type": "text", "text": PROMPT_TEXT }],
+            }
+        })
+    }
+
+    fn turn_complete(cost: f64) -> Box<TurnCompleteEvent> {
+        Box::new(TurnCompleteEvent {
+            message: Message::user(String::new()),
+            usage: TokenUsage::default(),
+            model: SELECTED_SPEC.to_owned(),
+            cost: Some(cost),
+            context_size: None,
+            context_window: CONTEXT_WINDOW,
+            cache_miss: false,
+            upstream: None,
+            turn_id: 1,
+            duration_ms: None,
+            ttfb_ms: None,
+            api_error_count: 0,
+        })
+    }
+
+    fn subagent(answer_tx: Option<Sender<String>>) -> SubagentInfo {
+        SubagentInfo {
+            parent_tool_use_id: PARENT_TOOL_USE_ID.to_owned(),
+            name: SUBAGENT_NAME.to_owned(),
+            prompt: None,
+            model: None,
+            opts: None,
+            answer_tx,
+        }
+    }
+
+    fn done_event() -> AgentEvent {
+        AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: CONTEXT_WINDOW,
+            num_turns: 1,
+            reason: DoneReason::EndTurn,
+        }
+    }
+
+    fn write_tool_start(tool_use_id: &str) -> AgentEvent {
+        AgentEvent::ToolStart(Box::new(ToolStartEvent {
+            id: tool_use_id.to_owned(),
+            tool: Arc::from(PERMISSION_TOOL),
+            summary: String::new(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: Some(serde_json::json!({"path": PUMP_CWD, "content": QUEUED_TEXT})),
+            output: None,
+        }))
+    }
+
+    fn permission_request(tool_use_id: &str) -> AgentEvent {
+        AgentEvent::PermissionRequest {
+            id: tool_use_id.to_owned(),
+            tool: ToolKey::native(PERMISSION_TOOL),
+            scopes: vec![PUMP_CWD.to_owned()],
+        }
+    }
+
+    #[test_case(false ; "answers_reach_the_agent_that_asked_even_out_of_order")]
+    #[test_case(true ; "cancel_drops_every_outstanding_answer")]
+    fn concurrent_subagent_permissions(cancel: bool) {
+        let (srv, main_rx, out_rx) = test_server();
+        let children = [flume::unbounded(), flume::unbounded()];
+        run_pump(&srv, None, |sender| {
+            for ((answer_tx, _), child_id) in children.iter().zip(CHILD_TOOL_USE_IDS) {
+                let info = subagent(Some(answer_tx.clone()));
+                for event in [
+                    AgentEvent::TextDelta {
+                        text: QUEUED_TEXT.to_owned(),
+                    },
+                    permission_request(child_id),
+                ] {
+                    sender
+                        .send_envelope(Envelope {
+                            event,
+                            subagent: Some(info.clone()),
+                            run_id: 0,
+                        })
+                        .unwrap();
+                }
+            }
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        });
+
+        let requests: Vec<_> = out_rx.try_iter().collect();
+        assert_eq!(
+            requests.len(),
+            3,
+            "of the subagent events only permissions reach the client"
+        );
+        for (request, title) in requests.iter().zip([
+            CHILD_PERMISSION_TITLE,
+            CHILD_PERMISSION_TITLE,
+            MAIN_PERMISSION_TITLE,
+        ]) {
+            assert_eq!(request["method"], "session/request_permission");
+            let call = &request["params"]["toolCall"];
+            assert_eq!(
+                call["toolCallId"], PARENT_TOOL_USE_ID,
+                "a child permission rides on the task call the client knows"
+            );
+            assert_eq!(call["title"], title);
+        }
+
+        if cancel {
+            handle_notification(&srv, "session/cancel");
+        }
+        for (request, option) in requests
+            .iter()
+            .zip(["reject_once", "allow_once", "allow_always"])
+            .rev()
+        {
+            handle_incoming_response(
+                &srv,
+                &serde_json::json!({
+                    "id": request["id"],
+                    "result": {"outcome": {"outcome": "selected", "optionId": option}},
+                }),
+            );
+        }
+        let child_rx = children.map(|(_, rx)| rx);
+        for ((rx, expected), asked_id) in child_rx
+            .iter()
+            .chain([&main_rx])
+            .zip([
+                PermissionAnswer::Deny,
+                PermissionAnswer::AllowOnce,
+                PermissionAnswer::AllowSession,
+            ])
+            .zip(CHILD_TOOL_USE_IDS.iter().chain([&PARENT_TOOL_USE_ID]))
+        {
+            let expected = TaggedAnswer::new(*asked_id, expected).encode();
+            assert_eq!(rx.try_recv().ok(), (!cancel).then_some(expected));
+            assert!(rx.is_empty(), "each answer is delivered only once");
+        }
+    }
+
+    /// Without a channel of its own a child's answer would land in the main
+    /// agent's, and the main agent's next wait would eat it as its own.
+    #[test]
+    fn a_subagent_permission_without_an_answer_channel_is_never_asked() {
+        let (srv, main_rx, out_rx) = test_server();
+        run_pump(&srv, None, |sender| {
+            sender
+                .send_envelope(Envelope {
+                    event: permission_request(CHILD_TOOL_USE_IDS[0]),
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+        });
+
+        assert!(out_rx.is_empty(), "the client is never asked");
+        assert!(main_rx.is_empty(), "the main agent keeps its own turn");
+        assert!(
+            pending(&srv).lock().unwrap().asks.is_empty(),
+            "nothing is left waiting for an answer"
+        );
+    }
+
+    /// Runs one permission wait the way a turn does, on the session's own
+    /// answer channel. Whatever is queued when this is called is what the
+    /// waiter finds, which is the shape of the bug: answers outlive the turn
+    /// that asked for them.
+    fn wait_for_permission(
+        srv: &Server,
+        answer_rx: &flume::Receiver<String>,
+        request_id: &str,
+    ) -> Result<(), PermissionError> {
+        let session = srv.session.as_ref().expect("a session is installed");
+        let (guard, _events) = maki_agent::event_stream();
+        let event_tx = guard.sender(0);
+        let rx = async_lock::Mutex::new(answer_rx.clone());
+        smol::block_on(session.handle.permissions.enforce(
+            &ToolKey::native(NEXT_TURN_TOOL),
+            &PermissionScopes::single(NEXT_TURN_SCOPE.to_owned()),
+            &event_tx,
+            Some(&rx),
+            request_id,
+            &CancelToken::none(),
+            None,
+        ))
+    }
+
+    fn queue_answer(srv: &Server, request_id: &str, answer: PermissionAnswer) {
+        let session = srv.session.as_ref().expect("a session is installed");
+        session
+            .handle
+            .answer_tx
+            .send(TaggedAnswer::new(request_id, answer).encode())
+            .unwrap();
+    }
+
+    fn next_turn_is_allowed(srv: &Server) -> bool {
+        let session = srv.session.as_ref().expect("a session is installed");
+        matches!(
+            session.handle.permissions.check(
+                &ToolKey::native(NEXT_TURN_TOOL),
+                NEXT_TURN_SCOPE,
+                None
+            ),
+            PermissionCheck::Allowed
+        )
+    }
+
+    /// The race the ids exist for: the cancel lands while the permission
+    /// envelope is still queued in the pump, so the pump registers a fresh ask
+    /// after `asks` was cleared and the client answers it for real. With
+    /// nobody parked, that answer waits in the channel for the next turn.
+    #[test]
+    fn an_answer_for_a_cancelled_ask_is_not_consumed_by_the_next_turn() {
+        let (srv, answer_rx, out_rx) = test_server();
+        handle_notification(&srv, "session/cancel");
+        run_pump(&srv, None, |sender| {
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        });
+
+        let request = out_rx.try_recv().expect("the pump still asked the client");
+        handle_incoming_response(
+            &srv,
+            &serde_json::json!({
+                "id": request["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
+            }),
+        );
+
+        queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::Deny);
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+
+        assert!(outcome.is_err(), "{STALE_ALLOW}");
+        assert!(!next_turn_is_allowed(&srv), "{STALE_ALLOW}");
+        assert!(
+            answer_rx.is_empty(),
+            "the stale answer was dropped, not left"
+        );
+    }
+
+    /// A mismatched answer is dropped without ending the wait: the tool is
+    /// still blocked on the ask the user was shown, and only that ask's answer
+    /// may end it.
+    #[test]
+    fn an_answer_naming_another_ask_is_discarded_and_the_wait_continues() {
+        let (srv, answer_rx, ..) = test_server();
+        queue_answer(&srv, PARENT_TOOL_USE_ID, PermissionAnswer::Deny);
+        queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, PermissionAnswer::AllowOnce);
+
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+
+        assert!(
+            outcome.is_ok(),
+            "the deny named another ask and must not have ended this wait"
+        );
+        assert!(
+            answer_rx.is_empty(),
+            "both answers were taken off the queue"
+        );
+    }
+
+    #[test_case(PermissionAnswer::AllowSession, true ; "allow_applies_the_decision")]
+    #[test_case(PermissionAnswer::Deny, false ; "deny_applies_the_decision")]
+    fn a_matching_answer_is_applied(answer: PermissionAnswer, allowed: bool) {
+        let (srv, answer_rx, ..) = test_server();
+        queue_answer(&srv, NEXT_TURN_TOOL_USE_ID, answer);
+
+        let outcome = wait_for_permission(&srv, &answer_rx, NEXT_TURN_TOOL_USE_ID);
+
+        assert_eq!(outcome.is_ok(), allowed);
+        assert_eq!(next_turn_is_allowed(&srv), allowed);
+    }
+
+    /// The close marker rides the same FIFO as the events, so a turn still
+    /// streaming when the session got replaced is reported in full and the
+    /// client's outstanding `session/prompt` is answered instead of hanging.
+    #[test]
+    fn event_pump_delivers_everything_queued_before_the_close() {
+        let (srv, .., out_rx) = test_server();
+        pending(&srv).lock().unwrap().prompt = Some(RequestId::Number(PROMPT_ID));
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(AgentEvent::TextDelta {
+                    text: QUEUED_TEXT.to_owned(),
+                })
+                .unwrap();
+            sender.send(done_event()).unwrap();
+        });
+
+        let chunk = out_rx.try_recv().expect("the queued text reaches the wire");
+        let update = &chunk["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(update["content"]["text"], QUEUED_TEXT);
+
+        let answer = out_rx.try_recv().expect("the pending prompt is answered");
+        assert_eq!(answer["id"], PROMPT_ID);
+        assert_eq!(answer["result"]["stopReason"], "end_turn");
+        assert!(pending(&srv).lock().unwrap().prompt.is_none());
+    }
+
+    /// A cached input holds the whole file a `write` is about to lay down, and
+    /// this pump lives as long as the session does, so a turn that died on a
+    /// provider error has to let go of it just like a turn that finished.
+    #[test_case(None, true ; "a_live_turn_shows_the_file_its_tool_call_named")]
+    #[test_case(Some(done_event()), false ; "a_finished_turn_releases_its_tool_inputs")]
+    #[test_case(Some(AgentEvent::Error { message: TURN_ERROR.to_owned() }), false ; "a_failed_turn_releases_its_tool_inputs")]
+    fn a_terminal_event_releases_the_turns_tool_inputs(
+        terminal: Option<AgentEvent>,
+        keeps_input: bool,
+    ) {
+        let (srv, .., out_rx) = test_server();
+        run_pump(&srv, None, |sender| {
+            sender.send(write_tool_start(PARENT_TOOL_USE_ID)).unwrap();
+            if let Some(event) = terminal {
+                sender.send(event).unwrap();
+            }
+            sender.send(permission_request(PARENT_TOOL_USE_ID)).unwrap();
+        });
+
+        let request = out_rx
+            .try_iter()
+            .last()
+            .expect("the permission request reaches the client");
+        let call = &request["params"]["toolCall"];
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(call["title"], MAIN_PERMISSION_TITLE);
+        assert_eq!(!call["rawInput"].is_null(), keeps_input, "{request}");
+    }
+
+    /// Ids are only unique inside one run, so a child can ask about a call whose
+    /// id the parent already cached. The dialog has to stay title only, or it
+    /// would name a file the subagent is not touching.
+    #[test]
+    fn a_subagent_permission_ignores_a_colliding_cached_input() {
+        let (srv, .., out_rx) = test_server();
+        let (answer_tx, _answer_rx) = flume::unbounded();
+        run_pump(&srv, None, |sender| {
+            sender
+                .send(write_tool_start(COLLIDING_TOOL_USE_ID))
+                .unwrap();
+            sender
+                .send_envelope(Envelope {
+                    event: permission_request(COLLIDING_TOOL_USE_ID),
+                    subagent: Some(subagent(Some(answer_tx))),
+                    run_id: 0,
+                })
+                .unwrap();
+        });
+
+        let request = out_rx
+            .try_iter()
+            .last()
+            .expect("the permission request reaches the client");
+        let call = &request["params"]["toolCall"];
+        assert_eq!(request["method"], "session/request_permission");
+        assert_eq!(call["toolCallId"], PARENT_TOOL_USE_ID);
+        assert_eq!(call["title"], CHILD_PERMISSION_TITLE);
+        for field in ["kind", "locations", "rawInput", "content"] {
+            assert!(call[field].is_null(), "{field} must stay unset: {request}");
+        }
+    }
+
+    /// A resumed session opens with a bill, and subagent turns spend against it
+    /// even though their events never enter the transcript.
+    #[test]
+    fn event_pump_folds_restored_and_subagent_cost_into_the_usage_update() {
+        let (srv, .., out_rx) = test_server();
+        run_pump(&srv, Some(RECORDED_COST), |sender| {
+            sender
+                .send_envelope(Envelope {
+                    event: AgentEvent::TurnComplete(turn_complete(SUBAGENT_COST)),
+                    subagent: Some(subagent(None)),
+                    run_id: 0,
+                })
+                .unwrap();
+            sender
+                .send(AgentEvent::TurnComplete(turn_complete(TURN_COST)))
+                .unwrap();
+        });
+
+        let usage = out_rx.try_recv().expect("the session's own turn reports");
+        let update = &usage["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "usage_update");
+        assert_eq!(
+            update["cost"]["amount"].as_f64(),
+            Some(RECORDED_COST + SUBAGENT_COST + TURN_COST)
+        );
+        assert!(
+            out_rx.is_empty(),
+            "the subagent turn pays but stays out of the transcript"
+        );
+    }
+
     #[test]
     fn close_session_awaits_the_session_end_hook() {
-        let (mut srv, ..) = server_with_ask(AskKind::Permission);
+        let (mut srv, ..) = test_server();
         let ended = srv.session.as_ref().unwrap().handle.session_id.id();
         let (ended_tx, ended_rx) = flume::bounded(1);
         srv.on_session_end = Some(Arc::new(move |id, reason| {
@@ -952,9 +1788,78 @@ mod tests {
         assert!(srv.session.is_none(), "close must take the session");
     }
 
+    /// A prompt only ever gets one response, and the client may not send the
+    /// next one until it arrives. An auth failure parks the agent on an answer
+    /// ACP cannot produce, so the turn has to end here instead.
+    #[test]
+    fn auth_required_ends_the_prompt_instead_of_parking_the_session() {
+        let (mut srv, .., out_rx) = test_server();
+        let (input_tx, input_rx) = flume::unbounded();
+        let (cancel_tx, cancel_rx) = flume::unbounded();
+        let session = srv.session.as_mut().expect("a session is installed");
+        session.handle.input_tx = input_tx;
+        session.handle.cancel_tx = cancel_tx;
+        let raw = prompt_request(&srv);
+
+        handle_prompt(&mut srv, &raw, &RequestId::Number(PROMPT_ID)).unwrap();
+        run_pump(&srv, None, |sender| {
+            sender.send(AgentEvent::AuthRequired).unwrap();
+        });
+
+        let response = out_rx.try_recv().expect("the in-flight prompt is answered");
+        assert_eq!(response["id"], PROMPT_ID);
+        assert_eq!(
+            response["error"]["code"],
+            i32::from(AcpError::auth_required().code)
+        );
+        assert_eq!(
+            response["error"]["data"], AUTH_FAILED_MSG,
+            "the client is told why the turn ended: {response}"
+        );
+        assert!(
+            cancel_rx.try_recv().is_ok(),
+            "the agent parked on re-authentication is released"
+        );
+
+        assert!(pending(&srv).lock().unwrap().prompt.is_none());
+        handle_prompt(&mut srv, &raw, &RequestId::Number(NEXT_PROMPT_ID))
+            .expect("the next prompt is accepted");
+        assert_eq!(input_rx.len(), 2, "both prompts reached the agent");
+    }
+
+    /// JSON-RPC ids are `string | number`, and a client is free to echo ours
+    /// back in either shape. An answer dropped for its shape leaves the tool
+    /// parked forever.
+    #[test_case(Value::from(ANSWERED_ID), true ; "a_numeric_id_answers_the_ask")]
+    #[test_case(Value::from(ANSWERED_ID.to_string()), true ; "a_string_id_answers_the_same_ask")]
+    #[test_case(Value::from(UNANSWERABLE_ID), false ; "an_id_matching_no_ask_answers_nothing")]
+    fn a_response_is_delivered_whatever_shape_its_id_has(id: Value, delivered: bool) {
+        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
+
+        handle_incoming_response(
+            &srv,
+            &serde_json::json!({
+                "id": id,
+                "result": { "outcome": { "outcome": "selected", "optionId": "allow_once" } },
+            }),
+        );
+
+        let answered = TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode();
+        assert_eq!(answer_rx.try_recv().ok(), delivered.then_some(answered));
+        assert_eq!(
+            pending(&srv)
+                .lock()
+                .unwrap()
+                .asks
+                .contains_key(&ANSWERED_ID),
+            !delivered,
+            "only the ask that was answered is retired"
+        );
+    }
+
     #[test]
     fn only_the_outstanding_request_id_is_answered() {
-        let (srv, answer_rx, ..) = server_with_ask(AskKind::Permission);
+        let (srv, answer_rx, ..) = server_with_ask(permission_ask(None));
 
         handle_incoming_response(&srv, &allow_once(UNKNOWN_ID));
         assert!(answer_rx.is_empty(), "an unknown id is dropped");
@@ -962,7 +1867,7 @@ mod tests {
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
         assert_eq!(
             answer_rx.try_recv().ok(),
-            Some(PermissionAnswer::AllowOnce.encode())
+            Some(TaggedAnswer::new(PARENT_TOOL_USE_ID, PermissionAnswer::AllowOnce).encode())
         );
 
         handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
@@ -973,17 +1878,8 @@ mod tests {
     }
 
     #[test]
-    fn cancel_drops_the_outstanding_permission_request() {
-        let (srv, answer_rx, ..) = server_with_ask(AskKind::Permission);
-        handle_notification(&srv, "session/cancel");
-
-        handle_incoming_response(&srv, &allow_once(ANSWERED_ID));
-        assert!(answer_rx.is_empty(), "the cancelled turn owns that answer");
-    }
-
-    #[test]
     fn elicitation_response_forwards_the_raw_result() {
-        let (srv, answer_rx, ..) = server_with_ask(AskKind::Elicitation);
+        let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
@@ -999,7 +1895,7 @@ mod tests {
 
     #[test]
     fn discovered_models_are_pushed_to_the_client() {
-        let (mut srv, .., out_rx) = server_with_ask(AskKind::Permission);
+        let (mut srv, .., out_rx) = test_server();
         srv.model_specs = vec![OFFLINE_SPEC.to_owned()];
         let batch = vec![DISCOVERED_SPEC.to_owned()];
 
@@ -1099,7 +1995,7 @@ mod tests {
                 &restored.usage,
                 &mut restored.by_model,
                 &recorded_model,
-                RESTORED_FAST
+                false
             ),
             Some(RECORDED_COST)
         );

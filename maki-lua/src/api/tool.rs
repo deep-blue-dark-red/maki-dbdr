@@ -18,8 +18,7 @@ use maki_agent::tools::{
     is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
-    TextOutput, ToolOutput,
+    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -36,7 +35,7 @@ use crate::api::util::command::{
     ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
-use crate::api::util::ctx::LuaCtx;
+use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
 use crate::runtime::{
@@ -533,7 +532,6 @@ impl ToolInvocation for LuaToolInvocation {
                         .emit(id, None, &ctx.event_tx);
                     }
                     let format = reply.format;
-                    let instructions = reply.instructions;
                     let image = reply.image;
                     let state = reply.state;
                     ToolExecResult {
@@ -549,9 +547,8 @@ impl ToolInvocation for LuaToolInvocation {
                                 }
                             } else {
                                 let inner = TextOutput {
-                                    text: s,
-                                    instructions: instructions.filter(|b| !b.is_empty()),
                                     state,
+                                    ..TextOutput::from(s)
                                 };
                                 match format {
                                     LuaOutputFormat::Markdown => ToolOutput::Markdown(inner),
@@ -688,7 +685,6 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///                                diff_before (string)  Before text of the diff.
 ///                                diff_after  (string)  After text of the diff.
 ///                                image       (table)   { media_type: string, data: string } base64 image.
-///                                instructions (table)  Array of { path, content } blocks injected as context.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
@@ -700,7 +696,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
 ///   permission      (string)   Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
-///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes.
+///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
 /// @example
@@ -709,6 +705,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   description = "Count words in a file.",
 ///   kind = "read",
 ///   schema = {
+///     type = "object",
 ///     properties = { path = { type = "string", description = "File path" } },
 ///     required = { "path" },
 ///   },
@@ -1243,8 +1240,9 @@ fn wrap_header(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
 /// Normalizes a restore fn to its body buf or nil (whether it returned
 /// the buf directly or a `{ body = buf }` reply), so callers composing
 /// another tool's rendering need no pcall of their own. The ctx arg may be
-/// a real `LuaCtx` or a plain `{ tool_output_lines =, state = }` table (how
-/// batch drives child restores); either way the fn sees a restore `LuaCtx`.
+/// a real `LuaCtx` or a plain `{ tool_output_lines =, state =, session_id =,
+/// task_id =, reason = }` table (how batch drives child restores); either way
+/// the fn sees a restore `LuaCtx`.
 fn wrap_restore(lua: &Lua, tool: String, f: Function) -> LuaResult<Function> {
     let prepped = lua.create_async_function(move |lua, mut args: MultiValue| {
         let f = f.clone();
@@ -1277,20 +1275,30 @@ fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue>
     {
         return Ok(LuaValue::UserData(ud.clone()));
     }
-    let (tol, state) = match v {
-        Some(LuaValue::Table(t)) => (
-            t.get::<LuaValue>("tool_output_lines")
-                .ok()
-                .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
-                .unwrap_or_default(),
-            t.get::<LuaValue>("state")
-                .ok()
-                .and_then(|v| lua_to_json(lua, &v).ok())
-                .filter(|v| !v.is_null()),
-        ),
-        _ => (ToolOutputLines::default(), None),
+    let ctx = match v {
+        Some(LuaValue::Table(t)) => {
+            let string = |key| t.get::<Option<String>>(key).ok().flatten();
+            RestoreCtx {
+                tool_output_lines: t
+                    .get::<LuaValue>("tool_output_lines")
+                    .ok()
+                    .and_then(|v| lua.from_value::<ToolOutputLines>(v).ok())
+                    .unwrap_or_default(),
+                state: t
+                    .get::<LuaValue>("state")
+                    .ok()
+                    .and_then(|v| lua_to_json(lua, &v).ok())
+                    .filter(|v| !v.is_null()),
+                session_id: string("session_id").and_then(|s| s.parse().ok()),
+                task_id: string("task_id").map(Arc::from),
+                reason: string("reason")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_default(),
+            }
+        }
+        _ => RestoreCtx::default(),
     };
-    let ud = lua.create_userdata(LuaCtx::restore(tol, state))?;
+    let ud = lua.create_userdata(LuaCtx::restore(ctx))?;
     Ok(LuaValue::UserData(ud))
 }
 
@@ -1507,6 +1515,18 @@ fn register_tool_from_lua(
     }
     let mutable_path_field = require_schema_field(spec, "mutable_path", &schema_val)?;
     let permission = parse_tool_permission(lua, spec, &name, &schema_val, permissions)?;
+    if mutable_path_field.is_none()
+        && permission
+            .as_ref()
+            .is_some_and(|p| p.permission == Permission::FsWrite)
+    {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool: '{name}' declares permission 'fs_write' but no 'mutable_path', \
+             so write serialization, the stale-read check, the plan-mode block and the \
+             boundary check would all be silently skipped. Add 'mutable_path' naming the \
+             schema field that holds the path it writes"
+        )));
+    }
 
     let header_fn: Option<Function> = spec.get("header").ok();
     let restore_fn: Option<Function> = spec.get("restore").ok();
@@ -1651,7 +1671,6 @@ pub(crate) struct ToolCallReply {
     pub live_buf: Option<Arc<SharedBuf>>,
     pub format: LuaOutputFormat,
     pub annotation: Option<String>,
-    pub instructions: Option<Vec<InstructionBlock>>,
     pub written_path: Option<String>,
     pub diff: Option<DiffPayload>,
     /// Set via `image = { media_type = "image/png", data = <base64> }` in the
@@ -1673,7 +1692,6 @@ impl ToolCallReply {
             .and_then(|v| Self::extract_snapshot(&v));
         let format = extract_format(t);
         let annotation = t.get::<String>("annotation").ok();
-        let instructions = extract_instructions(t);
         let written_path = t.get::<String>("written_path").ok();
         let diff = t.get::<String>("diff_path").ok().map(|path| DiffPayload {
             path,
@@ -1702,7 +1720,6 @@ impl ToolCallReply {
             live_buf,
             format,
             annotation,
-            instructions,
             written_path,
             diff,
             image,
@@ -1735,7 +1752,6 @@ impl ToolCallReply {
             live_buf: None,
             format: LuaOutputFormat::default(),
             annotation: None,
-            instructions: None,
             written_path: None,
             diff: None,
             image: None,
@@ -1795,30 +1811,6 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
         .decode(data.as_bytes())
         .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
     Ok(Some(ImageSource::new(media_type, Arc::from(data))))
-}
-
-fn extract_instructions(t: &mlua::Table) -> Option<Vec<InstructionBlock>> {
-    let Ok(LuaValue::Table(arr)) = t.get::<LuaValue>("instructions") else {
-        return None;
-    };
-    let mut blocks = Vec::new();
-    for pair in arr.sequence_values::<LuaValue>() {
-        let Ok(LuaValue::Table(entry)) = pair else {
-            continue;
-        };
-        let Ok(path) = entry.get::<String>("path") else {
-            continue;
-        };
-        let Ok(content) = entry.get::<String>("content") else {
-            continue;
-        };
-        blocks.push(InstructionBlock { path, content });
-    }
-    if blocks.is_empty() {
-        None
-    } else {
-        Some(blocks)
-    }
 }
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
@@ -2235,28 +2227,6 @@ mod tests {
         let bool_reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Boolean(true));
         assert_eq!(bool_reply.result, Err(TOOL_HANDLER_RETURN_ERR.to_string()));
         assert_eq!(bool_reply.format, LuaOutputFormat::Plain);
-    }
-
-    #[test]
-    fn from_lua_value_extracts_instructions() {
-        let lua = Lua::new();
-        let t = lua.create_table().unwrap();
-        t.set("llm_output", "file contents").unwrap();
-
-        let inst1 = lua.create_table().unwrap();
-        inst1.set("path", "AGENTS.md").unwrap();
-        inst1.set("content", "be nice").unwrap();
-
-        let instructions = lua.create_table().unwrap();
-        instructions.set(1, inst1).unwrap();
-        t.set("instructions", instructions).unwrap();
-
-        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(t));
-        assert_eq!(reply.result, Ok("file contents".to_string()));
-        let blocks = reply.instructions.expect("instructions should be Some");
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].path, "AGENTS.md");
-        assert_eq!(blocks[0].content, "be nice");
     }
 
     #[test]

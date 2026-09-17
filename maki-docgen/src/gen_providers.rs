@@ -18,7 +18,7 @@ const AUTH_RELOADING: &str = r#"## Auth Reloading
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
-You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors."#;
+You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`). On a rate-limit or auth error, maki switches to the next key right away, with no delay and without spending a retry. Each request walks the pool once before falling back to normal backoff. A plan quota error does not rotate keys, since the quota is per account and the others are just as spent."#;
 
 const BASE_URL_OVERRIDES: &str = r#"## Base URL Overrides
 
@@ -60,6 +60,10 @@ const XAI_OAUTH_NOTE: &str = r#"OAuth uses the same first-party xAI client as th
 
 If `~/.grok/auth.json` already exists, login offers to reuse it without writing that file."#;
 
+const OPENAI_OAUTH_NOTE: &str = r#"`maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
+
+With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped."#;
+
 const OPENCODE_FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
 ```toml
@@ -89,7 +93,25 @@ xai/grok-4.6
 zai/glm-4.7
 ```
 
-If the model name is unique across providers, the prefix can be omitted."#;
+If the model name is unique across providers, the prefix can be omitted.
+
+### Models newer than your Maki version
+
+The tables above list the models Maki curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
+
+For an id no table covers, rates, context window, vision and thinking support come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Maki reads each field on its own, so a row that lists a price but no context window still leaves the window to the sources below.
+
+Sources rank by how sure they are to describe the exact model you asked for:
+
+1. What the provider's own model endpoint reported this session.
+2. A curated row for that id, including its dated snapshots. `claude-sonnet-4-5-20250929` reads the `claude-sonnet-4-5` row.
+3. models.dev.
+4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family and tier from it either way.
+5. The provider's defaults, with no cost estimate.
+
+A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess.
+
+New models start at the **medium** tier until you assign one in the picker."#;
 
 fn providers_toml_section() -> String {
     let mut plan_rows = String::new();
@@ -387,7 +409,10 @@ fn build_sections() -> Vec<ProviderSection> {
                 sections.push(ProviderSection {
                     kind,
                     name: kind.display_name(),
-                    auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
+                    auth_line: format!(
+                        "{} (also supports OAuth via `maki auth login openai`)",
+                        format_auth(kind)
+                    ),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
                     entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
@@ -504,6 +529,16 @@ fn no_catalog_note(kind: ProviderKind) -> &'static str {
              Browse available models at [openrouter.ai/models](https://openrouter.ai/models). \
              Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`)."
         }
+        ProviderKind::Requesty => {
+            "Requesty routes 700+ models from many providers behind a single API key. \
+             Models are listed live from the API: curated managed policies first \
+             (short ids such as `requesty/claude-sonnet-4-5` or `requesty/gpt-5.4-mini`, \
+             `@eu` variants route only through EU providers), then the full \
+             `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). \
+             Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). \
+             Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all \
+             traffic in the EU."
+        }
         _ => "No hardcoded model catalog. Use any model ID supported by this provider.",
     }
 }
@@ -546,6 +581,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
     if section.name == "Anthropic" {
         let _ = writeln!(out, "\n{LONG_CONTEXT_NOTE}");
         let _ = writeln!(out, "\n{BEDROCK_NOTE}");
+    }
+
+    if section.kind == ProviderKind::OpenAi {
+        let _ = writeln!(out, "\n{OPENAI_OAUTH_NOTE}");
     }
 
     if section.kind == ProviderKind::Opencode {

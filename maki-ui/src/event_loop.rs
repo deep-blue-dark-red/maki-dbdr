@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
+use crate::app::tasks::{TaskStatus, diff_task_states};
 use crossterm::event::{
     Event, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
@@ -22,11 +24,16 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
-use maki_config::{ModelPolicy, UiConfig};
-use maki_lua::session_snapshot::{MODE_BUILD, MODE_PLAN, SessionQueueSnapshot, SessionSnapshot};
+use maki_config::project::TrustQuestion;
+use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_lua::session_snapshot::{
+    MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
+    SessionSnapshot,
+};
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionEndReason,
-    SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
+    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
+    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
+    UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -35,13 +42,14 @@ use maki_storage::StateDir;
 use maki_storage::StorageError;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::sessions::{SessionError, normalize_title};
+use ratatui::backend::Backend;
 use serde_json::json;
 use tracing::{info, warn};
 
 use crate::AppSession;
 use crate::agent::{
-    AgentCommand, AgentHandles, ModelSlot,
-    shared_queue::{QueueItem, QueuedInput},
+    AgentHandles, ModelSlot,
+    shared_queue::{Compaction, QueueItem, QueuedInput},
 };
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
@@ -68,6 +76,9 @@ const MODEL_POLICY_ERR: &str = "Model is not allowed by policy";
 const INVALID_MODEL_ERR: &str = "Invalid model";
 const PROVIDER_INIT_ERR: &str = "Failed to create provider";
 const NOT_LIVE_ERR: &str = "session not live";
+const PACK_PREPARING: &str = "Checking packages...";
+const PACK_BUSY_ERR: &str = "a package command is already running";
+const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -84,6 +95,7 @@ pub struct EventLoopParams {
     pub sessions: Vec<AppSession>,
     pub focused: usize,
     pub startup_warnings: Vec<String>,
+    pub startup_notice: Option<String>,
     pub storage: StateDir,
     pub config: AgentConfig,
     pub ui_config: UiConfig,
@@ -98,6 +110,10 @@ pub struct EventLoopParams {
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
     pub model_policy: Arc<ModelPolicy>,
+    pub project_config: ProjectConfig,
+    /// What `/trust` would grant and what the `[restricted]` indicator reports.
+    /// `None` when the folder is trusted or has nothing to ask about.
+    pub trust_question: Option<TrustQuestion>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -174,7 +190,6 @@ impl RunNotificationState {
         attention: Option<Notification>,
         status: SessionStatus,
         queue_empty: bool,
-        terminal_focused: bool,
     ) -> Option<Notification> {
         let settled = attention.is_none() && status == SessionStatus::Idle && queue_empty;
         let prompt = (attention != self.last_attention)
@@ -191,7 +206,7 @@ impl RunNotificationState {
                 None
             }
         };
-        (!terminal_focused).then(|| prompt.or(completion)).flatten()
+        prompt.or(completion)
     }
 }
 
@@ -208,9 +223,9 @@ impl SessionStatus {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Working => "working",
-            Self::NeedsInput => "needs_input",
-            Self::Idle => "idle",
+            Self::Working => STATUS_WORKING,
+            Self::NeedsInput => STATUS_NEEDS_INPUT,
+            Self::Idle => STATUS_IDLE,
         }
     }
 }
@@ -237,34 +252,79 @@ fn select_notification(
     }
 }
 
-#[cfg(not(windows))]
-fn terminal_focus_event(event: &Event) -> Option<bool> {
-    match event {
-        Event::FocusGained => Some(true),
-        Event::FocusLost => Some(false),
-        _ => None,
+/// Maki never turns focus reporting on under Windows, so anything that looks
+/// like a focus record there is a guess rather than a report.
+const TRUSTS_FOCUS_EVENTS: bool = !cfg!(windows);
+
+/// How long input keeps an unproven terminal counting as watched. Short on
+/// purpose: suppressing wrongly hides a finished turn, notifying wrongly only
+/// costs a bell.
+const INPUT_IMPLIES_WATCHING: Duration = Duration::from_secs(30);
+
+/// Whether the user is watching this terminal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Focus {
+    /// No focus report has arrived yet. Terminals that never send one (GNU
+    /// screen, tmux without `focus-events on`) stay here for good, and one
+    /// never arrives while the user simply keeps the window focused, so
+    /// recent input is the only evidence available.
+    Unproven {
+        last_input: Option<Instant>,
+    },
+    Focused,
+    Unfocused,
+}
+
+impl Default for Focus {
+    fn default() -> Self {
+        Self::Unproven { last_input: None }
     }
 }
 
-#[cfg(windows)]
-fn terminal_focus_event(_event: &Event) -> Option<bool> {
-    None
-}
+impl Focus {
+    /// A prompt parks the agent on the user, so it rings even while they
+    /// watch. A finished turn they can already see is just noise.
+    fn allows(self, notification: &Notification) -> bool {
+        notification.is_urgent() || !self.is_watched()
+    }
 
-#[cfg(not(windows))]
-fn terminal_input_proves_focus(event: &Event) -> bool {
-    match event {
-        Event::Key(key) => key.kind == KeyEventKind::Press,
-        Event::Paste(_) | Event::Mouse(_) => true,
-        _ => false,
+    fn is_watched(self) -> bool {
+        match self {
+            Self::Focused => true,
+            Self::Unfocused => false,
+            Self::Unproven { last_input } => {
+                last_input.is_some_and(|at| at.elapsed() < INPUT_IMPLIES_WATCHING)
+            }
+        }
+    }
+
+    fn report(&mut self, reported: Self) {
+        if TRUSTS_FOCUS_EVENTS {
+            *self = reported;
+        }
+    }
+
+    /// Typing proves the user was here just now. It never latches: without a
+    /// report to clear it, a terminal that cannot send `FocusLost` would go
+    /// quiet for good, so the evidence expires on its own.
+    fn note_input(&mut self) {
+        match self {
+            Self::Unfocused => *self = Self::Focused,
+            Self::Unproven { last_input } => *last_input = Some(Instant::now()),
+            Self::Focused => {}
+        }
+    }
+
+    /// An editor, a shell or a suspend eats the focus reports we would have
+    /// seen, so assume the user may have walked away.
+    fn on_resume(&mut self) {
+        match self {
+            Self::Focused => *self = Self::Unfocused,
+            Self::Unproven { last_input } => *last_input = None,
+            Self::Unfocused => {}
+        }
     }
 }
-
-#[cfg(windows)]
-fn terminal_input_proves_focus(_event: &Event) -> bool {
-    false
-}
-
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
 }
@@ -275,7 +335,16 @@ struct SessionRuntime {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     last_status: SessionStatus,
+    /// Keyed by task id, never by position: a session reset reuses positions,
+    /// so a new task would inherit the old one's status.
+    last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
+    /// The slot this session last synced from, compared by identity rather
+    /// than field by field: discovery fills in things like fast support long
+    /// after the model was built, and a hand written list would miss them.
+    /// `None` until the first sync, which is what pulls a restored session off
+    /// its own saved model and onto the one that is selected now.
+    slot: Option<Arc<ModelSlot>>,
 }
 
 impl SessionRuntime {
@@ -324,6 +393,7 @@ struct SpawnCtx {
     available_models: Arc<ArcSwapOption<Vec<String>>>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
+    trust_question: Option<TrustQuestion>,
 }
 
 impl SpawnCtx {
@@ -333,6 +403,7 @@ impl SpawnCtx {
         let handles = AgentHandles::spawn(
             &self.model_slot,
             session.messages().to_vec(),
+            session.meta.context_size,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,
@@ -361,6 +432,7 @@ impl SpawnCtx {
             self.lua_event_handle.clone(),
             Arc::clone(&self.model_policy),
         );
+        app.trust_question = self.trust_question.clone();
         handles.apply_to_app(&mut app);
         if resumed {
             app.restore_resumed_session();
@@ -372,7 +444,9 @@ impl SpawnCtx {
             shell_tx,
             shell_rx,
             last_status: SessionStatus::Idle,
+            last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
+            slot: None,
         }
     }
 }
@@ -381,8 +455,9 @@ pub(crate) struct EventLoop<'t> {
     terminal: &'t mut ratatui::DefaultTerminal,
     sessions: Vec<SessionRuntime>,
     focused: usize,
-    last_focused: Option<MakiId>,
-    terminal_focused: bool,
+    /// The `(session, task)` pair whose transcript was on screen last frame.
+    last_focus: Option<(MakiId, Arc<str>)>,
+    focus: Focus,
     notifier: Option<terminal::TerminalNotifier>,
     ctx: SpawnCtx,
     input: InputReader,
@@ -390,6 +465,12 @@ pub(crate) struct EventLoop<'t> {
     warn_tx: flume::Sender<String>,
     ui_action_rx: flume::Receiver<UiAction>,
     ui_attachment: UiAttachment,
+    pack_tx: flume::Sender<Box<PackPreparation>>,
+    pack_rx: flume::Receiver<Box<PackPreparation>>,
+    /// One package command at a time. The work runs on its own thread, so
+    /// without this a second `/packupdate` would race the first over the same
+    /// clones and locks.
+    pack_running: bool,
     _model_fetch_task: smol::Task<()>,
 }
 
@@ -402,6 +483,7 @@ enum Wake {
     Agent(usize, Box<maki_agent::Envelope>),
     Shell(usize, ShellEvent),
     Warn(String),
+    Pack(Box<PackPreparation>),
 }
 
 struct BackgroundModels {
@@ -431,6 +513,28 @@ fn merge_batch(
     available.store(Some(Arc::new(merged)));
 }
 
+fn resolve_discovered_model(model_slot: &ArcSwap<ModelSlot>, timeouts: Timeouts) {
+    let spec = model_slot.load().model.spec();
+    let mut resolved = match Model::from_spec(&spec) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(spec = %spec, error = %e, "failed to resolve model after discovery");
+            return;
+        }
+    };
+    let provider = match from_model(&mut resolved, timeouts) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(spec = %spec, error = %e, "failed to create provider after discovery");
+            return;
+        }
+    };
+    model_slot.store(Arc::new(ModelSlot {
+        model: resolved,
+        provider: Arc::from(provider),
+    }));
+}
+
 fn spawn_model_fetch(
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     timeouts: Timeouts,
@@ -443,27 +547,7 @@ fn spawn_model_fetch(
     let model_slot = Arc::clone(model_slot);
     let task = smol::spawn(async move {
         let warn_tx = warn_tx_bg;
-        let done = Box::new(move || {
-            let spec = model_slot.load().model.spec();
-            let mut resolved = match Model::from_spec(&spec) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(spec = %spec, error = %e, "failed to resolve model after discovery");
-                    return;
-                }
-            };
-            let provider = match from_model(&mut resolved, timeouts) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(spec = %spec, error = %e, "failed to create provider after discovery");
-                    return;
-                }
-            };
-            model_slot.store(Arc::new(ModelSlot {
-                model: resolved,
-                provider: Arc::from(provider),
-            }));
-        });
+        let done = Box::new(move || resolve_discovered_model(&model_slot, timeouts));
         fetch_all_models(
             &policy,
             |batch| merge_batch(&bg, batch, &warn_tx),
@@ -491,6 +575,7 @@ impl<'t> EventLoop<'t> {
             sessions,
             focused,
             mut startup_warnings,
+            startup_notice,
             storage,
             config,
             ui_config,
@@ -505,6 +590,8 @@ impl<'t> EventLoop<'t> {
             ui_attachment,
             lua_event_handle,
             model_policy,
+            project_config,
+            trust_question,
         } = params;
         // A `/reload` generation inherits the handles of the one before it,
         // so every loop has to claim the UI back for itself.
@@ -525,12 +612,12 @@ impl<'t> EventLoop<'t> {
 
         static PROCESS_WARMUP: std::sync::Once = std::sync::Once::new();
         PROCESS_WARMUP.call_once(|| {
-            std::thread::spawn(crate::highlight::warmup);
+            maki_highlight::pool::spawn(crate::highlight::warmup);
             crate::update::spawn_check();
         });
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd));
+        let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
 
         let provider: Arc<dyn Provider> = if needs_login {
             Arc::from(maki_providers::provider::from_model_fallback(
@@ -565,6 +652,7 @@ impl<'t> EventLoop<'t> {
             available_models: bg.available,
             storage_writer,
             model_policy,
+            trust_question,
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -584,16 +672,20 @@ impl<'t> EventLoop<'t> {
             let msg = format!("MCP config error: {}", ctx.mcp_config_errors);
             app.flash(msg);
         }
-        for w in startup_warnings {
-            app.flash(w);
+        if let Some(notice) = startup_notice {
+            app.flash(notice);
+        }
+        for warning in startup_warnings {
+            app.flash(warning);
         }
 
+        let (pack_tx, pack_rx) = flume::unbounded();
         Ok(Self {
             terminal,
             sessions: runtimes,
             focused,
-            last_focused: None,
-            terminal_focused: false,
+            last_focus: None,
+            focus: Focus::default(),
             notifier,
             ctx,
             input: InputReader::spawn(),
@@ -601,12 +693,40 @@ impl<'t> EventLoop<'t> {
             warn_tx: bg.warn_tx,
             ui_action_rx,
             ui_attachment,
+            pack_tx,
+            pack_rx,
+            pack_running: false,
             _model_fetch_task: bg.task,
         })
     }
 
     fn focused_app(&mut self) -> &mut App {
         &mut self.sessions[self.focused].app
+    }
+
+    /// Paints a frame and parks the terminal cursor on the cell the input box
+    /// reversed, without showing it. macOS anchors IME preedit text to the
+    /// cursor, so it has to sit there, but a visible one would invert that
+    /// already reversed cell back to plain text and ride along with every cell
+    /// the next diff writes.
+    ///
+    /// `Frame::set_cursor_position` cannot do this: ratatui shows the cursor
+    /// whenever a frame asks for a position. Hence the move after the draw,
+    /// and the hide that goes with it, so a widget that does ask for one
+    /// cannot bring the block cursor back.
+    fn paint(&mut self) -> Result<()> {
+        let app = &mut self.sessions[self.focused].app;
+        let mut cursor = None;
+        self.terminal.draw(|f| {
+            cursor = app.view(f);
+            color_compat::downgrade_if_needed(f.buffer_mut());
+        })?;
+        if let Some(pos) = cursor {
+            self.terminal.hide_cursor()?;
+            self.terminal.set_cursor_position(pos)?;
+            self.terminal.backend_mut().flush()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<ShutdownReport> {
@@ -628,14 +748,10 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
-            if dirty.take() {
-                let app = &mut self.sessions[self.focused].app;
-                if let Err(e) = self.terminal.draw(|f| {
-                    app.view(f);
-                    color_compat::downgrade_if_needed(f.buffer_mut());
-                }) {
-                    break Err(e.into());
-                }
+            if dirty.take()
+                && let Err(e) = self.paint()
+            {
+                break Err(e);
             }
 
             if let Some(i) = self.sessions.iter().position(|rt| {
@@ -692,6 +808,7 @@ impl<'t> EventLoop<'t> {
             sel = sel.recv(&self.ui_action_rx, |res| res.ok().map(Wake::Ui));
         }
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
+        sel = sel.recv(&self.pack_rx, |res| res.ok().map(Wake::Pack));
         for (i, rt) in self.sessions.iter().enumerate() {
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
@@ -706,10 +823,11 @@ impl<'t> EventLoop<'t> {
     }
 
     /// Whether the terminal has actually told us it lost focus. Terminals that
-    /// never answer DECSET 1004 leave `terminal_focused` false forever, so
-    /// throttling on the flag alone would slow the UI for everyone on them.
+    /// never answer DECSET 1004 leave the focus state unproven forever, so
+    /// throttling on anything short of a report would slow the UI for everyone
+    /// on them.
     fn unattended(&self) -> bool {
-        !self.terminal_focused
+        matches!(self.focus, Focus::Unfocused)
             && self
                 .notifier
                 .as_ref()
@@ -724,6 +842,7 @@ impl<'t> EventLoop<'t> {
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
+            Wake::Pack(preparation) => self.finish_pack(*preparation),
         }
         Ok(())
     }
@@ -792,23 +911,22 @@ impl<'t> EventLoop<'t> {
             }
         }
 
-        let slot_model = self.ctx.model_slot.load();
-        let spec = slot_model.model.spec();
+        let slot = self.ctx.model_slot.load_full();
         for rt in &mut self.sessions {
-            if rt.app.state.session.model != spec
-                || rt.app.state.model.context_window != slot_model.model.context_window
-            {
-                rt.app.update_model(&slot_model.model);
+            if rt.slot.as_ref().is_none_or(|s| !Arc::ptr_eq(s, &slot)) {
+                rt.slot = Some(Arc::clone(&slot));
+                rt.app.update_model(&slot.model);
                 dirty = Dirty::YES;
             }
+            rt.app.emit_model_change();
         }
-        drop(slot_model);
 
-        // These two only fire Lua autocmds. Anything a handler does comes back
+        // These only fire Lua autocmds. Anything a handler does comes back
         // as a `UiAction` on the next wake, which repaints then.
-        self.emit_focus_change();
+        self.emit_focus_changes();
         dirty |= self.start_mailbox_runs();
         self.emit_status_changes();
+        self.emit_task_changes();
         self.emit_notifications();
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
@@ -906,7 +1024,7 @@ impl<'t> EventLoop<'t> {
             crate::components::settings_picker::UserSettings::reload();
         }
         // The editor owned the terminal; whatever focus state we had is stale.
-        self.terminal_focused = false;
+        self.focus.on_resume();
         match result {
             Ok(code) => code,
             Err(e) => {
@@ -916,6 +1034,8 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// One diff per frame covers every path that finishes, cancels or errors a
+    /// chat, so none of them has to remember to fire an event.
     fn emit_status_changes(&mut self) {
         let handle = &self.ctx.lua_event_handle;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
@@ -946,11 +1066,10 @@ impl<'t> EventLoop<'t> {
                 rt.app.attention(),
                 rt.last_status,
                 rt.handles.queue.is_empty(),
-                self.terminal_focused,
             );
             selected = select_notification(selected, candidate);
         }
-        if let Some(notification) = selected
+        if let Some(notification) = selected.filter(|n| self.focus.allows(n))
             && let Err(error) = notifier.notify(&notification.message())
         {
             warn!(notifier = ?notifier.notifier(), %error, "terminal notifications disabled after write failure");
@@ -958,19 +1077,50 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn emit_focus_change(&mut self) {
-        let id = self.sessions[self.focused].id();
-        if self.last_focused == Some(id) {
+    /// One diff per frame covers every way a task status can move, so no path
+    /// has to remember to speak up.
+    fn emit_task_changes(&mut self) {
+        let handle = &self.ctx.lua_event_handle;
+        for rt in &mut self.sessions {
+            let session_id = rt.app.state.session.id;
+            diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
+                handle.fire_autocmd(
+                    "TaskStatusChanged",
+                    json!({
+                        "session_id": session_id,
+                        "id": task.id,
+                        "name": task.name,
+                        "status": task.status,
+                    }),
+                );
+            });
+        }
+    }
+
+    /// One diff per frame covers the session picker, the chat cycling keys
+    /// and `maki.task.focus`, so none of them has to remember to fire an
+    /// event. A session switch is a task switch too, so `TaskFocusChanged`
+    /// always follows `SessionFocusChanged`.
+    fn emit_focus_changes(&mut self) {
+        let rt = &self.sessions[self.focused];
+        let current = (rt.id(), rt.app.active_task_id());
+        if self.last_focus.as_ref() == Some(&current) {
             return;
         }
-        let mut data = json!({ "session_id": id });
-        if let Some(previous) = self.last_focused {
-            data["previous_session_id"] = json!(previous.to_string());
+        let previous_session = self.last_focus.replace(current.clone()).map(|(id, _)| id);
+        let (session_id, task_id) = current;
+        let eh = &self.ctx.lua_event_handle;
+        if previous_session != Some(session_id) {
+            let mut data = json!({ "session_id": session_id });
+            if let Some(id) = previous_session {
+                data["previous_session_id"] = json!(id.to_string());
+            }
+            eh.fire_autocmd("SessionFocusChanged", data);
         }
-        self.last_focused = Some(id);
-        self.ctx
-            .lua_event_handle
-            .fire_autocmd("SessionFocusChanged", data);
+        eh.fire_autocmd(
+            "TaskFocusChanged",
+            json!({ "session_id": session_id, "id": task_id }),
+        );
     }
 
     fn start_mailbox_runs(&mut self) -> Dirty {
@@ -1033,7 +1183,10 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
-                    rt.handles.cancel();
+                    self.ctx
+                        .lua_event_handle
+                        .end_session(rt.id(), SessionEndReason::Delete);
+                    rt.handles.cancel_all();
                 }
                 self.ctx.storage_writer.delete(id, move |res| {
                     let reply = match res {
@@ -1128,8 +1281,37 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Lua acts on the focused session, the same target the model picker and
-    /// `/thinking` write to.
+    /// Lua acts on the focused session, the same target the model picker
+    /// writes to.
+    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
+        match req {
+            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Available => {
+                let available = self.ctx.available_models.load();
+                Ok(json!(
+                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
+                ))
+            }
+            ModelRequest::Set {
+                spec,
+                thinking,
+                fast,
+            } => {
+                if let Some(spec) = spec {
+                    self.change_model(&spec)?;
+                }
+                let app = self.focused_app();
+                if let Some(thinking) = thinking {
+                    app.set_thinking(&thinking)?;
+                }
+                if let Some(fast) = fast {
+                    app.set_fast(fast)?;
+                }
+                Ok(app.model_state())
+            }
+        }
+    }
+
     fn handle_task_request(&mut self, req: TaskRequest) -> UiReply {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
@@ -1174,35 +1356,6 @@ impl<'t> EventLoop<'t> {
             cost: app.state.cost,
         };
         json!(snapshot)
-    }
-
-    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
-        match req {
-            ModelRequest::Get => Ok(self.focused_app().model_state()),
-            ModelRequest::Available => {
-                let available = self.ctx.available_models.load();
-                Ok(json!(
-                    available.as_deref().map(Vec::as_slice).unwrap_or(&[])
-                ))
-            }
-            ModelRequest::Set {
-                spec,
-                thinking,
-                fast,
-            } => {
-                if let Some(spec) = spec {
-                    self.change_model(&spec)?;
-                }
-                let app = self.focused_app();
-                if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
-                }
-                if let Some(fast) = fast {
-                    app.set_fast(fast)?;
-                }
-                Ok(app.model_state())
-            }
-        }
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
@@ -1277,29 +1430,27 @@ impl<'t> EventLoop<'t> {
     }
 
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
-        let supports_focus_reporting = self
-            .notifier
-            .as_ref()
-            .is_some_and(terminal::TerminalNotifier::supports_focus_reporting);
-        if let Some(focused) = terminal_focus_event(&raw) {
-            if supports_focus_reporting {
-                self.terminal_focused = focused;
-            }
-            return (None, None);
-        }
-        if supports_focus_reporting && terminal_input_proves_focus(&raw) {
-            self.terminal_focused = true;
-        }
         match raw {
-            Event::Key(key) if key.kind == KeyEventKind::Press => (Some(Msg::Key(key)), None),
-            Event::Key(_) => (None, None),
-            Event::Paste(text) => (Some(Msg::Paste(text)), None),
-            Event::Mouse(mouse) => self.translate_mouse(mouse),
-            // Reported only by terminals that answer DECSET 1004; the frame
-            // rate falls back to the foreground one everywhere else.
-            Event::FocusGained | Event::FocusLost => {
-                self.terminal_focused = raw == Event::FocusGained;
+            Event::FocusGained => {
+                self.focus.report(Focus::Focused);
                 (None, None)
+            }
+            Event::FocusLost => {
+                self.focus.report(Focus::Unfocused);
+                (None, None)
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.focus.note_input();
+                (Some(Msg::Key(key)), None)
+            }
+            Event::Key(_) => (None, None),
+            Event::Paste(text) => {
+                self.focus.note_input();
+                (Some(Msg::Paste(text)), None)
+            }
+            Event::Mouse(mouse) => {
+                self.focus.note_input();
+                self.translate_mouse(mouse)
             }
             _ => (None, None),
         }
@@ -1401,7 +1552,6 @@ impl<'t> EventLoop<'t> {
                 let run_id = rt.app.run_id;
                 rt.handles.queue.push(QueueItem::Message(QueuedInput {
                     text: input.message.clone(),
-                    image_count: input.images.len(),
                     input,
                     run_id,
                     displayed: true,
@@ -1410,13 +1560,10 @@ impl<'t> EventLoop<'t> {
             Action::CancelAgent { run_id } => {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
-                let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
+                rt.handles.cancel_run(run_id);
             }
             Action::CancelSubagent { tool_use_id } => {
-                let _ = self.sessions[idx]
-                    .handles
-                    .cmd_tx
-                    .try_send(AgentCommand::CancelSubagent { tool_use_id });
+                self.sessions[idx].handles.cancel_subagent(tool_use_id);
             }
             Action::NewSession => {
                 self.respawn_agent(idx, Vec::new());
@@ -1448,11 +1595,14 @@ impl<'t> EventLoop<'t> {
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
             }
-            Action::Compact => {
+            Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];
                 rt.reset_run_notifications();
                 let run_id = rt.app.run_id;
-                rt.handles.queue.push(QueueItem::Compact { run_id });
+                rt.handles.queue.push(QueueItem::Compact(Compaction {
+                    run_id,
+                    instructions,
+                }));
             }
             Action::Checkpoint => {
                 let rt = &mut self.sessions[idx];
@@ -1491,7 +1641,7 @@ impl<'t> EventLoop<'t> {
                     let _pause = self.input.pause();
                     terminal::edit_temp_content(&current_text, self.terminal)
                 };
-                self.terminal_focused = false;
+                self.focus.on_resume();
                 match result {
                     Ok(edited) => self.sessions[idx].app.input_box.set_input(edited),
                     Err(e) => self.sessions[idx].app.flash(e),
@@ -1505,10 +1655,11 @@ impl<'t> EventLoop<'t> {
                     slot.model.clone(),
                 );
             }
+            Action::PreparePack(command) => self.start_pack(idx, command),
             Action::Suspend => {
                 let _pause = self.input.pause();
                 terminal::suspend(self.terminal);
-                self.terminal_focused = false;
+                self.focus.on_resume();
             }
             Action::RenameSession(messages) => {
                 self.sessions[idx].handles.queue.push(QueueItem::Rename {
@@ -1581,16 +1732,56 @@ impl<'t> EventLoop<'t> {
         Ok(())
     }
 
+    /// Prepares a package command on its own thread.
+    ///
+    /// Preparation fetches over the network through a git child process nothing
+    /// here can cancel. Inline it would freeze drawing and input for as long as
+    /// the slowest remote takes, so the answer comes back as an event instead.
+    fn start_pack(&mut self, idx: usize, command: PackCommand) {
+        if self.pack_running {
+            self.sessions[idx].app.flash(PACK_BUSY_ERR.to_owned());
+            return;
+        }
+        self.pack_running = true;
+        self.sessions[idx].app.flash(PACK_PREPARING.to_owned());
+        let handle = self.ctx.lua_event_handle.clone();
+        let tx = self.pack_tx.clone();
+        std::thread::spawn(move || {
+            // Without this a panic drops the sender with no answer, and
+            // `pack_running` stays set for the rest of the process, so every
+            // later package command reports "already running".
+            let preparation = catch_unwind(AssertUnwindSafe(|| match handle.package_context() {
+                Ok(context) => maki_lua::prepare_pack_command(&command, &context),
+                Err(error) => PackPreparation::failed(error),
+            }))
+            .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
+            let _ = tx.send(Box::new(preparation));
+        });
+    }
+
+    /// The answer lands on the focused session, not on the one that asked: a
+    /// package command reloads the whole Lua host, and only the focused session
+    /// is read for an exit request or seen by whoever answers the review.
+    fn finish_pack(&mut self, preparation: PackPreparation) {
+        self.pack_running = false;
+        let actions = self.focused_app().handle_pack_preparation(preparation);
+        self.dispatch(self.focused, actions);
+    }
+
     fn refresh_models(&self) {
         let available = Arc::clone(&self.ctx.available_models);
         let warn_tx = self.warn_tx.clone();
         let policy = Arc::clone(&self.ctx.model_policy);
+        let model_slot = Arc::clone(&self.ctx.model_slot);
+        let timeouts = self.ctx.timeouts;
         available.store(None);
         smol::spawn(async move {
             fetch_all_models(
                 &policy,
                 |batch| merge_batch(&available, batch, &warn_tx),
-                None,
+                Some(Box::new(move || {
+                    resolve_discovered_model(&model_slot, timeouts)
+                })),
             )
             .await;
         })
@@ -1639,7 +1830,7 @@ impl<'t> EventLoop<'t> {
             phase_start = Instant::now();
             elapsed
         };
-        let exit = self.sessions[self.focused].app.exit_request;
+        let exit = self.sessions[self.focused].app.exit_request.clone();
         // The loop already stopped draining `UiAction`, so say so before the
         // handlers run. Dropping the receiver does not, since the Lua runtime
         // holds one of its own, and a handler touching the UI would then park
@@ -1660,7 +1851,7 @@ impl<'t> EventLoop<'t> {
             mcp::kill_process_groups(&h.reader().load().pids);
         }
         for rt in &self.sessions {
-            let _ = rt.handles.cmd_tx.try_send(AgentCommand::CancelAll);
+            rt.handles.cancel_all();
         }
         let kill_mcp_ms = lap();
         let mut tabs = Vec::with_capacity(self.sessions.len());
@@ -1776,39 +1967,31 @@ mod tests {
 
         state.on_done(&done_event());
         assert!(state.waiting_for_drain());
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
-            None
-        );
+        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
 
         state.on_drain();
         assert!(!state.waiting_for_drain());
         assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
+            state.reconcile(None, SessionStatus::Idle, true),
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
         );
     }
 
-    #[test_case(SessionStatus::Idle, true, false, true ; "fires_when_settled_and_unfocused")]
-    #[test_case(SessionStatus::Idle, true, true, false ; "focused_terminal_swallows")]
-    #[test_case(SessionStatus::Idle, false, false, false ; "queued_message_swallows")]
-    #[test_case(SessionStatus::Working, true, false, false ; "busy_session_swallows")]
+    #[test_case(SessionStatus::Idle, true, true ; "fires_when_settled")]
+    #[test_case(SessionStatus::Idle, false, false ; "queued_message_swallows")]
+    #[test_case(SessionStatus::Working, true, false ; "busy_session_swallows")]
     fn due_completion_is_decided_on_first_reconcile(
         status: SessionStatus,
         queue_empty: bool,
-        terminal_focused: bool,
         fires: bool,
     ) {
         let mut state = due_completion();
 
-        let first = state.reconcile(None, status, queue_empty, terminal_focused);
+        let first = state.reconcile(None, status, queue_empty);
         assert_eq!(first.is_some(), fires);
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
-            None
-        );
+        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
     }
 
     #[test]
@@ -1817,17 +2000,65 @@ mod tests {
         let mut state = due_completion();
 
         assert_eq!(
-            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true, false),
+            state.reconcile(Some(prompt.clone()), SessionStatus::Idle, true),
             Some(prompt.clone())
         );
         assert_eq!(
-            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true, false),
+            state.reconcile(Some(prompt), SessionStatus::NeedsInput, true),
             None
         );
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle, true, false),
-            None
-        );
+        assert_eq!(state.reconcile(None, SessionStatus::Idle, true), None);
+    }
+
+    #[test_case(Focus::Focused, false ; "watching_user_already_saw_the_turn_end")]
+    #[test_case(Focus::Unfocused, true ; "away_from_the_terminal")]
+    #[test_case(Focus::default(), true ; "unproven_terminal_without_input_notifies")]
+    #[test_case(stale_input(), true ; "unproven_terminal_left_alone_notifies")]
+    #[test_case(fresh_input(), false ; "unproven_terminal_typed_into_just_now")]
+    fn focus_suppresses_only_turn_completions(focus: Focus, completion_fires: bool) {
+        let completion = Notification::TurnComplete { response: None };
+
+        assert_eq!(focus.allows(&completion), completion_fires);
+        assert!(focus.allows(&Notification::QuestionRequested));
+    }
+
+    fn stale_input() -> Focus {
+        Focus::Unproven {
+            last_input: Instant::now().checked_sub(INPUT_IMPLIES_WATCHING),
+        }
+    }
+
+    fn fresh_input() -> Focus {
+        let mut focus = Focus::default();
+        focus.note_input();
+        focus
+    }
+
+    #[test]
+    fn input_never_latches_on_an_unproven_terminal() {
+        let mut focus = fresh_input();
+
+        focus.on_resume();
+
+        assert_eq!(focus, Focus::default());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_focus_report_makes_input_and_resume_meaningful() {
+        let mut focus = Focus::default();
+
+        focus.report(Focus::Focused);
+        assert_eq!(focus, Focus::Focused);
+
+        focus.on_resume();
+        assert_eq!(focus, Focus::Unfocused);
+
+        focus.note_input();
+        assert_eq!(focus, Focus::Focused);
+
+        focus.report(Focus::Unfocused);
+        assert_eq!(focus, Focus::Unfocused);
     }
 
     #[test]
@@ -1844,31 +2075,6 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    #[test]
-    fn focus_events_map_to_terminal_focus_state() {
-        assert_eq!(terminal_focus_event(&Event::FocusGained), Some(true));
-        assert_eq!(terminal_focus_event(&Event::FocusLost), Some(false));
-        assert_eq!(terminal_focus_event(&Event::Resize(80, 24)), None);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn interactive_input_proves_terminal_focus() {
-        let release = crossterm::event::KeyEvent {
-            code: crossterm::event::KeyCode::Enter,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-            kind: KeyEventKind::Release,
-            state: crossterm::event::KeyEventState::NONE,
-        };
-
-        assert!(terminal_input_proves_focus(&Event::Key(
-            crate::components::key(crossterm::event::KeyCode::Enter)
-        )));
-        assert!(terminal_input_proves_focus(&Event::Paste("text".into())));
-        assert!(!terminal_input_proves_focus(&Event::Key(release)));
-        assert!(!terminal_input_proves_focus(&Event::Resize(80, 24)));
-    }
-
     #[test]
     fn shell_results_do_not_replace_existing_preamble() {
         let mut preamble = vec![Message::observation(OBSERVATION.into())];

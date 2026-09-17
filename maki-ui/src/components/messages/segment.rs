@@ -1,12 +1,17 @@
 use crate::render_worker::RenderWorker;
+use crate::repaint::Dirty;
+use crate::terminal_image::InlineImage;
 use crate::theme;
+use maki_providers::ImageSource;
 
 use super::super::code_view::SectionFlags;
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use crate::components::wrap::WrapIndex;
 use ratatui::text::{Line, Span};
 use std::cell::RefCell;
+use std::mem;
 use std::ops::Range;
+use std::sync::Arc;
 
 const INST_SUFFIX: &str = "__inst";
 
@@ -43,7 +48,7 @@ impl HighlightKey {
 #[derive(Default)]
 pub(super) struct Segment {
     lines: Vec<Line<'static>>,
-    pub search_text: String,
+    pub images: Vec<InlineImage>,
     pub tool_id: Option<String>,
     /// Backlink to `self.messages`, set only by `with_lines`. A click on a
     /// collapsed thinking indicator has no tool_id to route by, so this is
@@ -80,14 +85,9 @@ impl Segment {
         }
     }
 
-    pub fn with_lines(
-        lines: Vec<Line<'static>>,
-        search_text: String,
-        msg_index: Option<usize>,
-    ) -> Self {
+    pub fn with_lines(lines: Vec<Line<'static>>, msg_index: Option<usize>) -> Self {
         Self {
             lines,
-            search_text,
             msg_index,
             ..Self::default()
         }
@@ -116,16 +116,16 @@ impl Segment {
         f(slot.as_ref().expect("wrap index just built"))
     }
 
-    /// Height in the document layout. While `stale` is set this is the height
-    /// measured at an older width, which is what keeps a resize off the
-    /// O(transcript) path: re-measuring means re-wrapping every line.
+    /// Rows the wrapped text takes at `width`, measured at that width whatever
+    /// [`Self::stale`] says. Render, [`super::scroll::Layout`], the scrollbar
+    /// and the copy path all read this one number, so none of them can
+    /// disagree on how tall the text is.
     ///
-    /// Render, `segment_at_row` and the scrollbar all read this same number so
-    /// the layout stays self consistent, and `reflow_viewport` keeps every
-    /// segment the viewport can reach fresh. A caller that re-wraps the lines
-    /// itself has to use `drawn_height`, or it disagrees with the layout by
-    /// however much the width moved.
-    pub fn height(&self, width: u16) -> u16 {
+    /// While `stale` is set this is the height measured at an older width,
+    /// which is what keeps a resize off the O(transcript) path: re-measuring
+    /// means re-wrapping every line, and `reflow_viewport` keeps every segment
+    /// the viewport can reach fresh instead.
+    pub fn text_height(&self, width: u16) -> u16 {
         // While stale, keep whatever the index was last built at. Rebuilding it
         // at `width` here is exactly the O(transcript) re-wrap that reflowing
         // only the viewport exists to avoid, so read the old total instead and
@@ -138,11 +138,51 @@ impl Segment {
         self.with_wrap(width, WrapIndex::total)
     }
 
-    /// Rows the lines really take at `width`, ignoring staleness. Same as
-    /// `height` for any segment that is not stale. Goes through `with_wrap`, so
-    /// asking at the current width costs a lookup rather than a re-wrap.
+    /// Height in the document layout: the wrapped text plus the rows the
+    /// images below it claim.
+    pub fn height(&self, width: u16) -> u16 {
+        self.images
+            .iter()
+            .fold(self.text_height(width), |height, image| {
+                height.saturating_add(image.height())
+            })
+    }
+
+    pub fn set_images(
+        &mut self,
+        sources: impl Iterator<Item = (ImageSource, Option<&'static str>)>,
+    ) {
+        let mut previous = mem::take(&mut self.images).into_iter();
+        self.images = sources
+            .map(|(source, fallback)| {
+                previous
+                    .next()
+                    .filter(|image| Arc::ptr_eq(&image.source().data, &source.data))
+                    .unwrap_or_else(|| InlineImage::new(source, fallback))
+            })
+            .collect();
+    }
+
+    pub fn poll_images(&mut self) -> Dirty {
+        Dirty::any(self.images.iter_mut().map(InlineImage::poll))
+    }
+
+    pub fn release_images(&mut self) {
+        for image in &mut self.images {
+            image.release();
+        }
+    }
+
+    /// Rows the lines really take at `width`, ignoring staleness, images
+    /// included. Same as `height` for any segment that is not stale. Goes
+    /// through `with_wrap`, so asking at the current width costs a lookup
+    /// rather than a re-wrap.
     pub fn drawn_height(&self, width: u16) -> u16 {
-        self.with_wrap(width, WrapIndex::total)
+        self.images
+            .iter()
+            .fold(self.with_wrap(width, WrapIndex::total), |height, image| {
+                height.saturating_add(image.height())
+            })
     }
 
     /// Maps a display row (after wrapping) back to the source line index.
@@ -381,13 +421,6 @@ impl SegmentCache {
         if !self.segments.is_empty() {
             self.segments.push(Segment::spacer());
         }
-    }
-
-    pub fn search_texts(&self) -> Vec<&str> {
-        self.segments
-            .iter()
-            .map(|s| s.search_text.as_str())
-            .collect()
     }
 
     pub fn mark_all_width_stale(&mut self) {

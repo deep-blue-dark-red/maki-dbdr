@@ -321,6 +321,7 @@ fn pop_terminal_modes() {
 }
 
 fn resume(terminal: &mut ratatui::DefaultTerminal) {
+    crate::terminal_image::invalidate();
     write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
     stdout().execute(EnterAlternateScreen).ok();
     stdout().execute(EnableBracketedPaste).ok();

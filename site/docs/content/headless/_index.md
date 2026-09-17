@@ -19,6 +19,10 @@ Pipe via stdin:
 echo "list all TODO comments" | maki -p
 ```
 
+A headless run never asks about [folder trust](/docs/folder-trust/), so a
+project `.maki` directory it has no stored answer for is skipped and reported on
+standard error. In a container, add `--trust` to load it for that run.
+
 ## Output Formats
 
 | Format | Description |

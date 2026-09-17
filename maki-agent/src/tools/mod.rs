@@ -5,14 +5,14 @@
 //! quotes, camelCase keys, extra wrappers). Plan mode rejects writes to
 //! anything but the plan file before they reach the tool.
 
-mod file_tracker;
+mod file_access;
 pub mod grep;
 pub mod hook;
 pub mod interpreter_bridge;
 pub mod registry;
 pub mod schema;
 
-pub use file_tracker::FileReadTracker;
+pub use file_access::{FileAccess, FileKey};
 pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
@@ -29,9 +29,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use humantime::format_duration;
 use ignore::WalkBuilder;
+use maki_config::ProjectConfig;
 use serde_json::Value;
 
-use crate::agent::LoadedInstructions;
+use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
@@ -43,6 +44,8 @@ use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
 
 pub(crate) const TOOL_NAME_FIELD: &str = "name";
+/// What `maki.task` calls the session's own chat.
+pub const MAIN_TASK_ID: &str = "main";
 
 /// Who made a tool call. A resumed session rebuilds its state from the `ToolUse`
 /// blocks in history, and those hold the model's own calls only, so a nested
@@ -334,9 +337,17 @@ pub struct ToolContext {
     /// so a tool can always tell which conversation it is serving. `None`
     /// when there is no session at all, like the `maki index` one-shot.
     pub session_id: Option<SessionRef>,
+    /// `None` in the agent that owns the session ([`MAIN_TASK_ID`]), the
+    /// spawning call's `tool_use_id` in a subagent. A subagent shares
+    /// `session_id` with its parent on purpose (provider affinity, hooks,
+    /// otel), so this is what tells their chats apart.
+    pub task_id: Option<Arc<str>>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
+    /// Session-wide: a file the model has already seen is never injected again.
     pub loaded_instructions: LoadedInstructions,
+    /// Per model call, shared with its nested calls.
+    pub call_instructions: CallInstructions,
     pub cancel: CancelToken,
     pub mcp: Option<McpSession>,
     pub deadline: Deadline,
@@ -345,7 +356,7 @@ pub struct ToolContext {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
-    pub file_tracker: Arc<FileReadTracker>,
+    pub file_access: Arc<FileAccess>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
     pub subagent_cancels: Arc<CancelMap<String>>,
@@ -548,7 +559,7 @@ pub fn interpreter_ctx(
     event_tx: &EventSender,
     cancel: CancelToken,
     permissions: Arc<PermissionManager>,
-    file_tracker: Arc<FileReadTracker>,
+    file_access: Arc<FileAccess>,
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     registry: Arc<ToolRegistry>,
 ) -> ToolContext {
@@ -561,9 +572,11 @@ pub fn interpreter_ctx(
         event_tx: event_tx.clone(),
         mode: mode.clone(),
         session_id: None,
+        task_id: None,
         tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
+        call_instructions: CallInstructions::default(),
         cancel,
         mcp: None,
         deadline: Deadline::None,
@@ -572,7 +585,7 @@ pub fn interpreter_ctx(
         tool_output_lines: ToolOutputLines::default(),
         permissions,
         timeouts: maki_providers::Timeouts::default(),
-        file_tracker,
+        file_access,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
         subagent_cancels: Arc::new(CancelMap::new()),
@@ -591,6 +604,7 @@ pub fn interpreter_ctx(
 pub fn cli_tool_ctx() -> ToolContext {
     let (tx, _rx) = flume::unbounded::<crate::Envelope>();
     let event_tx = crate::EventSender::new(tx, 0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     interpreter_ctx(
         &AgentMode::Build,
         &event_tx,
@@ -601,10 +615,11 @@ pub fn cli_tool_ctx() -> ToolContext {
                 rules: vec![],
                 ..Default::default()
             },
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cwd.clone(),
+            ProjectConfig::discover(&cwd),
             Arc::default(),
         )),
-        Arc::new(FileReadTracker::new()),
+        FileAccess::fresh(),
         None,
         Arc::clone(ToolRegistry::global_arc()),
     )
@@ -622,15 +637,29 @@ pub mod test_support {
     /// Registry and routing tests care about the name and audience only, never
     /// about what the tool returns.
     pub fn mock_tool(name: &str, audience: ToolAudience) -> Arc<dyn registry::Tool> {
+        mock_tool_with_schema(
+            name,
+            audience,
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        )
+    }
+
+    pub fn mock_tool_with_schema(
+        name: &str,
+        audience: ToolAudience,
+        schema: Value,
+    ) -> Arc<dyn registry::Tool> {
         Arc::new(MockTool {
             name: name.to_owned(),
             audience,
+            schema,
         })
     }
 
     struct MockTool {
         name: String,
         audience: ToolAudience,
+        schema: Value,
     }
 
     struct MockInvocation;
@@ -652,7 +681,7 @@ pub mod test_support {
             "mock tool".into()
         }
         fn schema(&self) -> Value {
-            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+            self.schema.clone()
         }
         fn audience(&self) -> ToolAudience {
             self.audience
@@ -711,6 +740,7 @@ pub mod test_support {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp"),
+            ProjectConfig::discover(Path::new("/tmp")),
             Arc::default(),
         ))
     });
@@ -733,7 +763,7 @@ pub mod test_support {
             event_tx,
             CancelToken::none(),
             Arc::clone(&TEST_PERMISSIONS),
-            Arc::new(FileReadTracker::new()),
+            FileAccess::fresh(),
             None,
             Arc::new(ToolRegistry::new()),
         );
@@ -757,7 +787,7 @@ pub mod test_support {
             &event_tx,
             CancelToken::none(),
             permissions,
-            Arc::new(FileReadTracker::new()),
+            FileAccess::fresh(),
             None,
             Arc::new(ToolRegistry::new()),
         );

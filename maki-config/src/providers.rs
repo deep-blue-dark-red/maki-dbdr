@@ -297,26 +297,39 @@ impl ProvidersConfig {
     /// in tier or pricing surfaces immediately instead of silently dropping
     /// every provider and starting maki with an empty registry.
     pub fn load() -> Self {
+        Self::read().unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            process::exit(BAD_CONFIG_EXIT_CODE);
+        })
+    }
+
+    /// Same read, but a typo only costs the answer. For callers past startup,
+    /// where taking the process down mid-session is never the right trade.
+    pub fn load_or_default() -> Self {
+        Self::read().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "ignoring providers.toml");
+            Self::default()
+        })
+    }
+
+    fn read() -> Result<Self, String> {
         let path = providers_file_path();
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "cannot read providers.toml");
-                return Self::default();
+                return Ok(Self::default());
             }
         };
         match toml::from_str::<ProvidersConfig>(&content) {
             Ok(config) => {
                 debug!(path = %path.display(), "loaded providers config");
-                config
+                Ok(config)
             }
-            Err(e) => {
-                eprintln!("error: invalid {}: {e}", path.display());
-                process::exit(BAD_CONFIG_EXIT_CODE);
-            }
+            Err(e) => Err(format!("invalid {}: {e}", path.display())),
         }
     }
 
@@ -345,10 +358,14 @@ impl ProvidersConfig {
     }
 }
 
+/// The `providers.toml` we already read, or where a fresh one goes. Both share
+/// this path so `save` cannot leave a second copy behind in the other dir.
 fn providers_file_path() -> PathBuf {
-    paths::config_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(PROVIDERS_FILE)
+    paths::find_config_path(PROVIDERS_FILE).unwrap_or_else(|| {
+        paths::config_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(PROVIDERS_FILE)
+    })
 }
 
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
@@ -688,7 +705,9 @@ tier = "{input}"
     fn resolve_base_url_env_beats_def() {
         let slug = "maki-test-env-base-url-slug";
         let env_var = base_url_env_var(slug);
-        // SAFETY: unique test-only var; removed before the test returns.
+        // SAFETY: setting a variable is only sound while no other thread reads
+        // the environment, and the runner is what holds that up: `just test`
+        // runs `cargo nextest`, which gives every test its own process.
         unsafe {
             std::env::set_var(&env_var, "http://env.local/v1");
         }
@@ -697,6 +716,7 @@ tier = "{input}"
             ..Default::default()
         };
         let got = resolve_base_url(slug, Some(&def));
+        // SAFETY: same one process per test rule as above.
         unsafe {
             std::env::remove_var(&env_var);
         }

@@ -1,15 +1,16 @@
 local FIELD_TRUNCATE_THRESHOLD = 8
 local LINE_WRAP_THRESHOLD = 120
 local MAX_INT = math.maxinteger or (2 ^ 53)
+local PARSE_ERROR_NOTE = "(no entries: file has syntax errors - use the read tool instead)"
 
 local EXT_TO_LANG = {
   rs = "rust",
   py = "python",
   pyi = "python",
   ts = "typescript",
-  tsx = "typescript",
+  tsx = "tsx",
   js = "javascript",
-  jsx = "javascript",
+  jsx = "tsx",
   mjs = "javascript",
   cjs = "javascript",
   gleam = "gleam",
@@ -45,6 +46,7 @@ local EXT_TO_LANG = {
   md = "markdown",
   markdown = "markdown",
   bzl = "bazel_bzl",
+  v = "v",
   zig = "zig",
   nix = "nix",
   dart = "dart",
@@ -71,9 +73,12 @@ local FILENAME_TO_LANG = {
   ["Makefile"] = "make",
 }
 
+-- JavaScript goes through the TSX grammar because that grammar is a superset
+-- of JavaScript and handles JSX. The one thing it gives up is the `<T>expr`
+-- type assertion, and that is TypeScript only, so a .js file never has one.
 local LANG_TO_PARSER = {
   lua_lang = "lua",
-  javascript = "typescript",
+  javascript = "tsx",
   bazel_build = "starlark",
   bazel_module = "starlark",
   bazel_bzl = "starlark",
@@ -421,11 +426,14 @@ local function extract_enum_variants(body, source, variant_kind)
   return values
 end
 
-local function extract_fields_truncated(body, source, field_kind, format_fn)
+local function extract_fields_truncated(body, source, field_kinds, format_fn)
+  if type(field_kinds) == "string" then
+    field_kinds = { field_kinds }
+  end
   local fields = {}
   local total = 0
   for _, child in ipairs(body:children()) do
-    if child:type() == field_kind then
+    if table.find(field_kinds, child:type()) then
       total = total + 1
       if total <= FIELD_TRUNCATE_THRESHOLD then
         fields[#fields + 1] = format_fn(child, source)
@@ -794,6 +802,12 @@ local U = {
 }
 
 local function default_extract(lang, source, root)
+  if lang.validate_root then
+    local err = lang.validate_root(root)
+    if err then
+      return nil, err
+    end
+  end
   local entries = {}
   local test_lines = {}
 
@@ -834,7 +848,7 @@ local function validate_lang(name, lang)
   end
   assert(type(lang.extract_nodes) == "function", name .. ": missing extract_nodes")
   assert(type(lang.import_separator) == "string", name .. ": missing import_separator")
-  for _, opt in ipairs({ "is_doc_comment", "is_module_doc", "is_attr", "is_test_node" }) do
+  for _, opt in ipairs({ "is_doc_comment", "is_module_doc", "is_attr", "is_test_node", "validate_root" }) do
     local v = lang[opt]
     assert(v == nil or type(v) == "function", name .. ": " .. opt .. " must be nil or function")
   end
@@ -842,6 +856,7 @@ end
 
 local LANG_ALIASES = {
   javascript = "typescript",
+  tsx = "typescript",
 }
 
 local KNOWN_LANGS = {}
@@ -886,7 +901,13 @@ local function index_source(source, lang_name)
   end
   local parser = maki.treesitter.get_parser(source, parser_name(lang_name))
   local root = parser:parse()[1]:root()
-  return extractor(source, root)
+  local skeleton, meta = extractor(source, root)
+  -- An empty skeleton reads as "this file declares nothing", and that is the
+  -- wrong story to tell when the parser choked on the file instead.
+  if skeleton == "" and root:has_error() then
+    skeleton = PARSE_ERROR_NOTE .. "\n"
+  end
+  return skeleton, meta
 end
 
 local LANG_TO_EXT = {}
@@ -902,4 +923,5 @@ return {
   LANG_TO_EXT = LANG_TO_EXT,
   FILENAME_TO_LANG = FILENAME_TO_LANG,
   TRUNCATED_SUFFIX = TRUNCATED_SUFFIX,
+  PARSE_ERROR_NOTE = PARSE_ERROR_NOTE,
 }

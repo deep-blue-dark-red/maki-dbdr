@@ -85,7 +85,7 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 * Plan mode.
 * Run bash commands using `!`, or `!!` if you want maki to not know about it.
 * `/cd` to change dir.
-* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions (although I wouldn't recommend that, maki is very new).
+* Use `--print --output-format stream-json` to run UI-less. Output is compatible with Claude Code, so you can easily replace your existing solutions.
 
 ## Supported providers
 
@@ -100,6 +100,7 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 * Z.AI - `ZHIPU_API_KEY`.
 * DeepSeek - `DEEPSEEK_API_KEY`.
 * OpenRouter - `OPENROUTER_API_KEY`.
+* Requesty - `REQUESTY_API_KEY`. Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` for the EU region.
 * Synthetic - `SYNTHETIC_API_KEY`.
 * Regolo - `REGOLO_API_KEY`. EU-hosted open-weight models.
 * TensorX - `TENSORX_API_KEY`.
@@ -149,7 +150,7 @@ Run `maki acp` or configure your ACP supporting editor to use maki, e.g. in [Zed
 "agent_servers": {
   "Maki": {
     "default_config_options": {
-      "model": "deepseek/deepseek-v4-flash"
+      "model": "deepseek/deepseek-flash"
     },
     "type": "custom",
     "command": "maki",

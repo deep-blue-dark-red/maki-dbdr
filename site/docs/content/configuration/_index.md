@@ -12,9 +12,12 @@ Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language
 Two places, both optional:
 
 - **Global**: `~/.config/maki/init.lua`
-- **Project**: `.maki/init.lua` (relative to your working directory)
+- **Project**: `.maki/init.lua` in the active Git checkout, or in the working
+  directory outside Git
 
 When both exist, project settings override global ones. Neither file is required.
+A project `init.lua` runs only once you trust that folder, see
+[Folder Trust](/docs/folder-trust/).
 
 ## Example
 
@@ -61,7 +64,7 @@ All fields are optional. Typos in field names cause an error right away.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
-| `always_fast` | bool | `false` | Start every session with Anthropic fast mode (Opus only; ignored otherwise) |
+| `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
 | `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
@@ -71,6 +74,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-------------|
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
+| `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
 | `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
@@ -88,7 +92,13 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
-Themes use 24-bit colors, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
+Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
+
+Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
+
+Theme files can also name terminal colors instead of giving hex values, using the same names as Helix: `default`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `light-red`, `light-green`, `light-yellow`, `light-blue`, `light-magenta`, `light-cyan`, `light-gray`, and `white`. Write them exactly as listed. `lightgray`, `light_gray` and `LIGHT-GRAY` are all rejected. `default` means the terminal default. Maki also takes a number from `0` to `255` to pick a palette entry by index, which Helix does not.
+
+These work everywhere a hex value does, including syntax highlighting scopes, so a theme can be written entirely against the palette your terminal already defines. Maki passes them through as palette references rather than resolving them to RGB, so the colors stay correct in terminals that mangle truecolor, such as nested tmux over ssh.
 
 ### `ui.tool_output_lines`
 
@@ -113,6 +123,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `max_output_bytes` | usize | `51200` | 1024 | Max tool output size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Max tool output lines |
 | `max_continuation_turns` | u32 | `3` | 1 | Max automatic continuation turns |
+| `max_turn_output` | u32 | `32768` | 1024 | Output tokens one turn asks for, raised where an effort level needs the room and capped by the model's own limit |
 | `compaction_buffer` | u32 \| string | `20%` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
 | `max_output_tokens` | u32 | `40000` | 1 | Max LLM response length (tokens) |
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
@@ -131,6 +142,10 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
 | `low_speed_timeout_secs` | u64 | `120` | 1 | Low speed timeout (seconds with less than 1 byte received) |
 | `stream_timeout_secs` | u64 | `300` | 10 | Streaming response timeout (seconds) |
+| `retry_base_ms` | u64 | `2000` | 1 | Base delay between retries (milliseconds, grows per attempt) |
+| `retry_max_ms` | u64 | `60000` | 1 | Cap on the guessed retry backoff (milliseconds) |
+| `max_retries` | u32 | `5` | - | Max retries on a rate limit the server sent no Retry-After for, 0 to never retry them |
+| `max_timeout_retries` | u32 | `10` | - | Max retries on stream timeouts |
 
 ### `storage`
 
@@ -157,6 +172,21 @@ maki.setup({
 ```
 
 An entry with no port covers every port. A name you list is allowed whatever it resolves to. A name you did not list stays blocked when DNS lands it on a private address, unless that address falls in a range you allowed, so keep ranges as small as the service needs. Every redirect hop is checked against the same list. [Permissions](/docs/permissions/#network-addresses) covers what the guard protects.
+
+### `trust`
+
+Answers the folder trust question in advance. Read from the global `~/.config/maki/init.lua` only, since a project file that could set it would be trusting itself:
+
+```lua
+maki.setup({
+    trust = {
+        paths = { "~/src/me/*", "/workspace" },
+        prompt = false,
+    },
+})
+```
+
+`paths` is a list of globs matched against the project root, empty by default. `prompt` is a bool, `true` by default. Setting it to `false` drops the startup card and leaves the folder restricted unless a `paths` entry matches. [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax and which run modes apply the policy.
 
 ### `telemetry`
 
@@ -299,6 +329,7 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default) or "youcom" (You.com MCP). |
 
 ## Validation
 
@@ -316,7 +347,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\maki\` |
 | Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\maki\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
 
 `~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 

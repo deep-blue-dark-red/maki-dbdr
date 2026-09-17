@@ -13,11 +13,12 @@ use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
-use maki_agent::tools::{ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::{AgentEvent, BufferSnapshot, ToolDoneEvent, ToolOutput, ToolStartEvent};
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::WinView;
-use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{ContentBlock, ImageSource, Message, RequestOptions, Role};
+use maki_storage::id::MakiId;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -36,7 +37,7 @@ pub enum ChatEventResult {
     Done,
     QueueItemConsumed {
         text: String,
-        image_count: usize,
+        images: Vec<ImageSource>,
     },
     Error(String),
     PermissionRequest {
@@ -52,40 +53,53 @@ pub struct Chat {
     pub cost: Option<f64>,
     pub context_size: u32,
     pub model_id: Option<String>,
+    /// A subagent's own settings; `None` on the main chat, which reads the
+    /// session's.
+    pub opts: Option<RequestOptions>,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
+    /// The ending and the index of the bubble announcing it, so a later, better
+    /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
-    task_id: Option<Arc<str>>,
 }
 
 impl Chat {
-    pub fn new(name: String, ui_config: UiConfig, lua_event_handle: maki_lua::EventHandle) -> Self {
+    /// A chat belongs to one session for life: every path that changes
+    /// `App::state.session` rebuilds the chats after the swap. `task_id` is
+    /// `None` for the main chat, the subagent's `tool_use_id` otherwise.
+    pub fn new(
+        session_id: MakiId,
+        task_id: Option<&str>,
+        name: String,
+        ui_config: UiConfig,
+        lua_event_handle: maki_lua::EventHandle,
+    ) -> Self {
+        let mut messages_panel = MessagesPanel::new(ui_config, lua_event_handle);
+        messages_panel.set_chat(session_id, task_id.map(Arc::from));
         Self {
             name,
             cost: None,
             context_size: 0,
             model_id: None,
+            opts: None,
             pending_turn_usage: None,
-            messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
+            messages_panel,
             finish: None,
-            task_id: None,
         }
     }
 
-    pub(crate) fn subagent(
-        task_id: &str,
-        name: String,
-        ui_config: UiConfig,
-        lua_event_handle: maki_lua::EventHandle,
-    ) -> Self {
-        Self {
-            task_id: Some(Arc::from(task_id)),
-            ..Self::new(name, ui_config, lua_event_handle)
-        }
-    }
-
+    /// The handle `maki.task` addresses a task by, see `app::tasks`.
     pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
-        self.task_id.as_ref()
+        self.messages_panel.task_id()
+    }
+
+    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
+        self.messages_panel.request_restores(items);
+    }
+
+    pub(crate) fn task_id_or_main(&self) -> Arc<str> {
+        self.task_id()
+            .map_or_else(|| Arc::from(MAIN_TASK_ID), Arc::clone)
     }
 
     pub(crate) fn task_status(&self) -> TaskStatus {
@@ -129,7 +143,18 @@ impl Chat {
                         .push(DisplayMessage::plan(content, pp.display().to_string()));
                 }
             }
-            AgentEvent::TurnComplete(_) => {}
+            AgentEvent::TurnComplete(turn) => {
+                for block in turn.message.content {
+                    if let ContentBlock::Image { source } = block {
+                        self.messages_panel.flush();
+                        self.messages_panel.push(DisplayMessage::with_images(
+                            DisplayRole::Assistant,
+                            String::new(),
+                            vec![source],
+                        ));
+                    }
+                }
+            }
             AgentEvent::ToolResultsSubmitted { .. } => {
                 if let Some(usage) = self.pending_turn_usage.take() {
                     self.messages_panel.set_turn_usage_on_last_tool(usage);
@@ -148,8 +173,8 @@ impl Chat {
             AgentEvent::CompactionDone { .. } => {
                 self.messages_panel.flush();
             }
-            AgentEvent::QueueItemConsumed { text, image_count } => {
-                return ChatEventResult::QueueItemConsumed { text, image_count };
+            AgentEvent::QueueItemConsumed { text, images } => {
+                return ChatEventResult::QueueItemConsumed { text, images };
             }
             AgentEvent::QueueDrained => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
@@ -177,11 +202,25 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::SubagentHistory { .. } => {}
+            AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
             }
-            AgentEvent::ToolSnapshot { .. } | AgentEvent::ToolHeaderSnapshot { .. } => {}
+            AgentEvent::ToolSnapshot {
+                id,
+                snapshot,
+                theme_gen,
+            } => {
+                self.messages_panel.tool_snapshot(&id, snapshot, theme_gen);
+            }
+            AgentEvent::ToolHeaderSnapshot {
+                id,
+                snapshot,
+                theme_gen,
+            } => {
+                self.messages_panel
+                    .tool_header_snapshot(&id, snapshot, theme_gen);
+            }
             // Handled in `App::update` (needs `turn_history`, which lives
             // above `Chat`), same as `TurnComplete` above.
             AgentEvent::TurnToolsDone { .. } => {}
@@ -211,6 +250,10 @@ impl Chat {
 
     pub fn half_page(&self) -> i32 {
         self.messages_panel.half_page()
+    }
+
+    pub fn page(&self) -> i32 {
+        self.messages_panel.page()
     }
 
     pub fn win_view(&self) -> WinView {
@@ -253,8 +296,15 @@ impl Chat {
         self.messages_panel.cadence()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
-        self.messages_panel.view(frame, area, has_selection);
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        has_selection: bool,
+        images_visible: bool,
+    ) {
+        self.messages_panel
+            .view(frame, area, has_selection, images_visible);
     }
 
     pub fn scroll_top(&self) -> u16 {
@@ -265,7 +315,7 @@ impl Chat {
         self.messages_panel.segment_heights()
     }
 
-    pub fn segment_search_texts(&self) -> Vec<&str> {
+    pub fn segment_search_texts(&self) -> Vec<String> {
         self.messages_panel.segment_search_texts()
     }
 
@@ -368,9 +418,13 @@ impl Chat {
 
     /// Flush, push, and re-pin scroll in one shot to avoid
     /// the one-frame hop where the bubble briefly lands in the wrong row.
-    pub fn show_user_message(&mut self, text: impl Into<String>) {
+    pub fn show_user_message(&mut self, text: impl Into<String>, images: Vec<ImageSource>) {
         self.flush();
-        self.push_user_message(text);
+        self.messages_panel.push(DisplayMessage::with_images(
+            DisplayRole::User,
+            text.into(),
+            images,
+        ));
         self.enable_auto_scroll();
     }
 
@@ -389,6 +443,11 @@ impl Chat {
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages_panel.message_count()
+    }
+
+    #[cfg(test)]
+    pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
+        self.messages_panel.message_at(index)
     }
 
     /// Number of tool calls currently executing. Used by the status bar to
@@ -458,8 +517,19 @@ pub fn history_to_display(
         }
         match msg.role {
             Role::User => {
-                if let Some(text) = msg.user_text() {
-                    display.push(DisplayMessage::new(DisplayRole::User, text.to_owned()));
+                // An empty `display_text` marks a message the transcript never
+                // shows, so its attachments must not sneak in either.
+                if msg.display_text.as_deref() == Some("") {
+                    continue;
+                }
+                let images = user_images(msg);
+                let text = msg.user_text();
+                if text.is_some() || !images.is_empty() {
+                    display.push(DisplayMessage::with_images(
+                        DisplayRole::User,
+                        text.unwrap_or_default().to_owned(),
+                        images,
+                    ));
                 }
             }
             Role::Assistant => {
@@ -467,6 +537,13 @@ pub fn history_to_display(
                     match block {
                         ContentBlock::Text { text } if !text.is_empty() => {
                             display.push(DisplayMessage::new(DisplayRole::Assistant, text.clone()));
+                        }
+                        ContentBlock::Image { source } => {
+                            display.push(DisplayMessage::with_images(
+                                DisplayRole::Assistant,
+                                String::new(),
+                                vec![source.clone()],
+                            ));
                         }
                         ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                             display
@@ -491,7 +568,7 @@ pub fn history_to_display(
                                     (s, Some(&**text))
                                 })
                                 .unwrap_or((ToolStatus::Success, None));
-                            let stored = tool_outputs.get(id.as_str()).map(Arc::as_ref);
+                            let stored = tool_outputs.get(id.as_str());
                             let (text, truncated_lines, tool_output, mut annotation) =
                                 build_loaded_tool(
                                     static_name,
@@ -531,6 +608,9 @@ pub fn history_to_display(
                                     theme_gen: None,
                                     clicks: Vec::new(),
                                     state,
+                                    session_id: None,
+                                    task_id: None,
+                                    reason: maki_lua::RestoreReason::Load,
                                 });
                             }
                             display.push(DisplayMessage {
@@ -540,6 +620,7 @@ pub fn history_to_display(
                                     name: static_name.into(),
                                 })),
                                 text,
+                                images: Vec::new(),
                                 tool_input: None,
                                 tool_raw_input: Some(raw_input),
                                 tool_output,
@@ -565,7 +646,8 @@ pub fn history_to_display(
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
-/// whatever the `DisplayMessage` kept.
+/// whatever the `DisplayMessage` kept. A rerender: the transcript was
+/// already replayed once, this asks for one call's buf again.
 pub(crate) fn restore_item_for(
     msg: &DisplayMessage,
     tool_output_lines: maki_config::ToolOutputLines,
@@ -591,6 +673,9 @@ pub(crate) fn restore_item_for(
         theme_gen: Some(theme_gen),
         clicks: Vec::new(),
         state,
+        session_id: None,
+        task_id: None,
+        reason: maki_lua::RestoreReason::Rerender,
     })
 }
 
@@ -599,14 +684,14 @@ pub(crate) fn restore_item_for(
 fn build_loaded_tool(
     tool: &str,
     summary: &str,
-    reconstructed: Option<ToolOutput>,
+    reconstructed: Option<Arc<ToolOutput>>,
     result_text: Option<&str>,
     tool_output_lines: &ToolOutputLines,
 ) -> (String, usize, Option<Arc<ToolOutput>>, Option<String>) {
     match reconstructed {
         Some(output) => {
             let annotation = output.annotation();
-            (summary.to_owned(), 0, Some(Arc::new(output)), annotation)
+            (summary.to_owned(), 0, Some(output), annotation)
         }
         None => {
             let result = result_text.unwrap_or("");
@@ -628,6 +713,25 @@ fn build_loaded_tool(
             }
         }
     }
+}
+
+/// Images the user attached. A tool result also rides in a user message, and
+/// its images already render under the tool itself, so those stay out.
+fn user_images(msg: &Message) -> Vec<ImageSource> {
+    if msg
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+    {
+        return Vec::new();
+    }
+    msg.content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image { source } => Some(source.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
@@ -653,9 +757,129 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use crate::components::IMAGE_PLACEHOLDER;
+    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
     use maki_config::UiConfig;
+    use maki_providers::ImageMediaType;
     use test_case::test_case;
+
+    const IMAGE_DATA: &str = "dGVzdA==";
+    const EXPECTED_QUEUE_DELIVERY: &str = "a consumed queue item must carry its images";
+
+    fn image() -> ImageSource {
+        ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))
+    }
+
+    #[test_case(USER_TEXT, USER_TEXT ; "captioned")]
+    #[test_case("", IMAGE_PLACEHOLDER ; "image_only")]
+    fn history_delivers_images_without_synthetic_or_tool_attachments(text: &str, expected: &str) {
+        let mut hidden = Message::synthetic(USER_TEXT.into());
+        hidden.content.push(ContentBlock::Image { source: image() });
+        let mut observation = Message::observation(USER_TEXT.into());
+        observation
+            .content
+            .push(ContentBlock::Image { source: image() });
+        let tool_result = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: TASK_ID.into(),
+                    content: USER_TEXT.into(),
+                    is_error: false,
+                },
+                ContentBlock::Image { source: image() },
+            ],
+            ..Default::default()
+        };
+        let assistant = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Image { source: image() }],
+            ..Default::default()
+        };
+        let (display, _) = history_to_display(
+            &[
+                Message::user_with_images(text.into(), vec![image()]),
+                hidden,
+                observation,
+                tool_result,
+                assistant,
+            ],
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+        );
+        assert_eq!(display.len(), 2);
+        assert_eq!(display[0].role, DisplayRole::User);
+        assert_eq!(display[0].text, expected);
+        assert_eq!(display[1].role, DisplayRole::Assistant);
+        assert_eq!(display[1].text, IMAGE_PLACEHOLDER);
+        for message in display {
+            assert_eq!(message.images.len(), 1);
+            assert_eq!(&*message.images[0].data, IMAGE_DATA);
+        }
+    }
+
+    #[test]
+    fn queued_user_images_reach_display() {
+        let mut chat = chat();
+        let result = chat.handle_event(
+            AgentEvent::QueueItemConsumed {
+                text: String::new(),
+                images: vec![image()],
+            },
+            None,
+        );
+        let ChatEventResult::QueueItemConsumed { text, images } = result else {
+            panic!("{EXPECTED_QUEUE_DELIVERY}");
+        };
+        chat.show_user_message(text, images);
+        let message = chat.message_at(0).unwrap();
+        assert_eq!(message.role, DisplayRole::User);
+        assert_eq!(message.text, IMAGE_PLACEHOLDER);
+        assert_eq!(message.images.len(), 1);
+        assert_eq!(&*message.images[0].data, IMAGE_DATA);
+    }
+
+    #[test_case("" ; "image_only")]
+    #[test_case(REPLY_TEXT ; "streamed_text")]
+    fn turn_complete_delivers_images_without_replaying_text(text: &str) {
+        let mut chat = chat();
+        text_delta(&mut chat, text);
+        chat.handle_event(
+            AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentBlock::Text { text: text.into() },
+                        ContentBlock::Image { source: image() },
+                    ],
+                    ..Default::default()
+                },
+                usage: Default::default(),
+                model: String::new(),
+                cost: None,
+                context_size: None,
+                context_window: 0,
+                cache_miss: false,
+                upstream: None,
+                turn_id: 1,
+                duration_ms: None,
+                ttfb_ms: None,
+                api_error_count: 0,
+            })),
+            None,
+        );
+        let image_index = usize::from(!text.is_empty());
+        assert_eq!(chat.message_count(), image_index + 1);
+        if !text.is_empty() {
+            assert_eq!(chat.message_at(0).unwrap().text, text);
+            assert!(chat.message_at(0).unwrap().images.is_empty());
+        }
+        let message = chat.message_at(image_index).unwrap();
+        assert_eq!(message.role, DisplayRole::Assistant);
+        assert_eq!(message.text, IMAGE_PLACEHOLDER);
+        assert_eq!(message.images.len(), 1);
+        assert_eq!(&*message.images[0].data, IMAGE_DATA);
+    }
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
         AgentEvent::ToolStart(Box::new(ToolStartEvent {
@@ -683,7 +907,7 @@ mod tests {
         AgentEvent::ToolDone(Box::new(ToolDoneEvent {
             id: id.into(),
             tool: tool.into(),
-            output,
+            output: Arc::new(output),
             is_error: false,
             annotation: None,
             written_path,
@@ -710,9 +934,49 @@ mod tests {
         HashMap::new()
     }
 
+    const MAIN_NAME: &str = "Main";
+    const SUBAGENT_NAME: &str = "research";
+    const TASK_ID: &str = "toolu_01";
+    const USER_TEXT: &str = "one more thing";
+    const REPLY_TEXT: &str = "on it";
+
+    fn chat() -> Chat {
+        Chat::new(
+            MakiId::generate(),
+            None,
+            MAIN_NAME.into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        )
+    }
+
+    fn subagent_chat() -> Chat {
+        Chat::new(
+            MakiId::generate(),
+            Some(TASK_ID),
+            SUBAGENT_NAME.into(),
+            UiConfig::default(),
+            maki_lua::EventHandle::disconnected_for_test(),
+        )
+    }
+
+    fn end(chat: &mut Chat, outcome: TaskOutcome) {
+        let text = match outcome {
+            TaskOutcome::Error => ERROR_TEXT,
+            TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
+        };
+        chat.mark_finished(outcome, text);
+    }
+
+    fn text_delta(chat: &mut Chat, text: &str) {
+        chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+    }
+
     #[test]
     fn tool_lifecycle() {
         let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
             "Main".into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
@@ -730,6 +994,8 @@ mod tests {
     #[test]
     fn plan_write_renders_file_content() {
         let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
             "Main".into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
@@ -754,6 +1020,8 @@ mod tests {
     #[test]
     fn plan_write_ignores_different_path() {
         let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
             "Main".into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
@@ -771,6 +1039,8 @@ mod tests {
     #[test]
     fn plan_edit_shows_path_only() {
         let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
             "Main".into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
@@ -1093,6 +1363,8 @@ mod tests {
     #[test]
     fn compaction_done_flushes_streaming_buffers() {
         let mut chat = Chat::new(
+            MakiId::generate(),
+            None,
             "Main".into(),
             UiConfig::default(),
             maki_lua::EventHandle::disconnected_for_test(),
@@ -1138,5 +1410,122 @@ mod tests {
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
+    }
+
+    /// The transcript keeps growing after the ending, since the subagent chat
+    /// stays on screen while the parent turn talks on. A fix aimed at the last
+    /// message would eat whatever landed in between.
+    #[test]
+    fn a_correction_rewrites_the_recorded_bubble_not_the_last_one() {
+        let mut chat = chat();
+        end(&mut chat, TaskOutcome::Unknown);
+        let ending = chat.message_count() - 1;
+
+        chat.show_user_message(USER_TEXT, Vec::new());
+        text_delta(&mut chat, REPLY_TEXT);
+        chat.flush();
+        let before = chat.message_count();
+
+        end(&mut chat, TaskOutcome::Error);
+
+        assert_eq!(chat.message_count(), before);
+        let bubble = chat
+            .message_at(ending)
+            .expect("recorded ending still there");
+        assert_eq!(bubble.text, ERROR_TEXT);
+        assert_eq!(bubble.role, DisplayRole::Error);
+        assert_eq!(
+            chat.message_at(ending + 1).map(|m| &m.role),
+            Some(&DisplayRole::User)
+        );
+        assert_eq!(
+            chat.message_at(ending + 1).map(|m| m.text.as_str()),
+            Some(USER_TEXT)
+        );
+        assert_eq!(chat.last_message_text(), REPLY_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Assistant));
+    }
+
+    /// The stream is flushed before the ending is pushed, so a reply still in
+    /// the buffer keeps its place ahead of it and the recorded index points at
+    /// the ending, not at the flushed text.
+    #[test]
+    fn a_pending_stream_lands_before_the_ending_bubble() {
+        let mut chat = chat();
+        text_delta(&mut chat, REPLY_TEXT);
+        assert!(!chat.streaming_text_is_empty());
+
+        end(&mut chat, TaskOutcome::Unknown);
+
+        assert!(chat.streaming_text_is_empty());
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(
+            chat.message_at(0).map(|m| m.text.as_str()),
+            Some(REPLY_TEXT)
+        );
+        assert_eq!(chat.last_message_text(), DONE_TEXT);
+
+        end(&mut chat, TaskOutcome::Error);
+
+        assert_eq!(chat.message_count(), 2);
+        assert_eq!(
+            chat.message_at(0).map(|m| m.text.as_str()),
+            Some(REPLY_TEXT)
+        );
+        assert_eq!(
+            chat.message_at(0).map(|m| &m.role),
+            Some(&DisplayRole::Assistant)
+        );
+        assert_eq!(chat.last_message_text(), ERROR_TEXT);
+        assert_eq!(chat.last_message_role(), Some(&DisplayRole::Error));
+    }
+
+    /// Every order two endings can arrive in. Only the placeholder gives way,
+    /// a verdict is never walked back, and no order grows a second bubble.
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Done, DONE_TEXT, DisplayRole::Done, TaskStatus::Done   ; "placeholder_settles_as_done")]
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Error, ERROR_TEXT, DisplayRole::Error, TaskStatus::Error ; "placeholder_corrected_to_error")]
+    #[test_case(TaskOutcome::Done, TaskOutcome::Error, DONE_TEXT, DisplayRole::Done, TaskStatus::Done     ; "verdict_survives_late_error")]
+    #[test_case(TaskOutcome::Error, TaskOutcome::Done, ERROR_TEXT, DisplayRole::Error, TaskStatus::Error  ; "verdict_survives_late_done")]
+    #[test_case(TaskOutcome::Done, TaskOutcome::Done, DONE_TEXT, DisplayRole::Done, TaskStatus::Done      ; "repeated_verdict")]
+    #[test_case(TaskOutcome::Unknown, TaskOutcome::Unknown, DONE_TEXT, DisplayRole::Done, TaskStatus::Done ; "repeated_placeholder")]
+    fn a_second_ending_never_adds_a_bubble(
+        first: TaskOutcome,
+        second: TaskOutcome,
+        text: &str,
+        role: DisplayRole,
+        status: TaskStatus,
+    ) {
+        let mut chat = chat();
+        chat.show_user_message(USER_TEXT, Vec::new());
+        end(&mut chat, first);
+        let count = chat.message_count();
+
+        end(&mut chat, second);
+
+        assert_eq!(chat.message_count(), count);
+        assert_eq!(chat.last_message_text(), text);
+        assert_eq!(chat.last_message_role(), Some(&role));
+        assert_eq!(chat.task_status(), status);
+    }
+
+    /// The shape `maki.task.list()` serializes: the main chat is not a task,
+    /// and a subagent is one from the moment it starts, working until an
+    /// ending lands on it.
+    #[test]
+    fn only_a_subagent_reports_a_task_and_its_status() {
+        let main = chat();
+        assert!(main.task_id().is_none());
+        assert!(!main.is_finished());
+
+        let mut sub = subagent_chat();
+        assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+        assert_eq!(sub.task_status(), TaskStatus::Working);
+        assert!(!sub.is_finished());
+
+        end(&mut sub, TaskOutcome::Error);
+
+        assert!(sub.is_finished());
+        assert_eq!(sub.task_status(), TaskStatus::Error);
+        assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
     }
 }

@@ -20,8 +20,9 @@ const TRUNCATE_PREFIX: &str = "..";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
+const RESTRICTED_LABEL: &str = " [restricted]";
 const YOLO_LABEL: &str = " [yolo]";
-const YOLO_DIM_FACTOR: f32 = 0.5;
+const YOLO_DIM_FACTOR: f32 = 0.15;
 
 pub struct UsageStats {
     /// The whole session's bill, drawn next to the focused chat's own once
@@ -75,6 +76,10 @@ pub struct StatusBarContext<'a> {
     pub thinking_label: Option<Cow<'static, str>>,
     pub fast: bool,
     pub workflow: bool,
+    /// The folder has a trust question nobody answered with a yes. Sourced from
+    /// the question, not from `!is_trusted()`, which is true in every folder
+    /// with no `.maki` at all.
+    pub restricted: bool,
     pub yolo: bool,
     pub restoring: bool,
     pub streaming_info: Option<StreamingInfo>,
@@ -255,16 +260,24 @@ impl StatusBar {
         }
 
         if let Some(retry) = ctx.retry_info {
-            let secs = retry
-                .deadline
-                .saturating_duration_since(Instant::now())
-                .as_secs();
             left_spans.push(Span::styled(
                 format!(" {}", retry.message),
                 theme::current().status_retry_error,
             ));
+            // A fresh API key, or a smaller ask, waits for nothing. With no
+            // countdown to run, a frozen "in 0s" would only look stuck, so the
+            // banner just stands until the next attempt says something.
+            let secs = retry
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs();
+            let countdown = if secs > 0 {
+                format!(" in {secs}s")
+            } else {
+                String::new()
+            };
             left_spans.push(Span::styled(
-                format!(" · retrying in {secs}s (#{})", retry.attempt),
+                format!(" · retrying{countdown} (#{})", retry.attempt),
                 theme::current().status_retry_info,
             ));
         }
@@ -316,6 +329,14 @@ impl StatusBar {
                     format!("{} ", FAST_LABEL.trim()),
                     theme::current().status_dim,
                 ));
+            }
+
+            if ctx.workflow {
+                right_spans.push(Span::styled(WORKFLOW_LABEL, theme::current().status_dim));
+            }
+
+            if ctx.restricted {
+                right_spans.push(Span::styled(RESTRICTED_LABEL, theme::current().status_dim));
             }
 
             right_spans.push(Span::styled(
@@ -581,13 +602,31 @@ mod tests {
     const SESSION_COST: f64 = 1.5;
     const SESSION_COST_TEXT: &str = "\u{03a3}$1.500";
     const SIGMA: char = '\u{03a3}';
+    const RETRY_MESSAGE: &str = "rate limited";
+    const RETRY_ATTEMPT: u32 = 2;
+    const COUNTDOWN: &str = "retrying in";
+    /// Long enough that the countdown cannot lapse mid-render.
+    const RETRY_DELAY: Duration = Duration::from_secs(600);
 
     fn render(global_cost: Option<f64>, show_global: bool) -> String {
+        draw(&ctx_of(&Status::Idle, global_cost, show_global))
+    }
+
+    fn draw(ctx: &StatusBarContext<'_>) -> String {
         let bar = StatusBar::new(FLASH_TTL);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(BAR_WIDTH, 1)).unwrap();
-        let ctx = StatusBarContext {
-            status: &Status::Idle,
+        terminal.draw(|f| bar.view(f, f.area(), ctx)).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    fn ctx_of<'a>(
+        status: &'a Status,
+        global_cost: Option<f64>,
+        show_global: bool,
+    ) -> StatusBarContext<'a> {
+        StatusBarContext {
+            status,
             mode_label: "build".into(),
             mode_style: Style::new(),
             model_id: MODEL_ID,
@@ -605,6 +644,7 @@ mod tests {
             thinking_label: None,
             fast: false,
             workflow: false,
+            restricted: false,
             restoring: false,
             streaming_info: None,
             streaming_active: false,
@@ -613,9 +653,7 @@ mod tests {
             show_token_stats: false,
             cache_miss_warning: None,
             yolo: false,
-        };
-        terminal.draw(|f| bar.view(f, f.area(), &ctx)).unwrap();
-        crate::components::buffer_text(terminal.backend().buffer())
+        }
     }
 
     /// The sigma is the whole session's bill, and only the session can hand it
@@ -721,6 +759,61 @@ mod tests {
             "a full channel makes the watcher drop the next switch"
         );
         dirty
+    }
+
+    #[test_case(false => false ; "a_yolo_bar_stays_quiet")]
+    #[test_case(true  => true  ; "yolo_is_advertised")]
+    fn the_bar_advertises_yolo(yolo: bool) -> bool {
+        let mut ctx = ctx_of(&Status::Idle, None, false);
+        ctx.yolo = yolo;
+        draw(&ctx).contains(YOLO_LABEL.trim())
+    }
+
+    #[test]
+    fn an_error_does_not_hide_yolo() {
+        let status = Status::Error {
+            message: "something went wrong".into(),
+            since: Instant::now(),
+        };
+        let mut ctx = ctx_of(&status, None, false);
+        ctx.yolo = true;
+
+        let text = draw(&ctx);
+        assert!(text.contains(YOLO_LABEL.trim()), "{text}");
+    }
+
+    /// A restricted folder says so for the whole session: the startup card is
+    /// long gone by the time the user wonders why their project config did
+    /// nothing.
+    #[test_case(true  => true  ; "a_restricted_folder_says_so")]
+    #[test_case(false => false ; "a_trusted_folder_stays_quiet")]
+    fn the_bar_advertises_restricted(restricted: bool) -> bool {
+        let mut ctx = ctx_of(&Status::Idle, None, false);
+        ctx.restricted = restricted;
+
+        draw(&ctx).contains(RESTRICTED_LABEL.trim())
+    }
+
+    /// A key rotation and a shrunk output budget both retry with no delay, so
+    /// their banner has nothing to count down and must not freeze on "in 0s".
+    #[test_case(Duration::ZERO => false ; "an_instant_retry_has_no_countdown")]
+    #[test_case(RETRY_DELAY    => true  ; "a_delayed_retry_counts_down")]
+    fn the_retry_banner_counts_down_only_when_there_is_a_wait(delay: Duration) -> bool {
+        let retry = RetryInfo {
+            attempt: RETRY_ATTEMPT,
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + delay,
+        };
+        let mut ctx = ctx_of(&Status::Streaming, None, false);
+        ctx.retry_info = Some(&retry);
+
+        let text = draw(&ctx);
+        assert!(text.contains(RETRY_MESSAGE), "{text}");
+        assert!(
+            text.contains(&format!("(#{RETRY_ATTEMPT})")),
+            "the attempt number survives either way: {text}"
+        );
+        text.contains(COUNTDOWN)
     }
 
     #[test_case("llama-cpp//mnt/commons/models/Qwen3.gguf", "llama-cpp/Qwen3.gguf" ; "strips_middle")]

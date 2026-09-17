@@ -53,6 +53,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/tools/"><span class="card-title">Tools</span><span class="card-desc">Every built-in tool and its parameters.</span></a>
     <a class="card" href="/docs/providers/"><span class="card-title">Providers</span><span class="card-desc">Model catalogs, env vars, providers.toml, model tiers.</span></a>
     <a class="card" href="/docs/permissions/"><span class="card-title">Permissions</span><span class="card-desc">What runs freely, what asks first, TOML rules.</span></a>
+    <a class="card" href="/docs/folder-trust/"><span class="card-title">Folder Trust</span><span class="card-desc">Whether a project's .maki config may run on your machine.</span></a>
     <a class="card" href="/docs/notifications/"><span class="card-title">Notifications</span><span class="card-desc">Know when a session finishes or needs your input.</span></a>
     <a class="card" href="/docs/mcp/"><span class="card-title">MCP</span><span class="card-desc">External tool servers over stdio or HTTP.</span></a>
     <a class="card" href="/docs/commands/"><span class="card-title">Commands</span><span class="card-desc">The / palette, sessions, toggles, custom commands.</span></a>

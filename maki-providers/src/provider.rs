@@ -12,12 +12,11 @@ use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
-use crate::providers::Timeouts;
 use crate::providers::anthropic::Anthropic;
 use crate::providers::anthropic::bedrock;
 use crate::providers::aperture::Aperture;
 use crate::providers::catalog::{
-    OPENCODE_FAMILY_SLUGS, available_if_warm, catalog_providers, catalog_providers_if_available,
+    CATALOG_BACKED_BUILTINS, available_if_warm, catalog_providers, catalog_providers_if_available,
 };
 use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
@@ -29,10 +28,12 @@ use crate::providers::openai::OpenAi;
 use crate::providers::opencode::Opencode;
 use crate::providers::openrouter::OpenRouter;
 use crate::providers::regolo::Regolo;
+use crate::providers::requesty::Requesty;
 use crate::providers::synthetic::Synthetic;
 use crate::providers::tensorx::TensorX;
 use crate::providers::xai::Xai;
 use crate::providers::zai::Zai;
+use crate::providers::{KeyRotation, Timeouts};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
@@ -51,6 +52,7 @@ pub enum ProviderKind {
     DeepSeek,
     #[strum(serialize = "openrouter")]
     OpenRouter,
+    Requesty,
     Synthetic,
     Regolo,
     #[strum(serialize = "tensorx")]
@@ -75,6 +77,7 @@ impl ProviderKind {
             Self::Zai => "Z.AI",
             Self::DeepSeek => "DeepSeek",
             Self::OpenRouter => "OpenRouter",
+            Self::Requesty => "Requesty",
             Self::Synthetic => "Synthetic",
             Self::Regolo => "Regolo",
             Self::TensorX => "TensorX",
@@ -96,6 +99,7 @@ impl ProviderKind {
             Self::Zai => "ZHIPU_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
             Self::OpenRouter => "OPENROUTER_API_KEY",
+            Self::Requesty => "REQUESTY_API_KEY",
             Self::Synthetic => "SYNTHETIC_API_KEY",
             Self::Regolo => "REGOLO_API_KEY",
             Self::TensorX => "TENSORX_API_KEY",
@@ -119,6 +123,7 @@ impl ProviderKind {
             Self::Zai => "https://api.z.ai/api/paas/v4",
             Self::DeepSeek => "https://api.deepseek.com",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
+            Self::Requesty => "https://router.requesty.ai/v1",
             Self::Synthetic => "https://api.synthetic.new/openai/v1",
             Self::Regolo => "https://api.regolo.ai/v1",
             Self::TensorX => "https://api.tensorx.ai/v1",
@@ -152,6 +157,9 @@ impl ProviderKind {
             Self::OpenRouter => {
                 Some("300+ models from all providers, prompt caching, provider routing")
             }
+            Self::Requesty => Some(
+                "700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`",
+            ),
             Self::Opencode => Some(
                 "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API",
             ),
@@ -177,6 +185,7 @@ impl ProviderKind {
             Self::Zai => ModelFamily::Glm,
             Self::DeepSeek => ModelFamily::Generic,
             Self::OpenRouter => ModelFamily::Generic,
+            Self::Requesty => ModelFamily::Generic,
             Self::Synthetic => ModelFamily::Synthetic,
             Self::Regolo => ModelFamily::Generic,
             Self::TensorX => ModelFamily::Generic,
@@ -203,6 +212,7 @@ impl ProviderKind {
             Self::Zai => Some(16_000),
             Self::DeepSeek => Some(384_000),
             Self::OpenRouter => Some(128_000),
+            Self::Requesty => Some(128_000),
             Self::Synthetic => Some(32_000),
             Self::Regolo => Some(120_000),
             Self::TensorX => None,
@@ -224,6 +234,7 @@ impl ProviderKind {
             Self::Zai => 128_000,
             Self::DeepSeek => 1_000_000,
             Self::OpenRouter => 200_000,
+            Self::Requesty => 200_000,
             Self::Synthetic => 128_000,
             Self::Regolo => 120_000,
             Self::TensorX => 200_000,
@@ -251,10 +262,11 @@ impl ProviderKind {
             Self::Zai => Ok(Box::new(Zai::new(timeouts)?)),
             Self::DeepSeek => Ok(Box::new(DeepSeek::new(timeouts)?)),
             Self::OpenRouter => Ok(Box::new(OpenRouter::new(timeouts)?)),
+            Self::Requesty => Ok(Box::new(Requesty::new(timeouts)?)),
             Self::Synthetic => Ok(Box::new(Synthetic::new(timeouts)?)),
             Self::Regolo => Ok(Box::new(Regolo::new(timeouts)?)),
             Self::TensorX => Ok(Box::new(TensorX::new(timeouts)?)),
-            Self::Opencode => Ok(Box::new(Opencode::new(timeouts)?)),
+            Self::Opencode => Ok(Box::new(Opencode::new(timeouts))),
             Self::Xai => Ok(Box::new(Xai::new(timeouts)?)),
             Self::Aperture => Ok(Box::new(Aperture::new(timeouts)?)),
         }
@@ -292,8 +304,13 @@ pub trait Provider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async { Ok(false) })
+    /// The keys this provider rotates through, and where the current one lives.
+    /// `None` is one fixed credential that never changes. This is the only hook
+    /// for rotation: both the count and the swap come off it, so they can never
+    /// describe different pools, which is what a per-provider `rotate_key` let
+    /// happen before.
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        None
     }
 
     fn adjust_model(&self, _model: &mut Model) {}
@@ -441,7 +458,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             if ProviderKind::from_str(&cat.slug).is_ok()
                 || dynamic::base_for_slug(&cat.slug).is_some()
                 || crate::providers::custom::base_kind(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+                || CATALOG_BACKED_BUILTINS.contains(&cat.slug.as_str())
             {
                 continue;
             }
@@ -552,7 +569,7 @@ pub async fn fetch_all_models(
         for cat in catalog {
             if ProviderKind::from_str(&cat.slug).is_ok()
                 || dynamic::base_for_slug(&cat.slug).is_some()
-                || OPENCODE_FAMILY_SLUGS.contains(&cat.slug.as_str())
+                || CATALOG_BACKED_BUILTINS.contains(&cat.slug.as_str())
             {
                 continue;
             }

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{PluginsConfig, RawConfig};
+use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
@@ -28,11 +28,39 @@ use maki_agent::prompt::ResolvedSlots;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
 /// Tests assert on this exact text, so a wording tweak here updates them too.
 pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for the builtin \
      tool of the same name, together with any \"always allow\" you saved";
+pub const TRUST_SCOPE_WARNING: &str =
+    "trust is only read from the global init.lua; ignoring the trust table in";
+
+/// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
+/// project folder nobody vouched for stops at the global file.
+///
+/// The project variant carries the path instead of a trust verdict, so the only
+/// way to build one is a `Some` out of [`ProjectConfig::gated_path`] and
+/// "trusted" cannot disagree with "which file".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InitFiles {
+    Disabled,
+    Global,
+    GlobalAndProject(PathBuf),
+}
+
+impl InitFiles {
+    pub fn resolve(project_config: &ProjectConfig, no_plugins: bool) -> Self {
+        if no_plugins {
+            return InitFiles::Disabled;
+        }
+        match project_config.gated_path(GatedFile::InitLua) {
+            Some(path) => InitFiles::GlobalAndProject(path),
+            None => InitFiles::Global,
+        }
+    }
+}
 
 pub(crate) struct BundledPlugin {
     pub(crate) name: &'static str,
@@ -45,6 +73,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "sessions",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/sessions"),
+    },
+    BundledPlugin {
+        name: "thinking",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
     },
     BundledPlugin {
         name: "index",
@@ -302,12 +334,29 @@ impl PluginHost {
 
     pub fn load_init_files(
         &self,
-        cwd: &Path,
+        init_files: InitFiles,
         warnings: &mut Vec<String>,
     ) -> Result<Option<RawConfig>, PluginError> {
+        self.load_init_files_from_dirs(
+            init_files,
+            maki_storage::paths::config_search_dirs(),
+            warnings,
+        )
+    }
+
+    fn load_init_files_from_dirs(
+        &self,
+        init_files: InitFiles,
+        global_dirs: impl IntoIterator<Item = PathBuf>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<RawConfig>, PluginError> {
+        if init_files == InitFiles::Disabled {
+            return Ok(None);
+        }
+
         let mut merged: Option<RawConfig> = None;
 
-        for global_dir in maki_config::global_config_dirs() {
+        for global_dir in global_dirs {
             self.run_init_file(
                 &global_dir.join("init.lua"),
                 ConfigScope::Global,
@@ -318,29 +367,11 @@ impl PluginHost {
                 break;
             }
         }
-        self.run_init_file(
-            &cwd.join(".maki/init.lua"),
-            ConfigScope::Project,
-            &mut merged,
-            warnings,
-        )?;
+        if let InitFiles::GlobalAndProject(path) = &init_files {
+            self.run_init_file(path, ConfigScope::Project, &mut merged, warnings)?;
+        }
 
         Ok(merged)
-    }
-
-    /// `--no-plugins` recovery path: skip every user `init.lua` while the
-    /// host and builtin plugins stay live. Centralized so every entry point
-    /// (TUI, index, acp, prompt) honors the flag identically.
-    pub fn load_init_files_or_skip(
-        &self,
-        no_plugins: bool,
-        cwd: &Path,
-        warnings: &mut Vec<String>,
-    ) -> Result<Option<RawConfig>, PluginError> {
-        if no_plugins {
-            return Ok(None);
-        }
-        self.load_init_files(cwd, warnings)
     }
 
     fn run_init_file(
@@ -369,7 +400,17 @@ impl PluginHost {
             return Ok(());
         }
         let owner = scope.label().to_owned();
-        if let Some(raw) = self.send_config_lua(source, scope, plugin_dir)? {
+        let global = matches!(scope, ConfigScope::Global);
+        if let Some(mut raw) = self.send_config_lua(source, scope, plugin_dir)? {
+            // A folder cannot vouch for itself: ACP resolves many
+            // client-chosen cwds against the config it read once at startup,
+            // so one trusted project's `trust.paths` would reach folders
+            // nobody ever trusted. Stripped rather than rejected, because
+            // there is no fallback config at this point and a hard error would
+            // brick the folder the user just trusted over an ignored setting.
+            if !global && std::mem::take(&mut raw.trust).is_set() {
+                warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+            }
             match merged {
                 Some(existing) => existing.merge(raw),
                 None => *merged = Some(raw),
@@ -979,6 +1020,20 @@ impl EventHandle {
         rx.recv().unwrap_or_default()
     }
 
+    pub fn package_context(&self) -> Result<crate::pack::PackContext, String> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.tx
+            .send(Request::CollectPackageContext { reply: reply_tx })
+            .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
+        let (declared, active) = reply_rx
+            .recv()
+            .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
+        let installed = crate::pack::installed_names()
+            .ok_or_else(|| "could not read the package lockfile".to_owned())?;
+
+        Ok(crate::pack::PackContext::new(declared, installed, active))
+    }
+
     pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
@@ -1154,6 +1209,30 @@ mod tests {
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
     use test_case::test_case;
+
+    const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
+    const PROJECT_TRUST_PATH: &str = "**";
+
+    /// Closing the queue and reading it are one message. A Lua task can record
+    /// an activation between a separate read and close, and a close that threw
+    /// the queue away would strand exactly the request that was about to be
+    /// honoured.
+    #[test]
+    fn closing_the_activation_queue_hands_back_what_it_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("recorder", r#"maki.packadd("demo")"#)
+            .expect("packadd is available to every plugin");
+
+        let leftover = host.seal_pack_ops().expect("the host is running");
+
+        assert_eq!(
+            leftover,
+            vec![crate::api::pack::PackOp::Activate {
+                name: "demo".to_owned()
+            }],
+            "a recorded activation must come back, not be dropped"
+        );
+    }
 
     /// jit=true is exercised by the whole integration suite
     /// (`tests/plugin_host.rs` boots hosts via `new`); only the O1
@@ -1396,13 +1475,8 @@ mod tests {
         }
     }
 
-    /// `load_init_files_or_skip` is the single seam every entry point
-    /// (TUI, index, acp, prompt) uses to honor `--no-plugins`. Verify both
-    /// halves: the flag skips a broken init.lua, and absence runs it (so
-    /// the skip path is not a tautology that hides a regression in the
-    /// unconditional loader).
     #[test]
-    fn load_init_files_or_skip_respects_flag() {
+    fn init_file_scope_controls_project_execution() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".maki")).unwrap();
         fs::write(
@@ -1413,18 +1487,105 @@ mod tests {
 
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
 
-        let skipped = host
-            .load_init_files_or_skip(true, dir.path(), &mut Vec::new())
-            .expect("no-plugins skips broken init.lua");
-        assert!(
-            skipped.is_none(),
-            "--no-plugins must skip user init.lua entirely"
-        );
+        let mut warnings = Vec::new();
+        for scope in [InitFiles::Disabled, InitFiles::Global] {
+            let skipped = host
+                .load_init_files_from_dirs(scope, [], &mut warnings)
+                .expect("scope skips broken project init.lua");
+            assert!(skipped.is_none());
+        }
 
-        let ran = host.load_init_files_or_skip(false, dir.path(), &mut Vec::new());
+        let ran = host.load_init_files_from_dirs(
+            InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+            [],
+            &mut warnings,
+        );
         assert!(
             ran.is_err(),
-            "without --no-plugins the broken init.lua must surface as an error"
+            "project-enabled loading must surface the init.lua error"
+        );
+    }
+
+    #[test]
+    fn project_scope_preserves_global_values_and_overrides_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ always_yolo = false, always_fast = true })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ always_yolo = true })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let global_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let global_only = global_host
+            .load_init_files_from_dirs(InitFiles::Global, [global.clone()], &mut warnings)
+            .unwrap()
+            .unwrap();
+        assert_eq!(global_only.always_yolo, Some(false));
+        assert_eq!(global_only.always_fast, Some(true));
+
+        let project_host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = project_host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged.always_yolo, Some(true));
+        assert_eq!(merged.always_fast, Some(true));
+    }
+
+    #[test]
+    fn project_scope_cannot_set_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            format!(
+                "maki.setup({{ trust = {{ paths = {{ \"{GLOBAL_TRUST_PATH}\" }}, prompt = false }} }})"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            format!("maki.setup({{ trust = {{ paths = {{ \"{PROJECT_TRUST_PATH}\" }} }} }})"),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged.trust.paths.expect("the global trust table survives"),
+            [GLOBAL_TRUST_PATH]
+        );
+        assert_eq!(merged.trust.prompt, Some(false));
+        assert!(
+            warnings.iter().any(|warning| {
+                warning.starts_with(TRUST_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())
+            }),
+            "{warnings:?}"
         );
     }
 
@@ -1815,5 +1976,173 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Identity),
             ["Dyn identity"]
         );
+    }
+}
+
+/// Holds every bundled `plugin.toml` to what its plugin actually does: the
+/// guarded `maki.*` calls in its lua, and the permissions its tools expose to
+/// the model. The guard map is read out of the `lua_fn` attributes the docs
+/// already record, so moving a function under a different guard shows up here
+/// without anyone editing a table.
+#[cfg(test)]
+mod bundled_manifests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use include_dir::{Dir, DirEntry, File};
+    use maki_agent::tools::{ToolRegistry, ToolSource};
+    use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+
+    use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use crate::docs::{DocKind, api_docs};
+    use crate::plugin_permissions::Permission;
+
+    const TEST_DIR: &str = "tests";
+    const LUA_EXT: &str = "lua";
+    const REQUIRE_CALL: &str = "require(";
+
+    /// Every guarded `maki.*` function under the dotted name lua calls it by.
+    fn guarded_calls() -> Vec<(String, Permission)> {
+        api_docs()
+            .into_iter()
+            .filter(|module| module.kind == DocKind::Table)
+            .flat_map(|module| {
+                module.fns.iter().filter_map(move |func| {
+                    let permission = Permission::from_key(func.guard?)?;
+                    Some((format!("{}.{}", module.name, func.name), permission))
+                })
+            })
+            .collect()
+    }
+
+    /// Read off a real load rather than off the source text, because
+    /// `register_tool` refuses a permission the plugin lacks, which makes
+    /// shipping the tool itself a use of it.
+    fn tool_permissions() -> BTreeMap<String, BTreeSet<Permission>> {
+        let registry = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&registry)).expect("host starts");
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .expect("every bundled plugin loads");
+
+        let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
+        for tool in registry.iter().iter() {
+            let (ToolSource::Lua { plugin }, Some(permission)) =
+                (&tool.source, tool.tool.required_permission())
+            else {
+                continue;
+            };
+            out.entry(plugin.to_string())
+                .or_default()
+                .insert(permission);
+        }
+        out
+    }
+
+    /// Specs, not runtime code. What a test calls must not buy the plugin a
+    /// permission its handlers never use.
+    fn runtime_lua(file: &'static File<'static>) -> Option<&'static str> {
+        let path = file.path();
+        if path.extension()? != LUA_EXT || path.components().any(|p| p.as_os_str() == TEST_DIR) {
+            return None;
+        }
+        file.contents_utf8()
+    }
+
+    fn collect_runtime_lua(dir: &'static Dir<'static>, out: &mut Vec<&'static str>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_runtime_lua(sub, out),
+                DirEntry::File(file) => out.extend(runtime_lua(file)),
+            }
+        }
+    }
+
+    fn required_module_names(source: &'static str) -> impl Iterator<Item = &'static str> {
+        source.match_indices(REQUIRE_CALL).filter_map(|(start, _)| {
+            let rest = &source[start + REQUIRE_CALL.len()..];
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let name = &rest[quote.len_utf8()..];
+            name.find(quote).map(|end| &name[..end])
+        })
+    }
+
+    /// A guard resolves against the calling plugin, so a `lib` helper spends
+    /// the caller's permissions and counts as the caller's usage. `lib` is the
+    /// only plugin another one reaches into: anything else a `require` names is
+    /// the plugin's own file, already collected, or a virtual module such as
+    /// `plugin_dev`. A plugin's own directory is taken whole rather than walked
+    /// from its entrypoint, because `index` builds its language module names at
+    /// runtime.
+    fn runtime_sources(dir: &'static Dir<'static>) -> Vec<&'static str> {
+        let mut sources = Vec::new();
+        collect_runtime_lua(dir, &mut sources);
+        let mut seen = BTreeSet::new();
+        let mut next = 0;
+        while let Some(source) = sources.get(next).copied() {
+            next += 1;
+            let reached: Vec<&'static str> = required_module_names(source)
+                .filter(|modname| seen.insert(*modname))
+                .filter_map(|modname| {
+                    lib_dir().get_file(format!("{}.{LUA_EXT}", modname.replace('.', "/")))
+                })
+                .filter_map(runtime_lua)
+                .collect();
+            sources.extend(reached);
+        }
+        sources
+    }
+
+    /// Whole-word only, so `maki.fs.read` is not reported for every
+    /// `maki.fs.read_bytes`.
+    fn calls(source: &str, name: &str) -> bool {
+        source.match_indices(name).any(|(at, _)| {
+            !source[at + name.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    #[test]
+    fn bundled_manifests_match_the_permissions_their_plugin_uses() {
+        let tools = tool_permissions();
+        let guarded = guarded_calls();
+        let mut drift = Vec::new();
+        // `lib` is the one bundled directory that never loads on its own, so it
+        // ships no manifest and its modules answer to whoever requires them.
+        for plugin in BUNDLED_PLUGINS
+            .iter()
+            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
+        {
+            let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
+            // Each permission paired with the usage demanding it, so a failure
+            // points at something to go look at.
+            let mut needed: BTreeMap<Permission, String> = tools
+                .get(plugin.name)
+                .into_iter()
+                .flatten()
+                .map(|permission| (*permission, format!("a tool exposing '{permission}'")))
+                .collect();
+            for source in runtime_sources(&plugin.dir) {
+                for (name, permission) in &guarded {
+                    if calls(source, name) {
+                        needed.entry(*permission).or_insert_with(|| name.clone());
+                    }
+                }
+            }
+
+            let manifest = format!("plugins/{}/plugin.toml", plugin.name);
+            for &permission in Permission::ALL {
+                match (declared.is_allowed(permission), needed.get(&permission)) {
+                    (false, Some(usage)) => drift.push(format!(
+                        "{manifest}: {usage} needs '{permission}', grant it or drop the usage"
+                    )),
+                    (true, None) => drift.push(format!(
+                        "{manifest}: declares '{permission}' but nothing its runtime lua reaches needs it, remove it"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        assert!(drift.is_empty(), "plugin.toml drift:\n{}", drift.join("\n"));
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use event_listener::Event;
 
@@ -88,6 +88,13 @@ impl CancelTrigger {
     pub fn cancel(self) {
         self.0.fire();
     }
+
+    /// Whether dropping this trigger is what fires {token}. A registry keeps
+    /// the triggers and hands out the tokens, so this is how an owner finds its
+    /// own row again without an id that somebody else could reuse.
+    pub fn fires(&self, token: &CancelToken) -> bool {
+        Arc::ptr_eq(&self.0, &token.0)
+    }
 }
 
 impl Drop for CancelTrigger {
@@ -101,17 +108,24 @@ impl Drop for CancelTrigger {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CancelSlot(u64);
 
-struct Slotted {
-    slot: CancelSlot,
-    trigger: Option<CancelTrigger>,
-}
-
 #[derive(Default)]
 struct Entry {
-    registrations: Vec<Slotted>,
+    /// Held, never read. Dropping a trigger is what fires the token of the
+    /// session that registered it.
+    registrations: Vec<(CancelSlot, CancelTrigger)>,
     cancelled: bool,
 }
 
+/// Triggers grouped under an id a user can name and stop from the outside. One
+/// subagent tool call can open several sessions under a single `tool_use_id`,
+/// and cancelling that id has to reach all of them, even the ones opened after
+/// the cancel.
+///
+/// So the mark lives on the id until the whole map is drained by
+/// [`cancel_all`](Self::cancel_all). Clearing it when the last sibling retires
+/// would lose the cancels that land while the id sits empty, which it does
+/// before the first session registers and again between two sessions one tool
+/// call opens back to back.
 pub struct CancelMap<K> {
     entries: Mutex<HashMap<K, Entry>>,
     next_slot: AtomicU64,
@@ -134,70 +148,58 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
     /// Registers {trigger} under {id}, alongside any already there, and
     /// returns the slot to hand back to [`retire`](Self::retire).
     pub fn insert(&self, id: K, trigger: CancelTrigger) -> CancelSlot {
-        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.lock();
         let slot = CancelSlot(self.next_slot.fetch_add(1, Ordering::Relaxed));
         let entry = map.entry(id).or_default();
-        let trigger = if entry.cancelled {
-            drop(trigger);
-            None
-        } else {
-            Some(trigger)
-        };
-        entry.registrations.push(Slotted { slot, trigger });
+        // Under a cancelled id the trigger is dropped instead of stored, and
+        // that drop is what fires the token, so the session is born cancelled.
+        if !entry.cancelled {
+            entry.registrations.push((slot, trigger));
+        }
         slot
     }
 
-    /// Retires one registration, dropping its trigger when it is still
-    /// active and leaving its siblings alone.
+    /// Retires one registration and drops its trigger. Siblings and the id's
+    /// cancelled mark stay.
     pub fn retire(&self, id: &K, slot: CancelSlot) {
-        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self.lock();
         let Some(entry) = map.get_mut(id) else {
             return;
         };
         entry
             .registrations
-            .retain(|registration| registration.slot != slot);
-        if entry.registrations.is_empty() {
-            map.remove(id);
-        }
+            .retain(|&(registered, _)| registered != slot);
     }
 
-    /// Cancels everything under {id} and marks later siblings cancelled.
-    /// The entry stays until every registered sibling retires.
-    pub fn cancel_or_precancel(&self, id: K) {
-        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+    /// Cancels every registration under {id} and marks the id, so a session
+    /// registering under it later is born cancelled too.
+    pub fn cancel(&self, id: K) {
+        let mut map = self.lock();
         let entry = map.entry(id).or_default();
         entry.cancelled = true;
-        for registration in &mut entry.registrations {
-            drop(registration.trigger.take());
-        }
+        entry.registrations.clear();
     }
 
-    pub fn remove(&self, id: &K) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
+    /// The run that owned these is over: stop what is still registered and drop
+    /// the marks with it, so no cancel of this run leaks into the next one.
+    pub fn cancel_all(&self) {
+        self.lock().clear();
     }
 
     #[cfg(test)]
     fn has_key(&self, id: &K) -> bool {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(id)
+        self.lock().contains_key(id)
     }
 
-    pub fn cancel_all(&self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain();
+    fn lock(&self) -> MutexGuard<'_, HashMap<K, Entry>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     #[test]
@@ -274,57 +276,75 @@ mod tests {
     }
 
     #[test]
-    fn cancel_map_insert_and_cancel() {
-        let map = CancelMap::new();
+    fn trigger_identity_tells_registrations_apart() {
         let (trigger, token) = CancelToken::new();
-        map.insert("t1".to_owned(), trigger);
-        assert!(!token.is_cancelled());
-        map.cancel_or_precancel("t1".to_owned());
-        assert!(token.is_cancelled());
+        let (_other_trigger, other_token) = CancelToken::new();
+        assert!(trigger.fires(&token));
+        assert!(!trigger.fires(&other_token));
     }
 
-    #[test]
-    fn cancel_map_cancel_before_insert() {
-        let map = CancelMap::new();
-        map.cancel_or_precancel("t1".to_owned());
-        let (trigger, token) = CancelToken::new();
-        map.insert("t1".to_owned(), trigger);
-        assert!(token.is_cancelled());
+    const KEY: &str = "x";
+    const OTHER_KEY: &str = "y";
+    const LOST_CANCEL: &str = "the cancel left no mark for the session after it";
+
+    fn key() -> String {
+        KEY.to_owned()
     }
 
-    #[test]
-    fn cancel_map_remove_clears_cancelled() {
+    /// What the id looks like when the cancel lands.
+    enum Shape {
+        /// Nothing registered yet, so the cancel and the first session race.
+        Empty,
+        Occupied,
+        /// One session retired and the next has yet to register, the gap a tool
+        /// call leaves between two it opens back to back.
+        Hole,
+    }
+
+    /// Whatever shape the id is in, the cancel has to reach the sessions the
+    /// tool call has not opened yet. Losing it left the next session running
+    /// with its pane already marked cancelled.
+    #[test_case(Shape::Empty    ; "the_cancel_beat_the_first_session")]
+    #[test_case(Shape::Occupied ; "a_sibling_is_still_running")]
+    #[test_case(Shape::Hole     ; "between_two_sessions_of_one_tool_call")]
+    fn cancel_map_cancel_catches_the_session_that_registers_after_it(shape: Shape) {
         let map: CancelMap<String> = CancelMap::new();
-        map.cancel_or_precancel("t1".to_owned());
-        map.remove(&"t1".to_owned());
+        let (earlier, _token) = CancelToken::new();
+        match shape {
+            Shape::Empty => {}
+            Shape::Occupied => {
+                map.insert(key(), earlier);
+            }
+            Shape::Hole => {
+                let slot = map.insert(key(), earlier);
+                map.retire(&key(), slot);
+            }
+        }
+
+        map.cancel(key());
+
         let (trigger, token) = CancelToken::new();
-        map.insert("t1".to_owned(), trigger);
-        assert!(!token.is_cancelled(), "remove should clear cancellation");
+        map.insert(key(), trigger);
+        assert!(token.is_cancelled(), "{LOST_CANCEL}");
     }
 
     #[test]
-    fn cancel_map_cancel_all() {
+    fn cancel_map_cancel_all_stops_everything_and_forgets_the_marks() {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        map.insert("a".to_owned(), t1);
-        map.insert("b".to_owned(), t2);
+        map.insert(key(), t1);
+        map.insert(OTHER_KEY.to_owned(), t2);
+        map.cancel(key());
+
         map.cancel_all();
         assert!(tok1.is_cancelled());
         assert!(tok2.is_cancelled());
-    }
+        assert!(!map.has_key(&key()));
 
-    #[test]
-    fn cancel_map_cancel_all_clears_cancelled() {
-        let map: CancelMap<String> = CancelMap::new();
-        map.cancel_or_precancel("t1".to_owned());
-        map.cancel_all();
         let (trigger, token) = CancelToken::new();
-        map.insert("t1".to_owned(), trigger);
-        assert!(
-            !token.is_cancelled(),
-            "cancel_all should clear cancelled entries"
-        );
+        map.insert(key(), trigger);
+        assert!(!token.is_cancelled());
     }
 
     /// One tool call can open several subagents. They used to evict each
@@ -334,12 +354,12 @@ mod tests {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        map.insert("x".to_owned(), t1);
-        map.insert("x".to_owned(), t2);
+        map.insert(key(), t1);
+        map.insert(key(), t2);
         assert!(!tok1.is_cancelled(), "a sibling must not evict the first");
         assert!(!tok2.is_cancelled());
 
-        map.cancel_or_precancel("x".to_owned());
+        map.cancel(key());
         assert!(tok1.is_cancelled(), "cancelling the key stops them all");
         assert!(tok2.is_cancelled());
     }
@@ -349,88 +369,14 @@ mod tests {
         let map = CancelMap::new();
         let (t1, tok1) = CancelToken::new();
         let (t2, tok2) = CancelToken::new();
-        let slot1 = map.insert("x".to_owned(), t1);
-        map.insert("x".to_owned(), t2);
+        let slot1 = map.insert(key(), t1);
+        map.insert(key(), t2);
 
-        map.retire(&"x".to_owned(), slot1);
+        map.retire(&key(), slot1);
         assert!(tok1.is_cancelled(), "retiring drops that trigger");
         assert!(!tok2.is_cancelled(), "the sibling keeps running");
 
-        map.cancel_or_precancel("x".to_owned());
+        map.cancel(key());
         assert!(tok2.is_cancelled());
-    }
-
-    /// The last one out clears the key so it can be reused.
-    #[test]
-    fn cancel_map_retiring_the_last_registration_clears_the_key() {
-        let map = CancelMap::new();
-        let (t1, _tok1) = CancelToken::new();
-        let slot = map.insert("x".to_owned(), t1);
-        assert!(map.has_key(&"x".to_owned()));
-
-        map.retire(&"x".to_owned(), slot);
-        assert!(!map.has_key(&"x".to_owned()), "empty key must be dropped");
-    }
-
-    /// Cancelling before anything registers has to catch every session the
-    /// tool call goes on to open, not just the first one through the door.
-    #[test]
-    fn cancel_map_precancel_catches_every_later_sibling() {
-        let map: CancelMap<String> = CancelMap::new();
-        map.cancel_or_precancel("x".to_owned());
-
-        let (t1, tok1) = CancelToken::new();
-        let (t2, tok2) = CancelToken::new();
-        let slot1 = map.insert("x".to_owned(), t1);
-        let slot2 = map.insert("x".to_owned(), t2);
-        assert!(tok1.is_cancelled());
-        assert!(
-            tok2.is_cancelled(),
-            "the mark must outlive the first insert"
-        );
-
-        map.retire(&"x".to_owned(), slot1);
-        assert!(map.has_key(&"x".to_owned()));
-        map.retire(&"x".to_owned(), slot2);
-        assert!(!map.has_key(&"x".to_owned()));
-    }
-
-    /// Pressing esc while a fan-out is running must also stop the sibling
-    /// that starts a moment later.
-    #[test]
-    fn cancel_map_cancel_catches_a_sibling_registered_after() {
-        let map = CancelMap::new();
-        let (t1, tok1) = CancelToken::new();
-        let slot1 = map.insert("x".to_owned(), t1);
-
-        map.cancel_or_precancel("x".to_owned());
-        assert!(tok1.is_cancelled());
-
-        let (t2, tok2) = CancelToken::new();
-        let slot2 = map.insert("x".to_owned(), t2);
-        assert!(tok2.is_cancelled(), "cancel left no mark for the sibling");
-
-        map.retire(&"x".to_owned(), slot1);
-        assert!(map.has_key(&"x".to_owned()));
-        map.retire(&"x".to_owned(), slot2);
-        assert!(!map.has_key(&"x".to_owned()));
-
-        let (t3, tok3) = CancelToken::new();
-        map.insert("x".to_owned(), t3);
-        assert!(
-            !tok3.is_cancelled(),
-            "the completed call must not poison a reused tool id"
-        );
-    }
-
-    #[test]
-    fn cancel_map_insert_into_cancelled_returns_retirement_slot() {
-        let map = CancelMap::new();
-        map.cancel_or_precancel("x".to_owned());
-        let (trigger, token) = CancelToken::new();
-        let slot = map.insert("x".to_owned(), trigger);
-        assert!(token.is_cancelled());
-        map.retire(&"x".to_owned(), slot);
-        assert!(!map.has_key(&"x".to_owned()));
     }
 }

@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use maki_config::ProjectConfig;
 use maki_providers::{ContentBlock, Message};
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -595,20 +596,39 @@ impl McpHandle {
             warn!("MCP shutdown timed out after {MCP_SHUTDOWN_TIMEOUT:?}");
         }
     }
+
+    /// Handle whose command loop is whatever the caller does with `cmd_rx`,
+    /// so a test can hold a `Shutdown` unacked and observe a wedged teardown.
+    #[cfg(test)]
+    pub(crate) fn for_test(cmd_tx: flume::Sender<McpCommand>) -> Self {
+        Self {
+            cmd_tx,
+            index: Arc::new(ArcSwap::from_pointee(ToolIndex::default())),
+            snapshot: Arc::new(ArcSwap::from_pointee(McpSnapshot::default())),
+            defer_tools: 0,
+            ready_rx: flume::bounded(0).1,
+        }
+    }
 }
 
 /// Returns as soon as the config is read, so nothing with a screen waits on a
 /// slow `initialize`. Await `McpHandle::ready` before touching the tool index.
-pub async fn start(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
+pub async fn start(
+    cwd: &Path,
+    project_config: ProjectConfig,
+) -> (Option<McpHandle>, McpConfigErrors) {
     tracing::info!(cwd = %cwd.display(), "starting MCP");
     let cwd = cwd.to_owned();
-    let (config, config_errors) = smol::unblock(move || load_config(&cwd)).await;
+    let (config, config_errors) = smol::unblock(move || load_config(&cwd, project_config)).await;
     (start_with_config(config), config_errors)
 }
 
 /// `start` for callers with no frame to protect, who want the tools up front.
-pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors) {
-    let (handle, config_errors) = start(cwd).await;
+pub async fn start_connected(
+    cwd: &Path,
+    project_config: ProjectConfig,
+) -> (Option<McpHandle>, McpConfigErrors) {
+    let (handle, config_errors) = start(cwd, project_config).await;
     if let Some(handle) = &handle {
         handle.ready().await;
     }
@@ -620,10 +640,12 @@ pub async fn start_connected(cwd: &Path) -> (Option<McpHandle>, McpConfigErrors)
 /// revive one they disabled.
 pub async fn start_with_extra(
     cwd: &Path,
+    project_config: ProjectConfig,
     extra: Vec<(String, RawTransport)>,
 ) -> (Option<McpHandle>, McpConfigErrors) {
     let owned_cwd = cwd.to_owned();
-    let (mut config, config_errors) = smol::unblock(move || load_config(&owned_cwd)).await;
+    let (mut config, config_errors) =
+        smol::unblock(move || load_config(&owned_cwd, project_config)).await;
     for (name, transport) in extra {
         match config.mcp.entry(name) {
             Entry::Vacant(slot) => {

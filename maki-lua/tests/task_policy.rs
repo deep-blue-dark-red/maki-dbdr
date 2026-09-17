@@ -142,6 +142,7 @@ end
 maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
+  recorder.thinking = opts.thinking
   local sess = { opts = opts }
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
@@ -164,6 +165,7 @@ maki.api.register_tool({
       closed = recorder.closed,
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
+      thinking = recorder.thinking,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -236,6 +238,26 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
 }
 
 const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+
+/// Advertised to the model, so the wording lives in the docs, not here: what
+/// matters is that the property exists and that whatever the model writes
+/// reaches the session verbatim, capping being the session's job.
+#[test_case::test_case(Some(json!("high")) ; "effort")]
+#[test_case::test_case(Some(json!(4096)) ; "token_budget")]
+#[test_case::test_case(None ; "inherit_parent_when_omitted")]
+fn thinking_forwards_to_session(thinking: Option<Value>) {
+    let (reg, _host) = load_task_host();
+    let entry = reg.get(TASK_TOOL).expect("task tool missing");
+    assert!(entry.tool.schema()["properties"]["thinking"].is_object());
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    if let Some(thinking) = &thinking {
+        input["thinking"] = thinking.clone();
+    }
+
+    exec_tool(&reg, TASK_TOOL, input).expect("task failed");
+    let snap = probe(&reg);
+    assert_eq!(snap.get("thinking"), thinking.as_ref());
+}
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {

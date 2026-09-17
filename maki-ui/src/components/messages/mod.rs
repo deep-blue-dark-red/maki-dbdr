@@ -9,12 +9,13 @@ use self::segment::{Segment, SegmentCache};
 use crate::components::wrap::WrapIndex;
 
 use super::tool_display::{
-    RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
+    RenderCtx, RoleStyle, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, error_style, format_timestamp_now,
-    thinking_style, truncate_to_header, user_style,
+    instructions_search_text, search_text_for, thinking_style, truncate_to_header, user_style,
 };
 use super::{
-    DisplayMessage, DisplayRole, ToolRole, ToolStatus, apply_scroll_delta, code_view::SectionFlags,
+    DisplayMessage, DisplayRole, IMAGE_PLACEHOLDER, ToolRole, ToolStatus, apply_scroll_delta,
+    code_view::SectionFlags,
 };
 use crate::animation::{self, active_spinner_str};
 use crate::components::keybindings::key;
@@ -22,9 +23,11 @@ use crate::markdown::{hr_line, plain_lines, text_to_lines, truncate_output};
 use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
+use crate::terminal_image;
 use crate::theme;
 use crate::update;
 use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
+use ratatui_image::picker::Picker;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -33,10 +36,11 @@ use std::time::Instant;
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
 use maki_agent::{
-    BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND, SharedBuf, ToolDoneEvent,
-    ToolOutput, ToolStartEvent,
+    BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
+    ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use maki_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+use maki_storage::id::{MakiId, SessionRef};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -48,6 +52,8 @@ use tracing::warn;
 
 const THINKING_HIDDEN_HEADER: &str = "thinking> ...";
 const REFLOW_MARGIN_VIEWPORTS: u32 = 1;
+/// How far outside the drawn range an image keeps its encoded protocol.
+const IMAGE_KEEP_MARGIN_SEGMENTS: usize = 8;
 
 #[derive(Clone, Copy)]
 pub struct PromptProgress {
@@ -69,6 +75,9 @@ pub struct MessagesPanel {
     cache: SegmentCache,
     last_total_lines: u16,
     hl_worker: RenderWorker,
+    image_picker: Option<Picker>,
+    inline_images: bool,
+    image_generation: u64,
     theme_generation: u64,
     highlight_segment: Option<usize>,
     idle_splash: Splash,
@@ -92,6 +101,10 @@ pub struct MessagesPanel {
     /// only bumps when colors actually land.
     rebake_requested: HashMap<String, u64>,
     prompt_progress: Option<PromptProgress>,
+    /// The chat this panel shows, stamped on every restore it requests so a
+    /// plugin files the call where the live one went.
+    session_id: Option<SessionRef>,
+    task_id: Option<Arc<str>>,
 }
 
 impl MessagesPanel {
@@ -122,6 +135,9 @@ impl MessagesPanel {
             cache: SegmentCache::new(),
             last_total_lines: 0,
             hl_worker: RenderWorker::new(),
+            image_picker: terminal_image::picker(ui_config.inline_images),
+            inline_images: ui_config.inline_images,
+            image_generation: terminal_image::generation(),
             theme_generation: theme::generation(),
             highlight_segment: None,
             idle_splash: Splash::new(ui_config.splash_animation),
@@ -138,11 +154,39 @@ impl MessagesPanel {
             clock_format: ui_config.clock_format,
             rebake_requested: HashMap::new(),
             prompt_progress: None,
+            session_id: None,
+            task_id: None,
         }
     }
 
     pub fn set_restore_channel(&mut self, event_tx: Option<EventSender>) {
         self.restore_event_tx = event_tx;
+    }
+
+    pub(crate) fn set_chat(&mut self, session_id: MakiId, task_id: Option<Arc<str>>) {
+        self.session_id = Some(SessionRef::from(session_id));
+        self.task_id = task_id;
+    }
+
+    fn stamp_chat(&self, item: &mut maki_lua::RestoreItem) {
+        item.session_id = self.session_id.clone();
+        item.task_id = self.task_id.clone();
+    }
+
+    pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
+        self.task_id.as_ref()
+    }
+
+    pub(crate) fn request_restores(&self, items: Vec<maki_lua::RestoreItem>) {
+        let Some(tx) = &self.restore_event_tx else {
+            return;
+        };
+        let theme_gen = crate::theme::generation();
+        for mut item in items {
+            item.theme_gen = Some(theme_gen);
+            self.stamp_chat(&mut item);
+            self.lua_event_handle.request_restore(item, tx.clone());
+        }
     }
 
     /// Hands back the index of the message, which [`Self::replace`] needs to
@@ -280,7 +324,7 @@ impl MessagesPanel {
             append_annotation(&mut msg.annotation, suffix);
         }
 
-        match &event.output {
+        match event.output.as_ref() {
             ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
                 if msg.render_snapshot.is_none() =>
             {
@@ -305,7 +349,7 @@ impl MessagesPanel {
             }
             _ => {}
         }
-        msg.tool_output = Some(Arc::new(event.output));
+        msg.tool_output = Some(event.output);
         msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
     }
@@ -373,11 +417,9 @@ impl MessagesPanel {
 
         if let Some(seg_idx) = self.cache.find_by_tool_id(&inst_id) {
             let seg = self.cache.get_mut(seg_idx).unwrap();
-            seg.search_text = tl.search_text.clone();
             seg.update_with_reuse(tl, &self.hl_worker);
         } else {
             let mut seg = Segment::with_tool(inst_id);
-            seg.search_text = tl.search_text.clone();
             seg.apply_highlight(tl, &self.hl_worker);
             self.cache.insert(parent_idx + 1, Segment::spacer());
             self.cache.insert(parent_idx + 2, seg);
@@ -423,7 +465,7 @@ impl MessagesPanel {
             self.tool_done(ToolDoneEvent {
                 id,
                 tool,
-                output: ToolOutput::Plain(message.clone().into()),
+                output: Arc::new(ToolOutput::Plain(message.clone().into())),
                 is_error: true,
                 annotation: None,
                 written_path: None,
@@ -494,6 +536,11 @@ impl MessagesPanel {
     #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    #[cfg(test)]
+    pub fn message_at(&self, index: usize) -> Option<&DisplayMessage> {
+        self.messages.get(index)
     }
 
     pub fn last_message_text(&self) -> &str {
@@ -618,6 +665,10 @@ impl MessagesPanel {
         self.viewport_height as i32 / 2
     }
 
+    pub fn page(&self) -> i32 {
+        self.viewport_height.max(1) as i32
+    }
+
     pub fn set_accent(&mut self, color: ratatui::style::Color) {
         self.accent.set(color);
     }
@@ -634,6 +685,9 @@ impl MessagesPanel {
         let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
             return self.try_toggle_collapsed_thinking(doc_row, width);
         };
+        if !seg.images.is_empty() && (doc_row - seg_start) >= u32::from(seg.text_height(width)) {
+            return false;
+        }
         let Some(tool_id) = seg.tool_id.as_deref() else {
             let msg_idx = seg.msg_index;
             return self.try_toggle_cached_thinking(msg_idx, width);
@@ -723,11 +777,12 @@ impl MessagesPanel {
         msg.tool_output.as_deref()?.owned_instructions()
     }
 
-    /// Drains the highlight worker and every live tool buffer. These used to
-    /// run inside [`Self::view`], which is why a running tool had to claim it
-    /// was animating: it was the only way to keep them fed.
+    /// Drains the highlight worker, every live tool buffer and the finished
+    /// image decodes. These used to run inside [`Self::view`], which is why a
+    /// running tool had to claim it was animating: it was the only way to keep
+    /// them fed.
     pub fn tick(&mut self) -> Dirty {
-        let mut dirty = self.drain_highlights() | self.poll_live_bufs();
+        let mut dirty = self.drain_highlights() | self.poll_live_bufs() | self.refresh_images();
         if self.show_idle_splash() {
             dirty |= self.idle_splash.poll_update(update::latest_version());
         }
@@ -761,7 +816,49 @@ impl MessagesPanel {
             && self.streaming_text.is_empty()
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, has_selection: bool) {
+    /// A resume can come back to a terminal whose font size changed while we
+    /// were suspended, and the picker caches those cell metrics, so rebuild it
+    /// and drop every protocol encoded against the old ones.
+    fn refresh_images(&mut self) -> Dirty {
+        let generation = terminal_image::generation();
+        if generation == self.image_generation {
+            return Dirty::any(
+                self.cache
+                    .segments_mut()
+                    .iter_mut()
+                    .map(Segment::poll_images),
+            );
+        }
+        self.image_generation = generation;
+        self.image_picker = terminal_image::picker(self.inline_images);
+        for seg in self.cache.segments_mut() {
+            seg.release_images();
+        }
+        Dirty::YES
+    }
+
+    /// Rebuilding an encoded protocol costs a decode, a resize and, on kitty, a
+    /// retransmit of megabytes. Releasing exactly at the viewport edge would
+    /// make a one row scroll thrash, so segments just outside keep theirs.
+    fn release_images_outside(&mut self, last_drawn: usize) {
+        let keep = self
+            .top_segment()
+            .saturating_sub(IMAGE_KEEP_MARGIN_SEGMENTS)
+            ..=last_drawn.saturating_add(IMAGE_KEEP_MARGIN_SEGMENTS);
+        for (i, seg) in self.cache.segments_mut().iter_mut().enumerate() {
+            if !keep.contains(&i) {
+                seg.release_images();
+            }
+        }
+    }
+
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        has_selection: bool,
+        images_visible: bool,
+    ) {
         self.viewport_height = area.height;
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
@@ -848,11 +945,12 @@ impl MessagesPanel {
         let spacer_wrap = WrapIndex::build(&spacer_lines, width);
         let collapsed_wrap = WrapIndex::build(&collapsed_thinking_lines, width);
 
-        for (i, seg) in self.cache.segments().iter().enumerate() {
+        let mut last_drawn = self.top_segment();
+        for (i, seg) in self.cache.segments_mut().iter_mut().enumerate() {
             if cursor.past_bottom() {
                 break;
             }
-            let h = seg.height(width);
+            let h = seg.text_height(width);
             let highlight = self.highlight_segment == Some(i);
             let style = seg.tool_id.as_ref().map(|_| theme::current().tool_bg);
             cursor.render(
@@ -863,7 +961,12 @@ impl MessagesPanel {
                 highlight,
                 frame,
             );
+            for image in &mut seg.images {
+                cursor.render_image(image, self.image_picker.as_ref(), images_visible, frame);
+            }
+            last_drawn = i;
         }
+        self.release_images_outside(last_drawn);
 
         let mut height_idx = 0usize;
         let streamed: [(&StreamingContent, bool); 2] = [
@@ -946,6 +1049,13 @@ impl MessagesPanel {
         self.last_total_lines.saturating_sub(self.viewport_height)
     }
 
+    /// Index of the segment the top of the viewport starts on.
+    fn top_segment(&self) -> usize {
+        self.cache
+            .segment_at_row(u32::from(self.scroll_top), self.viewport_width)
+            .map_or(0, |(i, _, _)| i)
+    }
+
     pub fn scroll_top(&self) -> u16 {
         self.scroll_top
     }
@@ -971,8 +1081,66 @@ impl MessagesPanel {
             .collect()
     }
 
-    pub fn segment_search_texts(&self) -> Vec<&str> {
-        self.cache.search_texts()
+    /// Built on demand rather than retained: a plain-text copy of the whole
+    /// transcript, sitting beside the rendered one, was the second largest
+    /// thing the panel held. Entry `i` must describe segment `i`, because
+    /// `SearchAction::Select` feeds the index straight back to
+    /// [`Self::scroll_to_segment`].
+    pub fn segment_search_texts(&self) -> Vec<String> {
+        let by_tool: HashMap<&str, &DisplayMessage> = self
+            .messages
+            .iter()
+            .filter_map(|m| match &m.role {
+                DisplayRole::Tool(t) => Some((t.id.as_str(), m)),
+                _ => None,
+            })
+            .collect();
+        let tool_text = |id: &str| match segment::instruction_parent(id) {
+            Some(parent) => by_tool
+                .get(parent)
+                .and_then(|m| m.tool_output.as_deref())
+                .and_then(ToolOutput::instructions)
+                .map(instructions_search_text),
+            None => by_tool.get(id).map(|m| search_text_for(m)),
+        };
+        let turn_prefixes = self.user_turn_prefixes();
+        self.cache
+            .segments()
+            .iter()
+            .map(|seg| {
+                match seg.tool_id.as_deref() {
+                    Some(id) => tool_text(id),
+                    None => seg.msg_index.and_then(|i| {
+                        self.messages
+                            .get(i)
+                            .map(|msg| message_search_text(msg, turn_prefixes[i].as_deref()))
+                    }),
+                }
+                .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The rendered `{n}‧ you ∙ ` prefix per message, `None` for everything
+    /// that is not a user message. Same numbering the transcript draws, so a
+    /// query for a turn number hits what the reader saw.
+    fn user_turn_prefixes(&self) -> Vec<Option<String>> {
+        let mut template: Option<String> = None;
+        let mut turns = 0usize;
+        self.messages
+            .iter()
+            .map(|msg| {
+                (msg.role == DisplayRole::User).then(|| {
+                    turns += 1;
+                    template
+                        .get_or_insert_with(|| {
+                            crate::components::settings_picker::UserSettings::load()
+                                .user_prompt_prefix_template()
+                        })
+                        .replace("{n}", &turns.to_string())
+                })
+            })
+            .collect()
     }
 
     pub fn extract_selection_text(&self, sel: &Selection, msg_area: Rect) -> String {
@@ -1029,7 +1197,17 @@ impl MessagesPanel {
             .messages
             .iter()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))?;
-        crate::chat::restore_item_for(msg, self.tool_output_lines, self.theme_generation)
+        self.restore_item_for(msg, self.theme_generation)
+    }
+
+    fn restore_item_for(
+        &self,
+        msg: &DisplayMessage,
+        theme_gen: u64,
+    ) -> Option<maki_lua::RestoreItem> {
+        let mut item = crate::chat::restore_item_for(msg, self.tool_output_lines, theme_gen)?;
+        self.stamp_chat(&mut item);
+        Some(item)
     }
 
     /// Re-restores every snapshot still painted with old-theme colors.
@@ -1040,7 +1218,6 @@ impl MessagesPanel {
         };
         let eh = &self.lua_event_handle;
         self.rebake_requested.retain(|_, g| *g >= current_gen);
-        let tol = self.tool_output_lines;
         let mut requested = Vec::new();
         for msg in &self.messages {
             let DisplayRole::Tool(role) = &msg.role else {
@@ -1053,7 +1230,7 @@ impl MessagesPanel {
             ) {
                 continue;
             }
-            if let Some(mut item) = crate::chat::restore_item_for(msg, tol, current_gen) {
+            if let Some(mut item) = self.restore_item_for(msg, current_gen) {
                 item.clicks = self.lua_clicks.get(&role.id).cloned().unwrap_or_default();
                 eh.request_restore(item, tx.clone());
                 requested.push(role.id.clone());
@@ -1249,7 +1426,6 @@ impl MessagesPanel {
                 None,
             )
         };
-        let search_text = format!("thinking> {text}");
         let seg_idx = self
             .cache
             .segments()
@@ -1258,7 +1434,6 @@ impl MessagesPanel {
         let Some(seg_idx) = seg_idx else { return };
         if let Some(seg) = self.cache.get_mut(seg_idx) {
             seg.set_lines(lines);
-            seg.search_text = search_text;
         }
     }
 
@@ -1323,8 +1498,8 @@ impl MessagesPanel {
             .and_then(|o| o.owned_instructions());
 
         let seg = self.cache.get_mut(seg_idx).unwrap();
-        seg.search_text = tl.search_text.clone();
         seg.update_with_reuse(tl, &self.hl_worker);
+        seg.set_images(message_images(msg));
 
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
@@ -1359,11 +1534,10 @@ impl MessagesPanel {
                 let status = t.status;
                 let tl = Self::build_tool_segment_lines(msg, status, &self.rctx(), exp);
                 let id = t.id.clone();
-                let search_text = tl.search_text.clone();
                 self.cache.push_spacer_if_needed();
                 let mut seg = Segment::with_tool(id.clone());
-                seg.search_text = search_text;
                 seg.apply_highlight(tl, &self.hl_worker);
+                seg.set_images(message_images(msg));
                 self.cache.push(seg);
 
                 let blocks = msg
@@ -1378,10 +1552,8 @@ impl MessagesPanel {
                 if matches!(&msg.role, DisplayRole::Thinking) && msg.thinking_collapsed {
                     let text = msg.text.clone();
                     let lines = self.build_cached_thinking_indicator(&text);
-                    let search_text = format!("thinking> {text}");
                     self.cache.push_spacer_if_needed();
-                    self.cache
-                        .push(Segment::with_lines(lines, search_text, Some(i)));
+                    self.cache.push(Segment::with_lines(lines, Some(i)));
                     continue;
                 }
                 let dynamic_prefix = (msg.role == DisplayRole::User).then(|| {
@@ -1391,11 +1563,12 @@ impl MessagesPanel {
                     });
                     template.replace("{n}", &user_turns.to_string())
                 });
-                let (lines, search_text) =
+                let lines =
                     build_message_lines(msg, self.viewport_width, dynamic_prefix.as_deref());
                 self.cache.push_spacer_if_needed();
-                self.cache
-                    .push(Segment::with_lines(lines, search_text, Some(i)));
+                let mut seg = Segment::with_lines(lines, Some(i));
+                seg.set_images(message_images(msg));
+                self.cache.push(seg);
             }
         }
         self.cache.mark_built(self.messages.len());
@@ -1533,12 +1706,11 @@ impl MessagesPanel {
                 .user_prompt_prefix_template()
                 .replace("{n}", &turn.to_string())
         });
-        let (lines, search_text) = build_message_lines(msg, width, dynamic_prefix.as_deref());
+        let lines = build_message_lines(msg, width, dynamic_prefix.as_deref());
         let Some(seg) = self.cache.get_mut(seg_idx) else {
             return;
         };
         seg.set_lines(lines);
-        seg.search_text = search_text;
     }
 }
 
@@ -1558,6 +1730,55 @@ fn thinking_indicator(line_count: usize) -> Vec<Line<'static>> {
     ]
 }
 
+/// An image the message carries is all there is to see, so a terminal without
+/// graphics gets an `[image]` line in its place. A tool's image already has a
+/// header naming the file above it, so it needs no stand-in.
+fn message_images(
+    msg: &DisplayMessage,
+) -> impl Iterator<Item = (ImageSource, Option<&'static str>)> + '_ {
+    msg.images
+        .iter()
+        .map(|source| (source.clone(), Some(IMAGE_PLACEHOLDER)))
+        .chain(match msg.tool_output.as_deref() {
+            Some(ToolOutput::Image { source, .. }) => Some((source.clone(), None)),
+            _ => None,
+        })
+}
+
+fn message_style(role: &DisplayRole) -> RoleStyle {
+    match role {
+        DisplayRole::User => user_style(),
+        DisplayRole::Assistant => assistant_style(),
+        DisplayRole::Thinking => thinking_style(),
+        DisplayRole::Error => error_style(),
+        DisplayRole::Done => done_style(),
+        DisplayRole::Tool(_) => unreachable!(),
+        DisplayRole::Compaction { .. } => assistant_style(),
+    }
+}
+
+/// A plan message draws its own rule and path instead of the role prefix.
+fn message_prefix(msg: &DisplayMessage, style: &RoleStyle) -> &'static str {
+    if msg.plan_path.is_some() {
+        ""
+    } else {
+        style.prefix
+    }
+}
+
+/// Carries the role prefix so a query can hit either the prose or the "you>"
+/// and "thinking>" markers the reader sees. Collapsed thinking needs no case of
+/// its own: its indicator is drawn from the same prefix. `turn_prefix` is the
+/// rendered `{n}‧ you ∙ ` for a user message, so a query for a turn number hits
+/// what the reader saw.
+fn message_search_text(msg: &DisplayMessage, turn_prefix: Option<&str>) -> String {
+    let prefix = match turn_prefix {
+        Some(p) if msg.plan_path.is_none() => p,
+        _ => message_prefix(msg, &message_style(&msg.role)),
+    };
+    format!("{prefix}{}", msg.text)
+}
+
 fn logical_line_count(text: &str) -> usize {
     if text.is_empty() {
         0
@@ -1567,33 +1788,30 @@ fn logical_line_count(text: &str) -> usize {
 }
 
 /// Builds ratatui lines for a non-Tool, non-collapsed-Thinking message at the
-/// given width, returning the lines and search text. Shared by
-/// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
-/// messages) so both paths produce identical segments.
+/// given width. Shared by `rebuild_line_cache` (new messages) and
+/// `reflow_text_segment` (stale-on-resize messages) so both paths produce
+/// identical segments.
 fn build_message_lines(
     msg: &DisplayMessage,
     width: u16,
     user_prefix: Option<&str>,
-) -> (Vec<Line<'static>>, String) {
-    let style = match &msg.role {
-        DisplayRole::User => user_style(),
-        DisplayRole::Assistant => assistant_style(),
-        DisplayRole::Thinking => thinking_style(),
-        DisplayRole::Error => error_style(),
-        DisplayRole::Done => done_style(),
-        DisplayRole::Tool(_) => unreachable!(),
-        DisplayRole::Compaction { .. } => assistant_style(),
-    };
+) -> Vec<Line<'static>> {
+    let style = message_style(&msg.role);
     let prefix = if msg.plan_path.is_some() {
         ""
     } else if let Some(p) = user_prefix.filter(|_| msg.role == DisplayRole::User) {
         p
     } else {
-        style.prefix
+        message_prefix(msg, &style)
+    };
+    let text = if !msg.images.is_empty() && msg.text == IMAGE_PLACEHOLDER {
+        ""
+    } else {
+        &msg.text
     };
     let mut lines = if style.use_markdown {
         text_to_lines(
-            &msg.text,
+            text,
             prefix,
             style.text_style,
             style.prefix_style,
@@ -1601,7 +1819,7 @@ fn build_message_lines(
             style.max_line_bytes,
         )
     } else {
-        plain_lines(&msg.text, prefix, style.text_style, style.prefix_style)
+        plain_lines(text, prefix, style.text_style, style.prefix_style)
     };
     if let Some(pp) = &msg.plan_path {
         if !msg.text.is_empty() {
@@ -1626,6 +1844,5 @@ fn build_message_lines(
             theme::current().tool_dim,
         )));
     }
-    let search_text = format!("{prefix}{}", msg.text);
-    (lines, search_text)
+    lines
 }

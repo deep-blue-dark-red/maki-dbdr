@@ -40,7 +40,7 @@ fn add(_lua: &Lua, lang: String, opts: Option<Table>) -> mlua::Result<()> {
 /// @param lang string Language name.
 /// @param filetype string|table A single filetype string or an array of filetype strings.
 /// @example
-/// maki.treesitter.language.register("typescript", { "ts", "tsx" })
+/// maki.treesitter.language.register("tsx", { "tsx", "jsx" })
 #[lua_fn]
 fn register(
     _lua: &Lua,
@@ -86,8 +86,8 @@ fn register(
 /// @param filetype string Filetype to look up, e.g. `"ts"`.
 /// @return (string|nil) Language name, or nil.
 /// @example
-/// local lang = maki.treesitter.language.get_lang("tsx")
-/// if lang then print(lang) end -- "typescript"
+/// maki.treesitter.language.register("tsx", { "tsx", "jsx" })
+/// local lang = maki.treesitter.language.get_lang("jsx") -- "tsx"
 #[lua_fn]
 fn get_lang(
     _lua: &Lua,
@@ -112,8 +112,8 @@ fn get_lang(
 /// @param lang string Language name.
 /// @return (table) Array of filetype strings.
 /// @example
-/// local fts = maki.treesitter.language.get_filetypes("typescript")
-/// -- { "ts", "tsx" }
+/// local fts = maki.treesitter.language.get_filetypes("tsx")
+/// -- { "tsx", "jsx" }
 #[lua_fn]
 fn get_filetypes(
     lua: &Lua,

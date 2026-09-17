@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use syntect::highlighting::{
     FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Style as SynStyle,
@@ -10,21 +11,107 @@ use syntect::highlighting::{
 use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
+pub mod pool;
+
 const TOKEN_ALIASES: &[(&str, &str)] = &[("jsx", "js")];
 pub const TAB_SPACES: &str = "  ";
+const BLOCK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bat encodes ANSI palette semantics in the syntect alpha channel, and
+/// syntect passes the bytes through untouched. `a = 0` means `r` holds a
+/// palette index, `a = 1` means the terminal default.
+const ANSI_ALPHA_INDEX: u8 = 0x00;
+const ANSI_ALPHA_DEFAULT: u8 = 0x01;
+pub const DEFAULT_COLOR_NAME: &str = "default";
+const HEX_RGB_LEN: usize = 6;
 
 type Rgb = (u8, u8, u8);
+pub type BlockSegments = Arc<Vec<Vec<StyledSegment>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentColor {
+    Rgb(Rgb),
+    Ansi(u8),
+    Default,
+}
+
+impl SegmentColor {
+    pub fn from_syntect(c: syntect::highlighting::Color) -> Self {
+        match c.a {
+            ANSI_ALPHA_INDEX => Self::Ansi(c.r),
+            ANSI_ALPHA_DEFAULT => Self::Default,
+            _ => Self::Rgb((c.r, c.g, c.b)),
+        }
+    }
+
+    pub fn to_syntect(self) -> syntect::highlighting::Color {
+        let (r, g, b, a) = match self {
+            Self::Rgb((r, g, b)) => (r, g, b, 0xFF),
+            Self::Ansi(i) => (i, 0, 0, ANSI_ALPHA_INDEX),
+            Self::Default => (0, 0, 0, ANSI_ALPHA_DEFAULT),
+        };
+        syntect::highlighting::Color { r, g, b, a }
+    }
+
+    /// The one reader of the `#rrggbb | index | name | default` grammar, so
+    /// themes, syntax scopes and plugin spans cannot drift apart on what they
+    /// accept.
+    pub fn parse(s: &str) -> Option<Self> {
+        if let Some(hex) = s.strip_prefix('#') {
+            return parse_hex_rgb(hex).map(Self::Rgb);
+        }
+        if s == DEFAULT_COLOR_NAME {
+            return Some(Self::Default);
+        }
+        if s.bytes().all(|b| b.is_ascii_digit()) {
+            return s.parse().ok().map(Self::Ansi);
+        }
+        ansi_color_index(s).map(Self::Ansi)
+    }
+}
+
+/// Rejects the `+4` and `-0` that `u8::from_str` would otherwise accept, and
+/// any casing or separator sloppiness, so a spelling either resolves exactly
+/// or not at all.
+fn parse_hex_rgb(hex: &str) -> Option<Rgb> {
+    if hex.len() != HEX_RGB_LEN || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some((channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// Resolve a terminal color name to its palette index. These are Helix's
+/// palette names, so its themes load unchanged. Spelling is exact:
+/// `light-gray` resolves, `lightgray` and `LIGHT-GRAY` do not.
+pub fn ansi_color_index(name: &str) -> Option<u8> {
+    let index = match name {
+        "black" => 0,
+        "red" => 1,
+        "green" => 2,
+        "yellow" => 3,
+        "blue" => 4,
+        "magenta" => 5,
+        "cyan" => 6,
+        "gray" => 7,
+        "light-gray" => 8,
+        "light-red" => 9,
+        "light-green" => 10,
+        "light-yellow" => 11,
+        "light-blue" => 12,
+        "light-magenta" => 13,
+        "light-cyan" => 14,
+        "white" => 15,
+        _ => return None,
+    };
+    Some(index)
+}
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<ThemeState>> = OnceLock::new();
-static UI_COLORS: OnceLock<RwLock<HashMap<String, Rgb>>> = OnceLock::new();
-static THEME_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Bumped on every actual theme change, so caches keyed on it can tell a
-/// re-render under the same theme from one under a new one.
-pub fn theme_generation() -> u64 {
-    THEME_GENERATION.load(Ordering::Relaxed)
-}
+static UI_COLORS: OnceLock<RwLock<HashMap<String, SegmentColor>>> = OnceLock::new();
+static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
+static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// The active theme plus its derived syntect highlighter.
 ///
@@ -34,18 +121,17 @@ pub fn theme_generation() -> u64 {
 /// can borrow the theme without a self-referential struct; `set_theme` skips the
 /// work (and the leak) when the theme is unchanged, so this only ever allocates
 /// once per distinct theme the user actually switches to.
-#[derive(Clone, Copy)]
 struct ThemeState {
-    theme: &'static Theme,
+    theme: Arc<Theme>,
     syn: &'static SynHighlighter<'static>,
 }
 
 impl ThemeState {
     fn new(theme: Theme) -> Self {
-        let theme: &'static Theme = Box::leak(Box::new(theme));
+        let leaked: &'static Theme = Box::leak(Box::new(theme.clone()));
         Self {
-            theme,
-            syn: Box::leak(Box::new(SynHighlighter::new(theme))),
+            theme: Arc::new(theme),
+            syn: Box::leak(Box::new(SynHighlighter::new(leaked))),
         }
     }
 }
@@ -54,8 +140,10 @@ fn theme_lock() -> &'static RwLock<ThemeState> {
     THEME.get_or_init(|| RwLock::new(ThemeState::new(Theme::default())))
 }
 
-fn theme_state() -> ThemeState {
-    *theme_lock().read().unwrap_or_else(|e| e.into_inner())
+/// The cached highlighter alone: the per-line constructors want this half and
+/// nothing else, so they skip the `Arc` bump a whole [`ThemeState`] copy costs.
+fn theme_syn() -> &'static SynHighlighter<'static> {
+    theme_lock().read().unwrap_or_else(|e| e.into_inner()).syn
 }
 
 pub fn warmup() {
@@ -75,22 +163,120 @@ pub fn set_theme(theme: Theme) {
         return;
     }
     *state = ThemeState::new(theme);
-    THEME_GENERATION.fetch_add(1, Ordering::Relaxed);
+    // Bump first: a highlight already in flight read the old generation, so its
+    // insert lands under a key nobody will look up again.
+    THEME_GEN.fetch_add(1, Ordering::Release);
+    block_cache_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
-pub fn theme() -> &'static Theme {
-    theme_state().theme
+/// Bumped by every [`set_theme`]. Anything derived from the theme, like an
+/// incremental [`CodeHighlighter`] or a bag of painted lines, is stale once
+/// this changes.
+pub fn theme_generation() -> u64 {
+    THEME_GEN.load(Ordering::Acquire)
 }
 
-fn ui_colors_lock() -> &'static RwLock<HashMap<String, Rgb>> {
+fn block_cache_lock() -> &'static RwLock<BlockCache> {
+    BLOCK_CACHE.get_or_init(RwLock::default)
+}
+
+/// The byte length rides along with the hash, so an accidental hit needs both
+/// to collide. A miss only costs a re-highlight, a false hit costs wrong colors.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct BlockKey {
+    hash: u64,
+    code_bytes: usize,
+    theme_gen: u64,
+}
+
+impl BlockKey {
+    fn new(lang: &str, code: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        lang.hash(&mut hasher);
+        code.hash(&mut hasher);
+        Self {
+            hash: hasher.finish(),
+            code_bytes: code.len(),
+            theme_gen: theme_generation(),
+        }
+    }
+}
+
+fn segments_bytes(segments: &[Vec<StyledSegment>]) -> usize {
+    segments
+        .iter()
+        .map(|line| {
+            size_of::<Vec<StyledSegment>>()
+                + line
+                    .iter()
+                    .map(|seg| size_of::<StyledSegment>() + seg.text.len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Budgeted in bytes, since entries range from a one-liner to a whole file.
+///
+/// Eviction picks an arbitrary entry on purpose. A resize walks the transcript
+/// in order, so an LRU (or dropping a whole generation) always throws out
+/// exactly what the walk asks for next and misses every time once the
+/// transcript outgrows the budget. Arbitrary eviction keeps a stable subset
+/// instead, and the hit rate settles near `budget / working set`.
+#[derive(Default)]
+struct BlockCache {
+    entries: HashMap<BlockKey, (BlockSegments, usize)>,
+    bytes: usize,
+}
+
+impl BlockCache {
+    fn get(&self, key: BlockKey) -> Option<BlockSegments> {
+        self.entries.get(&key).map(|(segs, _)| Arc::clone(segs))
+    }
+
+    /// Evicts before inserting, so the incoming entry is never its own victim.
+    fn insert(&mut self, key: BlockKey, segments: BlockSegments, budget: usize) {
+        let bytes = segments_bytes(&segments);
+        if bytes > budget {
+            return;
+        }
+        self.remove(key);
+        while self.bytes + bytes > budget
+            && let Some(&victim) = self.entries.keys().next()
+        {
+            self.remove(victim);
+        }
+        self.entries.insert(key, (segments, bytes));
+        self.bytes += bytes;
+    }
+
+    fn remove(&mut self, key: BlockKey) {
+        if let Some((_, bytes)) = self.entries.remove(&key) {
+            self.bytes -= bytes;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
+pub fn theme() -> Arc<Theme> {
+    Arc::clone(&theme_lock().read().unwrap_or_else(|e| e.into_inner()).theme)
+}
+
+fn ui_colors_lock() -> &'static RwLock<HashMap<String, SegmentColor>> {
     UI_COLORS.get_or_init(RwLock::default)
 }
 
-pub fn set_ui_colors(colors: HashMap<String, Rgb>) {
+pub fn set_ui_colors(colors: HashMap<String, SegmentColor>) {
     *ui_colors_lock().write().unwrap_or_else(|e| e.into_inner()) = colors;
 }
 
-pub fn theme_color(name: &str) -> Option<Rgb> {
+pub fn theme_color(name: &str) -> Option<SegmentColor> {
     if let Some(&c) = ui_colors_lock()
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -98,40 +284,40 @@ pub fn theme_color(name: &str) -> Option<Rgb> {
     {
         return Some(c);
     }
-    let s = &theme().settings;
+    let settings = &theme().settings;
     // Field names match `ThemeSettings`' serde representation, which is what
     // this used to go through `serde_json::to_value` to reach. Non-colour
     // settings (the `*_css` strings and `*_options` enums) resolve to `None`,
     // exactly as they did when the JSON lookup failed `as_object`.
     let color = match name {
-        "foreground" => s.foreground,
-        "background" => s.background,
-        "caret" => s.caret,
-        "line_highlight" => s.line_highlight,
-        "misspelling" => s.misspelling,
-        "minimap_border" => s.minimap_border,
-        "accent" => s.accent,
-        "bracket_contents_foreground" => s.bracket_contents_foreground,
-        "brackets_foreground" => s.brackets_foreground,
-        "brackets_background" => s.brackets_background,
-        "tags_foreground" => s.tags_foreground,
-        "highlight" => s.highlight,
-        "find_highlight" => s.find_highlight,
-        "find_highlight_foreground" => s.find_highlight_foreground,
-        "gutter" => s.gutter,
-        "gutter_foreground" => s.gutter_foreground,
-        "selection" => s.selection,
-        "selection_foreground" => s.selection_foreground,
-        "selection_border" => s.selection_border,
-        "inactive_selection" => s.inactive_selection,
-        "inactive_selection_foreground" => s.inactive_selection_foreground,
-        "guide" => s.guide,
-        "active_guide" => s.active_guide,
-        "stack_guide" => s.stack_guide,
-        "shadow" => s.shadow,
+        "foreground" => settings.foreground,
+        "background" => settings.background,
+        "caret" => settings.caret,
+        "line_highlight" => settings.line_highlight,
+        "misspelling" => settings.misspelling,
+        "minimap_border" => settings.minimap_border,
+        "accent" => settings.accent,
+        "bracket_contents_foreground" => settings.bracket_contents_foreground,
+        "brackets_foreground" => settings.brackets_foreground,
+        "brackets_background" => settings.brackets_background,
+        "tags_foreground" => settings.tags_foreground,
+        "highlight" => settings.highlight,
+        "find_highlight" => settings.find_highlight,
+        "find_highlight_foreground" => settings.find_highlight_foreground,
+        "gutter" => settings.gutter,
+        "gutter_foreground" => settings.gutter_foreground,
+        "selection" => settings.selection,
+        "selection_foreground" => settings.selection_foreground,
+        "selection_border" => settings.selection_border,
+        "inactive_selection" => settings.inactive_selection,
+        "inactive_selection_foreground" => settings.inactive_selection_foreground,
+        "guide" => settings.guide,
+        "active_guide" => settings.active_guide,
+        "stack_guide" => settings.stack_guide,
+        "shadow" => settings.shadow,
         _ => None,
     }?;
-    Some((color.r, color.g, color.b))
+    Some(SegmentColor::from_syntect(color))
 }
 
 pub fn syntax_set() -> &'static SyntaxSet {
@@ -193,15 +379,15 @@ impl Highlighter {
     }
 
     pub fn for_path(path: &str) -> Self {
-        Self::new(syntax_for_path(path), theme_state().syn)
+        Self::new(syntax_for_path(path), theme_syn())
     }
 
     pub fn for_syntax(syntax: &'static SyntaxReference) -> Self {
-        Self::new(syntax, theme_state().syn)
+        Self::new(syntax, theme_syn())
     }
 
     pub fn for_token(lang: &str) -> Self {
-        Self::new(syntax_for_token(lang), theme_state().syn)
+        Self::new(syntax_for_token(lang), theme_syn())
     }
 
     fn raw_highlight_line<'a>(
@@ -235,7 +421,7 @@ impl Highlighter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StyledSegment {
     pub text: String,
-    pub fg: (u8, u8, u8),
+    pub fg: SegmentColor,
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
@@ -243,10 +429,9 @@ pub struct StyledSegment {
 
 impl StyledSegment {
     fn from_syntect(style: SynStyle, text: String) -> Self {
-        let f = style.foreground;
         Self {
             text,
-            fg: (f.r, f.g, f.b),
+            fg: SegmentColor::from_syntect(style.foreground),
             bold: style.font_style.contains(FontStyle::BOLD),
             italic: style.font_style.contains(FontStyle::ITALIC),
             underline: style.font_style.contains(FontStyle::UNDERLINE),
@@ -256,7 +441,7 @@ impl StyledSegment {
     fn fallback(text: String) -> Self {
         Self {
             text,
-            fg: (204, 204, 204),
+            fg: SegmentColor::Default,
             bold: false,
             italic: false,
             underline: false,
@@ -276,6 +461,30 @@ pub fn highlight_code(lang: &str, code: &str, prefix: &str) -> Vec<Vec<StyledSeg
         .collect()
 }
 
+/// Highlights a whole block, memoized on its content.
+///
+/// Highlighting is by far the most expensive part of a markdown render (syntect
+/// burns ~270us of regex per line) and the result does not depend on terminal
+/// width, so laying the same text out again after a resize should never pay for
+/// it twice. Callers streaming a growing block stay on [`CodeHighlighter`]:
+/// it is incremental, and would miss this cache on every token.
+pub fn highlight_block(lang: &str, code: &str) -> BlockSegments {
+    let key = BlockKey::new(lang, code);
+    if let Some(hit) = block_cache_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+    {
+        return hit;
+    }
+    let segments: BlockSegments = Arc::new(highlight_code(lang, code, ""));
+    block_cache_lock()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, Arc::clone(&segments), BLOCK_CACHE_MAX_BYTES);
+    segments
+}
+
 pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegment>> {
     let syntax = syntax_for_token(lang);
     LinesWithEndings::from(code)
@@ -283,19 +492,29 @@ pub fn highlight_lines_independent(lang: &str, code: &str) -> Vec<Vec<StyledSegm
         .collect()
 }
 
-pub fn highlight_ansi(lang: &str, code: &str, bg: (u8, u8, u8)) -> String {
-    let bg_code = format!("\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+pub fn highlight_ansi(lang: &str, code: &str, bg: SegmentColor) -> String {
+    let bg_code = match bg {
+        SegmentColor::Rgb((r, g, b)) => format!("\x1b[48;2;{r};{g};{b}m"),
+        SegmentColor::Ansi(i) => format!("\x1b[48;5;{i}m"),
+        SegmentColor::Default => "\x1b[49m".to_owned(),
+    };
     let mut hl = Highlighter::for_token(lang);
     let mut out = String::new();
     for line in LinesWithEndings::from(code) {
         out.push_str(&bg_code);
         for seg in hl.highlight_line(line) {
             let bold = if seg.bold { "1;" } else { "" };
-            let _ = write!(
-                out,
-                "\x1b[{bold}38;2;{};{};{}m{}",
-                seg.fg.0, seg.fg.1, seg.fg.2, seg.text
-            );
+            match seg.fg {
+                SegmentColor::Ansi(i) => {
+                    let _ = write!(out, "\x1b[{bold}38;5;{i}m{}", seg.text);
+                }
+                SegmentColor::Default => {
+                    let _ = write!(out, "\x1b[{bold}39m{}", seg.text);
+                }
+                SegmentColor::Rgb((r, g, b)) => {
+                    let _ = write!(out, "\x1b[{bold}38;2;{r};{g};{b}m{}", seg.text);
+                }
+            }
         }
         out.push_str("\x1b[K\x1b[0m\n");
     }
@@ -303,6 +522,8 @@ pub fn highlight_ansi(lang: &str, code: &str, bg: (u8, u8, u8)) -> String {
 }
 
 pub struct CodeHighlighter {
+    start_parse: ParseState,
+    start_highlight: HighlightState,
     checkpoint_parse: ParseState,
     checkpoint_highlight: HighlightState,
     completed_lines: usize,
@@ -312,9 +533,13 @@ pub struct CodeHighlighter {
 impl CodeHighlighter {
     pub fn new(lang: &str) -> Self {
         let syntax = syntax_for_token(lang);
+        let parse = ParseState::new(syntax);
+        let highlight = HighlightState::new(theme_syn(), ScopeStack::new());
         Self {
-            checkpoint_parse: ParseState::new(syntax),
-            checkpoint_highlight: HighlightState::new(theme_state().syn, ScopeStack::new()),
+            start_parse: parse.clone(),
+            start_highlight: highlight.clone(),
+            checkpoint_parse: parse,
+            checkpoint_highlight: highlight,
             completed_lines: 0,
             cached_segments: Vec::new(),
         }
@@ -343,9 +568,20 @@ impl CodeHighlighter {
             total - 1
         };
 
+        // The input can shrink. Closing a fence drops the newline before it,
+        // so a line that was complete turns back into the partial tail, and the
+        // checkpoint already stands past it with no way back to an earlier one.
+        // Replaying from the block's start is the cheap way out, and it happens
+        // once per block.
+        if new_completed < self.completed_lines {
+            self.checkpoint_parse = self.start_parse.clone();
+            self.checkpoint_highlight = self.start_highlight.clone();
+            self.completed_lines = 0;
+        }
+
         if new_completed > self.completed_lines {
             let mut hl = Highlighter::from_state(
-                theme_state().syn,
+                theme_syn(),
                 self.checkpoint_highlight.clone(),
                 self.checkpoint_parse.clone(),
             );
@@ -365,7 +601,7 @@ impl CodeHighlighter {
 
         if new_completed < total {
             let mut hl = Highlighter::from_state(
-                theme_state().syn,
+                theme_syn(),
                 self.checkpoint_highlight.clone(),
                 self.checkpoint_parse.clone(),
             );
@@ -377,9 +613,88 @@ impl CodeHighlighter {
 }
 
 #[cfg(test)]
+mod color_names {
+    use super::{SegmentColor, ansi_color_index};
+    use test_case::test_case;
+
+    /// Every name in Helix's default palette, which we accept unchanged.
+    /// https://docs.helix-editor.com/themes.html#color-palettes
+    #[test_case("black", 0)]
+    #[test_case("red", 1)]
+    #[test_case("green", 2)]
+    #[test_case("yellow", 3)]
+    #[test_case("blue", 4)]
+    #[test_case("magenta", 5)]
+    #[test_case("cyan", 6)]
+    #[test_case("gray", 7)]
+    #[test_case("light-red", 9)]
+    #[test_case("light-green", 10)]
+    #[test_case("light-yellow", 11)]
+    #[test_case("light-blue", 12)]
+    #[test_case("light-magenta", 13)]
+    #[test_case("light-cyan", 14)]
+    #[test_case("light-gray", 8)]
+    #[test_case("white", 15)]
+    fn helix_palette_names_resolve(name: &str, index: u8) {
+        assert_eq!(ansi_color_index(name), Some(index));
+    }
+
+    #[test_case("lightgray"; "missing separator")]
+    #[test_case("LIGHT-GRAY"; "uppercase")]
+    #[test_case("bright-red"; "bright is not a helix name")]
+    #[test_case("grey"; "grey is not a helix name")]
+    fn sloppy_spellings_are_rejected(name: &str) {
+        assert_eq!(ansi_color_index(name), None);
+    }
+
+    /// Themes, syntax scopes and plugin spans all read the grammar through
+    /// here, so the accepted spellings are pinned once at the source rather
+    /// than at each of the three call sites.
+    #[test_case("#fda331", SegmentColor::Rgb((0xfd, 0xa3, 0x31)); "lowercase hex")]
+    #[test_case("#FDA331", SegmentColor::Rgb((0xfd, 0xa3, 0x31)); "uppercase hex")]
+    #[test_case("light-blue", SegmentColor::Ansi(12); "helix name")]
+    #[test_case("0", SegmentColor::Ansi(0); "first index")]
+    #[test_case("255", SegmentColor::Ansi(255); "last index")]
+    #[test_case("default", SegmentColor::Default; "terminal default")]
+    fn accepted_spellings(input: &str, expected: SegmentColor) {
+        assert_eq!(SegmentColor::parse(input), Some(expected));
+    }
+
+    #[test_case("+4"; "signed index")]
+    #[test_case("-0"; "negative index")]
+    #[test_case("256"; "index out of range")]
+    #[test_case("ff0000"; "hex without a hash")]
+    #[test_case("#fff"; "three digit hex")]
+    #[test_case("#gggggg"; "hex with non hex digits")]
+    #[test_case("#ff000000"; "eight digit hex")]
+    #[test_case("lightgray"; "sloppy name")]
+    #[test_case("LIGHT-GRAY"; "uppercase name")]
+    #[test_case(""; "empty")]
+    fn rejected_spellings(input: &str) {
+        assert_eq!(SegmentColor::parse(input), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+    use std::thread;
+
     use super::*;
     use test_case::test_case;
+
+    const BUDGETED_ENTRIES: usize = 32;
+    const RUST: &str = "rust";
+    const PYTHON: &str = "python";
+    const OPENS_A_STRING: &str = "x = '''";
+
+    /// The theme and the block cache are process globals. Nextest gives every
+    /// test its own process, `cargo test` does not, so tests that swap the theme
+    /// or read the cache take this first and cannot be tripped up by a sibling.
+    fn exclusive_globals() -> MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn segments_text(segs: &[StyledSegment]) -> String {
         segs.iter().map(|s| s.text.as_str()).collect()
@@ -387,6 +702,28 @@ mod tests {
 
     fn lines_text(lines: &[Vec<StyledSegment>]) -> Vec<String> {
         lines.iter().map(|l| segments_text(l)).collect()
+    }
+
+    /// A closing fence takes the newline before it, so the block's last line
+    /// arrives complete and then turns back into the partial tail. Painting it
+    /// from the checkpoint that already ate it opens the string twice, and the
+    /// line keeps the string's color for the rest of the turn.
+    #[test]
+    fn the_last_line_of_a_block_keeps_its_colors_when_the_fence_closes() {
+        warmup();
+        let mut ch = CodeHighlighter::new(PYTHON);
+        // The newline gives the line a trailing empty segment the fence takes
+        // away again, so only the colors of the text itself are comparable.
+        let colors = |lines: &[Vec<StyledSegment>]| {
+            lines
+                .iter()
+                .flatten()
+                .filter(|s| !s.text.is_empty())
+                .map(|s| (s.text.clone(), s.fg))
+                .collect::<Vec<_>>()
+        };
+        let while_streaming = colors(ch.update(&format!("{OPENS_A_STRING}\n")));
+        assert_eq!(while_streaming, colors(ch.update(OPENS_A_STRING)));
     }
 
     #[test]
@@ -439,6 +776,7 @@ mod tests {
 
     #[test]
     fn set_theme_applies_without_panic() {
+        let _globals = exclusive_globals();
         warmup();
         for _ in 0..3 {
             set_theme(Theme::default());
@@ -513,7 +851,11 @@ mod tests {
     #[test]
     fn highlight_ansi_formatting() {
         warmup();
-        let out = highlight_ansi("rust", "let x = 1;\nlet y = 2;\n", (30, 30, 30));
+        let out = highlight_ansi(
+            "rust",
+            "let x = 1;\nlet y = 2;\n",
+            SegmentColor::Rgb((30, 30, 30)),
+        );
         let bg_count = out.matches("\x1b[48;2;30;30;30m").count();
         assert_eq!(bg_count, 2, "each line should get its own bg escape");
         assert!(out.ends_with("\x1b[K\x1b[0m\n"));
@@ -526,7 +868,7 @@ mod tests {
         hl.advance("fn main() {\n");
         let (hs, ps) = hl.state();
 
-        let mut from_state = Highlighter::from_state(theme_state().syn, hs, ps);
+        let mut from_state = Highlighter::from_state(theme_syn(), hs, ps);
         let seg_from_state = from_state.highlight_line("    let x = 1;\n");
 
         let mut fresh = Highlighter::for_token("rust");
@@ -536,11 +878,278 @@ mod tests {
         assert_eq!(seg_from_state, seg_fresh);
     }
 
+    #[test_case(RUST, "fn main() {\n    let x = 1;\n}\n"; "rust_block")]
+    #[test_case(RUST, ""; "empty_code")]
+    #[test_case("totally_unknown_xyz", "!!! not a language !!!\n"; "unknown_language")]
+    fn highlight_block_matches_an_uncached_highlight(lang: &str, code: &str) {
+        let _globals = exclusive_globals();
+        warmup();
+        assert_eq!(*highlight_block(lang, code), highlight_code(lang, code, ""));
+    }
+
+    #[test]
+    fn highlight_block_memoizes_per_language() {
+        let _globals = exclusive_globals();
+        warmup();
+        const CODE: &str = "x = 1\n";
+        let rust = highlight_block(RUST, CODE);
+        assert!(
+            Arc::ptr_eq(&rust, &highlight_block(RUST, CODE)),
+            "the same block must hand back the same allocation"
+        );
+        assert!(
+            !Arc::ptr_eq(&rust, &highlight_block("python", CODE)),
+            "the language is part of the key"
+        );
+    }
+
+    /// Hashing the language and the code into one stream would make
+    /// `("rust", "x")` and `("rus", "tx")` the same key, and a false hit paints
+    /// a block with another block's colors.
+    #[test_case((RUST, "x"), ("rus", "tx"); "language_code_boundary")]
+    #[test_case((RUST, "let a = 1;\n"), (RUST, "let b = 2;\n"); "equal_length_bodies")]
+    fn distinct_blocks_get_distinct_keys(left: (&str, &str), right: (&str, &str)) {
+        assert!(BlockKey::new(left.0, left.1) != BlockKey::new(right.0, right.1));
+    }
+
+    /// `set_theme` bumps the generation before clearing, so a highlight that
+    /// started earlier and finishes after the clear lands under a key no later
+    /// lookup can mint. Bumping after the clear would leave that insert
+    /// reachable, serving the old palette until the next theme change.
+    #[test]
+    fn a_theme_change_orphans_the_blocks_highlighted_before_it() {
+        const CODE: &str = "let themed = 1;\n";
+        let _globals = exclusive_globals();
+        warmup();
+        let stale_key = BlockKey::new(RUST, CODE);
+        highlight_block(RUST, CODE);
+
+        // A no-op `set_theme` skips the clear (the fork does not leak a
+        // highlighter per redundant call), so switch to a distinct theme to
+        // exercise the clear path.
+        set_theme(Theme {
+            name: Some("not-the-default".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            block_cache_lock().read().unwrap().bytes,
+            0,
+            "set_theme must clear the cache"
+        );
+
+        let racing = one_line();
+        block_cache_lock().write().unwrap().insert(
+            stale_key,
+            Arc::clone(&racing),
+            BLOCK_CACHE_MAX_BYTES,
+        );
+        assert!(
+            !Arc::ptr_eq(&racing, &highlight_block(RUST, CODE)),
+            "an insert under a key minted before the bump must be unreachable"
+        );
+    }
+
+    fn block_of(lines: usize) -> BlockSegments {
+        Arc::new(vec![vec![StyledSegment::fallback("x".into())]; lines])
+    }
+
+    fn one_line() -> BlockSegments {
+        block_of(1)
+    }
+
+    fn assert_bytes_match_entries(cache: &BlockCache) {
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .values()
+                .map(|(segs, _)| segments_bytes(segs))
+                .sum::<usize>(),
+            "the byte tally must track the entries it holds"
+        );
+    }
+
+    /// A budget that fits exactly `BUDGETED_ENTRIES` of [`one_line`].
+    fn tiny_budget() -> usize {
+        segments_bytes(&one_line()) * BUDGETED_ENTRIES
+    }
+
+    /// Replays what a resize does: walk every block in order, over and over.
+    /// Returns hits per pass.
+    fn tiny_cache_scan(blocks: usize, passes: usize) -> (Vec<usize>, BlockCache) {
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        let mut hits = Vec::new();
+        for _ in 0..passes {
+            let mut pass_hits = 0;
+            for i in 0..blocks {
+                let key = BlockKey::new(RUST, &i.to_string());
+                if cache.get(key).is_some() {
+                    pass_hits += 1;
+                } else {
+                    cache.insert(key, one_line(), budget);
+                }
+            }
+            hits.push(pass_hits);
+        }
+        (hits, cache)
+    }
+
+    /// Arbitrary eviction is the whole point: an LRU or a generational rotation
+    /// would score a flat zero once the walk outgrows the budget. How far above
+    /// zero we land is `HashMap` iteration order talking, so only the floor is
+    /// ours to assert.
+    #[test_case(BUDGETED_ENTRIES, BUDGETED_ENTRIES; "a_scan_that_fits_stays_fully_warm")]
+    #[test_case(BUDGETED_ENTRIES * 4, 1; "a_scan_that_overflows_still_hits")]
+    fn a_repeated_scan_keeps_hitting_within_budget(blocks: usize, min_hits: usize) {
+        const PASSES: usize = 3;
+        let (hits, cache) = tiny_cache_scan(blocks, PASSES);
+        assert_eq!(hits[0], 0, "nothing is warm on the first pass");
+        assert!(
+            hits[1..].iter().all(|&pass| pass >= min_hits),
+            "a scan of {blocks} blocks must keep serving at least {min_hits}, got {hits:?}"
+        );
+        assert!(cache.bytes <= tiny_budget(), "{} over budget", cache.bytes);
+        assert_bytes_match_entries(&cache);
+    }
+
+    /// An entry too big for even an empty cache gets dropped, rather than spun
+    /// through the eviction loop until the cache is empty and it still does not
+    /// fit.
+    #[test]
+    fn block_cache_drops_an_entry_bigger_than_the_budget() {
+        const OVERSIZED_LINES: usize = BUDGETED_ENTRIES + 1;
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        let resident = BlockKey::new(RUST, "resident");
+        cache.insert(resident, one_line(), budget);
+        let bytes_before = cache.bytes;
+
+        cache.insert(
+            BlockKey::new(RUST, "oversized"),
+            block_of(OVERSIZED_LINES),
+            budget,
+        );
+
+        assert!(
+            cache.get(BlockKey::new(RUST, "oversized")).is_none(),
+            "an entry over the whole budget must not be cached"
+        );
+        assert!(
+            cache.get(resident).is_some(),
+            "a rejected insert must not evict what already fits"
+        );
+        assert_eq!(cache.bytes, bytes_before);
+    }
+
+    /// Without the `remove` before the insert, the replaced value's bytes stay
+    /// on the tally forever. A block streamed at growing lengths would then
+    /// drift up to the budget and evict everything on every insert while
+    /// holding almost nothing.
+    #[test]
+    fn reinserting_a_key_does_not_double_count_its_bytes() {
+        const GROWN_LINES: usize = 4;
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        let key = BlockKey::new(RUST, "same");
+
+        cache.insert(key, one_line(), budget);
+        cache.insert(key, block_of(GROWN_LINES), budget);
+        cache.insert(key, one_line(), budget);
+
+        assert_eq!(cache.entries.len(), 1);
+        assert_bytes_match_entries(&cache);
+    }
+
+    /// The eviction loop picks an arbitrary key, so inserting first would let it
+    /// pick the incoming one and hand the caller a value the cache never holds.
+    #[test]
+    fn eviction_spares_the_entry_being_inserted() {
+        let budget = tiny_budget();
+        let mut cache = BlockCache::default();
+        for i in 0..BUDGETED_ENTRIES {
+            cache.insert(BlockKey::new(RUST, &i.to_string()), one_line(), budget);
+        }
+        assert_eq!(cache.bytes, budget, "the cache must start out exactly full");
+
+        let incoming = BlockKey::new(RUST, "incoming");
+        cache.insert(incoming, block_of(BUDGETED_ENTRIES), budget);
+
+        assert!(
+            cache.get(incoming).is_some(),
+            "the entry that forced the eviction must survive it"
+        );
+        assert_eq!(cache.entries.len(), 1, "it takes the budget on its own");
+        assert_bytes_match_entries(&cache);
+    }
+
+    /// `highlight_block` drops the read lock before taking the write lock, so a
+    /// theme change can slip in between, and whatever comes back must still be
+    /// an honest highlight of its own input. The theme swapped in here is the
+    /// one already installed, so `highlight_code` stays a valid expectation
+    /// while the generation churns underneath.
+    #[test]
+    fn concurrent_blocks_survive_a_theme_change() {
+        const THREADS: usize = 4;
+        const ITERATIONS: usize = 8;
+        let _globals = exclusive_globals();
+        warmup();
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for i in 0..ITERATIONS {
+                        let code = format!("let v{i} = {i};\n");
+                        assert_eq!(
+                            *highlight_block(RUST, &code),
+                            highlight_code(RUST, &code, "")
+                        );
+                    }
+                });
+            }
+            scope.spawn(|| {
+                for _ in 0..THREADS * ITERATIONS {
+                    set_theme(Theme::default());
+                }
+            });
+        });
+
+        assert_bytes_match_entries(&block_cache_lock().read().unwrap());
+    }
+
     #[test_case("jsx", "js"; "jsx_alias")]
     fn token_alias_resolves(alias: &str, canonical: &str) {
         warmup();
         let aliased = syntax_for_token(alias);
         let canonical_syntax = syntax_set().find_syntax_by_token(canonical).unwrap();
         assert_eq!(aliased.name, canonical_syntax.name);
+    }
+
+    #[test_case(ANSI_ALPHA_INDEX, SegmentColor::Ansi(9); "index marker")]
+    #[test_case(ANSI_ALPHA_DEFAULT, SegmentColor::Default; "default marker")]
+    #[test_case(0xFF, SegmentColor::Rgb((9, 2, 3)); "opaque rgb")]
+    fn alpha_marker_decodes_to_segment_color(alpha: u8, expected: SegmentColor) {
+        let c = syntect::highlighting::Color {
+            r: 9,
+            g: 2,
+            b: 3,
+            a: alpha,
+        };
+        assert_eq!(SegmentColor::from_syntect(c), expected);
+    }
+
+    #[test_case(SegmentColor::Rgb((9, 2, 3)); "rgb")]
+    #[test_case(SegmentColor::Ansi(9); "palette index")]
+    #[test_case(SegmentColor::Default; "terminal default")]
+    fn segment_color_survives_a_syntect_roundtrip(color: SegmentColor) {
+        assert_eq!(SegmentColor::from_syntect(color.to_syntect()), color);
+    }
+
+    #[test_case(SegmentColor::Ansi(4), "\x1b[48;5;4m"; "palette background")]
+    #[test_case(SegmentColor::Default, "\x1b[49m"; "terminal default background")]
+    fn highlight_ansi_keeps_non_rgb_backgrounds_symbolic(bg: SegmentColor, expected: &str) {
+        warmup();
+        let out = highlight_ansi("rust", "let x = 1;\n", bg);
+        assert!(out.contains(expected), "{out:?}");
     }
 }

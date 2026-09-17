@@ -30,7 +30,14 @@ struct Scrape {
 /// begins at display row `skip - residual` and that is where bit 0 sits.
 fn scrape_window(seg: &Segment, skip: u16, rows: u16, width: u16) -> Scrape {
     let area = Rect::new(0, skip, width, rows);
-    let mut buf = Buffer::empty(area);
+    // A double width grapheme landing on the last column makes ratatui write
+    // one past the area it wrapped to, so the scratch buffer holds a spare
+    // column for that write. `area` keeps the real width, which is what decides
+    // the wrap and the columns copied.
+    let mut buf = Buffer::empty(Rect {
+        width: width.saturating_add(1),
+        ..area
+    });
     let (range, residual) = seg.window(skip, rows, width);
     let Some(visible) = seg.lines().get(range) else {
         return Scrape {
@@ -158,7 +165,10 @@ mod tests {
     /// O(segment) per copy, which is what `scrape_window` exists to avoid.
     fn scrape_whole(seg: &Segment, _skip: u16, _rows: u16, width: u16) -> Scrape {
         let area = Rect::new(0, 0, width, seg.height(width));
-        let mut buf = Buffer::empty(area);
+        let mut buf = Buffer::empty(Rect {
+            width: width.saturating_add(1),
+            ..area
+        });
         Paragraph::new(seg.lines().to_vec())
             .wrap(Wrap { trim: false })
             .render(area, &mut buf);
@@ -174,7 +184,7 @@ mod tests {
         let mut cache = SegmentCache::new();
         for lines in segments {
             let ls: Vec<Line<'static>> = lines.iter().map(|t| Line::raw(t.to_string())).collect();
-            cache.push(Segment::with_lines(ls, lines.join("\n"), None));
+            cache.push(Segment::with_lines(ls, None));
         }
         cache
     }
@@ -220,6 +230,30 @@ mod tests {
             }
         }
     }
+    /// A stale segment can hold a line far wider than the terminal now is, and
+    /// at two columns ratatui writes a double width grapheme one cell past the
+    /// area it wrapped to. The scrape used to hand that write a buffer exactly
+    /// as wide as the area, so releasing the mouse took the whole UI down.
+    /// The last grapheme is the one ratatui shoved over the edge, so it is off
+    /// screen and copying it back would not match what the user sees.
+    #[test]
+    fn copying_into_two_columns_gives_back_what_is_on_screen() {
+        const WIDTH: u16 = 2;
+        let mut cache = SegmentCache::new();
+        cache.push(Segment::with_lines(
+            vec![Line::from("a\u{4f60}\u{597d}")],
+            None,
+        ));
+        let area = Rect::new(0, 0, WIDTH, 24);
+
+        let mut sel = Selection::start(0, 0, area, SelectionZone::Messages, 0);
+        sel.update(1, WIDTH, 0);
+        assert_eq!(
+            extract_selection_text(&cache, WIDTH, &sel, area),
+            "a\u{4f60}"
+        );
+    }
+
     /// A tall segment is the case the window is for: the copied text must not
     /// depend on how much unselected content sits above it.
     #[test]

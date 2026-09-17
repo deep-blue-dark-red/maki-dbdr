@@ -805,11 +805,14 @@ mod tests {
         inject_file(&picker, MAIN_PATH);
         done_tx.send(Walk::Listed).unwrap();
 
-        // A quiet tick alone is not settled: nucleo's worker can lag the main
-        // thread, reporting no changes while still matching. Wait for the walk
-        // to end AND the matcher to go idle before demanding stillness.
-        let _ = tick_until(&mut picker, |s| s.walk != Walk::Running && !s.matching)
-            .expect("the picker never settled");
+        // Waiting for a tick to owe nothing is not the same as settling: the
+        // matcher answers on its own thread and can still be running on a tick
+        // that changed nothing, and the walk has to be over before the row
+        // count settles.
+        let _ = tick_until(&mut picker, |s| {
+            s.walk != Walk::Running && !s.matching && s.matches.len() == 1
+        })
+        .expect(NEVER_CONVERGED);
 
         assert_eq!(picker.tick(), (Dirty::NO, None), "{QUIET}");
         assert_eq!(picker.cadence(), Cadence::IDLE);

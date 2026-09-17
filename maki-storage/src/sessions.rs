@@ -19,8 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::id::{MakiId, MakiIdParseError};
+use crate::paths::canonical_key;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -245,6 +247,7 @@ pub struct Session<M, U, T> {
 pub struct SessionSummary {
     pub id: MakiId,
     pub title: String,
+    pub cwd: String,
     pub updated_at: u64,
     pub context_size: u32,
 }
@@ -418,6 +421,12 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Absent on subagents written before this was recorded, and the one flag
+    /// that says whether `fast` below is the subagent's or just a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
 }
 
 #[derive(Deserialize)]
@@ -1076,6 +1085,38 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
+/// The directories sessions were recorded in, most recently used first and at
+/// most `limit` of them.
+///
+/// The index is append only and the caller pays filesystem work per entry, so
+/// a limit is what keeps a long history off a startup path. Order comes from
+/// the session id, which is a UUIDv7 and carries the time it was made, so a
+/// history over the limit keeps the directories somebody still works in. A
+/// legacy v4 id has no time in it and sorts last.
+///
+/// Keys go through `canonical_key`, because the index holds whatever string a
+/// session was saved with while callers compare against canonicalized paths: a
+/// symlinked home would otherwise hide a folder's own history from it. A key
+/// that is not valid UTF-8 is dropped, because the callers store what they get
+/// back as text and a lossy path must never stand in for a real one.
+pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
+    let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
+        .into_iter()
+        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
+        .collect();
+    entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    entries.truncate(limit);
+    entries
+        .into_iter()
+        .filter_map(|(_, cwd)| canonical_key(Path::new(&cwd)).to_str().map(str::to_owned))
+        .collect()
+}
+
+fn session_time(session_id: &str) -> Option<(u64, u32)> {
+    let id: MakiId = session_id.parse().ok()?;
+    Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
+}
+
 fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
     let id_str = session_id.to_string();
@@ -1220,6 +1261,7 @@ fn scan_headers(cwd: Option<&str>, dir: &Path) -> Result<Vec<SessionSummary>, St
             out.push(SessionSummary {
                 id: h.id,
                 title: normalize_title(&h.title),
+                cwd: h.cwd.clone(),
                 updated_at: h.updated_at,
                 context_size: h.context_size,
             });
@@ -1357,6 +1399,9 @@ where
     T: DeserializeOwned,
 {
     let data = fs::read(path).map_err(StorageError::from)?;
+    // Held across both formats: either one decodes the same image payload once
+    // per record that mentions it.
+    let _intern = crate::intern::Scope::enter();
     let mut session: Session<M, U, T> = if path.extension().is_some_and(|e| e == "jsonl") {
         load_jsonl(&data, &path.display().to_string())?
     } else {
@@ -1520,8 +1565,8 @@ where
 
     /// A change under an existing id is not expressible as an append, so it
     /// voids the cursors; a new id is a pure append.
-    pub fn insert_tool_output(&mut self, id: String, output: T) {
-        if self.tool_outputs.insert(id, Arc::new(output)).is_some() {
+    pub fn insert_tool_output(&mut self, id: String, output: Arc<T>) {
+        if self.tool_outputs.insert(id, output).is_some() {
             self.rewrite();
         } else {
             self.touch();
@@ -1748,16 +1793,19 @@ mod tests {
     use super::Effort;
     use super::StoredThinking;
     use super::ThinkingParseError;
+    #[cfg(unix)]
+    use super::canonical_key;
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, StoredSubagent, TAIL_BUF,
-        generate_title, json_path, jsonl_path, load_cwd_index, next_epoch, update_cwd_index,
-        write_full_session,
+        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
+        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, next_epoch,
+        update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionError, SessionLog, SessionMeta,
         StorageError, TitleSource,
     };
+    use crate::StateDir;
     use crate::id::MakiId;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1778,6 +1826,7 @@ mod tests {
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
+    const ALL_RECORDED: usize = usize::MAX;
 
     impl TitleSource for Value {
         fn first_user_text(&self) -> Option<&str> {
@@ -1832,6 +1881,8 @@ mod tests {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
+                thinking: None,
+                fast: false,
             }
         }
 
@@ -1845,7 +1896,7 @@ mod tests {
             .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
         session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
         for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
-            session.insert_tool_output(id.into(), Value::Null);
+            session.insert_tool_output(id.into(), Arc::new(Value::Null));
         }
 
         session.prune_orphans(ids);
@@ -2522,7 +2573,28 @@ mod tests {
 
         let list = TestSession::list_in("/project-a", dir).unwrap();
         assert_eq!(list.len(), 2);
-        assert!(list.iter().all(|s| s.id != s2.id));
+        assert!(list.iter().all(|s| s.id != s2.id && s.cwd == "/project-a"));
+    }
+
+    #[test]
+    fn list_all_spans_cwds_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // `SessionLog::rewrite` persists `updated_at` verbatim; `save_to`
+        // would stamp both sessions with the same wall-clock second.
+        let mut older: TestSession = Session::new("m", "/project-a");
+        older.updated_at = 100;
+        SessionLog::rewrite(dir, &older).unwrap();
+        let mut newer: TestSession = Session::new("m", "/project-b");
+        newer.updated_at = 200;
+        SessionLog::rewrite(dir, &newer).unwrap();
+
+        let list = TestSession::list_all_in(dir).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, newer.id);
+        assert_eq!(list[0].cwd, "/project-b");
+        assert_eq!(list[1].id, older.id);
+        assert_eq!(list[1].cwd, "/project-a");
     }
 
     /// Rewrites the scan-cache title of `id` without touching the session
@@ -2899,6 +2971,70 @@ mod tests {
         super::remove_from_cwd_index(dir, session.id).unwrap();
         let after = load_cwd_index(dir);
         assert!(!after.contains_key("/project"));
+    }
+
+    #[test]
+    fn recorded_cwds_lists_the_directory_a_session_ran_in() {
+        const SESSION_CWD: &str = "/project/src";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().to_path_buf());
+        let mut session: TestSession = Session::new("m", SESSION_CWD);
+        session.save(&state).unwrap();
+
+        assert_eq!(
+            super::recorded_cwds(&state.path().join(SESSIONS_DIR), ALL_RECORDED),
+            vec![SESSION_CWD.to_owned()]
+        );
+    }
+
+    /// The freeze that reads this index pays filesystem work per entry, and
+    /// the index only ever grows, so it has to stop somewhere. It stops at the
+    /// oldest sessions, which are the directories nobody opens any more.
+    #[test]
+    fn recorded_cwds_keeps_the_most_recent_within_the_limit() {
+        const LIMIT: usize = 3;
+        const OLD: &str = "/project/old";
+        const NEWER: &str = "/project/newer";
+        const NEWEST: &str = "/project/newest";
+        const FORGOTTEN: &str = "/project/forgotten";
+        const SESSIONS: [(&str, &str); 4] = [
+            (OLD, "017f0000-0000-7000-8000-000000000001"),
+            (NEWER, "018f0000-0000-7000-8000-000000000002"),
+            (NEWEST, "019f0000-0000-7000-8000-000000000003"),
+            // A version 4 id from before time-ordered ids, which says nothing
+            // about when it was used and so goes last.
+            (FORGOTTEN, LEGACY_HEX_ID),
+        ];
+        let tmp = TempDir::new().unwrap();
+        for (cwd, id) in SESSIONS {
+            update_cwd_index(tmp.path(), cwd, id.parse().unwrap()).unwrap();
+        }
+
+        assert_eq!(
+            super::recorded_cwds(tmp.path(), LIMIT),
+            vec![NEWEST.to_owned(), NEWER.to_owned(), OLD.to_owned()]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recorded_cwds_resolves_a_session_recorded_through_a_symlink() {
+        const PROJECT_DIR: &str = "project";
+        const LINK_NAME: &str = "link";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join("state"));
+        let root = tmp.path().join(PROJECT_DIR);
+        fs::create_dir_all(&root).unwrap();
+        let link = tmp.path().join(LINK_NAME);
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let mut session: TestSession = Session::new("m", link.to_str().unwrap());
+        session.save(&state).unwrap();
+
+        assert_eq!(
+            super::recorded_cwds(&state.path().join(SESSIONS_DIR), ALL_RECORDED),
+            vec![canonical_key(&root).to_str().unwrap().to_owned()]
+        );
     }
 
     #[test]
@@ -3296,7 +3432,7 @@ mod tests {
                 session.push_message(tool_message(&slot));
                 session.push_message(assistant_message("reply"));
             }
-            2 => session.insert_tool_output(slot, Value::from(format!("out-{step}"))),
+            2 => session.insert_tool_output(slot, Arc::new(Value::from(format!("out-{step}")))),
             3 => {
                 let len = rng.below(4) as usize;
                 let msgs = (0..len)
@@ -3496,7 +3632,7 @@ mod tests {
         let held = Arc::clone(&session);
         let live = Arc::make_mut(&mut session);
         live.push_message(assistant_message("b"));
-        live.insert_tool_output("t1".into(), Value::from("out"));
+        live.insert_tool_output("t1".into(), Arc::new(Value::from("out")));
         live.set_subagent_messages("s1".into(), vec![user_message("sub")]);
 
         log.append(&session).unwrap();

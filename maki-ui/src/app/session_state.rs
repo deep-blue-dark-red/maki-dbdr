@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use maki_config::{Effect, ModelPolicy};
 use maki_providers::provider::adjust_model;
-use maki_providers::{Model, ThinkingConfig, Timeouts, TokenUsage, settle_session};
+use maki_providers::{Model, RequestOptions, ThinkingConfig, Timeouts, TokenUsage, settle_session};
 use maki_storage::StateDir;
 use maki_storage::sessions::{StoredEffect, StoredMode, StoredRule};
 
@@ -25,11 +25,24 @@ pub(crate) struct SessionState {
     pub plan: PlanState,
     pub warnings: Vec<String>,
     pub thinking: ThinkingConfig,
+    /// What we actually bill and send.
     pub fast: bool,
+    /// A wish parked until discovery answers, so a `/fast` typed while the
+    /// model list is still loading is not thrown on the floor.
+    pub pending_fast: bool,
     pub workflow: bool,
 }
 
 const PLAN_FILE_MISSING_WARNING: &str = "Plan file was deleted \u{2014} started a new plan";
+
+/// The badge, the cost line and the request all read the same gate, so none of
+/// them can advertise a mode this model lacks, or miss one it demands. Fast
+/// comes back split into "on now" and "still waiting", which is the only place
+/// those two bits are derived.
+fn clamp(thinking: ThinkingConfig, fast: bool, model: &Model) -> (ThinkingConfig, bool, bool) {
+    let opts = RequestOptions { thinking, fast }.clamped(model);
+    (opts.thinking, opts.fast, fast && model.fast_pending())
+}
 
 impl SessionState {
     pub fn from_session(
@@ -81,21 +94,18 @@ impl SessionState {
             plan.allocate_path(storage);
         }
 
-        let fast = session.meta.fast && model.supports_fast();
+        // Saved model may differ from the live one (updated, removed, etc), so
+        // reconcile before anyone reads the toggles or prices history with them.
+        let (thinking, fast, pending_fast) =
+            clamp(session.meta.thinking.into(), session.meta.fast, &model);
         let token_usage = session.token_usage;
         let cost = settle_session(&token_usage, session.usage_by_model_mut(), &model, fast);
         let context_size = session.meta.context_size;
 
         Self {
-            // Saved model may differ from the live one (updated, removed, etc).
-            // Reconcile so the UI badge and agent always see the truth.
-            thinking: session
-                .meta
-                .thinking
-                .map(Into::into)
-                .filter(|_| model.supports_thinking())
-                .unwrap_or_default(),
+            thinking,
             fast,
+            pending_fast,
             workflow: session.meta.workflow,
             session: Arc::new(session),
             model,
@@ -112,13 +122,19 @@ impl SessionState {
         Arc::make_mut(&mut self.session)
     }
 
+    /// What the user asked for, whether or not the model can honour it yet.
+    /// This is the bit that gets persisted.
+    pub fn fast_intent(&self) -> bool {
+        self.fast || self.pending_fast
+    }
+
+    pub fn set_fast(&mut self, fast: bool) {
+        (self.thinking, self.fast, self.pending_fast) = clamp(self.thinking, fast, &self.model);
+    }
+
     pub fn update_model(&mut self, model: &Model) {
-        if !model.supports_thinking() {
-            self.thinking = ThinkingConfig::Off;
-        }
-        if !model.supports_fast() {
-            self.fast = false;
-        }
+        (self.thinking, self.fast, self.pending_fast) =
+            clamp(self.thinking, self.fast_intent(), model);
         self.session_mut().set_model(model.spec());
         self.model = model.clone();
     }
@@ -208,7 +224,8 @@ pub(crate) fn stored_to_rules(stored: &[StoredRule]) -> Vec<maki_config::Permiss
 mod tests {
     use super::*;
     use crate::components::{test_model, test_pricing};
-    use maki_providers::{FastPricing, ModelPricing};
+    use maki_providers::model::FastSupport;
+    use maki_providers::{FastPricing, ModelPricing, ThinkingSupport};
     use maki_storage::sessions::StoredThinking;
     use test_case::test_case;
 
@@ -227,6 +244,8 @@ mod tests {
     const FAST_INPUT_RATE: f64 = 6.0;
     const UNRESOLVABLE_MODEL: &str = "a-model-no-table-has-ever-heard-of";
     const FAST_FLAG_LOST: &str = "the model has fast pricing, so the flag must survive as stored";
+    const THINKING_NOT_LIFTED: &str =
+        "a model that requires thinking must not show, or send, thinking off";
 
     fn resumed(session: AppSession, model: &Model) -> SessionState {
         let tmp = tempfile::tempdir().unwrap();
@@ -285,6 +304,45 @@ mod tests {
 
         assert_eq!(state.fast, fast, "{FAST_FLAG_LOST}");
         state.cost
+    }
+
+    #[test_case(FastSupport::Pending, false, true ; "pending_preserves_saved_intent")]
+    #[test_case(FastSupport::Supported, true, false ; "supported_restores_fast")]
+    #[test_case(FastSupport::Unsupported, false, false ; "unsupported_clears_saved_intent")]
+    fn resume_fast_support(support: FastSupport, fast: bool, pending: bool) {
+        let mut session = session_with_counters();
+        session.meta.fast = true;
+        let mut model = test_model();
+        model.supports_fast_override = Some(support);
+        model.pricing.fast = Some(FastPricing {
+            input: FAST_INPUT_RATE,
+            output: test_pricing().output,
+        });
+        let state = resumed(session, &model);
+        assert_eq!((state.fast, state.pending_fast), (fast, pending));
+        assert_eq!(
+            state.cost,
+            Some(if fast { FAST_INPUT_RATE } else { LIST_PRICE })
+        );
+    }
+
+    #[test_case(FastSupport::Supported, false, true, false ; "discovery_enables_fast")]
+    #[test_case(FastSupport::Unsupported, false, false, false ; "discovery_rejects_fast")]
+    #[test_case(FastSupport::Pending, false, false, true ; "still_pending_keeps_intent")]
+    #[test_case(FastSupport::Supported, true, true, false ; "switch_keeps_pending_intent")]
+    fn pending_fast_model_update(support: FastSupport, switch: bool, fast: bool, pending: bool) {
+        let mut session = session_with_counters();
+        session.meta.fast = true;
+        let mut model = test_model();
+        model.supports_fast_override = Some(FastSupport::Pending);
+        let mut state = resumed(session, &model);
+        assert_eq!((state.fast, state.pending_fast), (false, true));
+        if switch {
+            model.id = UNRESOLVABLE_MODEL.into();
+        }
+        model.supports_fast_override = Some(support);
+        state.update_model(&model);
+        assert_eq!((state.fast, state.pending_fast), (fast, pending));
     }
 
     #[test]
@@ -357,6 +415,21 @@ mod tests {
             SessionState::from_session(session, &test_model(), &storage, &ModelPolicy::default());
         assert_eq!(state.mode, Mode::Build);
         assert!(state.plan.path().is_none());
+    }
+
+    /// The level `clamped` picks is its own business. All this layer promises
+    /// is that it asks, instead of keeping its own rule that only knew how to
+    /// turn thinking off.
+    #[test]
+    fn update_model_lifts_thinking_for_a_model_that_requires_it() {
+        let mut state = resumed(AppSession::new("test-model", "/tmp"), &test_model());
+        state.thinking = ThinkingConfig::Off;
+
+        let mut required = test_model();
+        required.thinking_override = Some(ThinkingSupport::Required);
+        state.update_model(&required);
+
+        assert_ne!(state.thinking, ThinkingConfig::Off, "{THINKING_NOT_LIFTED}");
     }
 
     #[test]

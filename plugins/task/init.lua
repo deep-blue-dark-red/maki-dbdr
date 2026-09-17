@@ -76,6 +76,9 @@ local schema = {
       type = "string",
       description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
     },
+    thinking = {
+      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
+    },
     output_schema = {
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
@@ -176,16 +179,21 @@ local function handler(input, ctx)
   end
 
   local permit = semaphore:acquire()
+  -- Declared out here so the epilogue closes it on every path: left to the
+  -- garbage collector it keeps the subagent's event relay alive on an idle VM.
+  local sess
 
-  -- pcall so a raised error cannot leak the permit.
+  -- pcall so a raised error cannot leak the permit or the session.
   local ok, out = pcall(function()
-    local sess, sess_err = maki.agent.session(ctx, {
+    local sess_err
+    sess, sess_err = maki.agent.session(ctx, {
       model_spec = model.spec,
       system = system,
       tools = tool_defs,
       local_tools = local_tools,
       audience = audience,
       name = input.description,
+      thinking = input.thinking,
     })
     if sess_err then
       return { llm_output = sess_err, is_error = true }
@@ -210,8 +218,6 @@ local function handler(input, ctx)
       end
     end
 
-    sess:close()
-
     if err then
       -- A result alongside the error means the run was cut short after
       -- streaming some text, and half a transcript beats a bare error.
@@ -233,6 +239,9 @@ local function handler(input, ctx)
     return { llm_output = captured and maki.json.encode(captured) or result.text, format = "markdown" }
   end)
 
+  if sess then
+    sess:close()
+  end
   permit:release()
   if not ok then
     error(out, 0)

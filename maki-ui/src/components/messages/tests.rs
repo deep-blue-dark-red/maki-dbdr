@@ -1,5 +1,6 @@
 use super::segment;
 use super::*;
+use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
@@ -7,10 +8,92 @@ use maki_agent::tools::{BASH_TOOL_NAME, GREP_TOOL_NAME, WRITE_TOOL_NAME};
 use maki_agent::{
     GrepFileEntry, GrepMatchGroup, SnapshotLine, SnapshotSpan, SpanStyle, ToolInput, ToolOutput,
 };
+use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
 use std::collections::HashSet;
 use std::time::Duration;
 use test_case::test_case;
+
+const UNDECODABLE_IMAGE: &str = "invalid image";
+const VIEW_WIDTH: u16 = 80;
+const VIEW_HEIGHT: u16 = 24;
+
+#[test_case(false ; "live")]
+#[test_case(true ; "loaded")]
+fn tool_images_survive_snapshot_rebuilds(loaded: bool) {
+    const TOOL_ID: &str = "image_tool";
+    const CAPTION: &str = "image caption";
+    const SAME_IMAGE: &str = "a rebuild must reuse the image, not decode it again";
+    const NO_FALLBACK_ROW: &str = "the header names the image, so an undrawable one takes no row";
+
+    let source = ImageSource::new(ImageMediaType::Png, Arc::from(UNDECODABLE_IMAGE));
+    let mut panel = panel_with_tools(&[(TOOL_ID, BASH_TOOL_NAME)]);
+    // No picker, so nothing is ever decoded and the test never touches the
+    // decode thread. What it watches is the segment keeping its image across
+    // rebuilds, without leaving anything behind in the transcript.
+    panel.image_picker = None;
+    rebuild(&mut panel);
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Image {
+            source: source.clone(),
+            text: CAPTION.into(),
+        }),
+        ..done(TOOL_ID)
+    });
+    if loaded {
+        panel.load_messages(panel.messages.clone());
+        rebuild(&mut panel);
+    }
+    panel.tool_snapshot(TOOL_ID, BufferSnapshot::plain_text(CAPTION.into()), None);
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let index = panel.cache.find_by_tool_id(TOOL_ID).unwrap();
+    let segment = panel.cache.get(index).unwrap();
+    assert_eq!(segment.images.len(), 1);
+    assert!(
+        Arc::ptr_eq(&segment.images[0].source().data, &source.data),
+        "{SAME_IMAGE}"
+    );
+    assert_eq!(
+        image_fallback(segment, &terminal),
+        (0, false),
+        "{NO_FALLBACK_ROW}"
+    );
+}
+
+#[test]
+fn pasted_image_falls_back_to_text() {
+    const PROMPT: &str = "what is in this picture";
+    const FALLBACK_ROW: &str = "nothing else names this image, so it must announce itself";
+
+    let mut panel = panel_with_tools(&[]);
+    panel.image_picker = None;
+    panel.push(DisplayMessage::with_images(
+        DisplayRole::User,
+        PROMPT.into(),
+        vec![ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(UNDECODABLE_IMAGE),
+        )],
+    ));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let segment = panel.cache.get(0).unwrap();
+    assert_eq!(
+        image_fallback(segment, &terminal),
+        (1, true),
+        "{FALLBACK_ROW}"
+    );
+}
+
+/// Rows the image adds on top of the text, and whether the `[image]` line made
+/// it to the screen. The same fallback feeds both, so they have to agree. The
+/// panel lays text out one column short of the terminal, the scrollbar owns it.
+fn image_fallback(segment: &Segment, terminal: &ratatui::Terminal<TestBackend>) -> (u16, bool) {
+    let width = terminal.backend().buffer().area.width - 1;
+    (
+        segment.height(width) - segment.text_height(width),
+        buffer_text(terminal).contains(IMAGE_PLACEHOLDER),
+    )
+}
 
 fn snap_line(text: &str) -> SnapshotLine {
     SnapshotLine {
@@ -46,7 +129,7 @@ fn done(id: &str) -> ToolDoneEvent {
     ToolDoneEvent {
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -80,7 +163,7 @@ fn tool_done_updates_start_status(is_error: bool, expected: ToolStatus) {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error,
         annotation: None,
         written_path: None,
@@ -109,7 +192,7 @@ fn tool_done_sets_annotation(tool: &'static str, output: ToolOutput, expected: O
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: tool.into(),
-        output,
+        output: Arc::new(output),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -127,7 +210,7 @@ fn tool_done_annotation_merge(output: &str, expected: Option<&str>) {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(output.into()),
+        output: Arc::new(ToolOutput::Plain(output.into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -153,7 +236,7 @@ fn tool_done_grep_shows_matches() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
-        output: grep_output(2),
+        output: Arc::new(grep_output(2)),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -217,7 +300,7 @@ fn render_sel(
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal
         .draw(|f| {
-            panel.view(f, f.area(), has_selection);
+            panel.view(f, f.area(), has_selection, true);
         })
         .unwrap();
     terminal
@@ -255,7 +338,7 @@ fn unknown_tool_id_is_noop() {
     panel.tool_done(ToolDoneEvent {
         id: "orphan".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -284,7 +367,7 @@ fn in_progress_tracking() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("ok".into()),
+        output: Arc::new(ToolOutput::Plain("ok".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -294,7 +377,7 @@ fn in_progress_tracking() {
     panel.tool_done(ToolDoneEvent {
         id: "t2".into(),
         tool: "read".into(),
-        output: ToolOutput::Plain("ok".into()),
+        output: Arc::new(ToolOutput::Plain("ok".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -361,7 +444,7 @@ fn events_before_cache_built_render_correctly() {
     panel.tool_done(ToolDoneEvent {
         id: "t2".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("result".into()),
+        output: Arc::new(ToolOutput::Plain("result".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -400,7 +483,7 @@ fn bash_live_output_with_code_input() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("done".into()),
+        output: Arc::new(ToolOutput::Plain("done".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -417,7 +500,7 @@ fn cancel_in_progress_marks_pending_as_error(cache_built: bool) {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("ok".into()),
+        output: Arc::new(ToolOutput::Plain("ok".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -507,13 +590,13 @@ fn tick_drains_the_highlight_worker() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: ToolOutput::ReadCode {
+        output: Arc::new(ToolOutput::ReadCode {
             path: "file.rs".into(),
             start_line: 1,
             lines: vec![HIGHLIGHTED_CODE.into()],
             total_lines: 1,
             instructions: None,
-        },
+        }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -557,7 +640,7 @@ fn tool_done_after_cancel_in_progress_does_not_underflow() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "bash".into(),
-        output: ToolOutput::Plain("late".into()),
+        output: Arc::new(ToolOutput::Plain("late".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -586,14 +669,13 @@ fn selection_freezes_viewport_during_auto_scroll() {
 }
 
 fn seg_search(panel: &MessagesPanel, tool_id: &str) -> String {
-    panel
+    let idx = panel
         .cache
         .segments()
         .iter()
-        .find(|s| s.tool_id.as_deref() == Some(tool_id))
-        .unwrap()
-        .search_text
-        .clone()
+        .position(|s| s.tool_id.as_deref() == Some(tool_id))
+        .unwrap();
+    panel.segment_search_texts().swap_remove(idx)
 }
 
 #[test]
@@ -603,7 +685,7 @@ fn search_text_grep_result_includes_structured_output() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "grep".into(),
-        output: grep_output(2),
+        output: Arc::new(grep_output(2)),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -620,12 +702,12 @@ fn search_text_diff_output_includes_hunks() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "edit".into(),
-        output: ToolOutput::Diff {
+        output: Arc::new(ToolOutput::Diff {
             path: "src/main.rs".into(),
             before: "old\n".into(),
             after: "new\n".into(),
             summary: "1 edit".into(),
-        },
+        }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -642,7 +724,7 @@ fn search_text_bash_with_code_input() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("hello".into()),
+        output: Arc::new(ToolOutput::Plain("hello".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -650,6 +732,42 @@ fn search_text_bash_with_code_input() {
     rebuild(&mut panel);
     let text = seg_search(&panel, "t1");
     assert!(text.contains("echo hello") && text.contains("hello"));
+}
+
+/// The instruction segment is a corpus row no message owns: it is reached only
+/// by stripping the `__inst` suffix back to a parent and re-reading that
+/// parent's blocks. A wrong lookup misaligns the index `SearchAction::Select`
+/// hands to `scroll_to_segment`, which scrolls somewhere else instead of failing.
+#[test]
+fn search_text_instruction_segment_indexes_its_own_blocks() {
+    const PATH: &str = "agents.md";
+    const BODY: &str = "follow style guide";
+
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", "read"));
+    panel.tool_done(ToolDoneEvent {
+        id: "t1".into(),
+        tool: "read".into(),
+        output: Arc::new(read_code_with_instructions(vec![InstructionBlock {
+            path: PATH.into(),
+            content: BODY.into(),
+        }])),
+        is_error: false,
+        annotation: None,
+        written_path: None,
+    });
+    rebuild(&mut panel);
+
+    let text = seg_search(&panel, &segment::instruction_id("t1"));
+    assert!(
+        text.starts_with(&format!("load> {PATH}")),
+        "the instruction segment searches under its own header, got: {text}"
+    );
+    assert!(text.contains(BODY), "got: {text}");
+    assert!(
+        !seg_search(&panel, "t1").contains(BODY),
+        "the parent tool renders the code, not the instructions it carried"
+    );
 }
 
 #[test]
@@ -936,7 +1054,7 @@ fn panel_with_long_tool(line_count: usize) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(body.into()),
+        output: Arc::new(ToolOutput::Plain(body.into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1021,7 +1139,7 @@ fn panel_with_grep_tool(match_count: usize) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: GREP_TOOL_NAME.into(),
-        output: ToolOutput::GrepResult { entries },
+        output: Arc::new(ToolOutput::GrepResult { entries }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1092,7 +1210,7 @@ fn search_text_includes_truncated_bash_output() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain(full_output.clone().into()),
+        output: Arc::new(ToolOutput::Plain(full_output.clone().into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1130,7 +1248,7 @@ fn instruction_segment_has_spacer_before_it() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: read_code_with_instructions(instruction_blocks()),
+        output: Arc::new(read_code_with_instructions(instruction_blocks())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1163,7 +1281,7 @@ fn toggle_instruction_segment_expands_and_collapses() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: read_code_with_instructions(blocks),
+        output: Arc::new(read_code_with_instructions(blocks)),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1195,7 +1313,7 @@ fn handle_click_on_done_tool_records_click_row() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1256,7 +1374,7 @@ fn tool_done_removes_live_buf_and_snapshots_dirty() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1510,6 +1628,31 @@ fn rebake_request_stops_watching_buf() {
     assert_eq!(probe.try_recv(), None);
 }
 
+const REBAKE_TASK_ID: &str = "toolu_sub";
+
+/// A rebake replays one call for its colors. The plugin behind it only sees
+/// the item, so the item has to say which chat it is and that nothing but
+/// the buf is wanted, or a stateful tool (the todo panel) would treat a
+/// years-old call as news from the main chat.
+#[test]
+fn rebake_stamps_the_chat_and_asks_for_a_rerender() {
+    let (eh, probe) = maki_lua::test_support::probed_event_handle();
+    let session_id = MakiId::generate();
+    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
+    panel.set_chat(session_id, Some(Arc::from(REBAKE_TASK_ID)));
+    panel.set_restore_channel(Some(test_event_sender()));
+    finish_with_live_buf(&mut panel, "t1", "old-theme", false);
+
+    panel.rebake_stale_snapshots(panel.snapshot_gen_of("t1").unwrap() + 1);
+
+    let item = probe
+        .try_recv_restore_item()
+        .expect("rebake requests a restore");
+    assert_eq!(item.session_id.map(|s| s.id()), Some(session_id));
+    assert_eq!(item.task_id.as_deref(), Some(REBAKE_TASK_ID));
+    assert_eq!(item.reason, maki_lua::RestoreReason::Rerender);
+}
+
 #[test]
 fn live_buf_streams_across_clean_polls() {
     let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -1541,7 +1684,7 @@ fn tool_done_without_live_buf_preserves_existing_snapshot() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1564,7 +1707,7 @@ fn tool_done_clean_live_buf_does_not_snapshot() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1590,7 +1733,7 @@ fn bash_tool_with_snapshot(id: &str) -> MessagesPanel {
     panel.tool_done(ToolDoneEvent {
         id: id.into(),
         tool: BASH_TOOL_NAME.into(),
-        output: ToolOutput::Plain("output".into()),
+        output: Arc::new(ToolOutput::Plain("output".into())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -1972,7 +2115,7 @@ fn user_turn_numbers_count_every_user_message() {
 #[test]
 fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
     let long_line = Line::from("x".repeat(80));
-    let mut seg = Segment::with_lines(vec![long_line.clone()], "test".into(), None);
+    let mut seg = Segment::with_lines(vec![long_line.clone()], None);
 
     let h_wide = seg.height(80);
     assert_eq!(h_wide, 1, "80 chars at width 80 fits on one line");
@@ -1996,6 +2139,9 @@ fn stale_height_keeps_the_old_width_but_drawn_height_does_not() {
     assert_eq!(seg.height(40), 2, "80 chars at width 40 wraps to two lines");
 }
 
+/// The copy path sizes its buffer from `height` and then re-wraps the lines
+/// itself, so a height left over from the old width used to clip every off
+/// screen line it copied.
 #[test]
 fn copy_after_resize_keeps_offscreen_text() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -2141,7 +2287,7 @@ fn resize_reflows_tool_segment_and_keeps_instruction_segment() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: read_code_with_instructions(instruction_blocks()),
+        output: Arc::new(read_code_with_instructions(instruction_blocks())),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -2281,13 +2427,13 @@ fn theme_switch_repaints_highlighted_code() {
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
         tool: "read".into(),
-        output: ToolOutput::ReadCode {
+        output: Arc::new(ToolOutput::ReadCode {
             path: "file.rs".into(),
             start_line: 1,
             lines: vec![THEME_CODE.into()],
             total_lines: 1,
             instructions: None,
-        },
+        }),
         is_error: false,
         annotation: None,
         written_path: None,
@@ -2306,4 +2452,73 @@ fn theme_switch_repaints_highlighted_code() {
         code_span_styles(&panel, "t1"),
         "a theme switch must re-highlight, not splice old-palette lines back"
     );
+}
+
+const FIRST_TEXT: &str = "run the migration";
+const FOLLOW_UP_TEXT: &str = "and then deploy";
+const STALE_BUBBLE_MSG: &str = "the superseded bubble must disappear from the viewport";
+const UNTOUCHED_MSG: &str = "a rejected replace must leave the transcript untouched";
+
+fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+    let buf = terminal.backend().buffer();
+    for y in 0..buf.area.height {
+        let row: String = (0..buf.area.width)
+            .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+            .collect();
+        if let Some(col) = row.find(text) {
+            return buf.cell((col as u16, y)).unwrap().style();
+        }
+    }
+    panic!("{text} was never rendered");
+}
+
+/// `Chat::mark_finished` corrects a bubble long after it was drawn, with the
+/// transcript still growing in between. Unless `replace` throws the baked
+/// segments away, the viewport keeps painting a green "Done!" the message
+/// vector no longer holds.
+#[test]
+fn replace_repaints_the_corrected_bubble_in_place() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::User, FIRST_TEXT.into()));
+    let bubble = panel.push(DisplayMessage::new(DisplayRole::Done, DONE_TEXT.into()));
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        FOLLOW_UP_TEXT.into(),
+    ));
+    let done_style = style_of(&render(&mut panel, 80, 24), DONE_TEXT);
+
+    panel.replace(
+        bubble,
+        DisplayMessage::new(DisplayRole::Error, ERROR_TEXT.into()),
+    );
+
+    let rendered = render(&mut panel, 80, 24);
+    let text = buffer_text(&rendered);
+    let texts: Vec<&str> = panel.messages.iter().map(|m| m.text.as_str()).collect();
+    assert_eq!(texts, [FIRST_TEXT, ERROR_TEXT, FOLLOW_UP_TEXT]);
+    assert!(text.contains(ERROR_TEXT), "got: {text}");
+    assert!(text.contains(FOLLOW_UP_TEXT), "got: {text}");
+    assert!(!text.contains(DONE_TEXT), "{STALE_BUBBLE_MSG}: {text}");
+    assert_ne!(
+        style_of(&rendered, ERROR_TEXT),
+        done_style,
+        "the corrected bubble kept the success styling"
+    );
+}
+
+#[test]
+fn replace_past_the_end_is_a_noop() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(DisplayRole::Done, DONE_TEXT.into()));
+    rebuild(&mut panel);
+
+    panel.replace(
+        panel.message_count(),
+        DisplayMessage::new(DisplayRole::Error, ERROR_TEXT.into()),
+    );
+
+    assert_eq!(panel.message_count(), 1, "{UNTOUCHED_MSG}");
+    let text = buffer_text(&render(&mut panel, 80, 10));
+    assert!(text.contains(DONE_TEXT), "{UNTOUCHED_MSG}: {text}");
+    assert!(!text.contains(ERROR_TEXT), "{UNTOUCHED_MSG}: {text}");
 }

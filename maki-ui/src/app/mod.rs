@@ -40,6 +40,7 @@ use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
 use crate::components::plan_form::{PlanForm, PlanFormAction};
 use crate::components::plugins_modal::{PluginsAction, PluginsModal};
@@ -56,18 +57,21 @@ use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
 };
 use crate::image;
+use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
-use maki_agent::permissions::PermissionManager;
+use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
 };
+use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
+    PackCommand, PackPreparation, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
 use maki_storage::StateDir;
@@ -101,12 +105,17 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
-const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
+const FAST_PENDING_MSG: &str = "Fast mode: pending model discovery";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
+pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+const TRUSTED_PREFIX: &str = "Trusted this folder: ";
+const PACK_CHANGES_DECLINED: &str = "Package changes declined";
+const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
 /// Idle time after which a prompt cache is likely evicted by the provider.
@@ -114,6 +123,10 @@ const CACHE_MISS_IDLE: Duration = Duration::from_secs(300);
 
 const MISSING_TOOL_COMPLETION: &str = "Tool did not report completion before the turn ended";
 const NOTIFICATION_PREVIEW_CHARS: usize = 200;
+/// An API error carries the provider's raw response body, sometimes a whole
+/// HTML page from a broken proxy, and the bubble stays for the rest of the
+/// session. Well above any real error message, small enough to not drown chat.
+const ERROR_BUBBLE_MAX_CHARS: usize = 2_000;
 
 /// Depth budget for `maki.api.run_command` chains. Aliases nest a level or two
 /// in practice; the cap only exists so a command aliasing itself reports an
@@ -177,6 +190,13 @@ fn normalize_preview(text: &str) -> Option<String> {
     notification_preview(std::iter::once(text))
 }
 
+fn cap_error_text(message: &str) -> String {
+    match message.char_indices().nth(ERROR_BUBBLE_MAX_CHARS) {
+        Some((end, _)) => format!("{}{TRUNCATION_PREFIX}", &message[..end]),
+        None => message.to_owned(),
+    }
+}
+
 pub(crate) fn turn_response(message: &Message) -> Option<String> {
     if message.has_tool_calls() {
         return None;
@@ -226,6 +246,7 @@ pub struct App {
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
+    pub(super) pack_review: PackReview,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
     pub(super) settings_picker: SettingsPicker,
@@ -237,7 +258,6 @@ pub struct App {
     pub(crate) queue: MessageQueue,
     recoverable_queue: Vec<String>,
     pub answer_tx: Option<flume::Sender<String>>,
-    pub(crate) cmd_tx: Option<flume::Sender<super::AgentCommand>>,
     pub(super) pending_input: PendingInput,
     pub(crate) run_id: u64,
     pub(super) retry_info: Option<RetryInfo>,
@@ -280,6 +300,11 @@ pub struct App {
     last_turn_at: Option<Instant>,
 
     pub(crate) storage: StateDir,
+    /// The folder trust question this run was started with, `None` when the
+    /// folder is trusted or has nothing to ask about. Frozen at startup on
+    /// purpose: a kind the project adds mid-session is not something the user
+    /// was shown, so `/trust` must not cover it and the next start asks.
+    pub(crate) trust_question: Option<TrustQuestion>,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
@@ -294,6 +319,10 @@ pub struct App {
     pub(crate) permissions: Arc<PermissionManager>,
     pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
+    /// The spec Lua was last told about. Seeded with the live model rather
+    /// than the session's stored one: a restored session may name another
+    /// model, and the event loop swaps the live one in on the first tick.
+    announced_model_spec: String,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
@@ -333,6 +362,8 @@ impl App {
         );
         let mut app = Self {
             chats: vec![Chat::new(
+                state.session.id,
+                None,
                 "Main".into(),
                 ui_config.clone(),
                 lua_event_handle.clone(),
@@ -360,6 +391,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
+            pack_review: PackReview::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
             settings_picker: SettingsPicker::new(),
@@ -371,7 +403,6 @@ impl App {
             queue: MessageQueue::default(),
             recoverable_queue: Vec::new(),
             answer_tx: None,
-            cmd_tx: None,
             pending_input: PendingInput::None,
             run_id: 0,
             retry_info: None,
@@ -391,6 +422,7 @@ impl App {
             last_seen_output_tokens: 0,
             last_turn_at: None,
             storage,
+            trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
@@ -405,6 +437,7 @@ impl App {
             permissions,
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
+            announced_model_spec: model.spec(),
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
@@ -424,6 +457,10 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
+        // The manager arrives forked from the prototype the process was
+        // started with, so a tab that resumes or spawns blank runs on
+        // `--yolo` until its own meta is read back here.
+        app.apply_stored_permissions(&app.state.session.meta);
         *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.to_string());
         *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(app.state.session.title.clone());
         app
@@ -446,22 +483,45 @@ impl App {
         persist_model(&self.storage, &self.state.session.model);
     }
 
-    /// Takes the spelling both `/thinking` and `maki.model.set` accept; a
-    /// blank {input} toggles.
+    /// One diff per frame covers every way a model can change (the picker,
+    /// `/model`, `maki.model.set`, the provider fallback, loading another
+    /// session, which swaps `state` wholesale), so no path has to remember to
+    /// speak up. The spec alone decides: the background catalog fetch
+    /// re-stores the running model once it learns its context window, and a
+    /// hint has nothing new to draw for that.
+    pub(crate) fn emit_model_change(&mut self) {
+        let spec = self.state.model.spec();
+        if spec == self.announced_model_spec {
+            return;
+        }
+        let previous_spec = std::mem::replace(&mut self.announced_model_spec, spec);
+        self.fire_session_autocmd(
+            "ModelChanged",
+            serde_json::json!({ "model": self.model_state(), "previous_spec": previous_spec }),
+        );
+    }
+
+    /// Takes the spelling `maki.model.set` accepts, which is what the
+    /// `/thinking` plugin passes through. A blank {input} toggles.
+    ///
+    /// Stores the clamped value rather than the typed one, so the status bar
+    /// can never read `off` on a model that is really sending minimal effort.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
-        self.state.thinking =
-            ThinkingConfig::parse(input.trim(), self.state.thinking).map_err(str::to_owned)?;
+        self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
+            .map_err(str::to_owned)?
+            .clamped(&self.state.model);
         Ok(self.state.thinking)
     }
 
     pub(crate) fn set_fast(&mut self, fast: bool) -> Result<(), String> {
-        if fast && !self.state.model.supports_fast() {
+        let model = &self.state.model;
+        if fast && !model.supports_fast() && !model.fast_pending() {
             return Err(FAST_UNSUPPORTED_MSG.into());
         }
-        self.state.fast = fast;
+        self.state.set_fast(fast);
         Ok(())
     }
 
@@ -473,6 +533,7 @@ impl App {
             "id": model.id,
             "provider": model.provider.to_string(),
             "thinking": self.state.thinking.to_string(),
+            "thinking_options": model.thinking_options(),
             "fast": self.state.fast,
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
@@ -750,14 +811,28 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        // With both up the permission prompt goes first: a tool is blocked on
+        // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
             if let Some(answer) = self.permission_prompt.handle_key(key) {
                 let subagent_id = self.permission_prompt.subagent_id().map(str::to_owned);
-                let encoded = answer.encode();
+                let request_id = self.permission_prompt.request_id().unwrap_or_default();
+                let encoded = TaggedAnswer::new(request_id, answer).encode();
                 self.permission_prompt.close();
                 self.send_to_agent(subagent_id.as_deref(), encoded);
             }
             return Some(vec![]);
+        }
+
+        if self.pack_review.is_open() {
+            return Some(match self.pack_review.handle_key(key) {
+                Some(PackReviewAction::Accept(plan)) => self.quit_with(ExitRequest::Pack(plan)),
+                Some(PackReviewAction::Decline) => {
+                    self.flash(PACK_CHANGES_DECLINED.to_owned());
+                    Vec::new()
+                }
+                None => Vec::new(),
+            });
         }
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
@@ -892,12 +967,7 @@ impl App {
 
         if self.search_modal.is_open() {
             match self.search_modal.handle_key(key) {
-                SearchAction::Consumed => {
-                    let chat = &mut self.chats[self.active_chat];
-                    let texts = chat.segment_search_texts();
-                    self.search_modal.update_matches(&texts);
-                    sync_search_highlight(&self.search_modal, chat);
-                }
+                SearchAction::Consumed => self.refresh_search_matches(),
                 SearchAction::Navigate => {
                     sync_search_highlight(&self.search_modal, &mut self.chats[self.active_chat]);
                 }
@@ -1126,9 +1196,9 @@ impl App {
                 self.file_picker.open(&self.state.session.cwd);
             }
             BuiltinAction::Search => {
-                let top = self.chats[self.active_chat].scroll_top();
-                let auto = self.chats[self.active_chat].auto_scroll();
-                self.search_modal.open(top, auto);
+                let chat = &self.chats[self.active_chat];
+                self.search_modal
+                    .open(chat.scroll_top(), chat.auto_scroll());
             }
             BuiltinAction::Help => self.help_modal.toggle(),
             BuiltinAction::PlanToggle => {
@@ -1180,6 +1250,17 @@ impl App {
 
         if let Some(actions) = self.handle_ctrl(key) {
             return actions;
+        }
+
+        if key::SCROLL_PAGE_UP.matches(key) {
+            let page = self.chats[self.active_chat].page();
+            self.active_chat().scroll(page);
+            return vec![];
+        }
+        if key::SCROLL_PAGE_DOWN.matches(key) {
+            let page = self.chats[self.active_chat].page();
+            self.active_chat().scroll(-page);
+            return vec![];
         }
 
         if !self.is_main_chat() {
@@ -1354,6 +1435,22 @@ impl App {
         self.quit_with(ExitRequest::Success)
     }
 
+    /// `maki trust` lives outside the TUI, so without this a "not now" or a
+    /// `.maki/` created mid-session is unrecoverable without quitting.
+    fn trust_folder(&mut self) -> Vec<Action> {
+        let Some(question) = self.trust_question.clone() else {
+            self.flash(NOTHING_TO_TRUST_MSG.into());
+            return Vec::new();
+        };
+        if let Err(error) = project::grant(&self.storage, &question) {
+            self.flash(error);
+            return Vec::new();
+        }
+        let covered: Vec<String> = question.present.iter().map(GatedFile::to_string).collect();
+        self.flash(format!("{TRUSTED_PREFIX}{}", covered.join(", ")));
+        self.quit_with(ExitRequest::Reload)
+    }
+
     fn quit_with(&mut self, req: ExitRequest) -> Vec<Action> {
         self.save_input_history();
         self.flush_turn_stats();
@@ -1443,7 +1540,7 @@ impl App {
             let id = self.shell.reserve_id();
             let sigil = if prefix.visible { "!" } else { "!!" };
             let display = format!("{sigil} {}", prefix.command);
-            self.main_chat().show_user_message(display);
+            self.main_chat().show_user_message(display, Vec::new());
             return vec![Action::ShellCommand {
                 id,
                 command: prefix.command,
@@ -1630,9 +1727,8 @@ impl App {
                 .session_mut()
                 .add_model_usage(&tc.model, tc.usage.billed(tc.cost));
             let ctx_size = tc.context_size.unwrap_or_else(|| tc.usage.context_tokens());
-            self.chats[chat_idx].context_size = ctx_size;
+            self.set_context_size(chat_idx, ctx_size);
             if chat_idx == 0 {
-                self.state.context_size = ctx_size;
                 // `TurnComplete` fires once per internal continuation round
                 // (tool calls make the agent auto-continue), not once per
                 // user-facing turn. `round_start` measures just this round
@@ -1779,6 +1875,17 @@ impl App {
             return vec![];
         }
 
+        // Compaction is the one thing that lowers the context size with no turn
+        // behind it. The number is stored in the session meta and seeds the
+        // next run's gauge, so left stale a session compacted just before exit
+        // gets compacted again on resume.
+        if let AgentEvent::CompactionDone {
+            context_size_after, ..
+        } = envelope.event
+        {
+            self.set_context_size(chat_idx, context_size_after);
+        }
+
         let plan_path = if self.state.mode == Mode::Plan {
             self.state.plan.path()
         } else {
@@ -1786,16 +1893,17 @@ impl App {
         };
         let result = self.chats[chat_idx].handle_event(envelope.event, plan_path);
 
-        if let ChatEventResult::QueueItemConsumed { text, image_count } = result {
+        if let ChatEventResult::QueueItemConsumed { text, images } = result {
             if chat_idx == 0 {
-                self.on_queue_item_consumed(&text, image_count);
+                self.on_queue_item_consumed(text, images);
             }
             return vec![];
         }
 
         if let ChatEventResult::PermissionRequest { id, tool, scopes } = result {
+            let project_trusted = self.permissions.project_is_trusted();
             self.permission_prompt
-                .open(id, tool, scopes, subagent_id.clone());
+                .open(id, tool, scopes, subagent_id.clone(), project_trusted);
             return vec![];
         }
 
@@ -1834,6 +1942,10 @@ impl App {
                 ChatEventResult::Error(message) => {
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
+                    self.main_chat().push(DisplayMessage::new(
+                        DisplayRole::Error,
+                        cap_error_text(&message),
+                    ));
                     self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
@@ -1857,6 +1969,15 @@ impl App {
         vec![]
     }
 
+    /// Chat 0 is the session itself, and its size is the one stored in the
+    /// session meta.
+    fn set_context_size(&mut self, chat_idx: usize, size: u32) {
+        self.chats[chat_idx].context_size = size;
+        if chat_idx == 0 {
+            self.state.context_size = size;
+        }
+    }
+
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
         let id = &subagent.parent_tool_use_id;
         if let Some(&idx) = self.chat_index.get(id.as_str()) {
@@ -1871,14 +1992,16 @@ impl App {
         if let Some(ref model) = subagent.model {
             self.chats[0].update_tool_model(id, model);
         }
-        let mut chat = Chat::subagent(
-            id,
+        let mut chat = Chat::new(
+            self.state.session.id,
+            Some(id),
             subagent.name.clone(),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
         );
         chat.set_restore_channel(self.restore_event_tx.clone());
         chat.model_id = subagent.model.clone();
+        chat.opts = subagent.opts;
         if let Some(ref prompt) = subagent.prompt {
             chat.push_user_message(prompt);
         }
@@ -1917,6 +2040,7 @@ impl App {
             ParsedCommand {
                 name: resolved,
                 args: args.trim().to_string(),
+                bang: false,
             },
             depth,
         ))
@@ -1929,13 +2053,14 @@ impl App {
         // Lua and must leave whatever the user is halfway through writing.
         match cmd.name.as_str() {
             "/compact" => {
+                let instructions = (!cmd.args.is_empty()).then(|| cmd.args.clone());
                 if self.status == Status::Streaming {
-                    self.queue_compact();
+                    self.queue_compact(instructions);
                     return vec![];
                 }
                 self.status = Status::Streaming;
                 self.start_turn_timer();
-                vec![Action::Compact]
+                vec![Action::Compact(instructions)]
             }
             "/checkpoint" => {
                 if self.status == Status::Streaming {
@@ -2030,17 +2155,18 @@ impl App {
                 self.flash(msg.into());
                 vec![]
             }
-            "/thinking" => {
-                match self.set_thinking(&cmd.args) {
-                    Ok(thinking) => self.flash(format!("Thinking: {thinking}")),
-                    Err(msg) => self.flash(msg),
-                }
-                vec![]
-            }
             "/fast" => {
-                let fast = !self.state.fast;
-                match self.set_fast(fast) {
-                    Ok(()) => self.flash(if fast { FAST_ON_MSG } else { FAST_OFF_MSG }.into()),
+                match self.set_fast(!self.state.fast_intent()) {
+                    Ok(()) => self.flash(
+                        if self.state.pending_fast {
+                            FAST_PENDING_MSG
+                        } else if self.state.fast {
+                            FAST_ON_MSG
+                        } else {
+                            FAST_OFF_MSG
+                        }
+                        .into(),
+                    ),
                     Err(msg) => self.flash(msg),
                 }
                 vec![]
@@ -2081,7 +2207,22 @@ impl App {
                 self.reload_config();
                 vec![]
             }
-            "/rename" if cmd.args.trim().is_empty() => self.start_rename(),
+            // Typing `/trust` is the consent, exactly like `maki trust add
+            // --yes`, so there is no second question to ask here.
+            "/trust" => self.trust_folder(),
+            name @ ("/packupdate" | "/packdel") => {
+                if depth > 0 {
+                    self.flash(format!("{name}{PACK_USER_ONLY_SUFFIX}"));
+                    return vec![];
+                }
+                match PackCommand::parse(name, &cmd.args, cmd.bang) {
+                    Ok(command) => vec![Action::PreparePack(command)],
+                    Err(message) => {
+                        self.flash(message);
+                        vec![]
+                    }
+                }
+            }
             name if name.starts_with("/project:") || name.starts_with("/user:") => {
                 self.execute_custom_command(name, &cmd.args)
             }
@@ -2106,6 +2247,20 @@ impl App {
             args,
             depth,
         );
+    }
+
+    pub(crate) fn handle_pack_preparation(&mut self, preparation: PackPreparation) -> Vec<Action> {
+        match preparation {
+            PackPreparation::Complete(report) => {
+                self.flash(report.message());
+                Vec::new()
+            }
+            PackPreparation::Ready(plan) => self.quit_with(ExitRequest::Pack(plan)),
+            PackPreparation::Review { prompt, plan } => {
+                self.pack_review.open(prompt, plan);
+                Vec::new()
+            }
+        }
     }
 
     fn execute_mcp_prompt(&mut self, name: &str, args: &str) -> Vec<Action> {
@@ -2212,7 +2367,7 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 18] {
+    fn overlays(&self) -> [&dyn Overlay; 19] {
         [
             &self.help_modal,
             &self.export_picker,
@@ -2231,11 +2386,12 @@ impl App {
             &self.settings_picker,
             &self.login_picker,
             &self.mcp_picker,
+            &self.pack_review,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 18] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 19] {
         [
             &mut self.help_modal,
             &mut self.export_picker,
@@ -2254,6 +2410,7 @@ impl App {
             &mut self.settings_picker,
             &mut self.login_picker,
             &mut self.mcp_picker,
+            &mut self.pack_review,
             &mut self.permission_prompt,
         ]
     }
@@ -2296,6 +2453,17 @@ impl App {
 
     pub fn has_modal_overlay(&self) -> bool {
         self.overlays().iter().any(|o| o.is_open() && o.is_modal())
+    }
+
+    /// Derived fresh every time rather than snapshotted on open: output can
+    /// land behind the modal, and a `!` shell command streams into a segment
+    /// that already existed without ever setting [`Status::Streaming`]. The
+    /// copy is cheaper than the match pass that follows it over the same bytes.
+    fn refresh_search_matches(&mut self) {
+        let chat = &mut self.chats[self.active_chat];
+        self.search_modal
+            .update_matches(|| chat.segment_search_texts());
+        sync_search_highlight(&self.search_modal, chat);
     }
 
     pub fn close_all_overlays(&mut self) {
@@ -2395,10 +2563,7 @@ impl App {
         }
         if self.search_modal.is_open() {
             self.search_modal.handle_paste(text);
-            let chat = &mut self.chats[self.active_chat];
-            let texts = chat.segment_search_texts();
-            self.search_modal.update_matches(&texts);
-            sync_search_highlight(&self.search_modal, chat);
+            self.refresh_search_matches();
             return;
         }
         macro_rules! try_picker {
@@ -2499,12 +2664,4 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
         chat.scroll_to_segment(i);
     }
     chat.set_highlight_segment(idx);
-}
-
-fn format_with_images(text: &str, image_count: usize) -> String {
-    match image_count {
-        0 => text.to_string(),
-        1 => format!("{text} [1 image]"),
-        n => format!("{text} [{n} images]"),
-    }
 }

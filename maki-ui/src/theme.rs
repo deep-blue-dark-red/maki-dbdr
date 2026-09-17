@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use arc_swap::{ArcSwap, Guard};
+use maki_agent::SpanColor;
+use maki_highlight::SegmentColor;
 use maki_storage::StateDir;
 use ratatui::style::{Color, Modifier, Style};
 use serde::Deserialize;
@@ -12,6 +14,7 @@ use syntect::highlighting::{
 };
 
 const DEFAULT_THEME: &str = "dracula";
+const THEMES_DIR: &str = "themes";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
@@ -369,7 +372,9 @@ pub(crate) fn test_read_lock() -> std::sync::RwLockReadGuard<'static, ()> {
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
-    if let Some(path) = user_themes_dir().map(|d| d.join(format!("{name}.toml")))
+    if let Some(path) = user_themes_dirs()
+        .map(|dir| dir.join(format!("{name}.toml")))
+        .find(|path| path.is_file())
         && let Ok(toml) = std::fs::read_to_string(&path)
     {
         return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
@@ -381,16 +386,15 @@ pub fn load_by_name(name: &str) -> Result<Theme, String> {
         .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
 }
 
-fn user_themes_dir() -> Option<PathBuf> {
-    maki_storage::paths::config_dir()
-        .ok()
-        .map(|d| d.join("themes"))
+fn user_themes_dirs() -> impl Iterator<Item = PathBuf> {
+    maki_storage::paths::config_search_dirs()
+        .into_iter()
+        .map(|dir| dir.join(THEMES_DIR))
 }
 
 pub fn all_theme_names() -> Vec<String> {
-    let user_names = user_themes_dir()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .into_iter()
+    let user_names = user_themes_dirs()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .flatten()
         .filter_map(|e| {
@@ -445,6 +449,7 @@ pub fn style_by_name(name: &str) -> Style {
         "tool_error" => t.tool_error,
         "tool_annotation" => t.tool_annotation,
         "spinner" => t.spinner,
+        "thinking" => t.thinking,
         "error" => t.error,
         "bold" => t.bold,
         "italic" => t.italic,
@@ -461,6 +466,11 @@ pub fn style_by_name(name: &str) -> Style {
         "line_nr" | "index_line_nr" => t.index_line_nr,
         "diff_old" => t.diff_old,
         "diff_new" => t.diff_new,
+        "diff_old_sign" => t.diff_old_sign,
+        "diff_new_sign" => t.diff_new_sign,
+        "diff_line_nr" => t.diff_line_nr,
+        "diff_old_line_nr" => t.diff_old_line_nr,
+        "diff_new_line_nr" => t.diff_new_line_nr,
         "item" => t.item,
         "item_desc" => t.item_desc,
         "item_selected" | "selected" => t.item_selected,
@@ -514,9 +524,13 @@ pub struct Theme {
     pub table_border: Style,
     pub diff_old: Style,
     pub diff_new: Style,
+    pub diff_old_sign: Style,
+    pub diff_new_sign: Style,
     pub diff_old_emphasis: Style,
     pub diff_new_emphasis: Style,
     pub diff_line_nr: Style,
+    pub diff_old_line_nr: Style,
+    pub diff_new_line_nr: Style,
     pub todo_completed: Style,
     pub todo_in_progress: Style,
     pub todo_pending: Style,
@@ -573,38 +587,103 @@ fn helix_to_textmate_scope(key: &str) -> &str {
     key
 }
 
-fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
-    let hex = s.strip_prefix('#')?;
-    if hex.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-    Some((r, g, b))
+fn parse_color(s: &str) -> Option<Color> {
+    SegmentColor::parse(s).map(to_color)
 }
 
-fn parse_hex(s: &str) -> Option<Color> {
-    let (r, g, b) = parse_hex_rgb(s)?;
-    Some(Color::Rgb(r, g, b))
+/// Named variants beat `Indexed(0..=7)` because terminals treat the bold
+/// attribute differently for the two, and ANSI themes expect named behaviour.
+fn indexed_to_color(i: u8) -> Color {
+    match i {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::Gray,
+        8 => Color::DarkGray,
+        9 => Color::LightRed,
+        10 => Color::LightGreen,
+        11 => Color::LightYellow,
+        12 => Color::LightBlue,
+        13 => Color::LightMagenta,
+        14 => Color::LightCyan,
+        15 => Color::White,
+        n => Color::Indexed(n),
+    }
 }
 
 fn parse_syn_color(s: &str, palette: &HashMap<String, String>) -> Option<SynColor> {
     let resolved = if s.starts_with('#') {
         s
     } else {
-        palette.get(s)?.as_str()
+        palette.get(s).map(String::as_str).unwrap_or(s)
     };
-    let (r, g, b) = parse_hex_rgb(resolved)?;
-    Some(SynColor { r, g, b, a: 0xFF })
+    SegmentColor::parse(resolved).map(SegmentColor::to_syntect)
+}
+
+/// The highlighter speaks [`SegmentColor`], ratatui speaks [`Color`]. Anything
+/// the terminal resolves itself (named, indexed, reset) crosses over as a
+/// palette index so it stays symbolic.
+pub(crate) fn segment_color(c: Color) -> SegmentColor {
+    match c {
+        Color::Rgb(r, g, b) => SegmentColor::Rgb((r, g, b)),
+        Color::Indexed(i) => SegmentColor::Ansi(i),
+        Color::Reset => SegmentColor::Default,
+        Color::Black => SegmentColor::Ansi(0),
+        Color::Red => SegmentColor::Ansi(1),
+        Color::Green => SegmentColor::Ansi(2),
+        Color::Yellow => SegmentColor::Ansi(3),
+        Color::Blue => SegmentColor::Ansi(4),
+        Color::Magenta => SegmentColor::Ansi(5),
+        Color::Cyan => SegmentColor::Ansi(6),
+        Color::Gray => SegmentColor::Ansi(7),
+        Color::DarkGray => SegmentColor::Ansi(8),
+        Color::LightRed => SegmentColor::Ansi(9),
+        Color::LightGreen => SegmentColor::Ansi(10),
+        Color::LightYellow => SegmentColor::Ansi(11),
+        Color::LightBlue => SegmentColor::Ansi(12),
+        Color::LightMagenta => SegmentColor::Ansi(13),
+        Color::LightCyan => SegmentColor::Ansi(14),
+        Color::White => SegmentColor::Ansi(15),
+    }
+}
+
+/// Inverse of [`segment_color`]. `Default` becomes [`Color::Reset`] rather
+/// than a guess, so the terminal keeps deciding.
+pub(crate) fn to_color(c: SegmentColor) -> Color {
+    match c {
+        SegmentColor::Rgb((r, g, b)) => Color::Rgb(r, g, b),
+        SegmentColor::Ansi(i) => indexed_to_color(i),
+        SegmentColor::Default => Color::Reset,
+    }
+}
+
+/// Plugin spans speak [`SpanColor`] because their crate is a wire format that
+/// must not pull in the highlighter. Both types are foreign here, so the
+/// orphan rule rules out a `From` impl.
+pub(crate) fn segment_color_from_span(c: SpanColor) -> SegmentColor {
+    match c {
+        SpanColor::Rgb(rgb) => SegmentColor::Rgb(rgb),
+        SpanColor::Ansi(i) => SegmentColor::Ansi(i),
+        SpanColor::Default(_) => SegmentColor::Default,
+    }
+}
+
+/// A segment asking for the terminal default leaves the slot unset so the
+/// enclosing style still shows through, which [`Color::Reset`] would override.
+pub(crate) fn segment_slot(c: SegmentColor) -> Option<Color> {
+    (c != SegmentColor::Default).then(|| to_color(c))
+}
+
+pub(crate) fn segment_style(c: SegmentColor) -> Style {
+    segment_slot(c).map_or(Style::new(), |c| Style::new().fg(c))
 }
 
 fn resolve_color(name: &str, palette: &HashMap<String, Color>) -> Option<Color> {
-    if name.starts_with('#') {
-        parse_hex(name)
-    } else {
-        palette.get(name).copied()
-    }
+    palette.get(name).copied().or_else(|| parse_color(name))
 }
 
 fn resolve_modifier(name: &str) -> Modifier {
@@ -636,15 +715,10 @@ fn resolve_style(def: &StyleDef, palette: &HashMap<String, Color>) -> Style {
 fn scope_fg(
     full_table: &toml::Table,
     palette: &HashMap<String, Color>,
-    raw_palette: &HashMap<String, String>,
     scope: &str,
 ) -> Option<Color> {
     let table = full_table.get(scope)?.as_table()?;
-    let fg_val = table.get("fg")?.as_str()?;
-    resolve_color(fg_val, palette).or_else(|| {
-        let resolved = raw_palette.get(fg_val)?;
-        parse_hex(resolved)
-    })
+    resolve_color(table.get("fg")?.as_str()?, palette)
 }
 
 fn resolve_font_style(modifiers: &[String]) -> FontStyle {
@@ -738,7 +812,7 @@ fn build_syntax_theme(
 }
 
 impl Theme {
-    fn from_toml(toml_str: &str) -> Result<Self, String> {
+    pub(crate) fn from_toml(toml_str: &str) -> Result<Self, String> {
         let full_table: toml::Table = toml::from_str(toml_str).map_err(|e| e.to_string())?;
 
         let raw_palette: HashMap<String, String> = full_table
@@ -753,7 +827,7 @@ impl Theme {
 
         let palette: HashMap<String, Color> = raw_palette
             .iter()
-            .filter_map(|(k, v)| parse_hex(v).map(|c| (k.clone(), c)))
+            .filter_map(|(k, v)| parse_color(v).map(|c| (k.clone(), c)))
             .collect();
 
         let ui: HashMap<String, StyleDef> = full_table
@@ -774,13 +848,14 @@ impl Theme {
                 .map(|d| resolve_style(d, &palette))
                 .unwrap_or_default()
         };
+        let style_or = |key: &str, fallback: &str| -> Style { style(fallback).patch(style(key)) };
 
         let derived_color = |ui_key: &str, scopes: &[&str]| -> Color {
             if let Some(c) = palette.get(ui_key) {
                 return *c;
             }
             for scope in scopes {
-                if let Some(c) = scope_fg(&full_table, &palette, &raw_palette, scope) {
+                if let Some(c) = scope_fg(&full_table, &palette, scope) {
                     return c;
                 }
             }
@@ -792,7 +867,7 @@ impl Theme {
                 return resolve_style(d, &palette);
             }
             for scope in scopes {
-                if let Some(c) = scope_fg(&full_table, &palette, &raw_palette, scope) {
+                if let Some(c) = scope_fg(&full_table, &palette, scope) {
                     return Style::new().fg(c).add_modifier(mods);
                 }
             }
@@ -868,9 +943,13 @@ impl Theme {
             table_border: style("table_border"),
             diff_old: style("diff_old"),
             diff_new: style("diff_new"),
+            diff_old_sign: style_or("diff_old_sign", "diff_old"),
+            diff_new_sign: style_or("diff_new_sign", "diff_new"),
             diff_old_emphasis: style("diff_old_emphasis"),
             diff_new_emphasis: style("diff_new_emphasis"),
             diff_line_nr: style("diff_line_nr"),
+            diff_old_line_nr: style_or("diff_old_line_nr", "diff_line_nr"),
+            diff_new_line_nr: style_or("diff_new_line_nr", "diff_line_nr"),
             todo_completed: style("todo_completed"),
             todo_in_progress: style("todo_in_progress"),
             todo_pending: style("todo_pending"),
@@ -960,6 +1039,8 @@ pub(crate) fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)) as u8
 }
 
+/// A palette color has no numeric value to blend toward the background, so
+/// those themes fall back to the terminal's own dim attribute.
 pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
     match (style.fg, current().background) {
         (Some(Color::Rgb(fr, fg, fb)), Color::Rgb(br, bg, bb)) => style.fg(Color::Rgb(
@@ -967,7 +1048,7 @@ pub(crate) fn dim_style(style: Style, factor: f32) -> Style {
             lerp_u8(fg, bg, factor),
             lerp_u8(fb, bb, factor),
         )),
-        _ => style,
+        _ => style.add_modifier(Modifier::DIM),
     }
 }
 
@@ -986,6 +1067,21 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test_case(Color::Rgb(1, 2, 3), SegmentColor::Rgb((1, 2, 3)); "truecolor")]
+    #[test_case(Color::Indexed(200), SegmentColor::Ansi(200); "indexed")]
+    #[test_case(Color::Reset, SegmentColor::Default; "reset")]
+    #[test_case(Color::LightBlue, SegmentColor::Ansi(12); "named maps to its palette index")]
+    fn ratatui_colors_convert_to_segment_colors(color: Color, expected: SegmentColor) {
+        assert_eq!(segment_color(color), expected);
+    }
+
+    #[test]
+    fn dim_style_falls_back_to_the_dim_modifier_for_palette_colors() {
+        let dimmed = dim_style(Style::new().fg(Color::Blue), 0.4);
+        assert_eq!(dimmed.fg, Some(Color::Blue), "palette color stays symbolic");
+        assert!(dimmed.add_modifier.contains(Modifier::DIM));
+    }
 
     fn dracula_toml() -> &'static str {
         BUNDLED_THEMES
@@ -1235,6 +1331,87 @@ mode_build = "#112233"
     }
 
     #[test]
+    fn diff_sign_and_line_nr_fall_back_to_legacy_keys_when_unset() {
+        let toml = r##"
+[palette]
+foreground = "#f8f8f2"
+background = "#282a36"
+red = "#ff5555"
+green = "#50fa7b"
+grey = "#6272a4"
+
+[ui]
+diff_old = { fg = "red" }
+diff_new = { fg = "green" }
+diff_line_nr = { fg = "grey" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.diff_old_sign, t.diff_old);
+        assert_eq!(t.diff_new_sign, t.diff_new);
+        assert_eq!(t.diff_old_line_nr, t.diff_line_nr);
+        assert_eq!(t.diff_new_line_nr, t.diff_line_nr);
+    }
+
+    #[test]
+    fn diff_sign_and_line_nr_keys_override_legacy_fallback() {
+        let toml = r##"
+[palette]
+foreground = "#f8f8f2"
+background = "#282a36"
+red = "#ff5555"
+green = "#50fa7b"
+grey = "#6272a4"
+old_sign = "#aa1111"
+new_sign = "#11aa11"
+old_nr = "#222222"
+new_nr = "#333333"
+
+[ui]
+diff_old = { fg = "red" }
+diff_new = { fg = "green" }
+diff_line_nr = { fg = "grey" }
+diff_old_sign = { fg = "old_sign" }
+diff_new_sign = { fg = "new_sign" }
+diff_old_line_nr = { fg = "old_nr" }
+diff_new_line_nr = { fg = "new_nr" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.diff_old_sign.fg, Some(Color::Rgb(0xaa, 0x11, 0x11)));
+        assert_ne!(t.diff_old_sign, t.diff_old);
+        assert_eq!(t.diff_new_sign.fg, Some(Color::Rgb(0x11, 0xaa, 0x11)));
+        assert_ne!(t.diff_new_sign, t.diff_new);
+        assert_eq!(t.diff_old_line_nr.fg, Some(Color::Rgb(0x22, 0x22, 0x22)));
+        assert_ne!(t.diff_old_line_nr, t.diff_line_nr);
+        assert_eq!(t.diff_new_line_nr.fg, Some(Color::Rgb(0x33, 0x33, 0x33)));
+        assert_ne!(t.diff_new_line_nr, t.diff_line_nr);
+    }
+
+    #[test]
+    fn diff_sign_and_line_nr_keys_merge_over_legacy_fallback() {
+        let toml = r##"
+[palette]
+foreground = "#f8f8f2"
+background = "#282a36"
+red = "#ff5555"
+old_bg = "#4d1f1f"
+new_bg = "#1f4d1f"
+grey_bg = "#333333"
+
+[ui]
+diff_old = { bg = "old_bg" }
+diff_new = { bg = "new_bg" }
+diff_line_nr = { bg = "grey_bg" }
+diff_old_sign = { fg = "red" }
+diff_new_line_nr = { fg = "red" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.diff_old_sign.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
+        assert_eq!(t.diff_old_sign.bg, t.diff_old.bg);
+        assert_eq!(t.diff_new_line_nr.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
+        assert_eq!(t.diff_new_line_nr.bg, t.diff_line_nr.bg);
+    }
+
+    #[test]
     fn style_by_name_resolves() {
         let _guard = test_write_lock();
         set(dracula());
@@ -1256,6 +1433,11 @@ mode_build = "#112233"
         assert_eq!(style_by_name("bold_italic"), t.bold_italic);
         assert_eq!(style_by_name("diff_old"), t.diff_old);
         assert_eq!(style_by_name("diff_new"), t.diff_new);
+        assert_eq!(style_by_name("diff_old_sign"), t.diff_old_sign);
+        assert_eq!(style_by_name("diff_new_sign"), t.diff_new_sign);
+        assert_eq!(style_by_name("diff_line_nr"), t.diff_line_nr);
+        assert_eq!(style_by_name("diff_old_line_nr"), t.diff_old_line_nr);
+        assert_eq!(style_by_name("diff_new_line_nr"), t.diff_new_line_nr);
         assert_eq!(style_by_name("item_selected"), t.item_selected);
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
@@ -1271,6 +1453,7 @@ mode_build = "#112233"
         assert_eq!(style_by_name("warning"), t.todo_in_progress);
         assert_eq!(style_by_name("match"), t.item_match);
         assert_eq!(style_by_name("match_selected"), t.item_match_selected);
+        assert_eq!(style_by_name("thinking"), t.thinking);
     }
 
     #[test_case("nonexistent_style")]
@@ -1330,6 +1513,101 @@ mode_build = "#112233"
         assert_eq!(
             maki_highlight::theme().settings.background,
             tokyonight().syntax.settings.background,
+        );
+    }
+
+    #[test_case("light-gray", Color::DarkGray; "name")]
+    #[test_case("4", Color::Blue; "low index prefers the named variant")]
+    #[test_case("42", Color::Indexed(42); "high index stays indexed")]
+    #[test_case("#fda331", Color::Rgb(0xfd, 0xa3, 0x31); "hex")]
+    fn theme_accepts_documented_spellings(input: &str, expected: Color) {
+        assert_eq!(parse_color(input), Some(expected));
+    }
+
+    #[test_case("lightgray"; "missing separator")]
+    #[test_case("256"; "index out of range")]
+    fn theme_rejects_sloppy_spellings(input: &str) {
+        assert_eq!(parse_color(input), None);
+    }
+
+    #[test]
+    fn ansi_syntax_scopes_encode_palette_markers() {
+        let toml = r##"
+"keyword" = { fg = "magenta" }
+"comment" = { fg = "default" }
+"type"    = { fg = "#fda331" }
+
+[palette]
+background = "black"
+foreground = "white"
+magenta    = "magenta"
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+
+        let fg = t
+            .syntax
+            .settings
+            .foreground
+            .expect("foreground must resolve");
+        assert_eq!(
+            SegmentColor::from_syntect(fg),
+            SegmentColor::Ansi(15),
+            "white is palette 15"
+        );
+
+        let bg = t
+            .syntax
+            .settings
+            .background
+            .expect("background must resolve");
+        assert_eq!(
+            SegmentColor::from_syntect(bg),
+            SegmentColor::Ansi(0),
+            "black is palette 0"
+        );
+
+        let scope = |name: &str| {
+            let item = t
+                .syntax
+                .scopes
+                .iter()
+                .find(|i| format!("{:?}", i.scope).contains(name))
+                .unwrap_or_else(|| panic!("scope {name} must exist"));
+            item.style.foreground.expect("scope fg must resolve")
+        };
+
+        let kw = scope("keyword");
+        assert_eq!(SegmentColor::from_syntect(kw), SegmentColor::Ansi(5));
+
+        let comment = scope("comment");
+        assert_eq!(
+            SegmentColor::from_syntect(comment),
+            SegmentColor::Default,
+            "default means terminal default"
+        );
+
+        let ty = scope("type");
+        assert_eq!((ty.r, ty.g, ty.b, ty.a), (0xfd, 0xa3, 0x31, 0xFF));
+    }
+
+    #[test]
+    fn ui_entries_resolve_through_the_palette() {
+        let toml = r##"
+[palette]
+background = "black"
+orange = "light-red"
+
+[ui]
+accent = { fg = "orange" }
+error = { fg = "red" }
+"##;
+        let t = Theme::from_toml(toml).unwrap();
+        assert_eq!(t.background, Color::Black);
+        assert_eq!(t.accent.fg, Some(Color::LightRed), "via palette key");
+        assert_eq!(
+            t.error.fg,
+            Some(Color::Red),
+            "direct name, no palette entry"
         );
     }
 }

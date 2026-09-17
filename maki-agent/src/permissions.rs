@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
-    ToolKey, append_permission_rule,
+    ProjectConfig, ToolKey, append_permission_rule,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -28,6 +28,19 @@ pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 
 const TASK_TOOL: &str = "task";
 const BASH_TOOL: &str = "bash";
+
+/// Splits the ask id from the encoded answer on the answer channel. A control
+/// character cannot appear in a tool-use id, and the answer is the tail, so
+/// deny guidance holding one still round-trips.
+const ANSWER_ID_SEPARATOR: char = '\u{1f}';
+
+/// Words that open a block the bash plugin keeps as one scope. Their first
+/// token names no program, so wildcarding it would cover every command the
+/// block can hold. See [`generalize_bash_segment`].
+const SHELL_KEYWORDS: [&str; 15] = [
+    "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "select", "function", "time",
+];
 
 fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
     let cwd_glob = format!(
@@ -146,11 +159,11 @@ impl ApprovalGate {
 pub enum PermissionAnswer {
     AllowOnce,
     AllowSession,
-    AllowAlwaysLocal,
+    AllowAlwaysProject,
     AllowAlwaysGlobal,
     Deny,
     DenyWithGuidance(String),
-    DenyAlwaysLocal,
+    DenyAlwaysProject,
     DenyAlwaysGlobal,
 }
 
@@ -159,9 +172,9 @@ impl PermissionAnswer {
         match self {
             Self::AllowOnce | Self::Deny | Self::DenyWithGuidance(_) => DECISION_SOURCE_USER_ONCE,
             Self::AllowSession => DECISION_SOURCE_USER_SESSION,
-            Self::AllowAlwaysLocal
+            Self::AllowAlwaysProject
             | Self::AllowAlwaysGlobal
-            | Self::DenyAlwaysLocal
+            | Self::DenyAlwaysProject
             | Self::DenyAlwaysGlobal => DECISION_SOURCE_USER_ALWAYS,
         }
     }
@@ -169,7 +182,10 @@ impl PermissionAnswer {
     pub fn is_allow(&self) -> bool {
         matches!(
             self,
-            Self::AllowOnce | Self::AllowSession | Self::AllowAlwaysLocal | Self::AllowAlwaysGlobal
+            Self::AllowOnce
+                | Self::AllowSession
+                | Self::AllowAlwaysProject
+                | Self::AllowAlwaysGlobal
         )
     }
 
@@ -177,11 +193,11 @@ impl PermissionAnswer {
         match self {
             Self::AllowOnce => "allow".to_string(),
             Self::AllowSession => "allow_session".to_string(),
-            Self::AllowAlwaysLocal => "allow_always_local".to_string(),
+            Self::AllowAlwaysProject => "allow_always_project".to_string(),
             Self::AllowAlwaysGlobal => "allow_always_global".to_string(),
             Self::Deny => "deny".to_string(),
             Self::DenyWithGuidance(g) => format!("deny:{g}"),
-            Self::DenyAlwaysLocal => "deny_always_local".to_string(),
+            Self::DenyAlwaysProject => "deny_always_project".to_string(),
             Self::DenyAlwaysGlobal => "deny_always_global".to_string(),
         }
     }
@@ -190,10 +206,10 @@ impl PermissionAnswer {
         match s {
             "allow" => Some(Self::AllowOnce),
             "allow_session" => Some(Self::AllowSession),
-            "allow_always_local" => Some(Self::AllowAlwaysLocal),
+            "allow_always_project" => Some(Self::AllowAlwaysProject),
             "allow_always_global" => Some(Self::AllowAlwaysGlobal),
             "deny" => Some(Self::Deny),
-            "deny_always_local" => Some(Self::DenyAlwaysLocal),
+            "deny_always_project" => Some(Self::DenyAlwaysProject),
             "deny_always_global" => Some(Self::DenyAlwaysGlobal),
             _ if s.starts_with("deny:") => {
                 let guidance = s.strip_prefix("deny:").unwrap();
@@ -212,6 +228,42 @@ impl PermissionAnswer {
             Self::DenyWithGuidance(g) => Some(g),
             _ => None,
         }
+    }
+}
+
+/// An answer together with the id of the ask it answers.
+///
+/// The name is what makes a late answer harmless. The answer channel is a
+/// queue with no receiver parked between turns, so an answer to a cancelled
+/// turn's ask can sit there until the next turn's first permission wait pops
+/// it. Untagged, that stale answer is applied to a different tool and scope,
+/// and an `allow_always_*` then installs a rule for something the user never
+/// saw. Tagged, the waiter can tell it apart and drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedAnswer {
+    pub request_id: String,
+    pub answer: PermissionAnswer,
+}
+
+impl TaggedAnswer {
+    pub fn new(request_id: impl Into<String>, answer: PermissionAnswer) -> Self {
+        Self {
+            request_id: request_id.into(),
+            answer,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!(
+            "{}{ANSWER_ID_SEPARATOR}{}",
+            self.request_id,
+            self.answer.encode()
+        )
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        let (request_id, answer) = raw.split_once(ANSWER_ID_SEPARATOR)?;
+        Some(Self::new(request_id, PermissionAnswer::decode(answer)?))
     }
 }
 
@@ -264,6 +316,7 @@ pub struct PermissionManager {
     default: DefaultEffect,
     tool_defaults: HashMap<ToolKey, DefaultEffect>,
     cwd: PathBuf,
+    project_config: ProjectConfig,
     plugin_rules: Arc<PluginRuleStore>,
 }
 
@@ -271,6 +324,7 @@ impl PermissionManager {
     pub fn new(
         config: PermissionsConfig,
         cwd: PathBuf,
+        project_config: ProjectConfig,
         plugin_rules: Arc<PluginRuleStore>,
     ) -> Self {
         let config_rules = config.rules;
@@ -309,6 +363,7 @@ impl PermissionManager {
             default: config.default,
             tool_defaults: config.tool_defaults,
             cwd,
+            project_config,
             plugin_rules,
         }
     }
@@ -327,6 +382,7 @@ impl PermissionManager {
             default: self.default,
             tool_defaults: self.tool_defaults.clone(),
             cwd: self.cwd.clone(),
+            project_config: self.project_config.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
         }
     }
@@ -534,6 +590,29 @@ impl PermissionManager {
         *self.session_rules() = rules;
     }
 
+    pub fn project_is_trusted(&self) -> bool {
+        self.project_config.is_trusted()
+    }
+
+    /// Where an always-answer gets written, or `None` when it only holds for
+    /// this session. An untrusted folder gets nothing, for a different reason
+    /// on each side. An allow saved there is stripped on the next start, so it
+    /// would only look forgotten. A deny would survive, because an untrusted
+    /// project still contributes its deny scopes, but saving it means Maki
+    /// writing `.maki/permissions.toml` into a checkout the user declined to
+    /// trust, and the next start would then ask them about a gated file Maki
+    /// created itself. The durable deny is the global one, which lands in the
+    /// user's own config and no repository can touch.
+    fn persist_target(&self, answer: &PermissionAnswer) -> Option<PermissionTarget> {
+        match answer {
+            PermissionAnswer::AllowAlwaysProject | PermissionAnswer::DenyAlwaysProject => self
+                .project_config
+                .is_trusted()
+                .then(|| PermissionTarget::Project(self.project_config.clone())),
+            _ => Some(PermissionTarget::Global),
+        }
+    }
+
     pub fn apply_decision(&self, tool: &ToolKey, scopes: &[String], answer: &PermissionAnswer) {
         let resolved = if answer.is_allow() || tool.is_mcp() {
             // MCP scopes are always wildcarded — both allow and deny generalize to "*".
@@ -557,28 +636,31 @@ impl PermissionManager {
                     });
                 }
             }
-            PermissionAnswer::AllowAlwaysLocal
+            PermissionAnswer::AllowAlwaysProject
             | PermissionAnswer::AllowAlwaysGlobal
-            | PermissionAnswer::DenyAlwaysLocal
+            | PermissionAnswer::DenyAlwaysProject
             | PermissionAnswer::DenyAlwaysGlobal => {
                 let effect = if answer.is_allow() {
                     Effect::Allow
                 } else {
                     Effect::Deny
                 };
-                let target = match answer {
-                    PermissionAnswer::AllowAlwaysLocal | PermissionAnswer::DenyAlwaysLocal => {
-                        PermissionTarget::Project(self.cwd.clone())
-                    }
-                    _ => PermissionTarget::Global,
-                };
+                let target = self.persist_target(answer);
+                if target.is_none() {
+                    info!(
+                        tool = %tool,
+                        "project answer stays in this session because the folder is not trusted, the global answer is the one that lasts"
+                    );
+                }
                 for s in &resolved {
                     self.add_session_rule(PermissionRule {
                         tool: tool.clone(),
                         scope: Some(s.clone()),
                         effect,
                     });
-                    if let Err(e) = append_permission_rule(tool, Some(s), effect, &target) {
+                    if let Some(target) = &target
+                        && let Err(e) = append_permission_rule(tool, Some(s), effect, target)
+                    {
                         tracing::warn!(error = %e, "failed to persist permission rule");
                     }
                 }
@@ -650,21 +732,36 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
         });
-        let response = cancel.race(guard.recv_async()).await;
+        // Only the answer naming this ask may be applied. Anything else is a
+        // leftover from a cancelled or reassigned ask, so it is dropped and the
+        // wait continues: consuming it would approve or deny this tool on a
+        // decision the user made about another one.
+        let answer = loop {
+            let response = cancel.race(guard.recv_async()).await;
+            match response {
+                Ok(Ok(raw)) => match TaggedAnswer::decode(&raw) {
+                    Some(tagged) if tagged.request_id == request_id => break tagged.answer,
+                    tagged => warn!(
+                        tool = %tool,
+                        scope = %scope_display(),
+                        request_id,
+                        answered = tagged.map(|t| t.request_id).unwrap_or_default(),
+                        "discarding a permission answer that does not name this request"
+                    ),
+                },
+                Ok(Err(_)) => {
+                    drop(guard);
+                    warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
+                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                }
+                Err(_) => {
+                    drop(guard);
+                    return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+                }
+            }
+        };
         drop(guard);
 
-        let answer = match response {
-            Ok(Ok(a)) => a,
-            Ok(Err(_)) => {
-                warn!(tool = %tool, scope = %scope_display(), "permission channel closed");
-                return Err(deny(DECISION_SOURCE_USER_ABORT, None));
-            }
-            Err(_) => return Err(deny(DECISION_SOURCE_USER_ABORT, None)),
-        };
-
-        let Some(answer) = PermissionAnswer::decode(&answer) else {
-            return Err(deny(DECISION_SOURCE_USER_ABORT, None));
-        };
         self.apply_decision(&t2, &s2, &answer);
         let source = answer.decision_source();
         if answer.is_allow() {
@@ -709,15 +806,11 @@ fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
     }
 }
 
-/// Absolutize first, then resolve symlinks in the leading components that
-/// exist and append the rest as written. The order matters: a relative rule
-/// like `dist/**` has to match before the dir exists, and
-/// `incremental_canonicalize` leaves a relative path relative when the leading
-/// component is missing.
+/// A rule and the path it is matched against have to agree on what file they
+/// name, including for a relative rule like `dist/**` written before the dir
+/// exists — both are `canonical_key`'s job.
 fn normalize_scope_prefix(path: &str) -> PathBuf {
-    let abs = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
-    maki_storage::paths::incremental_canonicalize(&abs)
-        .unwrap_or_else(|| maki_storage::paths::normalize_path(&abs))
+    maki_storage::paths::canonical_key(Path::new(path))
 }
 
 /// A pattern with nothing left once its trailing glob is taken off covers
@@ -812,9 +905,24 @@ pub fn physical_boundary_check(parent: &Path, child: &Path) -> Option<bool> {
     Some(child_canon.starts_with(&parent_canon))
 }
 
+/// A `<cmd> *` rule is only safe when `<cmd>` names one program. The bash
+/// plugin keeps block forms whole on purpose, so `for f in *.rs; do wc -l $f;
+/// done` arrives as one scope and its first token is `for`; wildcarding that
+/// hands out every loop the model can write. Same for a bodiless `> log`,
+/// whose first token is the redirect. Those scopes stay literal: remembering
+/// one exact command is worth little, but it is never a blank cheque.
 fn generalize_bash_segment(segment: &str) -> String {
     let first_token = segment.split_whitespace().next().unwrap_or(segment);
-    format!("{first_token} *")
+    let is_command_word = !first_token.is_empty()
+        && first_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.:/@+-".contains(c))
+        && !SHELL_KEYWORDS.contains(&first_token);
+    if is_command_word {
+        format!("{first_token} *")
+    } else {
+        segment.to_string()
+    }
 }
 
 pub fn generalized_scopes(tool: &ToolKey, scopes: &[String]) -> Vec<String> {
@@ -859,10 +967,15 @@ mod tests {
     const MCP_ARGS: &str = "{\"q\":\"maki\"}";
     const READ_TOOL: &str = "read";
     const READ_SCOPE: &str = "/home/user/project/src/main.rs";
+    const TAGGED_REQUEST_ID: &str = "toolu_1";
+    /// Guidance is free text and may hold the separator itself.
+    const TAGGED_GUIDANCE: &str = "no\u{1f}way";
 
     const ALLOWED: &str = "allowed";
     const DENIED: &str = "denied";
     const PROMPTS: &str = "prompts";
+    const PROJECT_DIR: &str = ".maki";
+    const PROJECT_PERMISSIONS: &str = ".maki/permissions.toml";
 
     fn outcome(check: PermissionCheck) -> &'static str {
         match check {
@@ -910,7 +1023,8 @@ mod tests {
     }
 
     fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionManager {
-        PermissionManager::new(config, cwd, Arc::default())
+        let project_config = ProjectConfig::for_project(&cwd);
+        PermissionManager::new(config, cwd, project_config, Arc::default())
     }
 
     fn default_mgr() -> PermissionManager {
@@ -1126,11 +1240,12 @@ mod tests {
 
     #[test]
     fn deny_decision_uses_exact() {
-        let mgr = default_mgr();
+        let project = tempfile::tempdir().unwrap();
+        let mgr = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
         mgr.apply_decision(
             &ToolKey::native("bash"),
             &["cargo test".into()],
-            &PermissionAnswer::DenyAlwaysLocal,
+            &PermissionAnswer::DenyAlwaysProject,
         );
         assert!(matches!(
             mgr.check(&ToolKey::native("bash"), "cargo test", None),
@@ -1142,6 +1257,41 @@ mod tests {
         ));
     }
 
+    /// A trusted folder collects the answer in `.maki/permissions.toml`. An
+    /// untrusted one keeps it for the session and gets no `.maki` directory,
+    /// for deny as much as for allow, because declining to trust a checkout
+    /// has to leave nothing behind in it. The deny that lasts is the global
+    /// one.
+    #[test_case(PermissionAnswer::AllowAlwaysProject, true, true ; "allow_is_written_when_trusted")]
+    #[test_case(PermissionAnswer::DenyAlwaysProject, false, true ; "deny_is_written_when_trusted")]
+    #[test_case(PermissionAnswer::AllowAlwaysProject, true, false ; "allow_stays_in_the_session_when_untrusted")]
+    #[test_case(PermissionAnswer::DenyAlwaysProject, false, false ; "deny_stays_in_the_session_when_untrusted")]
+    fn project_answer_is_written_only_in_a_trusted_folder(
+        answer: PermissionAnswer,
+        allowed: bool,
+        trusted: bool,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let mgr = PermissionManager::new(
+            PermissionsConfig::default(),
+            project.path().to_path_buf(),
+            if trusted {
+                ProjectConfig::for_project(project.path())
+            } else {
+                ProjectConfig::discover(project.path())
+            },
+            Arc::default(),
+        );
+
+        mgr.apply_decision(&ToolKey::native("bash"), &["cargo test".into()], &answer);
+
+        assert_eq!(mgr.session_rules_snapshot().len(), 1);
+        assert_eq!(project.path().join(PROJECT_DIR).exists(), trusted);
+        assert_eq!(project.path().join(PROJECT_PERMISSIONS).is_file(), trusted);
+        let check = mgr.check(&ToolKey::native("bash"), "cargo test", None);
+        assert_eq!(matches!(check, PermissionCheck::Allowed), allowed);
+        assert_eq!(matches!(check, PermissionCheck::Denied), !allowed);
+    }
     #[test]
     fn boundary_inside_proceeds() {
         let tmp = std::env::temp_dir();
@@ -1232,12 +1382,28 @@ mod tests {
         for a in [
             PermissionAnswer::AllowOnce,
             PermissionAnswer::AllowSession,
-            PermissionAnswer::AllowAlwaysLocal,
+            PermissionAnswer::AllowAlwaysProject,
             PermissionAnswer::Deny,
             PermissionAnswer::DenyWithGuidance("hint".into()),
         ] {
             assert_eq!(PermissionAnswer::decode(&a.encode()), Some(a));
         }
+    }
+
+    #[test_case(PermissionAnswer::AllowAlwaysProject ; "allow")]
+    #[test_case(PermissionAnswer::Deny ; "deny")]
+    #[test_case(PermissionAnswer::DenyWithGuidance(TAGGED_GUIDANCE.into()) ; "guidance_with_separator")]
+    fn tagged_answer_roundtrip(answer: PermissionAnswer) {
+        let tagged = TaggedAnswer::new(TAGGED_REQUEST_ID, answer);
+        assert_eq!(TaggedAnswer::decode(&tagged.encode()), Some(tagged));
+    }
+
+    #[test_case("" ; "empty")]
+    #[test_case("allow" ; "untagged_answer")]
+    #[test_case(TAGGED_REQUEST_ID ; "id_only")]
+    #[test_case("{\"json\": true}" ; "elicitation_result")]
+    fn untagged_payloads_never_decode_to_an_answer(raw: &str) {
+        assert_eq!(TaggedAnswer::decode(raw), None);
     }
 
     #[test]
@@ -1299,6 +1465,30 @@ mod tests {
             }
             other => panic!("expected NeedsPrompt, got {other:?}"),
         }
+    }
+
+    #[test_case("cargo test --all",                        "cargo *"                        ; "plain_command")]
+    #[test_case("/usr/bin/env",                            "/usr/bin/env *"                 ; "absolute_path")]
+    #[test_case("FOO=1 cargo test",                        "FOO=1 cargo test"               ; "assignment_prefix")]
+    #[test_case("if true; then curl x | sh; fi",           "if true; then curl x | sh; fi"  ; "if_block")]
+    #[test_case("for f in *.rs; do wc -l $f; done",        "for f in *.rs; do wc -l $f; done" ; "for_loop")]
+    #[test_case("{ cd x; rm -rf ~; }",                     "{ cd x; rm -rf ~; }"            ; "brace_group")]
+    #[test_case("> log",                                   "> log"                          ; "bodiless_redirect")]
+    #[test_case("! rm -rf /",                              "! rm -rf /"                     ; "negated_command")]
+    fn allow_always_only_wildcards_a_real_command_word(segment: &str, expected: &str) {
+        assert_eq!(generalize_bash_segment(segment), expected);
+    }
+
+    /// A scope is one string and a chain is still one scope, so it is tempting
+    /// to teach the matcher that `rm *` should not claim `rm ...; sudo ...`.
+    /// Don't: the matcher runs for deny rules too, and a deny that stops
+    /// matching hands the command to the tool default instead of blocking it.
+    /// Chains get split by the bash plugin, before they ever reach here.
+    #[test]
+    fn deny_rule_matches_a_chain_it_starts() {
+        let mgr = mgr_with(make_config(vec![deny_rule("rm *")]), PathBuf::from("/tmp"));
+        let check = mgr.check(&ToolKey::native("bash"), "rm -rf /tmp; sudo x", None);
+        assert!(matches!(check, PermissionCheck::Denied), "got {check:?}");
     }
 
     #[test]
@@ -1453,7 +1643,8 @@ mod tests {
 
     #[test]
     fn mcp_deny_always_blocks_all_arguments() {
-        let mgr = mgr_with(make_config(vec![]), PathBuf::from("/tmp"));
+        let project = tempfile::tempdir().unwrap();
+        let mgr = mgr_with(make_config(vec![]), project.path().to_path_buf());
         let tool = ToolKey::McpTool {
             server: "deepwiki".into(),
             tool: "search".into(),
@@ -1462,7 +1653,7 @@ mod tests {
         mgr.apply_decision(
             &tool,
             &["{\"q\":\"dangerous\"}".into()],
-            &PermissionAnswer::DenyAlwaysLocal,
+            &PermissionAnswer::DenyAlwaysProject,
         );
         // Different arguments: still denied.
         assert!(matches!(
@@ -1816,6 +2007,7 @@ mod tests {
         let mgr = PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             Arc::clone(&store),
         );
         let fork = mgr.fork();
@@ -1835,6 +2027,7 @@ mod tests {
         let mgr = PermissionManager::new(
             make_config(vec![plugin_edit_rule("/x/**", Effect::Deny)]),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             store,
         );
         assert!(matches!(

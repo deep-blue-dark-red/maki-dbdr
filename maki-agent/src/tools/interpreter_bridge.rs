@@ -1,24 +1,16 @@
 use serde_json::Value;
 
-use crate::agent::tool_dispatch::{self, Emit};
+use crate::ToolOutput;
+use crate::agent::tool_dispatch;
 
-use super::ToolContext;
+use super::{CallOrigin, ToolContext};
 
 pub const IMAGE_NOT_VISIBLE_NOTE: &str =
     "image pixels are not visible from here; call the view_image tool directly";
 
 pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<String, String> {
     ctx.deadline.check()?;
-    let done = tool_dispatch::run(
-        &ctx.registry,
-        ctx.mcp.as_ref(),
-        String::new(),
-        name,
-        input,
-        ctx,
-        Emit::Silent,
-    )
-    .await;
+    let done = tool_dispatch::run(String::new(), name, input, ctx, CallOrigin::Nested).await;
     flatten(&done)
 }
 
@@ -26,9 +18,9 @@ pub async fn dispatch(ctx: &ToolContext, name: &str, input: &Value) -> Result<St
 /// Both the interpreter and `maki.agent.call_tool` come through here,
 /// so the two can never drift apart.
 pub fn flatten(done: &crate::ToolDoneEvent) -> Result<String, String> {
-    let text = match &done.output {
+    let text = match done.output.as_ref() {
         // The pixels are dropped here; say so instead of implying they were seen.
-        crate::ToolOutput::Image { text, .. } if !done.is_error => {
+        ToolOutput::Image { text, .. } if !done.is_error => {
             format!("{text} ({IMAGE_NOT_VISIBLE_NOTE})")
         }
         out => out.as_text(),

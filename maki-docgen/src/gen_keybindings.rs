@@ -12,11 +12,22 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
     ("Session Picker", "`Ctrl+N`", "New session"),
     ("Session Picker", "`Ctrl+R`", "Rename session"),
     ("Session Picker", "`Ctrl+D`", "Delete session (press twice)"),
+    ("Thinking Picker", "`↑`/`↓`", "Move between effort levels"),
+    ("Thinking Picker", "`0`-`9`", "Type a token budget"),
+    ("Thinking Picker", "`Enter`", "Apply and close"),
+    (
+        "Thinking Picker",
+        "`Esc`",
+        "Close without changing anything",
+    ),
 ];
 
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.
-const PLUGIN_BINDS: &[(&str, &str)] =
-    &[("`Ctrl+P`", "Browse sessions"), ("`Ctrl+X`", "Open tasks")];
+const PLUGIN_BINDS: &[(&str, &str)] = &[
+    ("`Ctrl+P`", "Browse sessions"),
+    ("`Ctrl+X`", "Open tasks"),
+    ("`Alt+T`", "Thinking effort"),
+];
 
 const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::General,
@@ -199,8 +210,9 @@ fn write_overrides(out: &mut String) {
     out.push_str(
         "Skips user `init.lua` files (global and project) but keeps the \
          Lua host and builtin plugins running, so tools still work. \
-         `permissions.toml`, custom commands, and env files load as \
-         usual.\n\n",
+         Custom commands and skills still load, and the project \
+         permission rules and env file follow \
+         [folder trust](/docs/folder-trust/).\n\n",
     );
     out.push_str(
         "The default keymap lives in Rust, not Lua, so `--no-plugins` \

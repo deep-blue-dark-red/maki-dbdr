@@ -49,6 +49,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--no-plugins` | Skip user `init.lua` (global and project); keep the Lua host and builtin plugins so tools and the default keymap still load |
 | `--no-jit` | Run plugin Lua on the interpreter with full debug info |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
+| `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
@@ -93,7 +94,22 @@ maki auth status
 
 ### `maki models`
 
-Lists every model Maki currently knows about (built-ins, discovered, catalog). One model spec per line. Warnings from discovery go to stderr.
+```bash
+maki models
+maki models --refresh    # refetch the models.dev catalog
+```
+
+One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
+
+### `maki session`
+
+```bash
+maki session list            # sessions for the current directory
+maki session list --global   # sessions from all projects
+maki session delete <id>     # asks first, -f skips
+```
+
+Prints stored sessions as a table (id, title, project directory with `$HOME` collapsed to `~`, last update as a relative age), newest first. A listed id works with `maki --session <id>` to resume it. `delete` removes the session log along with its archives and index entries, and asks for confirmation first unless you pass `-f` / `--force`; without a terminal to ask on it refuses outright. A maki that already has the session open will not notice the delete and will lose the rest of that conversation, so close it first. Inside the TUI the same data lives behind `/sessions` (`Ctrl+P`), where `Ctrl+D` deletes.
 
 ### `maki mcp`
 
@@ -154,6 +170,20 @@ maki migrate xdg
 ```
 
 Moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+
+### `maki trust`
+
+```bash
+maki trust add [PATH]
+maki trust add [PATH] --yes
+maki trust remove [PATH]
+maki trust list
+```
+
+Records whether a folder's `.maki` configuration may load. `PATH` defaults to
+the current directory, `--yes` skips the confirmation, and `list` shows trusted
+and rejected folders. See [Folder Trust](/docs/folder-trust/) for what is gated
+and for the `--trust` flag that grants trust for a single run.
 
 ## Everyday examples
 

@@ -7,21 +7,20 @@ use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
+    StopReason, StreamResponse, estimate_prompt_tokens,
 };
 
 use super::compaction;
 use super::history::{History, sanitize_cancelled_history};
-use super::instructions::LoadedInstructions;
-use super::streaming::{StreamError, estimate_input_tokens, json_byte_len, stream_with_retry};
+use super::instructions::{CallInstructions, LoadedInstructions};
+use super::streaming::{StreamError, StreamRequest, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::RunLedger;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
-use crate::tools::{
-    Deadline, FileReadTracker, LocalTools, RequestTools, ToolAudience, ToolContext,
-};
+use crate::tools::{Deadline, FileAccess, LocalTools, RequestTools, ToolAudience, ToolContext};
 use crate::{
     AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, SessionMailbox, TurnCompleteEvent,
@@ -30,6 +29,9 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+/// One compaction is the whole remedy for an overflowing prompt, so a second
+/// overflow in a row means it did not help and retrying only burns a summary.
+const MAX_OVERFLOW_RECOVERIES: u32 = 1;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -40,6 +42,10 @@ const RECENT_TOOL_WINDOW: usize = 5;
 /// turn, and a model resuming its own cut-off text can wedge the session
 /// (seen with llama.cpp stuck on an unterminated tool call).
 const CANCELLED_TEXT_NOTE: &str = "[Response cut off by user cancel]";
+/// Framing note a queued user message is wrapped in, so the model reads it as
+/// an interruption of the work in flight rather than a fresh instruction.
+const INTERRUPT_NOTE: &str =
+    "The user sent a new message while you were working. Address it and continue.";
 
 pub fn resolve_compaction_model(
     provider: &Arc<dyn Provider>,
@@ -71,9 +77,10 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
-    pub file_tracker: Arc<FileReadTracker>,
+    pub file_access: Arc<FileAccess>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub subagent_cancels: Arc<CancelMap<String>>,
     pub registry: Arc<crate::tools::ToolRegistry>,
@@ -84,6 +91,10 @@ pub struct AgentParams {
 
 pub struct AgentRunParams<'h> {
     pub history: &'h mut History,
+    /// Borrowed from the same owner as `history`, since it describes that
+    /// transcript. A gauge rebuilt per run would forget every measurement the
+    /// session made and fall back to the estimate.
+    pub gauge: &'h mut ContextGauge,
     pub system: String,
     pub event_tx: EventSender,
     pub tools: RequestTools,
@@ -93,6 +104,7 @@ pub struct Agent<'h> {
     provider: Arc<dyn Provider>,
     model: Arc<Model>,
     history: &'h mut History,
+    gauge: &'h mut ContextGauge,
     system: String,
     event_tx: EventSender,
     tools: RequestTools,
@@ -100,23 +112,24 @@ pub struct Agent<'h> {
     user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
-    total_usage: TokenUsage,
-    context_size: u32,
     num_turns: u32,
     recent_calls: RecentCalls,
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
+    carry_from: usize,
     mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
+    overflow_recoveries: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
-    file_tracker: Arc<FileReadTracker>,
+    file_access: Arc<FileAccess>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     subagent_cancels: Arc<crate::cancel::CancelMap<String>>,
     registry: Arc<crate::tools::ToolRegistry>,
@@ -138,6 +151,7 @@ impl<'h> Agent<'h> {
             permissions: params.permissions,
             timeouts: params.timeouts,
             history: run.history,
+            gauge: run.gauge,
             system: run.system,
             event_tx: run.event_tx,
             tools: run.tools,
@@ -145,19 +159,20 @@ impl<'h> Agent<'h> {
             user_response_rx: None,
             interrupt_source: None,
             cancel: CancelToken::none(),
-            total_usage: TokenUsage::default(),
-            context_size: 0,
             num_turns: 0,
             recent_calls: RecentCalls::new(),
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
+            carry_from: 0,
             mcp: None,
             reauth_attempts: 0,
+            overflow_recoveries: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            task_id: params.task_id,
             mailbox: params.mailbox,
-            file_tracker: params.file_tracker,
+            file_access: params.file_access,
             prompt_slots: params.prompt_slots,
             subagent_cancels: params.subagent_cancels,
             registry: params.registry,
@@ -217,6 +232,7 @@ impl<'h> Agent<'h> {
             prompt: _,
         } = input;
         self.rollback_len = self.history.len();
+        self.carry_from = self.history.len();
         self.push_input_context(preamble);
         if !message.trim().is_empty() || !images.is_empty() {
             self.history
@@ -244,6 +260,12 @@ impl<'h> Agent<'h> {
             }
             maki_otel::emit::user_prompt(&message);
         }
+
+        self.gauge.seed_if_empty(
+            self.history.as_slice(),
+            &self.system,
+            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
+        );
 
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
@@ -283,22 +305,11 @@ impl<'h> Agent<'h> {
             {
                 return Ok(DoneReason::MaxTurns);
             }
+            self.try_auto_compact().await?;
             match self.turn().await? {
                 TurnOutcome::Continue => {}
                 TurnOutcome::Done(reason) => return Ok(reason),
             }
-        }
-    }
-
-    /// `self.tools` holds base tools only; the MCP part is recomputed here
-    fn request_tools(&self) -> Cow<'_, Value> {
-        match self.mcp {
-            Some(ref mcp) => {
-                let mut tools = self.tools.definitions().clone();
-                mcp.extend_tools(&mut tools);
-                Cow::Owned(tools)
-            }
-            None => Cow::Borrowed(self.tools.definitions()),
         }
     }
 
@@ -310,17 +321,12 @@ impl<'h> Agent<'h> {
         // bookkeeping below needs `&mut self` while `tools` is still in use
         // for the request below; a borrowed `Cow` tied to `&self` would
         // conflict with those mutations.
-        let tools = self.request_tools().into_owned();
-        let mut model = (*self.model).clone();
-        if let Some(max) = model.max_output_tokens {
-            model.max_output_tokens = Some(max.min(self.config.max_output_tokens));
-        } else {
-            model.max_output_tokens = Some(self.config.max_output_tokens);
-        }
-        let estimated_tokens = estimate_input_tokens(self.history.as_slice(), &self.system, &tools);
+        let tools = request_tools(&self.tools, self.mcp.as_ref()).into_owned();
+        let estimated_tokens =
+            estimate_prompt_tokens(self.history.as_slice(), &self.system, &tools);
         let turn_idx = (self.num_turns + 1) as usize;
         if self.num_turns == 0 {
-            let turn_0_est = estimate_input_tokens(&[], &self.system, &tools);
+            let turn_0_est = estimate_prompt_tokens(&[], &self.system, &tools);
             let turn_1_est = estimated_tokens.saturating_sub(turn_0_est);
             self.turn_state.record_estimate(0, turn_0_est);
             self.turn_state.record_estimate(1, turn_1_est);
@@ -339,15 +345,20 @@ impl<'h> Agent<'h> {
         let mut first_byte_at = None;
         let mut api_error_count = 0u32;
         let response = match stream_with_retry(
-            &*self.provider,
-            &model,
-            self.history.as_slice(),
-            &self.system,
-            &tools,
+            StreamRequest {
+                provider: &*self.provider,
+                model: &self.model,
+                messages: self.history.as_slice(),
+                system: &self.system,
+                tools: &tools,
+                opts: self.opts,
+                output_budget: self.config.max_turn_output,
+                session_id: self.session_id.as_ref(),
+                retry: self.timeouts.retry,
+            },
+            Some(self.gauge),
             &self.event_tx,
             &self.cancel,
-            self.opts,
-            self.session_id.as_ref(),
             &mut first_byte_at,
             &mut api_error_count,
         )
@@ -355,6 +366,7 @@ impl<'h> Agent<'h> {
         {
             Ok(r) => {
                 self.reauth_attempts = 0;
+                self.overflow_recoveries = 0;
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
@@ -372,6 +384,9 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Other(e)) if e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
+            }
+            Err(StreamError::Other(e)) if e.is_context_overflow() => {
+                return self.recover_from_overflow(e).await;
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -435,9 +450,9 @@ impl<'h> Agent<'h> {
             "API response received"
         );
 
-        let cost = self
-            .model
-            .billed_cost(&response.usage, self.opts.clamped(&self.model).fast);
+        // The gauge already took the provider's own count inside the stream.
+        let cost = self.model.billed_cost(&response.usage, self.opts.fast);
+        let list_cost = self.model.list_cost(&response.usage, self.opts.fast);
         self.turn_state.record_response(
             turn_idx,
             response.usage.cache_read,
@@ -446,23 +461,15 @@ impl<'h> Agent<'h> {
             cost,
         );
         self.turn_state.record_turn_complete(turn_idx);
+        self.ledger.add(response.usage, cost, list_cost);
 
         self.emit_turn_complete(&response, cost, &self.turn_state.turns[turn_idx])?;
-        let usage = response.usage;
-        self.total_usage += usage;
-        self.ledger.add(
-            usage,
-            cost,
-            self.model
-                .list_cost(&usage, self.opts.clamped(&self.model).fast),
-        );
-        self.context_size = usage.total_input();
 
         if has_tools {
             let history_len_before = self.history.len();
             self.process_tool_calls(response).await?;
-            self.context_size +=
-                estimate_message_tokens(&self.history.as_slice()[history_len_before..]);
+            self.gauge
+                .append(&self.history.as_slice()[history_len_before..]);
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
@@ -493,7 +500,11 @@ impl<'h> Agent<'h> {
             }
         }
 
-        if self.try_auto_compact().await? || self.handle_queued_command().await? {
+        // Everything the turn appended is answered, so a compaction from here
+        // on may summarize it. Input arriving after this point may not.
+        self.carry_from = self.history.len();
+
+        if self.handle_queued_command().await? {
             return Ok(TurnOutcome::Continue);
         }
 
@@ -502,6 +513,25 @@ impl<'h> Agent<'h> {
         } else {
             Ok(TurnOutcome::Done(stop_reason.into()))
         }
+    }
+
+    /// The gauge is a chars/4 floor, so a prompt can overflow with the
+    /// compaction threshold still unmet. Compaction is the only way out and it
+    /// is exactly what the gauge would have asked for, so run it and retry.
+    /// The counter resets on every successful stream, so a second overflow
+    /// means compaction did not help and the error is the honest answer.
+    async fn recover_from_overflow(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+        if !self.auto_compact || self.overflow_recoveries >= MAX_OVERFLOW_RECOVERIES {
+            error!(error = %err, model = %self.model.id, self.num_turns, "stream_message failed");
+            return Err(err);
+        }
+        self.overflow_recoveries += 1;
+        warn!(
+            context_size = self.gauge.size(),
+            "prompt overflowed below the compaction threshold"
+        );
+        self.compact_now().await?;
+        Ok(TurnOutcome::Continue)
     }
 
     async fn wait_for_reauth(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
@@ -543,7 +573,7 @@ impl<'h> Agent<'h> {
                 usage: response.usage,
                 model: self.model.id.clone(),
                 cost,
-                context_size: Some(response.usage.context_tokens()),
+                context_size: Some(self.gauge.size()),
                 context_window: self.model.context_window,
                 cache_miss: turn.is_cache_miss,
                 upstream: response.upstream.clone(),
@@ -567,7 +597,7 @@ impl<'h> Agent<'h> {
             usage: totals.usage,
             cost: totals.cost,
             list_cost: totals.list_cost,
-            context_size: self.context_size,
+            context_size: self.gauge.size(),
             context_window: self.model.context_window,
             num_turns: self.num_turns,
             reason,
@@ -599,7 +629,6 @@ impl<'h> Agent<'h> {
         let records = tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
-            self.mcp.as_ref(),
             self.history,
             &self.event_tx,
             &ctx,
@@ -624,9 +653,11 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
+            call_instructions: CallInstructions::default(),
             cancel: self.cancel.clone(),
             mcp: self.mcp.clone(),
             deadline: Deadline::None,
@@ -634,7 +665,7 @@ impl<'h> Agent<'h> {
             tool_output_lines: self.tool_output_lines,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
-            file_tracker: Arc::clone(&self.file_tracker),
+            file_access: Arc::clone(&self.file_access),
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
             subagent_cancels: Arc::clone(&self.subagent_cancels),
@@ -649,30 +680,47 @@ impl<'h> Agent<'h> {
         }
     }
 
-    async fn try_auto_compact(&mut self) -> Result<bool, AgentError> {
-        if !self.auto_compact
-            || !compaction::is_overflow(
-                &TokenUsage {
-                    input: self.context_size,
-                    ..Default::default()
-                },
-                &self.model,
-                self.config.compaction_buffer,
-            )
-        {
-            return Ok(false);
+    async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
+        let context_size = self.gauge.size();
+        if !self.auto_compact || !compaction::is_overflow(context_size, &self.model, &self.config) {
+            return Ok(());
         }
-        info!(context_size = self.context_size, "auto-compacting");
-        self.event_tx.send(AgentEvent::AutoCompacting {
-            context_size: self.context_size,
-            context_window: self.model.context_window,
-        })?;
-        self.do_compact().await?;
-        Ok(true)
+        info!(context_size, "auto-compacting");
+        self.compact_now().await
     }
 
-    async fn do_compact(&mut self) -> Result<(), AgentError> {
-        let context_size_before = self.context_size;
+    async fn compact_now(&mut self) -> Result<(), AgentError> {
+        self.event_tx.send(AgentEvent::AutoCompacting {
+            context_size: self.gauge.size(),
+            context_window: self.model.context_window,
+        })?;
+        self.do_compact(None).await
+    }
+
+    async fn do_compact(&mut self, instructions: Option<&str>) -> Result<(), AgentError> {
+        // Compaction replaces the whole transcript, so input no turn has
+        // answered yet would be summarized away before the model ever saw it,
+        // images and all. `carry_from` is where that input starts: the run's
+        // own prompt, plus anything queued in since the last turn ended.
+        let carry_len = self.history.len().saturating_sub(self.carry_from);
+        self.compact_and_bill(instructions, carry_len).await?;
+        // An unanswered prompt says what to do next better than the generic
+        // nudge, so it stands in for it.
+        if carry_len == 0 {
+            self.history
+                .push(Message::synthetic(compaction::continue_message(
+                    &self.config,
+                )));
+        }
+        Ok(())
+    }
+
+    async fn compact_and_bill(
+        &mut self,
+        instructions: Option<&str>,
+        carry_len: usize,
+    ) -> Result<(), AgentError> {
+        let context_size_before = self.gauge.size();
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
@@ -685,33 +733,37 @@ impl<'h> Agent<'h> {
             self.history,
             &self.event_tx,
             &self.cancel,
-            None,
             &self.config,
+            instructions,
+            carry_len,
+            self.session_id.as_ref(),
+            self.timeouts.retry,
+            None,
         )
         .await?;
-        self.total_usage += compaction_usage;
         // The summariser can be a different model, so price this with
-        // `compact_model` and not `self.model`.
-        let fast = self.opts.clamped(&compact_model).fast;
-        self.ledger.add(
-            compaction_usage,
-            compact_model.billed_cost(&compaction_usage, fast),
-            compact_model.list_cost(&compaction_usage, fast),
+        // `compact_model` and not `self.model`. `list_cost` gates `fast`
+        // against whichever one it gets.
+        let compact_cost = compact_model.billed_cost(&compaction_usage, self.opts.fast);
+        let compact_list_cost = compact_model.list_cost(&compaction_usage, self.opts.fast);
+        self.ledger
+            .add(compaction_usage, compact_cost, compact_list_cost);
+        // The measurement the gauge holds describes the transcript that was
+        // just summarized away, so what is left is all it may count.
+        self.gauge.reset(
+            self.history.as_slice(),
+            &self.system,
+            request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
         );
-        // The summary the model just wrote is all the next call will see, so
-        // its output count is the new gauge.
-        let context_size_after = compaction_usage.output;
-        self.context_size = context_size_after;
-        self.rollback_len = self.history.len();
+        let context_size_after = self.gauge.size();
+        let carry_from = self.history.len().saturating_sub(carry_len);
+        self.rollback_len = carry_from;
+        self.carry_from = carry_from;
         self.event_tx.send(AgentEvent::CompactionDone {
             context_size_before,
             context_size_after,
             context_window: self.model.context_window,
         })?;
-        self.history
-            .push(Message::synthetic(compaction::continue_message(
-                &self.config,
-            )));
         Ok(())
     }
 
@@ -731,7 +783,6 @@ impl<'h> Agent<'h> {
             None,
         )
         .await?;
-        self.total_usage += checkpoint_usage;
         let fast = self.opts.clamped(&model).fast;
         self.ledger.add(
             checkpoint_usage,
@@ -749,21 +800,34 @@ impl<'h> Agent<'h> {
             return Ok(false);
         };
         match cmd {
-            ExtractedCommand::Interrupt(mut input, _) => {
-                self.event_tx.send(AgentEvent::QueueItemConsumed {
-                    text: input.message.clone(),
-                    image_count: input.images.len(),
-                })?;
-                self.push_input_context(std::mem::take(&mut input.preamble));
-                self.mode = input.mode.clone();
-                let display = input.message.clone();
-                let wrapped = format!(
-                    "<user-interrupt>\nThe user sent a new message while you were working. Address it and continue.\n\n{display}\n</user-interrupt>"
-                );
-                self.history.push(Message::user_display(wrapped, display));
+            // The burst lands as consecutive user messages, so one request
+            // carries all of it.
+            ExtractedCommand::Interrupt(inputs) => {
+                for input in inputs {
+                    self.event_tx.send(AgentEvent::QueueItemConsumed {
+                        text: input.message.clone(),
+                        images: input.images.clone(),
+                    })?;
+                    self.push_input_context(input.preamble);
+                    self.mode = input.mode;
+                    let wrapped = format!(
+                        "<user-interrupt>\n{INTERRUPT_NOTE}\n\n{}\n</user-interrupt>",
+                        input.message
+                    );
+                    self.history.push(Message {
+                        display_text: Some(
+                            if input.message.is_empty() && !input.images.is_empty() {
+                                IMAGE_PLACEHOLDER.into()
+                            } else {
+                                input.message
+                            },
+                        ),
+                        ..Message::user_with_images(wrapped, input.images)
+                    });
+                }
             }
-            ExtractedCommand::Compact(_) => {
-                self.do_compact().await?;
+            ExtractedCommand::Compact(instructions) => {
+                self.do_compact(instructions.as_deref()).await?;
             }
             ExtractedCommand::Checkpoint(_) => {
                 self.do_checkpoint().await?;
@@ -773,34 +837,30 @@ impl<'h> Agent<'h> {
     }
 }
 
-const CHARS_PER_TOKEN: usize = 4;
-
-/// Counts message content only. The system prompt and the tool schemas, a five
-/// figure baseline on a full tool set, stay invisible here, so never let this
-/// replace a context size the provider measured.
-pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
-    if messages.is_empty() {
-        return 0;
+/// `tools` holds base tools only. The MCP part is recomputed per request, so
+/// `tool_search` loads and late-connecting servers take effect on the next one.
+///
+/// Free-standing rather than a method, so a caller can hold the result and
+/// still reach `&mut self.gauge`, and so a frontend sizing the same prompt
+/// outside a run does not rebuild the array by hand.
+pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> Cow<'t, Value> {
+    match mcp {
+        Some(mcp) => {
+            let mut tools = tools.definitions().clone();
+            mcp.extend_tools(&mut tools);
+            Cow::Owned(tools)
+        }
+        None => Cow::Borrowed(tools.definitions()),
     }
-    let total_bytes: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.len()),
-            ContentBlock::ToolResult { content, .. } => Some(content.len()),
-            ContentBlock::ToolUse { input, .. } => Some(json_byte_len(input)),
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
-            _ => None,
-        })
-        .sum();
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
+    use maki_config::ProjectConfig;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
@@ -813,6 +873,10 @@ mod tests {
     use crate::Envelope;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+
+    const QUEUED_MESSAGES: [&str; 3] = ["first", "second", "third"];
+    const ONE_GAUGE_MSG: &str =
+        "TurnComplete, Done, and the compaction trigger must read one context gauge";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -899,10 +963,7 @@ mod tests {
                     trigger.cancel();
                 }
                 match self.fail_status {
-                    Some(status) => Err(AgentError::Api {
-                        status,
-                        message: "stub".into(),
-                    }),
+                    Some(status) => Err(AgentError::api(status, "stub")),
                     None => futures_lite::future::pending().await,
                 }
             })
@@ -956,6 +1017,8 @@ mod tests {
         }
     }
 
+    /// The leaked gauge outlives the agent that borrows it, so no caller here
+    /// has to own one.
     fn make_agent(
         provider: impl Provider + 'static,
         history: &mut History,
@@ -974,12 +1037,14 @@ mod tests {
                         ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),
+                    ProjectConfig::for_project(Path::new("/tmp")),
                     Arc::default(),
                 )),
                 session_id: None,
+                task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
-                file_tracker: FileReadTracker::fresh(),
+                file_access: FileAccess::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
                 subagent_cancels: Arc::new(crate::cancel::CancelMap::new()),
                 registry: Arc::new(crate::tools::ToolRegistry::new()),
@@ -989,6 +1054,7 @@ mod tests {
             },
             AgentRunParams {
                 history,
+                gauge: Box::leak(Box::default()),
                 system: "system".into(),
                 event_tx: EventSender::new(raw_tx, 0),
                 tools: RequestTools::assembled(
@@ -1046,7 +1112,7 @@ mod tests {
             SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
-            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(input, 0)]);
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
             agent.mailbox = Some(mailbox);
@@ -1228,8 +1294,7 @@ mod tests {
         smol::block_on(async {
             let source = if queued.is_some() {
                 Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
-                    default_input(),
-                    0,
+                    vec![default_input()],
                 )]))
             } else {
                 None
@@ -1270,9 +1335,51 @@ mod tests {
         });
     }
 
+    /// Every message queued back to back is handed over as one `Interrupt`, so
+    /// that answers all three queued messages. Answering them one by one would
+    /// ask the mock for a response it does not have.
+    #[test]
+    fn queued_messages_are_delivered_in_one_turn() {
+        smol::block_on(async {
+            let inputs = Vec::from(QUEUED_MESSAGES.map(|text| AgentInput {
+                message: text.into(),
+                ..default_input()
+            }));
+            let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(inputs)]);
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+
+            let mut agent = agent.with_interrupt_source(source);
+            agent.run(default_input()).await.unwrap();
+            let events = drain_events(&event_rx);
+            drop(agent);
+
+            let user_texts: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter(|m| matches!(m.role, Role::User))
+                .filter_map(Message::user_text)
+                .collect();
+            assert_eq!(user_texts[1..], QUEUED_MESSAGES);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e.event, AgentEvent::QueueItemConsumed { .. }))
+                    .count(),
+                QUEUED_MESSAGES.len()
+            );
+        });
+    }
+
     #[test_case(
         (0..10).map(|i| Message::user(format!("msg {i}"))).collect(),
-        vec![ExtractedCommand::Compact(0)],
+        vec![ExtractedCommand::Compact(None)],
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
     )]
@@ -1295,6 +1402,38 @@ mod tests {
         });
     }
 
+    /// `TurnComplete`, `Done` and the auto-compaction trigger all report the
+    /// same context number, so nobody downstream thinks it has spare room.
+    #[test]
+    fn context_size_is_one_gauge_across_turn_complete_and_done() {
+        smol::block_on(async {
+            let mut response = text_response(StopReason::EndTurn);
+            response.usage = TokenUsage {
+                input: 1_000,
+                output: 400,
+                cache_read: 250,
+                cache_creation: 50,
+                ..Default::default()
+            };
+            let expected = response.usage.total_input();
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let events = drain_events(&event_rx);
+            let reported: Vec<u32> = events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    AgentEvent::TurnComplete(tc) => tc.context_size,
+                    AgentEvent::Done { context_size, .. } => Some(*context_size),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reported, vec![expected, expected], "{ONE_GAUGE_MSG}");
+        });
+    }
+
     #[test_case(true,  170_000, true  ; "enabled_and_over_threshold")]
     #[test_case(true,  150_000, false ; "enabled_but_below_threshold")]
     #[test_case(false, 170_000, false ; "disabled_even_over_threshold")]
@@ -1307,12 +1446,10 @@ mod tests {
             };
             let mut history = History::new(vec![Message::user("go".into())]);
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+            *agent.gauge = ContextGauge::restored(context_size);
             agent.model = Arc::new(small_context_model(200_000, 8_192));
             agent.auto_compact = enabled;
-            agent.context_size = context_size;
-            let result = agent.try_auto_compact().await.unwrap();
-
-            assert_eq!(result, expected);
+            agent.try_auto_compact().await.unwrap();
             drop(agent);
             assert_eq!(
                 has_event(&drain_events(&event_rx), |e| matches!(
@@ -1320,6 +1457,184 @@ mod tests {
                     AgentEvent::AutoCompacting { .. }
                 )),
                 expected,
+            );
+        });
+    }
+
+    const OVERFLOW_CHUNK: &str = "restored transcript chunk ";
+    const OVERFLOW_CHUNKS: u32 = 400;
+    const TINY_CONTEXT_WINDOW: u32 = 1_000;
+    const TINY_MAX_OUTPUT: u32 = 256;
+    const PENDING_PROMPT: &str = "fix the flaky test in run.rs";
+    const COMPACT_FIRST_MSG: &str =
+        "a resumed session over the threshold must compact before its first request";
+    const PROMPT_KEPT_MSG: &str =
+        "the prompt that started the run must survive the compaction verbatim";
+
+    /// A resumed transcript that already fills the window has to be caught
+    /// before the first request, and the prompt that triggered the run must
+    /// not be summarized away along with it.
+    #[test]
+    fn resumed_overflowing_history_compacts_before_first_request() {
+        smol::block_on(async {
+            let prior = (0..OVERFLOW_CHUNKS)
+                .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+                .collect();
+            let mut history = History::new(prior);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
+            agent.auto_compact = true;
+            agent
+                .run(AgentInput {
+                    message: PENDING_PROMPT.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap();
+            drop(agent);
+
+            let first = drain_events(&event_rx)
+                .into_iter()
+                .map(|e| e.event)
+                .find(|e| {
+                    matches!(
+                        e,
+                        AgentEvent::AutoCompacting { .. } | AgentEvent::TurnComplete(_)
+                    )
+                });
+            assert!(
+                matches!(first, Some(AgentEvent::AutoCompacting { .. })),
+                "{COMPACT_FIRST_MSG}"
+            );
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text == PENDING_PROMPT)),
+                "{PROMPT_KEPT_MSG}"
+            );
+        });
+    }
+
+    const OVERFLOW_STATUS: u16 = 413;
+    const OVERFLOW_MESSAGE: &str = "prompt is too long";
+    const RECOVER_MSG: &str = "an overflow the gauge missed must compact and retry";
+    const GIVE_UP_MSG: &str = "a second overflow in a row must surface, not compact again";
+
+    /// Overflows the next `0` requests, then behaves.
+    struct OverflowProvider(Mutex<u32>);
+
+    impl Provider for OverflowProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                let mut remaining = self.0.lock().unwrap();
+                match remaining.checked_sub(1) {
+                    Some(rest) => {
+                        *remaining = rest;
+                        Err(AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE))
+                    }
+                    None => Ok(text_response(StopReason::EndTurn)),
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// The gauge is an estimate, so a prompt can overflow with the threshold
+    /// still unmet. That is what compaction is for, but only once: a second
+    /// overflow means it did not help.
+    #[test_case(0, true, RECOVER_MSG ; "unpredicted_overflow_compacts_and_retries")]
+    #[test_case(MAX_OVERFLOW_RECOVERIES, false, GIVE_UP_MSG ; "exhausted_recoveries_surface_the_error")]
+    fn overflow_recovery(recoveries: u32, expected: bool, message: &str) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(OverflowProvider(Mutex::new(1)), &mut history);
+            agent.auto_compact = true;
+            agent.overflow_recoveries = recoveries;
+
+            let recovered = agent.run(default_input()).await.is_ok();
+            drop(agent);
+
+            assert_eq!(recovered, expected, "{message}");
+            assert_eq!(
+                has_event(&drain_events(&event_rx), |e| matches!(
+                    e,
+                    AgentEvent::AutoCompacting { .. }
+                )),
+                expected,
+                "{message}"
+            );
+        });
+    }
+
+    const QUEUED_INPUT: &str = "actually, check the other module first";
+    const QUEUED_COMPACTED_MSG: &str = "the filled gauge must trigger a compaction";
+    const QUEUED_KEPT_MSG: &str = "input queued mid-run must survive the compaction verbatim";
+
+    /// The turn before it already appended an assistant message, so the tail
+    /// alone cannot tell that this input is still unanswered.
+    #[test]
+    fn compaction_carries_input_queued_mid_run() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let filling = StreamResponse {
+                usage: TokenUsage {
+                    input: TINY_CONTEXT_WINDOW,
+                    ..Default::default()
+                },
+                ..text_response(StopReason::EndTurn)
+            };
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![
+                    filling,
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
+            agent.auto_compact = true;
+            agent.interrupt_source =
+                Some(MockInterruptSource::new(vec![ExtractedCommand::Interrupt(
+                    vec![AgentInput {
+                        message: QUEUED_INPUT.into(),
+                        ..default_input()
+                    }],
+                )]));
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert!(
+                has_event(&drain_events(&event_rx), |e| matches!(
+                    e,
+                    AgentEvent::AutoCompacting { .. }
+                )),
+                "{QUEUED_COMPACTED_MSG}"
+            );
+            assert!(
+                history.as_slice().iter().flat_map(|m| &m.content).any(
+                    |b| matches!(b, ContentBlock::Text { text } if text.contains(QUEUED_INPUT))
+                ),
+                "{QUEUED_KEPT_MSG}"
             );
         });
     }
@@ -1334,7 +1649,8 @@ mod tests {
                 &mut history,
             );
             agent.config.post_compaction_instructions = Some(POST.into());
-            agent.do_compact().await.unwrap();
+            agent.carry_from = agent.history.len();
+            agent.do_compact(None).await.unwrap();
             drop(agent);
 
             let last = history.as_slice().last().unwrap();

@@ -3,7 +3,14 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Wrap};
+use ratatui_image::{
+    Image,
+    picker::Picker,
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
+};
 use std::ops::Range;
+
+use crate::terminal_image::InlineImage;
 
 pub(super) struct RenderCursor {
     skip: u16,
@@ -35,6 +42,71 @@ impl RenderCursor {
     /// `Text` conversion clones every line and span it is given. Handing it
     /// the whole block would deep-copy a segment's worth of strings per frame
     /// to paint a viewport's worth of rows.
+    /// `visible` is false while an overlay covers the transcript. The encoded
+    /// protocol is kept either way: releasing it here would re-decode and
+    /// re-transmit every image each time a permission prompt opens and closes.
+    pub fn render_image(
+        &mut self,
+        image: &mut InlineImage,
+        picker: Option<&Picker>,
+        visible: bool,
+        frame: &mut Frame,
+    ) {
+        if self.past_bottom() {
+            return;
+        }
+        // Ask for the pixels before measuring: an image with no fallback row is
+        // zero rows tall until its protocol lands, and the check below reads
+        // zero rows as scrolled past, so it would never get around to asking.
+        if let Some(picker) = picker.filter(|_| visible) {
+            image.prepare(picker, self.viewport.width);
+        }
+        let height = image.height();
+        if self.skip >= height {
+            self.skip -= height;
+            return;
+        }
+        let Some(protocol) = image.protocol(self.viewport.width) else {
+            let fallback = image.fallback().map(Line::from);
+            let lines: &[Line<'static>] = fallback.as_slice();
+            self.render(
+                lines,
+                height,
+                |skip, _| (0..lines.len(), skip),
+                None,
+                false,
+                frame,
+            );
+            return;
+        };
+        let visible_rows = height
+            .saturating_sub(self.skip)
+            .min(self.bottom.saturating_sub(self.y));
+        let area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_rows);
+        if let SlicedProtocol::Sliced(rows) = protocol {
+            // Not `SlicedImage::new`: upstream renders `.skip(skip).take(len - drop)`
+            // rows into `area`, which is `skip` rows too many when an image is
+            // clipped at the top and the bottom at once, so it draws past `area`
+            // into the segments below. Placing each row ourselves cannot overdraw.
+            for (offset, row) in rows
+                .iter()
+                .skip(self.skip as usize)
+                .take(visible_rows as usize)
+                .enumerate()
+            {
+                frame.render_widget(
+                    Image::new(row),
+                    Rect::new(area.x, area.y + offset as u16, area.width, 1),
+                );
+            }
+        } else {
+            let position = SignedPosition::from((0, -(self.skip as i16)));
+            frame.render_widget(SlicedImage::new(protocol, position), area);
+        }
+        self.skip = 0;
+        self.y += visible_rows;
+    }
+
     pub fn render(
         &mut self,
         lines: &[Line<'static>],

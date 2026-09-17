@@ -1,101 +1,174 @@
 use std::env;
 
-use maki_config::{AgentConfig, CompactionBuffer};
+use maki_config::AgentConfig;
+use maki_providers::retry::RetryPolicy;
 use maki_providers::{
-    ContentBlock, Message, Model, RequestOptions, Role, StreamResponse, TokenUsage,
+    ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, Message, Model, RequestOptions, Role,
+    StreamResponse, TokenUsage,
 };
+use maki_storage::id::SessionRef;
+use serde_json::Value;
 use tracing::info;
 
 use super::history::{History, remove_orphaned_tool_results};
-use super::streaming::{StreamError, stream_with_retry};
+use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use crate::cancel::CancelToken;
+use crate::prompt::COMPACTION_USER;
 use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
-const IMAGE_PLACEHOLDER: &str = "[image]";
+const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
+/// How much of the newest tool output survives a compaction verbatim. This
+/// used to be a count, which kept three huge results and threw away thirty
+/// cheap ones, so one giant MCP dump could sit in the protected tail and blow
+/// the window on every retry.
+const RECENT_TOOL_RESULT_BUDGET: usize = 64 * 1024;
+/// A summary runs to a few thousand tokens. Giving compaction the full turn
+/// budget would reserve tens of thousands it cannot use, on the one request
+/// already sent under the most context pressure a session ever sees.
+const SUMMARY_OUTPUT_BUDGET: u32 = 16_384;
+/// Ceiling on everything [`reserved`] holds back, as a share of the window.
+///
+/// The floor under a reservation is a fixed token count and the buffer can be
+/// written as one, so on a small window either can reach the whole context. A
+/// reservation that large leaves no usable window at all: every turn reads as
+/// an overflow, and compaction cannot get under a threshold of zero, so a
+/// llama.cpp server started with `n_ctx 4096` summarized itself before every
+/// single turn.
+const MAX_RESERVED_PERCENT: u32 = 50;
 
 /// Framing line prepended to an interleaved checkpoint summary in history. Not a
 /// locator: checkpoints are append-only, so nothing is ever matched or removed.
 pub(super) const CHECKPOINT_INTRO: &str = "Progress summary since last checkpoint:";
 
-fn normalize(text: &Option<String>) -> Option<&str> {
-    text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+fn percent_of(tokens: u32, percent: u32) -> u32 {
+    (u64::from(tokens) * u64::from(percent) / 100) as u32
+}
+
+fn normalize(text: Option<&str>) -> Option<&str> {
+    text.map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Config instructions steer every compaction, `request` only the one the user
+/// asked for with `/compact <guidance>`, so both are kept and neither wins.
+fn summary_prompt(config: &AgentConfig, request: Option<&str>) -> String {
+    let extras = [
+        normalize(config.compaction_instructions.as_deref()),
+        normalize(request),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    if extras.is_empty() {
+        return COMPACTION_USER.to_string();
+    }
+    format!("{COMPACTION_USER}\n\nAdditional instructions:\n{extras}")
 }
 
 pub(super) fn continue_message(config: &AgentConfig) -> String {
-    match normalize(&config.post_compaction_instructions) {
+    match normalize(config.post_compaction_instructions.as_deref()) {
         Some(extra) => format!("{CONTINUE_AFTER_COMPACT}\n\n{extra}"),
         None => CONTINUE_AFTER_COMPACT.to_string(),
     }
 }
 
-/// The compaction instruction the model is finally handed: the built-in prompt
-/// plus whatever `compaction_instructions` adds. Built here rather than inside
-/// `run_summary_stream` because checkpoint mode passes its own prompt.
-fn summary_prompt(config: &AgentConfig) -> String {
-    match normalize(&config.compaction_instructions) {
-        Some(extra) => format!(
-            "{}\n\nAdditional instructions:\n{extra}",
-            crate::prompt::COMPACTION_USER
-        ),
-        None => crate::prompt::COMPACTION_USER.to_string(),
-    }
-}
-
-/// Stream a summary of `history` under the compaction system prompt using
-/// `user_prompt` as the final instruction. Mutates nothing; the caller decides
-/// what to do with the response (replace history vs. append a checkpoint).
+/// Replaces `history` with a summary of itself, retrying on overflow by
+/// pruning what it sends.
 ///
-/// `strip` removes images/thinking/old tool-results to shrink the request. It's
-/// right for compaction (history is about to be discarded) but not for
-/// checkpoint: an unstripped request shares the main conversation's cached
-/// prefix, so it rides the prompt cache instead of forcing a full reprocess.
+/// The last `carry_len` messages are held out of the summary and re-appended
+/// after it, so input no turn has answered yet survives verbatim without ever
+/// leaving `history`. Anything less and the mirror would publish a transcript
+/// missing that input for the length of the summary request.
 #[allow(clippy::too_many_arguments)]
-async fn run_summary_stream(
+pub(super) async fn compact_history(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
-    history: &History,
-    user_prompt: &str,
-    strip: bool,
+    history: &mut History,
     event_tx: &EventSender,
     cancel: &CancelToken,
+    config: &AgentConfig,
+    instructions: Option<&str>,
+    carry_len: usize,
+    session_id: Option<&SessionRef>,
+    retry: RetryPolicy,
     target_tokens: Option<usize>,
-) -> Result<StreamResponse, AgentError> {
-    let mut compaction_history: Vec<Message> = history.as_slice().to_vec();
+) -> Result<TokenUsage, AgentError> {
+    let compact_start = std::time::Instant::now();
+    let summarized = history.len().saturating_sub(carry_len);
+    let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
-    if strip {
-        strip_images(&mut compaction_history);
-        strip_thinking(&mut compaction_history);
-        strip_old_tool_results(&mut compaction_history);
-    }
-    compaction_history.push(Message::user(user_prompt.to_string()));
+    strip_images(&mut compaction_history);
+    strip_thinking(&mut compaction_history);
+    collapse_tool_results(&mut compaction_history, RECENT_TOOL_RESULT_BUDGET);
+    compaction_history.push(Message::user(summary_prompt(config, instructions)));
+    let response = summarize(
+        provider,
+        model,
+        compaction_history,
+        target_tokens,
+        event_tx,
+        cancel,
+        session_id,
+        retry,
+    )
+    .await?;
+    finish_compact(
+        response,
+        history,
+        summarized,
+        event_tx,
+        compact_start,
+        model,
+    )
+}
 
+/// One summary request. Compaction and checkpoints differ only in the transcript
+/// they send and what they do with the answer, so the retry loop that has to
+/// survive a server refusing the prompt lives here once.
+///
+/// The retry prunes what it sends: truncation eats from the front, so it can
+/// never shrink an oversized result sitting in the protected tail. That gets
+/// collapsed first, and once there is nothing left to collapse the oldest round
+/// is dropped rather than resending the same request.
+#[allow(clippy::too_many_arguments)]
+async fn summarize(
+    provider: &dyn maki_providers::provider::Provider,
+    model: &Model,
+    mut messages: Vec<Message>,
+    target_tokens: Option<usize>,
+    event_tx: &EventSender,
+    cancel: &CancelToken,
+    session_id: Option<&SessionRef>,
+    retry: RetryPolicy,
+) -> Result<StreamResponse, AgentError> {
     let empty_tools = serde_json::json!([]);
     let max_attempts = 3;
     let mut last_error = None;
-
-    let mut system_prompt = crate::prompt::COMPACTION_SYSTEM.to_string();
-    if let Some(target) = target_tokens {
-        let approx_words = (target as f64 * 0.75).round() as usize;
-        system_prompt.push_str(&format!(
-            "\n\nLENGTH CONSTRAINT: keep the whole block under ~{} words (~{} tokens). Shed detail in the FIDELITY order; never drop MISSION, GIT, or the final [NEXT].",
-            approx_words, target
-        ));
-    }
+    let system_prompt = summary_system_prompt(target_tokens);
 
     for attempt in 0..max_attempts {
         let mut first_byte_at = None;
         let mut api_error_count = 0u32;
         match stream_with_retry(
-            provider,
-            model,
-            &compaction_history,
-            &system_prompt,
-            &empty_tools,
+            StreamRequest {
+                provider,
+                model,
+                messages: &messages,
+                system: &system_prompt,
+                tools: &empty_tools,
+                opts: RequestOptions::default(),
+                output_budget: SUMMARY_OUTPUT_BUDGET,
+                session_id,
+                retry,
+            },
+            // A stripped, collapsed rewrite of the transcript, far smaller than
+            // it. Sizing this request as the session would trim the
+            // summariser's budget by the weight of the messages it is deleting,
+            // and its measurement describes a prompt the session never had.
+            None,
             event_tx,
             cancel,
-            RequestOptions::default(),
-            None,
             &mut first_byte_at,
             &mut api_error_count,
         )
@@ -109,7 +182,9 @@ async fn run_summary_stream(
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
-                truncate_oldest_round(&mut compaction_history);
+                if !collapse_tool_results(&mut messages, 0) {
+                    truncate_oldest_round(&mut messages);
+                }
             }
             Err(e) => return Err(e.into()),
         }
@@ -118,33 +193,24 @@ async fn run_summary_stream(
     Err(last_error.unwrap())
 }
 
-pub(super) async fn compact_history(
-    provider: &dyn maki_providers::provider::Provider,
-    model: &Model,
-    history: &mut History,
-    event_tx: &EventSender,
-    cancel: &CancelToken,
-    target_tokens: Option<usize>,
-    config: &AgentConfig,
-) -> Result<TokenUsage, AgentError> {
-    let compact_start = std::time::Instant::now();
-    let response = run_summary_stream(
-        provider,
-        model,
-        history,
-        &summary_prompt(config),
-        true,
-        event_tx,
-        cancel,
-        target_tokens,
-    )
-    .await?;
-    finish_compact(response, history, event_tx, compact_start, model)
+/// The compaction system prompt, with the length constraint a `/compact <N>`
+/// target asked for appended to it.
+fn summary_system_prompt(target_tokens: Option<usize>) -> String {
+    let mut system_prompt = crate::prompt::COMPACTION_SYSTEM.to_string();
+    if let Some(target) = target_tokens {
+        let approx_words = (target as f64 * 0.75).round() as usize;
+        system_prompt.push_str(&format!(
+            "\n\nLENGTH CONSTRAINT: keep the whole block under ~{} words (~{} tokens). Shed detail in the FIDELITY order; never drop MISSION, GIT, or the final [NEXT].",
+            approx_words, target
+        ));
+    }
+    system_prompt
 }
 
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
+    summarized: usize,
     event_tx: &EventSender,
     compact_start: std::time::Instant,
     model: &Model,
@@ -173,10 +239,11 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     }
 
-    let new_history = vec![
+    let mut new_history = vec![
         Message::user("What did we do so far?".into()),
         response.message,
     ];
+    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.replace(new_history);
     info!(
         model = %model.id,
@@ -187,35 +254,62 @@ fn finish_compact(
     Ok(response.usage)
 }
 
+/// `system` and `tools` are the ones the next request will carry: compaction
+/// replaces the transcript and leaves that baseline untouched, so the gauge
+/// cannot be resized without them.
+///
+/// A retry in here can honour a server `Retry-After` that parks the request for
+/// an hour, so esc has to reach it. The cancel comes back as
+/// `Ok(DoneReason::Cancelled)`, like [`Agent::run`](super::Agent::run) does, to
+/// leave the error path for real failures.
+#[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
     history: &mut History,
+    gauge: &mut ContextGauge,
+    system: &str,
+    tools: &Value,
     event_tx: &EventSender,
     target_tokens: Option<usize>,
+    cancel: &CancelToken,
     config: &AgentConfig,
-) -> Result<(), AgentError> {
-    let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: false });
-    let cancel = CancelToken::none();
-    let usage = compact_history(
+    instructions: Option<&str>,
+    session_id: Option<&SessionRef>,
+    retry: RetryPolicy,
+) -> Result<DoneReason, AgentError> {
+    let size_before = gauge.size();
+    let usage = match compact_history(
         provider,
         model,
         history,
         event_tx,
-        &cancel,
-        target_tokens,
+        cancel,
         config,
+        instructions,
+        0,
+        session_id,
+        retry,
+        target_tokens,
     )
-    .await?;
-    if let Some(post) = normalize(&config.post_compaction_instructions) {
+    .await
+    {
+        Ok(usage) => usage,
+        // `finish_compact` is the only writer in here, so a cancel leaves the
+        // transcript and the gauge untouched and the session carries on.
+        Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
+        Err(e) => return Err(e),
+    };
+    if let Some(post) = normalize(config.post_compaction_instructions.as_deref()) {
         history.push(Message::synthetic(post.to_string()));
     }
+    gauge.reset(history.as_slice(), system, tools);
 
-    // There is no running context gauge on the manual `/compact` path, so the
-    // summariser stands in for it: what it read is the size before, what it
-    // wrote is the size after.
-    let context_size_before = usage.total_input();
-    let context_size_after = usage.output;
+    // The summariser read a subset of the session's prompt, so its own count is
+    // a floor on the size before, and the only number a gauge that has not seen
+    // a turn yet can offer.
+    let context_size_before = size_before.max(usage.total_input());
+    let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
         context_size_after,
@@ -234,7 +328,7 @@ pub async fn compact(
         reason: DoneReason::Compact,
     })?;
 
-    Ok(())
+    Ok(DoneReason::Compact)
 }
 
 /// Generate a session name from user messages using an isolated LLM call.
@@ -326,15 +420,18 @@ pub(super) async fn checkpoint_history(
     target_tokens: Option<usize>,
 ) -> Result<TokenUsage, AgentError> {
     let _ = event_tx.send(AgentEvent::CompactionStart { checkpoint: true });
-    let response = run_summary_stream(
+    let mut messages: Vec<Message> = history.as_slice().to_vec();
+    remove_orphaned_tool_results(&mut messages);
+    messages.push(Message::user(crate::prompt::CHECKPOINT_USER.to_string()));
+    let response = summarize(
         provider,
         model,
-        history,
-        crate::prompt::CHECKPOINT_USER,
-        false,
+        messages,
+        target_tokens,
         event_tx,
         cancel,
-        target_tokens,
+        None,
+        RetryPolicy::default(),
     )
     .await?;
 
@@ -344,11 +441,37 @@ pub(super) async fn checkpoint_history(
     Ok(response.usage)
 }
 
-pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
-    let usable = model
-        .context_window
-        .saturating_sub(buffer.resolve(model.context_window));
-    usage.context_tokens() >= usable
+/// Context held back from the transcript.
+///
+/// Never below [`min_output`], the floor a request may ask for, so under this
+/// threshold the window still houses the prompt and an answer and a server
+/// checking `prompt + max_tokens <= context_window` has nothing to object to.
+/// That floor tracks the model's own cap, or a small-window model would compact
+/// itself over output tokens it could never emit.
+///
+/// Reserving a whole [`AgentConfig::max_turn_output`] would guarantee more and
+/// cost more: on a small window that is half the context, and compacting that
+/// early hurts worse than the odd turn whose output budget gets trimmed.
+///
+/// Whatever the floor and the buffer work out to, [`MAX_RESERVED_PERCENT`] has
+/// the last word, because a reservation that eats the window leaves compaction
+/// nothing to compact into.
+pub(super) fn reserved(model: &Model, config: &AgentConfig) -> u32 {
+    config
+        .compaction_buffer
+        .resolve(model.context_window)
+        .max(min_output(model))
+        .min(percent_of(model.context_window, MAX_RESERVED_PERCENT))
+}
+
+/// What [`reserved`] leaves the transcript. Always a real number of tokens, so
+/// `>=` against it is a threshold a session can sit below.
+pub(super) fn usable(model: &Model, config: &AgentConfig) -> u32 {
+    model.context_window - reserved(model, config)
+}
+
+pub(super) fn is_overflow(context_tokens: u32, model: &Model, config: &AgentConfig) -> bool {
+    context_tokens >= usable(model, config)
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -369,27 +492,30 @@ fn strip_thinking(messages: &mut [Message]) {
     }
 }
 
-const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
-const KEEP_LAST_TOOL_RESULTS: usize = 3;
-
-fn strip_old_tool_results(messages: &mut [Message]) {
-    let total: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        .count();
-
-    let mut seen = 0;
-    for msg in messages {
-        for block in &mut msg.content {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                if seen < total.saturating_sub(KEEP_LAST_TOOL_RESULTS) {
+/// Walks newest first and collapses every tool result that does not fit in
+/// what is left of `budget`. One oversized result is collapsed on its own and
+/// leaves the budget to the older ones, which is the whole point: charging it
+/// would spend the tail on a block that is no longer there. Returns whether
+/// anything actually shrank, so a caller retrying on overflow can tell
+/// progress from a no-op.
+fn collapse_tool_results(messages: &mut [Message], mut budget: usize) -> bool {
+    let mut collapsed = false;
+    for block in messages
+        .iter_mut()
+        .rev()
+        .flat_map(|m| m.content.iter_mut().rev())
+    {
+        if let ContentBlock::ToolResult { content, .. } = block {
+            match budget.checked_sub(content.len()) {
+                Some(rest) => budget = rest,
+                None => {
+                    collapsed |= content != TOOL_RESULT_PLACEHOLDER;
                     *content = TOOL_RESULT_PLACEHOLDER.into();
                 }
-                seen += 1;
             }
         }
     }
+    collapsed
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -441,11 +567,31 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
+    use maki_config::CompactionBuffer;
+
+    const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
+    const REQUEST_EXTRA: &str = "Keep the failing test names";
+    const POST: &str = "Re-read plan.md and agent.md";
+    const OVERFLOW_MESSAGE: &str = "prompt is too long";
+    const OVERFLOW_STATUS: u16 = 413;
+    /// Shorter than [`NEW_RESULT`], so the budget-burn case below is the only
+    /// reason it collapses.
+    const OLD_RESULT: &str = "old";
+    const NEW_RESULT: &str = "new result";
+    const KEPT_TEXT: &str = "keep me";
+    /// These tests assert on the transcript and on gauge sizes relative to each
+    /// other, so the baseline would only add noise.
+    const NO_SYSTEM: &str = "";
+
+    fn no_tools() -> Value {
+        Value::Array(Vec::new())
+    }
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         requests: Mutex<Vec<Vec<Message>>>,
         system_prompts: Mutex<Vec<String>>,
+        sessions: Mutex<Vec<Option<String>>>,
     }
 
     impl MockProvider {
@@ -454,6 +600,7 @@ mod tests {
                 responses: Mutex::new(responses),
                 requests: Mutex::new(Vec::new()),
                 system_prompts: Mutex::new(vec![]),
+                sessions: Mutex::new(Vec::new()),
             }
         }
     }
@@ -467,14 +614,18 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             self.system_prompts
                 .lock()
                 .unwrap()
                 .push(system_prompt.to_string());
-            Box::pin(async {
+            Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .push(session_id.map(|s| s.as_str().to_string()));
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 responses.remove(0)
@@ -496,6 +647,10 @@ mod tests {
         model
     }
 
+    fn overflow_error() -> AgentError {
+        AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE)
+    }
+
     fn text_response(stop_reason: StopReason) -> StreamResponse {
         StreamResponse {
             message: Message {
@@ -511,14 +666,67 @@ mod tests {
         }
     }
 
+    async fn summarize(
+        provider: &MockProvider,
+        history: &mut History,
+        gauge: &mut ContextGauge,
+        config: &AgentConfig,
+        instructions: Option<&str>,
+        cancel: &CancelToken,
+    ) -> Result<DoneReason, AgentError> {
+        let (raw_tx, _rx) = flume::unbounded();
+        compact(
+            provider,
+            &default_model(),
+            history,
+            gauge,
+            NO_SYSTEM,
+            &no_tools(),
+            &EventSender::new(raw_tx, 0),
+            None,
+            cancel,
+            config,
+            instructions,
+            None,
+            RetryPolicy::default(),
+        )
+        .await
+    }
+
+    async fn summarize_history(
+        provider: &MockProvider,
+        history: &mut History,
+        carry_len: usize,
+        session_id: Option<&SessionRef>,
+    ) {
+        let (raw_tx, _rx) = flume::unbounded();
+        compact_history(
+            provider,
+            &default_model(),
+            history,
+            &EventSender::new(raw_tx, 0),
+            &CancelToken::none(),
+            &AgentConfig::default(),
+            None,
+            carry_len,
+            session_id,
+            RetryPolicy::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test_case(Some("  \n "), None ; "whitespace_only_is_none")]
+    #[test_case(Some("  keep plan.md "), Some("keep plan.md") ; "trimmed")]
+    fn normalize_instructions(raw: Option<&str>, expected: Option<&str>) {
+        assert_eq!(normalize(raw), expected);
+    }
+
     #[test]
     fn compact_replaces_history_with_summary() {
         smol::block_on(async {
-            let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(MockProvider::new(
-                vec![Ok(text_response(StopReason::EndTurn))],
-            ));
-            let model = default_model();
-            let (raw_tx, _rx) = flume::unbounded();
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![
                 Message::user("first".into()),
                 Message {
@@ -530,13 +738,13 @@ mod tests {
                 },
             ]);
 
-            compact(
-                &*provider,
-                &model,
+            summarize(
+                &provider,
                 &mut history,
-                &EventSender::new(raw_tx, 0),
-                None,
+                &mut ContextGauge::default(),
                 &AgentConfig::default(),
+                None,
+                &CancelToken::none(),
             )
             .await
             .unwrap();
@@ -545,6 +753,84 @@ mod tests {
             assert_eq!(msgs.len(), 2);
             assert!(matches!(msgs[0].role, Role::User));
             assert!(matches!(msgs[1].role, Role::Assistant));
+        });
+    }
+
+    const SUMMARISED_PROMPT: u32 = 150_000;
+
+    /// The measurement the gauge holds is of the transcript compaction just
+    /// deleted, so left in place it sizes every later turn against a session
+    /// that no longer exists.
+    #[test]
+    fn compact_leaves_the_gauge_describing_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                usage: TokenUsage {
+                    input: SUMMARISED_PROMPT,
+                    ..Default::default()
+                },
+                ..text_response(StopReason::EndTurn)
+            })]);
+            let mut history = History::new(vec![Message::user("first".into())]);
+            let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+
+            summarize(
+                &provider,
+                &mut history,
+                &mut gauge,
+                &AgentConfig::default(),
+                None,
+                &CancelToken::none(),
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                gauge.size() < SUMMARISED_PROMPT,
+                "the gauge still sizes the session by the transcript it summarized away"
+            );
+        });
+    }
+
+    /// The summariser reads a stripped, collapsed subset of the transcript, so
+    /// its count is well under the session's real prompt. Left in the gauge by
+    /// a compaction that then failed, it reads as a session with room to spare
+    /// and silences the threshold that would have tried again.
+    #[test]
+    fn a_failed_compaction_leaves_the_gauge_alone() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: Vec::new(),
+                    ..Default::default()
+                },
+                usage: TokenUsage {
+                    input: SUMMARISED_PROMPT / 2,
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+                upstream: None,
+            })]);
+            let mut history = History::new(vec![Message::user("first".into())]);
+            let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
+
+            summarize(
+                &provider,
+                &mut history,
+                &mut gauge,
+                &AgentConfig::default(),
+                None,
+                &CancelToken::none(),
+            )
+            .await
+            .expect_err("empty summary must fail");
+
+            assert_eq!(
+                gauge.size(),
+                SUMMARISED_PROMPT,
+                "the summariser's own prompt was written over the session's size"
+            );
         });
     }
 
@@ -564,15 +850,14 @@ mod tests {
             })]);
             const KEPT: &str = "first";
             let mut history = History::new(vec![Message::user(KEPT.into())]);
-            let (raw_tx, _rx) = flume::unbounded();
 
-            let err = compact(
+            let err = summarize(
                 &provider,
-                &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
-                None,
+                &mut ContextGauge::default(),
                 &AgentConfig::default(),
+                None,
+                &CancelToken::none(),
             )
             .await
             .expect_err("empty summary must fail");
@@ -584,37 +869,66 @@ mod tests {
     }
 
     #[test]
-    fn compact_applies_custom_instructions() {
+    fn compact_reports_a_cancel_as_an_ending_not_a_failure() {
         smol::block_on(async {
-            const EXTRA: &str = "Record anything that belongs in plan.md";
-            const POST: &str = "Re-read plan.md and agent.md";
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+            let (trigger, cancel) = CancelToken::new();
+            trigger.cancel();
 
+            let reason = summarize(
+                &provider,
+                &mut history,
+                &mut ContextGauge::default(),
+                &AgentConfig::default(),
+                None,
+                &cancel,
+            )
+            .await
+            .expect("a cancel is an ending, not a failure");
+
+            assert_eq!(reason, DoneReason::Cancelled);
+            assert!(
+                provider.requests.lock().unwrap().is_empty(),
+                "the cancel should have landed before the request went out"
+            );
+            assert_eq!(
+                history.as_slice()[0].user_text(),
+                Some(KEPT_TEXT),
+                "a cancelled compaction must leave the transcript alone"
+            );
+        });
+    }
+
+    /// `summary_prompt_merges_instructions` covers the merge, this one the
+    /// wiring around it.
+    #[test]
+    fn compact_sends_instructions_and_appends_post() {
+        smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
-            let (raw_tx, _rx) = flume::unbounded();
             let config = AgentConfig {
-                compaction_instructions: Some(EXTRA.into()),
+                compaction_instructions: Some(CONFIG_EXTRA.into()),
                 post_compaction_instructions: Some(POST.into()),
                 ..Default::default()
             };
 
-            compact(
+            summarize(
                 &provider,
-                &default_model(),
                 &mut history,
-                &EventSender::new(raw_tx, 0),
-                None,
+                &mut ContextGauge::default(),
                 &config,
+                Some(REQUEST_EXTRA),
+                &CancelToken::none(),
             )
             .await
             .unwrap();
 
             let requests = provider.requests.lock().unwrap();
-            let summary_prompt = requests[0].last().unwrap();
             assert!(matches!(
-                &summary_prompt.content[0],
+                &requests[0].last().unwrap().content[0],
                 ContentBlock::Text { text }
-                    if text.starts_with(crate::prompt::COMPACTION_USER) && text.ends_with(EXTRA)
+                    if text.contains(CONFIG_EXTRA) && text.contains(REQUEST_EXTRA)
             ));
             assert!(matches!(
                 &history.as_slice().last().unwrap().content[0],
@@ -623,10 +937,31 @@ mod tests {
         });
     }
 
-    #[test_case(Some("  \n ".into()), None ; "whitespace_only_is_none")]
-    #[test_case(Some("  keep plan.md ".into()), Some("keep plan.md") ; "trimmed")]
-    fn normalize_instructions(raw: Option<String>, expected: Option<&str>) {
-        assert_eq!(normalize(&raw), expected);
+    #[test_case(None, None, false, false ; "no_instructions")]
+    #[test_case(Some(CONFIG_EXTRA), None, true, false ; "config_only")]
+    #[test_case(None, Some(REQUEST_EXTRA), false, true ; "request_only")]
+    #[test_case(Some(CONFIG_EXTRA), Some(REQUEST_EXTRA), true, true ; "both_kept")]
+    #[test_case(Some(CONFIG_EXTRA), Some("   "), true, false ; "blank_request_ignored")]
+    #[test_case(Some(" \n "), Some(REQUEST_EXTRA), false, true ; "blank_config_ignored")]
+    fn summary_prompt_merges_instructions(
+        config_extra: Option<&str>,
+        request: Option<&str>,
+        has_config: bool,
+        has_request: bool,
+    ) {
+        let config = AgentConfig {
+            compaction_instructions: config_extra.map(str::to_string),
+            ..Default::default()
+        };
+        let prompt = summary_prompt(&config, request);
+
+        assert!(prompt.starts_with(COMPACTION_USER));
+        assert_eq!(
+            prompt.len() > COMPACTION_USER.len(),
+            has_config || has_request
+        );
+        assert_eq!(prompt.contains(CONFIG_EXTRA), has_config);
+        assert_eq!(prompt.contains(REQUEST_EXTRA), has_request);
     }
 
     #[test]
@@ -700,19 +1035,7 @@ mod tests {
                 ..Default::default()
             };
             let mut history = History::new(vec![orphan, chat_image]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                None,
-                &AgentConfig::default(),
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
             let request = &requests[0];
@@ -744,6 +1067,11 @@ mod tests {
     #[test_case(262_144, 0,       0,       0,      262_144, true  ; "equal_context_and_max_output")]
     #[test_case(51_199,  0,       0,       0,      64_000,  false ; "small_window_below_scaled_threshold")]
     #[test_case(51_200,  0,       0,       0,      64_000,  true  ; "small_window_at_scaled_threshold")]
+    // The output floor alone is the whole window here, so without a ceiling on
+    // the reservation every one of these would overflow on an empty transcript.
+    #[test_case(2_047,   0,       0,       0,      4_096,   false ; "llama_cpp_default_window_is_usable")]
+    #[test_case(2_048,   0,       0,       0,      4_096,   true  ; "llama_cpp_default_window_still_compacts")]
+    #[test_case(0,       0,       0,       0,      1_024,   false ; "an_empty_transcript_never_overflows")]
     fn overflow_detection(
         input: u32,
         cache_read: u32,
@@ -761,7 +1089,7 @@ mod tests {
             reasoning: 0,
         };
         assert_eq!(
-            is_overflow(&usage, &model, AgentConfig::default().compaction_buffer),
+            is_overflow(usage.context_tokens(), &model, &AgentConfig::default()),
             expected
         );
     }
@@ -769,13 +1097,15 @@ mod tests {
     #[test_case(CompactionBuffer::Tokens(10_000), 53_999, false ; "explicit_tokens_below")]
     #[test_case(CompactionBuffer::Tokens(10_000), 54_000, true  ; "explicit_tokens_honored")]
     #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
+    // A buffer under the output floor cannot leave a turn room to answer.
+    #[test_case(CompactionBuffer::Tokens(1_000),  60_000, true  ; "buffer_below_the_output_floor_is_raised")]
     fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
         let model = small_context_model(64_000);
-        let usage = TokenUsage {
-            input,
-            ..Default::default()
+        let config = AgentConfig {
+            compaction_buffer: buffer,
+            ..AgentConfig::default()
         };
-        assert_eq!(is_overflow(&usage, &model, buffer), expected);
+        assert_eq!(is_overflow(input, &model, &config), expected);
     }
 
     #[test]
@@ -815,61 +1145,38 @@ mod tests {
         assert!(matches!(&messages[0].content[0], ContentBlock::Text { text } if text == "hello"));
     }
 
-    #[test]
-    fn strip_old_tool_results_keeps_newest() {
+    #[test_case(OLD_RESULT.len() + NEW_RESULT.len(), &[OLD_RESULT, NEW_RESULT] ; "whole_tail_fits")]
+    #[test_case(NEW_RESULT.len(), &[TOOL_RESULT_PLACEHOLDER, NEW_RESULT] ; "only_newest_fits")]
+    #[test_case(NEW_RESULT.len() - 1, &[OLD_RESULT, TOOL_RESULT_PLACEHOLDER] ; "oversized_newest_spares_the_older_ones")]
+    fn collapse_tool_results_budgets_the_tail(budget: usize, expected: &[&str]) {
         let mut messages = vec![Message {
             role: Role::User,
             content: vec![
                 ContentBlock::ToolResult {
                     tool_use_id: "t1".into(),
-                    content: "old result 1".into(),
+                    content: OLD_RESULT.into(),
                     is_error: false,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "t2".into(),
-                    content: "old result 2".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t3".into(),
-                    content: "keep 1".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t4".into(),
-                    content: "keep 2".into(),
-                    is_error: false,
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "t5".into(),
-                    content: "keep 3".into(),
+                    content: NEW_RESULT.into(),
                     is_error: false,
                 },
                 ContentBlock::Text {
-                    text: "keep me".into(),
+                    text: KEPT_TEXT.into(),
                 },
             ],
             ..Default::default()
         }];
-        strip_old_tool_results(&mut messages);
-        assert_eq!(messages[0].content.len(), 6);
+        collapse_tool_results(&mut messages, budget);
+
+        for (block, expected) in messages[0].content.iter().zip(expected) {
+            assert!(
+                matches!(block, ContentBlock::ToolResult { content, .. } if content == expected)
+            );
+        }
         assert!(
-            matches!(&messages[0].content[0], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t1")
-        );
-        assert!(
-            matches!(&messages[0].content[1], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t2")
-        );
-        assert!(
-            matches!(&messages[0].content[2], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 1" && tool_use_id == "t3")
-        );
-        assert!(
-            matches!(&messages[0].content[3], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 2" && tool_use_id == "t4")
-        );
-        assert!(
-            matches!(&messages[0].content[4], ContentBlock::ToolResult { content, tool_use_id, .. } if content == "keep 3" && tool_use_id == "t5")
-        );
-        assert!(
-            matches!(&messages[0].content[5], ContentBlock::Text { text } if text == "keep me")
+            matches!(&messages[0].content[2], ContentBlock::Text { text } if text == KEPT_TEXT)
         );
     }
 
@@ -913,10 +1220,8 @@ mod tests {
             const TOOL_USE_ID: &str = "call_dMZDTpEfz2JxMvFbqFHua1Zy";
 
             let provider = MockProvider::new(vec![
-                Err(AgentError::Api {
-                    status: 413,
-                    message: "prompt is too long".into(),
-                }),
+                Err(overflow_error()),
+                Err(overflow_error()),
                 Ok(text_response(StopReason::EndTurn)),
             ]);
             let mut history = History::new(vec![
@@ -929,32 +1234,89 @@ mod tests {
                 },
                 Message::user("prompt".into()),
             ]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                None,
-                &AgentConfig::default(),
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
-            assert_eq!(requests.len(), 2);
+            assert_eq!(requests.len(), 3);
             assert!(requests[0]
                 .iter()
                 .flat_map(|message| &message.content)
                 .any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == TOOL_USE_ID)));
+            // Attempt 1 only collapses the result, attempt 2 drops the round.
+            assert!(requests[1]
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { content, .. } if content == TOOL_RESULT_PLACEHOLDER)));
             assert!(
-                !requests[1]
+                !requests[2]
                     .iter()
                     .flat_map(|message| &message.content)
                     .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
             );
+        });
+    }
+
+    const NO_COLLAPSE_MSG: &str =
+        "with no tool result to collapse the retry must prune instead of resending";
+
+    #[test]
+    fn compact_history_prunes_when_there_is_nothing_to_collapse() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![
+                Err(overflow_error()),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message::user("second".into()),
+            ]);
+            summarize_history(&provider, &mut history, 0, None).await;
+
+            let requests = provider.requests.lock().unwrap();
+            assert!(requests[1].len() < requests[0].len(), "{NO_COLLAPSE_MSG}");
+        });
+    }
+
+    /// OpenCode Go rejects requests without `x-opencode-session`, so the
+    /// summariser must ride the conversation's id like every other turn.
+    #[test]
+    fn compact_history_sends_the_conversations_session_id() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![Message::user("work".into())]);
+            let session = SessionRef::generate();
+            summarize_history(&provider, &mut history, 0, Some(&session)).await;
+
+            let sessions = provider.sessions.lock().unwrap();
+            assert_eq!(sessions[0].as_deref(), Some(session.as_str()));
+        });
+    }
+
+    const CARRIED: &str = "answer this next";
+    const CARRY_UNSENT_MSG: &str = "carried input is not the summariser's to read";
+    const CARRY_KEPT_MSG: &str = "carried input must outlive the summary verbatim";
+
+    #[test]
+    fn compact_history_carries_the_tail_past_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                Message::user(CARRIED.into()),
+            ]);
+            summarize_history(&provider, &mut history, 1, None).await;
+
+            let carried = |messages: &[Message]| {
+                messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == CARRIED))
+            };
+            assert!(
+                !carried(&provider.requests.lock().unwrap()[0]),
+                "{CARRY_UNSENT_MSG}"
+            );
+            assert!(carried(history.as_slice()), "{CARRY_KEPT_MSG}");
         });
     }
 
@@ -972,19 +1334,7 @@ mod tests {
                     ..Default::default()
                 },
             ]);
-            let (raw_tx, _rx) = flume::unbounded();
-
-            compact_history(
-                &provider,
-                &default_model(),
-                &mut history,
-                &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                None,
-                &AgentConfig::default(),
-            )
-            .await
-            .unwrap();
+            summarize_history(&provider, &mut history, 0, None).await;
 
             let requests = provider.requests.lock().unwrap();
             assert!(requests[0][0].is_observation());
@@ -1142,6 +1492,8 @@ mod tests {
     }
 
     // ── maki-dbdr fork tests ───────────────────────────────────────────────────────
+    const TARGET_TOKENS: usize = 100;
+
     #[test]
     fn compact_appends_length_constraint_to_system_prompt() {
         smol::block_on(async {
@@ -1152,21 +1504,29 @@ mod tests {
             let (raw_tx, _rx) = flume::unbounded();
             let mut history = History::new(vec![Message::user("hi".into())]);
 
-            compact(
+            let reason = compact(
                 &*provider,
                 &model,
                 &mut history,
+                &mut ContextGauge::default(),
+                NO_SYSTEM,
+                &no_tools(),
                 &EventSender::new(raw_tx, 0),
-                Some(100),
+                Some(TARGET_TOKENS),
+                &CancelToken::none(),
                 &AgentConfig::default(),
+                None,
+                None,
+                RetryPolicy::default(),
             )
             .await
             .unwrap();
+            assert_eq!(reason, DoneReason::Compact);
 
             let prompts = provider.system_prompts.lock().unwrap();
             assert_eq!(prompts.len(), 1);
             assert!(prompts[0].contains("LENGTH CONSTRAINT:"));
-            assert!(prompts[0].contains("~100 tokens"));
+            assert!(prompts[0].contains(&format!("~{TARGET_TOKENS} tokens")));
         });
     }
 }

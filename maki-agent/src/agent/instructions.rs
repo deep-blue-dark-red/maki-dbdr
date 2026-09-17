@@ -3,11 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use maki_providers::model::Model;
-
-use crate::AgentMode;
-use crate::command::find_project_ancestor_dirs;
+use crate::command::project_ancestor_dirs;
 use crate::template::Vars;
+use crate::{AgentMode, InstructionBlock};
+use maki_providers::model::Model;
 
 const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",
@@ -23,7 +22,12 @@ const INSTRUCTION_FILES: &[&str] = &[
 ];
 
 const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
+const GLOBAL_INSTRUCTION_FILE: &str = "AGENTS.md";
 
+/// Instruction files the model has seen this session. Startup inserts the
+/// root files; a subdirectory file is inserted by the dispatcher only once its
+/// block lands on an output the model reads, so a cancelled child or an
+/// output with no slot for it leaves the file unseen for the next call.
 #[derive(Clone, Default)]
 pub struct LoadedInstructions(Arc<Mutex<HashSet<PathBuf>>>);
 
@@ -32,9 +36,40 @@ impl LoadedInstructions {
         Self::default()
     }
 
+    pub fn contains(&self, path: &Path) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(path)
+    }
+
     pub fn contains_or_insert(&self, path: PathBuf) -> bool {
         let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
         !set.insert(path)
+    }
+}
+
+/// Instruction files found during one model call, at any nesting depth.
+/// Blocks used to ride on each child's text, and a `code_execution` script
+/// that filtered that text lost them. Nested calls share the parent's handle
+/// instead, and the dispatcher drains it onto the model call's output.
+#[derive(Clone, Default)]
+pub struct CallInstructions(Arc<Mutex<Vec<InstructionBlock>>>);
+
+impl CallInstructions {
+    /// Siblings under one `batch` can find the same file before either is
+    /// marked seen, so a path is kept once.
+    pub fn record(&self, blocks: Vec<InstructionBlock>) {
+        let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for block in blocks {
+            if !found.iter().any(|seen| seen.path == block.path) {
+                found.push(block);
+            }
+        }
+    }
+
+    pub fn take(&self) -> Vec<InstructionBlock> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -73,12 +108,19 @@ pub fn build_system_prompt(
     out
 }
 
-fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
+fn read_unseen(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
     let canonical = path.canonicalize().ok()?;
-    if loaded.contains_or_insert(canonical.clone()) {
+    if loaded.contains(&canonical) {
         return None;
     }
     let content = fs::read_to_string(&canonical).ok()?;
+    Some((canonical, content))
+}
+
+/// Root files go straight into the system prompt, so reading one is seeing it.
+fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf, String)> {
+    let (canonical, content) = read_unseen(path, loaded)?;
+    loaded.contains_or_insert(canonical.clone());
     Some((canonical, content))
 }
 
@@ -90,7 +132,7 @@ fn collect_instruction_files(
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
-    let ancestor_dirs: Vec<_> = find_project_ancestor_dirs(Path::new(cwd)).collect();
+    let ancestor_dirs: Vec<_> = project_ancestor_dirs(Path::new(cwd)).collect();
     let has_git_root = ancestor_dirs.iter().any(|dir| dir.join(".git").exists());
     let project_dirs = if has_git_root {
         ancestor_dirs
@@ -120,7 +162,8 @@ fn collect_instruction_files(
         }
     }
 
-    for path in maki_storage::paths::user_config_dirs(home, xdg_config, "AGENTS.md") {
+    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+        let path = dir.join(GLOBAL_INSTRUCTION_FILE);
         if let Some((canonical, content)) = read_instruction(&path, loaded) {
             let label = format!("Global instructions ({})", canonical.display());
             out.push((label, content));
@@ -135,7 +178,7 @@ pub fn load_instruction_text(cwd: &str) -> String {
     load_instruction_text_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 
@@ -158,7 +201,7 @@ pub fn load_instructions(cwd: &str) -> Instructions {
     load_instructions_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::config_dir().ok().as_deref(),
+        maki_storage::paths::xdg_config_dir().ok().as_deref(),
     )
 }
 
@@ -177,11 +220,13 @@ pub(crate) fn load_instructions_with_home(
     instr
 }
 
+/// Read-only against `loaded`: the dispatcher marks a file seen when it
+/// attaches the block, not when it is found.
 pub fn find_subdirectory_instructions(
     dir: &Path,
     cwd: &Path,
     loaded: &LoadedInstructions,
-) -> Vec<(String, String)> {
+) -> Vec<InstructionBlock> {
     let Ok(cwd) = cwd.canonicalize() else {
         return Vec::new();
     };
@@ -197,8 +242,11 @@ pub fn find_subdirectory_instructions(
     let mut current = dir.as_path();
     while current != cwd {
         for filename in INSTRUCTION_FILES {
-            if let Some((canonical, content)) = read_instruction(&current.join(filename), loaded) {
-                results.push((canonical.display().to_string(), content));
+            if let Some((canonical, content)) = read_unseen(&current.join(filename), loaded) {
+                results.push(InstructionBlock {
+                    path: canonical.display().to_string(),
+                    content,
+                });
                 break;
             }
         }
@@ -220,6 +268,8 @@ mod tests {
     use super::*;
 
     const PLAN_PATH: &str = ".maki/plans/123.md";
+    const LEGACY_RULES: &str = "legacy global rules";
+    const XDG_RULES: &str = "xdg global rules";
 
     #[test_case(&AgentMode::Build, false ; "build_excludes_plan")]
     #[test_case(&AgentMode::Plan(PathBuf::from(PLAN_PATH)), true ; "plan_includes_plan")]
@@ -333,6 +383,29 @@ mod tests {
         assert!(text.contains("global rules"));
     }
 
+    #[test_case(false, XDG_RULES, LEGACY_RULES ; "xdg_is_searched_even_though_legacy_dir_exists")]
+    #[test_case(true, LEGACY_RULES, XDG_RULES ; "legacy_wins_when_both_have_a_file")]
+    fn load_instructions_global_search_order(write_legacy: bool, wanted: &str, unwanted: &str) {
+        let cwd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".maki");
+        fs::create_dir(&legacy).unwrap();
+        if write_legacy {
+            fs::write(legacy.join(GLOBAL_INSTRUCTION_FILE), LEGACY_RULES).unwrap();
+        }
+        fs::write(xdg.path().join(GLOBAL_INSTRUCTION_FILE), XDG_RULES).unwrap();
+
+        let text = load_instructions_with_home(
+            cwd.path().to_str().unwrap(),
+            Some(home.path()),
+            Some(xdg.path()),
+        )
+        .text;
+        assert!(text.contains(wanted), "got {text}");
+        assert!(!text.contains(unwanted), "got {text}");
+    }
+
     #[test]
     fn load_instructions_includes_parent_directory_instructions() {
         let dir = tempfile::tempdir().unwrap();
@@ -370,8 +443,8 @@ mod tests {
         let results = find_subdirectory_instructions(&sub, dir.path(), &loaded);
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].0.ends_with("AGENTS.md"));
-        assert_eq!(results[0].1, "api rules");
+        assert!(results[0].path.ends_with("AGENTS.md"));
+        assert_eq!(results[0].content, "api rules");
     }
 
     #[test]
@@ -385,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn find_subdirectory_instructions_deduplicates() {
+    fn find_subdirectory_instructions_skips_loaded_without_marking() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("src");
         fs::create_dir_all(&sub).unwrap();
@@ -394,7 +467,7 @@ mod tests {
 
         let canonical = agents_path.canonicalize().unwrap();
         let loaded = LoadedInstructions::new();
-        loaded.contains_or_insert(canonical);
+        loaded.contains_or_insert(canonical.clone());
         let pre_loaded = find_subdirectory_instructions(&sub, dir.path(), &loaded);
         assert!(pre_loaded.is_empty(), "should skip already-loaded files");
 
@@ -402,10 +475,28 @@ mod tests {
         let first = find_subdirectory_instructions(&sub, dir.path(), &loaded);
         let second = find_subdirectory_instructions(&sub, dir.path(), &loaded);
         assert_eq!(first.len(), 1);
-        assert!(
-            second.is_empty(),
-            "should not return same file twice across calls"
+        assert_eq!(
+            second.len(),
+            1,
+            "finding is not seeing; the dispatcher marks the file when it attaches the block"
         );
+        assert!(!loaded.contains(&canonical));
+    }
+
+    #[test]
+    fn call_instructions_record_keeps_a_path_once() {
+        let block = |content: &str| InstructionBlock {
+            path: "/repo/sub/AGENTS.md".into(),
+            content: content.into(),
+        };
+        let call = CallInstructions::default();
+        call.record(vec![block("first"), block("again")]);
+        call.record(vec![block("later")]);
+
+        let blocks = call.take();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].content, "first");
+        assert!(call.take().is_empty());
     }
 
     #[test]

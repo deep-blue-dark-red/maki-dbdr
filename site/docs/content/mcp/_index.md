@@ -14,7 +14,11 @@ Maki connects to external tool servers over MCP. Both **stdio** and **HTTP** tra
 Add servers under `[mcp.*]` in your MCP config:
 
 - **Global**: `~/.config/maki/mcp.toml`
-- **Project**: `.maki/mcp.toml` (project config wins when both set a value)
+- **Project**: `.maki/mcp.toml` in the active Git checkout, or in the working
+  directory outside Git (project config wins when both set a value)
+
+Servers in the project file start only after you trust that folder, see
+[Folder Trust](/docs/folder-trust/).
 
 ### Stdio
 

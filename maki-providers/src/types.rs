@@ -8,8 +8,10 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 
+use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, TitleSource};
 use serde::{Deserialize, Serialize};
@@ -18,9 +20,16 @@ use strum::{Display, IntoStaticStr};
 use tracing::warn;
 
 use crate::TokenUsage;
+use crate::image::{Fix, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
+
+/// The two thinking modes that are neither an effort level nor a token count.
+/// `Display` and [`Model::thinking_options`] both spell them from here, so the
+/// picker offers exactly the strings the parser accepts.
+pub(crate) const THINKING_OFF: &str = "off";
+pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -63,10 +72,40 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone)]
 pub struct ImageSource {
     pub media_type: ImageMediaType,
     pub data: Arc<str>,
+    /// What [`adapt_images_for_model`] has to do with `data` before a provider
+    /// will take it, decided at most once. It describes the payload, so it
+    /// rides with it: every clone shares one verdict, and it dies with the
+    /// pixels instead of outliving them in a side table.
+    pub(crate) verdict: Arc<OnceLock<Fix>>,
+}
+
+/// The payload is the largest string a session holds, and a verdict can carry
+/// a second one, so neither belongs in a log line.
+impl fmt::Debug for ImageSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImageSource")
+            .field("media_type", &self.media_type)
+            .field("base64_len", &self.data.len())
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            media_type: ImageMediaType,
+            data: String,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        // Base64 image payloads are the largest strings a session holds, and a
+        // load decodes each one once per record that carries it.
+        Ok(Self::new(wire.media_type, intern::shared_str(wire.data)))
+    }
 }
 
 impl Serialize for ImageSource {
@@ -82,7 +121,11 @@ impl Serialize for ImageSource {
 
 impl ImageSource {
     pub fn new(media_type: ImageMediaType, data: Arc<str>) -> Self {
-        Self { media_type, data }
+        Self {
+            media_type,
+            data,
+            verdict: Arc::default(),
+        }
     }
 
     pub fn to_data_url(&self) -> String {
@@ -92,35 +135,102 @@ impl ImageSource {
 
 pub const IMAGE_OMITTED_NOTE: &str =
     "[image omitted: the current model does not support image input]";
+/// A broken payload has to leave the request, or every turn after it fails.
+pub const IMAGE_UNUSABLE_NOTE: &str = "[image omitted: the image could not be decoded]";
+/// Past [`MAX_IMAGES`] the request itself is refused, so the oldest pixels
+/// make way rather than taking the whole session down.
+pub const IMAGE_EVICTED_NOTE: &str = "[image omitted: too many images in this conversation]";
+/// Stands in for the text of a message that carries only images, both in model
+/// context and in the transcript. One const so the two can never drift apart.
+pub const IMAGE_PLACEHOLDER: &str = "[image]";
 /// See [`Message::empty_marker`].
 pub const EMPTY_RESPONSE_MARKER: &str = "(empty)";
 
-/// For models without vision, image blocks become a text note instead of a
-/// wire block the API would reject. History keeps the pixels, so switching
-/// back to a vision-capable model restores them.
-pub fn adapt_images_for_model<'a>(model: &Model, messages: &'a [Message]) -> Cow<'a, [Message]> {
-    let has_image = |m: &Message| {
-        m.content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Image { .. }))
-    };
-    if model.supports_vision() || !messages.iter().any(has_image) {
-        return Cow::Borrowed(messages);
-    }
-    let adapted = messages
+/// The last stop before the wire for every image in a request, whatever put
+/// it there. For models without vision, image blocks become a text note
+/// instead of a block the API would reject, and history keeps the pixels, so
+/// switching back to a vision-capable model restores them. For the rest,
+/// oversized payloads are rewritten to fit provider limits, because one image
+/// a provider refuses would otherwise fail every later request in the session
+/// too.
+pub async fn adapt_images_for_model<'a>(
+    model: &Model,
+    messages: &'a [Message],
+) -> Cow<'a, [Message]> {
+    // Newest first: the stale screenshots are the ones a long session can
+    // spare once the request runs out of room for them. Collected rather than
+    // walked lazily, since a borrow of `messages` held across the await below
+    // leaves callers unable to prove their own futures `Send`.
+    let images: Vec<(usize, usize, ImageSource)> = messages
         .iter()
-        .map(|m| {
-            let mut m = m.clone();
-            for block in &mut m.content {
-                if matches!(block, ContentBlock::Image { .. }) {
-                    *block = ContentBlock::Text {
-                        text: IMAGE_OMITTED_NOTE.into(),
-                    };
-                }
-            }
-            m
+        .enumerate()
+        .rev()
+        .flat_map(|(m, message)| {
+            message
+                .content
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(move |(b, block)| match block {
+                    ContentBlock::Image { source } => Some((m, b, source.clone())),
+                    _ => None,
+                })
         })
         .collect();
+    let note = |text: &str| ContentBlock::Text { text: text.into() };
+    let vision = model.supports_vision();
+    let mut edits: Vec<(usize, usize, ContentBlock)> = Vec::new();
+    // Counts survivors, not blocks, or an image nobody can read would cost a
+    // good one its place. Nothing past the cap is decoded at all.
+    let mut kept = 0;
+    for (m, b, source) in images {
+        if !vision {
+            edits.push((m, b, note(IMAGE_OMITTED_NOTE)));
+        } else if kept == MAX_IMAGES {
+            edits.push((m, b, note(IMAGE_EVICTED_NOTE)));
+        } else {
+            match fix_for_wire(&source).await {
+                Fix::Keep => kept += 1,
+                Fix::Replace(source) => {
+                    kept += 1;
+                    edits.push((m, b, ContentBlock::Image { source }));
+                }
+                Fix::Drop => edits.push((m, b, note(IMAGE_UNUSABLE_NOTE))),
+            }
+        }
+    }
+    if edits.is_empty() {
+        return Cow::Borrowed(messages);
+    }
+    // A settled image hands its cached verdict back, so once anything here
+    // needed repairing `edits` is non-empty on every later turn too. The owned
+    // slice a provider takes has to carry every message, so the untouched ones
+    // are still cloned, but only a message an edit lands on is rebuilt, and it
+    // is rebuilt out of the blocks it keeps rather than cloned whole and then
+    // written over. History keeps the originals on purpose: see above.
+    // The walk above ran newest-first, so reversing the edits lines them up
+    // with a single forward pass.
+    let mut edits = edits.into_iter().rev().peekable();
+    let mut adapted = Vec::with_capacity(messages.len());
+    for (m, message) in messages.iter().enumerate() {
+        if edits.peek().is_none_or(|&(edited, ..)| edited != m) {
+            adapted.push(message.clone());
+            continue;
+        }
+        let mut content = Vec::with_capacity(message.content.len());
+        for (b, block) in message.content.iter().enumerate() {
+            match edits.next_if(|&(edited, at, _)| (edited, at) == (m, b)) {
+                Some((.., replacement)) => content.push(replacement),
+                None => content.push(block.clone()),
+            }
+        }
+        adapted.push(Message {
+            role: message.role.clone(),
+            content,
+            display_text: message.display_text.clone(),
+            kind: message.kind,
+        });
+    }
     Cow::Owned(adapted)
 }
 
@@ -405,7 +515,7 @@ pub const THINKING_USAGE: &str =
 /// Effort levels are percentages, so they need a ceiling even when the model
 /// never told us its output window. 32k matches common frontier thinking
 /// caps. Explicit user budgets never go through this.
-const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
+pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 
 /// First Claude version that speaks adaptive thinking. Opus got there a
 /// generation early, at 4.7; the other families joined at 5.
@@ -536,6 +646,13 @@ pub mod dialect {
         adaptive: Some(Medium),
         off: Some(OFF),
     };
+    /// OpenAI GPT-6 (Astra): `low` through `max`, no `minimal` and no
+    /// explicit opt-out, so Off omits the reasoning field.
+    pub const GPT_6: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High, XHigh, Max],
+        adaptive: Some(Medium),
+        off: None,
+    };
     /// opencode chat-completions, openrouter (static fallback).
     pub const PREFER_HIGH: EffortDialect = EffortDialect {
         supported: &[Low, Medium, High],
@@ -607,6 +724,40 @@ impl ThinkingConfig {
         !matches!(self, Self::Off)
     }
 
+    /// Thinking tokens this config asks for on `model` before any request-level
+    /// trim, or `None` when the provider decides (`Off`, `Adaptive`, or an
+    /// unknown output window). This is the number a caller sizing `max_tokens`
+    /// has to leave room for.
+    pub fn reserved_thinking(self, model: &Model) -> Option<u32> {
+        match self.budget(model.max_thinking_budget()) {
+            Budgeted::Tokens(n) => Some(n),
+            Budgeted::Off | Budgeted::Adaptive => None,
+        }
+    }
+
+    /// What [`Self::reserved_thinking`] comes out as once the `max_tokens` on
+    /// the wire has had its say.
+    pub fn request_thinking(self, model: &Model) -> Option<u32> {
+        let asked = self.reserved_thinking(model)?;
+        Some(model.thinking_ceiling().map_or(asked, |c| asked.min(c)))
+    }
+
+    /// The budget one request carries: the level the user picked resolved
+    /// against what the model declares (`declared`), then cut to what the
+    /// `max_tokens` on the wire can house.
+    ///
+    /// Resolve then cut, never resolve against the cut. An effort level is a
+    /// percentage, so handing it a trimmed ceiling redefines what the user
+    /// picked, and an explicit budget read back through [`Effort::from_budget`]
+    /// comes out as a *higher* level than it went in as. Cutting afterwards
+    /// lowers the thinking exactly as far as the window forces and no further.
+    fn request_budget(self, model: &Model, declared: Option<u32>) -> Budgeted {
+        match (self.budget(declared), model.thinking_ceiling()) {
+            (Budgeted::Tokens(asked), Some(ceiling)) => Budgeted::Tokens(asked.min(ceiling)),
+            (budgeted, _) => budgeted,
+        }
+    }
+
     /// The effort string to send, snapped to the dialect's supported levels
     /// here and nowhere else (never chain snaps). `None` means send nothing:
     /// `Off` without an explicit off string, or `Adaptive` on APIs with their
@@ -660,7 +811,7 @@ impl ThinkingConfig {
             }
             return;
         }
-        match self.budget(model.max_thinking_budget()) {
+        match self.request_budget(model, model.max_thinking_budget()) {
             Budgeted::Off => {}
             Budgeted::Adaptive => body["thinking"] = json!({"type": "adaptive"}),
             Budgeted::Tokens(n) => {
@@ -689,8 +840,10 @@ impl ThinkingConfig {
         }
     }
 
-    pub fn apply_google_thinking(self, body: &mut Value, max: u32) {
-        match self.budget(Some(max)) {
+    /// `max` is Google's own documented ceiling on thinking, which is a
+    /// capability and so part of resolving the level, not a trim.
+    pub fn apply_google_thinking(self, body: &mut Value, model: &Model, max: u32) {
+        match self.request_budget(model, Some(max)) {
             Budgeted::Off => {}
             Budgeted::Adaptive => {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
@@ -708,14 +861,14 @@ impl ThinkingConfig {
             && let Some(object) = body.as_object_mut()
         {
             merge_body(object, fragment);
-            if keep_budget && let Budgeted::Tokens(budget) = self.budget(max) {
+            if keep_budget && let Budgeted::Tokens(budget) = self.request_budget(model, max) {
                 body[LOCAL_BUDGET_FIELD] = json!(budget);
             }
             return;
         }
         // No fragment means the model has no way to spell this mode, so the
         // budget field takes over: a request must never end up saying nothing.
-        let budget = match self.budget(max) {
+        let budget = match self.request_budget(model, max) {
             Budgeted::Off => 0,
             Budgeted::Adaptive => -1,
             Budgeted::Tokens(n) => i64::from(n),
@@ -736,12 +889,52 @@ impl ThinkingConfig {
             .map_err(|_| THINKING_USAGE)
     }
 
+    /// Caps this config at `parent`. A subagent's thinking request is written
+    /// by the model, not the user, so it may go down but never above what the
+    /// parent session runs with. A parent of `Adaptive` set no ceiling at all,
+    /// so the child gets whatever it asked for; but against a parent that did
+    /// name a level or a count, a child's `Adaptive` is "let the model decide"
+    /// with no upper bound, which sits above any concrete ceiling, so the
+    /// parent's config wins. Concrete sides compare as token budgets, the only
+    /// unit an effort level and an explicit count share; the winner keeps its
+    /// original form either way.
+    pub fn clamp_to(self, parent: Self) -> Self {
+        match (parent.budget(None), self.budget(None)) {
+            (Budgeted::Off, _) | (_, Budgeted::Off) => Self::Off,
+            (Budgeted::Adaptive, _) => self,
+            (_, Budgeted::Adaptive) => parent,
+            (Budgeted::Tokens(ceiling), Budgeted::Tokens(asked)) => {
+                if asked <= ceiling {
+                    self
+                } else {
+                    parent
+                }
+            }
+        }
+    }
+
+    /// The status bar already wraps this in brackets, so a level just names
+    /// itself. A raw count keeps its unit, or it reads like any other number
+    /// up there.
+    /// What the model will really run, so stored state can never disagree with
+    /// the request. Clamps both ways: down to `Off` where thinking is
+    /// unsupported, up to minimal effort where it is mandatory.
+    pub fn clamped(self, model: &Model) -> Self {
+        if !model.supports_thinking() {
+            return Self::Off;
+        }
+        if model.requires_thinking() && !self.is_enabled() {
+            return Self::Effort(Effort::Minimal);
+        }
+        self
+    }
+
     pub fn status_label(self) -> Option<Cow<'static, str>> {
         match self {
             Self::Off => None,
-            Self::Adaptive => Some(Cow::Borrowed("thinking")),
-            Self::Effort(e) => Some(Cow::Owned(format!("thinking: {e}"))),
-            Self::Budget(n) => Some(Cow::Owned(format!("thinking: {n}"))),
+            Self::Adaptive => Some(Cow::Borrowed(THINKING_ADAPTIVE)),
+            Self::Effort(e) => Some(Cow::Borrowed(e.as_str())),
+            Self::Budget(n) => Some(Cow::Owned(format!("{n} tokens"))),
         }
     }
 }
@@ -749,8 +942,8 @@ impl ThinkingConfig {
 impl std::fmt::Display for ThinkingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Off => f.write_str("off"),
-            Self::Adaptive => f.write_str("adaptive"),
+            Self::Off => f.write_str(THINKING_OFF),
+            Self::Adaptive => f.write_str(THINKING_ADAPTIVE),
             Self::Effort(e) => f.write_str(e.as_str()),
             Self::Budget(n) => write!(f, "{n}"),
         }
@@ -765,6 +958,15 @@ impl From<StoredThinking> for ThinkingConfig {
             StoredThinking::Effort { level } => Self::Effort(level),
             StoredThinking::Budget { tokens } => Self::Budget(tokens),
         }
+    }
+}
+
+/// One place decides what silence means, so a session that never set a level, a
+/// config without `always_thinking` and a frontend with no toggle all read it
+/// the same way: off.
+impl From<Option<StoredThinking>> for ThinkingConfig {
+    fn from(s: Option<StoredThinking>) -> Self {
+        s.map_or(Self::Off, Self::from)
     }
 }
 
@@ -789,17 +991,10 @@ pub struct RequestOptions {
 impl RequestOptions {
     /// Reconciles options with the model's capabilities. Called once before
     /// every request so UI state, restored sessions, and subagent flags all go
-    /// through the same gate. Despite the name, thinking clamps both ways:
-    /// down to `Off` when unsupported, up to minimal effort when required.
-    pub fn clamped(self, model: &crate::model::Model) -> Self {
+    /// through the same gate.
+    pub fn clamped(self, model: &Model) -> Self {
         Self {
-            thinking: if !model.supports_thinking() {
-                ThinkingConfig::Off
-            } else if model.requires_thinking() && !self.thinking.is_enabled() {
-                ThinkingConfig::Effort(Effort::Minimal)
-            } else {
-                self.thinking
-            },
+            thinking: self.thinking.clamped(model),
             fast: self.fast && model.supports_fast(),
         }
     }
@@ -891,6 +1086,15 @@ mod tests {
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
+    const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
+    /// Valid ASCII, but no image ever started with these bytes.
+    const UNREADABLE_PAYLOAD: &str = "abc123";
+    const OTHER_DATA: &str = "b3RoZXItcGF5bG9hZA==";
+    /// Below `Minimal` against [`FALLBACK_MAX_THINKING_BUDGET`].
+    const SMALL_BUDGET: u32 = 2048;
+    /// Between `Medium` and `High` against [`FALLBACK_MAX_THINKING_BUDGET`].
+    const LARGE_BUDGET: u32 = 16_384;
+
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
     #[test_case("max_tokens", StopReason::MaxTokens ; "max_tokens")]
@@ -958,18 +1162,47 @@ mod tests {
         assert_eq!(ImageMediaType::from_mime(mime), expected);
     }
 
+    fn png_block(edge: usize) -> ContentBlock {
+        let data = crate::image::png_base64(edge as u32, edge as u32);
+        ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from(data)),
+        }
+    }
+
+    fn unreadable_block() -> ContentBlock {
+        ContentBlock::Image {
+            source: ImageSource::new(ImageMediaType::Png, Arc::from(UNREADABLE_PAYLOAD)),
+        }
+    }
+
+    fn adapt(model: &Model, content: Vec<ContentBlock>) -> Vec<ContentBlock> {
+        let messages = vec![Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        }];
+        smol::block_on(adapt_images_for_model(model, &messages))[0]
+            .content
+            .clone()
+    }
+
+    fn image_count(blocks: &[ContentBlock]) -> usize {
+        blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count()
+    }
+
     #[test]
-    fn adapt_images_borrows_when_model_has_vision_or_no_images() {
+    fn adapt_images_borrows_when_nothing_has_to_change() {
         let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
         let with_image = vec![Message {
             role: Role::User,
-            content: vec![ContentBlock::Image {
-                source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
-            }],
+            content: vec![png_block(32)],
             ..Default::default()
         }];
         assert!(matches!(
-            adapt_images_for_model(&model, &with_image),
+            smol::block_on(adapt_images_for_model(&model, &with_image)),
             Cow::Borrowed(_)
         ));
 
@@ -977,38 +1210,132 @@ mod tests {
         text_only_model.supports_vision_override = Some(false);
         let no_images = vec![Message::user("hi".into())];
         assert!(matches!(
-            adapt_images_for_model(&text_only_model, &no_images),
+            smol::block_on(adapt_images_for_model(&text_only_model, &no_images)),
             Cow::Borrowed(_)
         ));
+    }
+
+    /// A repaired image is repaired for the rest of the session, so this path
+    /// is walked on every later turn: the messages the repair does not reach
+    /// must come out of it untouched, and history must keep its own pixels.
+    #[test]
+    fn adapt_images_rebuilds_only_the_messages_that_change() {
+        const CAPTION: &str = "look";
+        const OVERSIZED: u32 = 2600;
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let fine = ImageSource::new(
+            ImageMediaType::Png,
+            Arc::from(crate::image::png_base64(32, 32)),
+        );
+        let carries = |content: Vec<ContentBlock>| Message {
+            role: Role::User,
+            content,
+            ..Default::default()
+        };
+        let history = vec![
+            Message::user(CAPTION.into()),
+            carries(vec![ContentBlock::Image {
+                source: fine.clone(),
+            }]),
+            carries(vec![
+                ContentBlock::Text {
+                    text: CAPTION.into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::new(
+                        ImageMediaType::Png,
+                        Arc::from(crate::image::png_base64(OVERSIZED, 30)),
+                    ),
+                },
+            ]),
+        ];
+
+        let adapted = smol::block_on(adapt_images_for_model(&model, &history));
+        assert!(matches!(adapted, Cow::Owned(_)), "the repair needs a copy");
+        assert_eq!(adapted[0].first_user_text(), Some(CAPTION));
+        let ContentBlock::Image { source } = &adapted[1].content[0] else {
+            panic!("an image nothing is wrong with must stay an image");
+        };
+        assert!(
+            Arc::ptr_eq(&source.data, &fine.data),
+            "an untouched image must not be re-encoded"
+        );
+        assert!(
+            matches!(&adapted[2].content[0], ContentBlock::Text { text } if text == CAPTION),
+            "the blocks beside a repaired one must survive"
+        );
+        let ContentBlock::Image { source } = &history[2].content[1] else {
+            panic!("history must keep its image block");
+        };
+        assert_eq!(
+            crate::image::dimensions(source),
+            (OVERSIZED, 30),
+            "only the copy going out is rewritten"
+        );
+    }
+
+    #[test]
+    fn adapt_images_shrinks_what_a_provider_would_refuse() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let oversized = ContentBlock::Image {
+            source: ImageSource::new(
+                ImageMediaType::Png,
+                Arc::from(crate::image::png_base64(2600, 30)),
+            ),
+        };
+        let text = ContentBlock::Text {
+            text: "look".into(),
+        };
+        let blocks = adapt(&model, vec![text, oversized]);
+        assert!(matches!(&blocks[0], ContentBlock::Text { .. }));
+        let ContentBlock::Image { source } = &blocks[1] else {
+            panic!("an image block must stay an image block");
+        };
+        let (width, height) = crate::image::dimensions(source);
+        assert!(
+            width.max(height) <= crate::image::MAX_EDGE,
+            "{width}x{height}"
+        );
+    }
+
+    #[test]
+    fn adapt_images_evicts_the_oldest_past_the_request_cap() {
+        const EXTRA: usize = 3;
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
+        assert_eq!(image_count(&blocks), MAX_IMAGES);
+        assert!(
+            matches!(&blocks[EXTRA - 1], ContentBlock::Text { text } if text == IMAGE_EVICTED_NOTE),
+            "the oldest images are the ones that make way"
+        );
+        assert!(matches!(&blocks[EXTRA], ContentBlock::Image { .. }));
+    }
+
+    /// An image no provider could read frees no room, so the cap is spent on
+    /// survivors: counting blocks instead would evict a good one in its place.
+    #[test]
+    fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
+        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let mut content = vec![png_block(1), unreadable_block()];
+        content.extend((2..=MAX_IMAGES).map(png_block));
+        let blocks = adapt(&model, content);
+        assert_eq!(image_count(&blocks), MAX_IMAGES);
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_UNUSABLE_NOTE));
     }
 
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
         let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
         model.supports_vision_override = Some(false);
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "t1".into(),
-                    content: "[image: pic.png 1KB]".into(),
-                    is_error: false,
-                },
-                ContentBlock::Image {
-                    source: ImageSource::new(ImageMediaType::Png, Arc::from("abc123")),
-                },
-            ],
-            ..Default::default()
-        }];
-        let adapted = adapt_images_for_model(&model, &messages);
-        assert_eq!(adapted[0].content.len(), 2);
-        assert!(matches!(
-            &adapted[0].content[0],
-            ContentBlock::ToolResult { .. }
-        ));
-        assert!(
-            matches!(&adapted[0].content[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE)
-        );
+        let tool_result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "[image: pic.png 1KB]".into(),
+            is_error: false,
+        };
+        let blocks = adapt(&model, vec![tool_result, unreadable_block()]);
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(&blocks[0], ContentBlock::ToolResult { .. }));
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == IMAGE_OMITTED_NOTE));
     }
 
     #[test]
@@ -1021,6 +1348,25 @@ mod tests {
         let deserialized: ImageSource = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.media_type, ImageMediaType::Png);
         assert_eq!(&*deserialized.data, "abc123");
+    }
+
+    /// The payloads a session repeats across records collapse to one
+    /// allocation, and only while a load is in flight.
+    #[test]
+    fn image_source_deserialize_shares_identical_payloads_within_a_load() {
+        let wire = |data: &str| json!({"media_type": "image/png", "data": data}).to_string();
+        let read = |data: &str| serde_json::from_str::<ImageSource>(&wire(data)).unwrap();
+
+        let (first, other) = {
+            let _scope = intern::Scope::enter();
+            let first = read(INTERNED_DATA);
+            assert!(Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
+            (first, read(OTHER_DATA))
+        };
+
+        assert!(!Arc::ptr_eq(&first.data, &other.data));
+        assert_eq!(&*first.data, INTERNED_DATA);
+        assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
     use Effort::{High, Low, Max, Minimal, XHigh};
@@ -1101,6 +1447,32 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    const TRIMMED_TURN: u32 = 8_192;
+    const REWRITTEN_CAP: u32 = 131_072;
+
+    /// Providers that resolve limits per request rewrite `max_output_tokens`
+    /// after the agent sized the turn (catalog, opencode). Cutting the budget
+    /// to what the `max_tokens` on the wire can house means no rewrite leaves a
+    /// request asking to think for longer than it may answer, which Anthropic
+    /// refuses outright and every other dialect answers with nothing but
+    /// thinking.
+    #[test_case(ThinkingConfig::Effort(Max) ; "the_top_effort_level")]
+    #[test_case(ThinkingConfig::Effort(Minimal) ; "the_lowest")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET) ; "an_explicit_budget")]
+    fn a_provider_that_rewrites_the_output_cap_cannot_unbound_the_thinking(config: ThinkingConfig) {
+        let model = crate::model::Model {
+            turn_output_tokens: Some(TRIMMED_TURN),
+            max_output_tokens: Some(REWRITTEN_CAP),
+            ..thinking_model("claude-sonnet-4-20250514")
+        };
+        let budget = config.request_thinking(&model).expect("a budget is sent");
+
+        assert!(
+            budget * 2 <= TRIMMED_TURN,
+            "{budget} thinking tokens under a {TRIMMED_TURN} token cap"
+        );
+    }
+
     #[test_case(&dialect::STANDARD, ThinkingConfig::Off,             None            ; "standard_off_noop")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Adaptive,        Some("medium")  ; "standard_adaptive")]
     #[test_case(&dialect::STANDARD, ThinkingConfig::Effort(Minimal), Some("minimal") ; "standard_minimal_passthrough")]
@@ -1137,6 +1509,16 @@ mod tests {
         }
     }
 
+    /// The badge reads as whatever the session is set to, and stays quiet when
+    /// thinking is off.
+    #[test_case(ThinkingConfig::Off, None ; "off_shows_no_badge")]
+    #[test_case(ThinkingConfig::Adaptive, Some("adaptive") ; "adaptive")]
+    #[test_case(ThinkingConfig::Effort(High), Some("high") ; "effort_names_the_level")]
+    #[test_case(ThinkingConfig::Budget(8192), Some("8192 tokens") ; "budget_keeps_its_unit")]
+    fn thinking_status_label(config: ThinkingConfig, expected: Option<&str>) {
+        assert_eq!(config.status_label().as_deref(), expected);
+    }
+
     #[test_case(ThinkingConfig::Off,             Some(4096), Budgeted::Off            ; "off")]
     #[test_case(ThinkingConfig::Adaptive,        Some(4096), Budgeted::Adaptive       ; "adaptive")]
     #[test_case(ThinkingConfig::Effort(Max),     Some(4096), Budgeted::Tokens(4096)   ; "effort_delegates_to_level_budget")]
@@ -1152,13 +1534,54 @@ mod tests {
         assert_eq!(config.budget(max), expected);
     }
 
-    #[test_case(ThinkingConfig::Off,          json!({})                                                                  ; "off")]
-    #[test_case(ThinkingConfig::Adaptive,     json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped")]
-    fn thinking_apply_google_thinking(config: ThinkingConfig, expected: Value) {
+    #[test_case(ThinkingConfig::Off, ThinkingConfig::Effort(Max), ThinkingConfig::Off ; "parent_off_wins_over_any_request")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Off, ThinkingConfig::Off ; "child_may_always_turn_it_off")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Off, ThinkingConfig::Off ; "child_off_beats_an_unbounded_parent")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Max) ; "parent_adaptive_is_not_a_ceiling")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "parent_adaptive_lets_the_child_stay_adaptive")]
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Minimal) ; "child_adaptive_cannot_escape_a_parent_effort")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Max) ; "child_adaptive_yields_even_to_the_top_effort")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Adaptive, ThinkingConfig::Budget(SMALL_BUDGET) ; "child_adaptive_cannot_escape_a_parent_budget")]
+    #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low) ; "effort_capped_at_parent")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low) ; "effort_lower_child_kept")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "budget_capped_at_parent")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "budget_lower_child_kept")]
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Effort(Minimal) ; "mixed_parent_effort_caps_child_budget")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "mixed_lower_child_budget_keeps_its_tokens")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Effort(High), ThinkingConfig::Budget(SMALL_BUDGET) ; "mixed_parent_budget_caps_child_effort")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Effort(Minimal), ThinkingConfig::Effort(Minimal) ; "mixed_lower_child_effort_keeps_its_level")]
+    fn thinking_clamp_to_parent(
+        parent: ThinkingConfig,
+        child: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        assert_eq!(child.clamp_to(parent), expected);
+    }
+
+    /// Google's own documented ceiling on thinking, which is a capability and
+    /// so part of resolving the level.
+    const GOOGLE_CAP: u32 = 8192;
+    /// Roomy enough that the request ceiling is not what binds.
+    const ROOMY_OUTPUT: Option<u32> = Some(65_536);
+
+    #[test_case(ThinkingConfig::Off, ROOMY_OUTPUT, json!({})                                                                  ; "off")]
+    #[test_case(ThinkingConfig::Adaptive, ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped_to_googles_cap")]
+    // Half the `maxOutputTokens` the same request carries, or the answer has
+    // nowhere to land.
+    #[test_case(ThinkingConfig::Budget(10000), Some(GOOGLE_CAP), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget_cut_to_what_the_request_can_house")]
+    fn thinking_apply_google_thinking(
+        config: ThinkingConfig,
+        max_output_tokens: Option<u32>,
+        expected: Value,
+    ) {
         let mut body = json!({});
-        config.apply_google_thinking(&mut body, 8192);
+        let model = crate::model::Model {
+            max_output_tokens,
+            ..thinking_model("gemini-2.5-pro")
+        };
+        config.apply_google_thinking(&mut body, &model, GOOGLE_CAP);
         assert_eq!(body, expected);
     }
 
@@ -1253,9 +1676,11 @@ mod tests {
             supports_tool_examples_override: None,
             thinking_override: None,
             supports_vision_override: Some(provider.family().supports_vision()),
+            supports_fast_override: None,
             pricing: crate::model::ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 200_000,
             thinking_fields: None,
         }
@@ -1278,6 +1703,15 @@ mod tests {
             fast: false,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]
+    #[test_case(Some(StoredThinking::Adaptive), ThinkingConfig::Adaptive ; "a_stored_level_carries_over")]
+    fn optional_stored_thinking_into_config(
+        stored: Option<StoredThinking>,
+        expected: ThinkingConfig,
+    ) {
+        assert_eq!(ThinkingConfig::from(stored), expected);
     }
 
     #[test]

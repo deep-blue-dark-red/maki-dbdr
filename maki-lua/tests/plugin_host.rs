@@ -16,8 +16,8 @@ use maki_config::{
     ToolOutputLines,
 };
 use maki_lua::{
-    MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost, SKIPPED_PLUGIN_WARNING,
-    SessionEndReason, WARM_TOOL_CAP,
+    InitFiles, MAX_INFLIGHT_TOOLS, PERMISSION_NAME_WARNING, PluginError, PluginHost,
+    SKIPPED_PLUGIN_WARNING, SessionEndReason, WARM_TOOL_CAP,
 };
 use maki_providers::Model;
 use maki_storage::id::SessionRef;
@@ -31,6 +31,7 @@ const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
 const USAGE_VALUE: &str = "12.3k↑ 456↓ $0.123";
 const USAGE_OUTPUT: &str = "usage_done";
+const INSTRUCTION_CONTENT: &str = "sub rules";
 const FLOORED_PACKAGE: &str = "future_pack";
 const SIBLING_PACKAGE: &str = "sibling_pack";
 const MALFORMED_FLOOR: &str = "min_maki_version = 12\n";
@@ -94,6 +95,30 @@ fn builtins_host_with(config: &PluginsConfig) -> (Arc<ToolRegistry>, PluginHost)
     let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_builtins(config).unwrap();
     (reg, host)
+}
+
+/// A tool can be registered and still stay invisible to the model, so this
+/// goes through the definitions a real request is built from.
+fn tool_description(reg: &ToolRegistry, agent: &maki_config::AgentConfig, name: &str) -> String {
+    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+    let filter = ToolFilter::from_config(agent, &model, &[]);
+    let ctx = DescriptionContext {
+        filter: &filter,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    let defs = reg.definitions(&Vars::new(), &ctx, false);
+    let def = defs
+        .as_array()
+        .expect("definitions returns an array")
+        .iter()
+        .find(|def| def["name"] == name)
+        .unwrap_or_else(|| panic!("{name} must reach the model"));
+    def["description"]
+        .as_str()
+        .expect("description is a string")
+        .to_owned()
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: serde_json::Value) -> Result<String, String> {
@@ -181,6 +206,7 @@ const SCOPES_WITHOUT_PERMISSION_SRC: &str =
 const PERMISSION_WITHOUT_SCOPES_SRC: &str =
     r#"name = "no_scopes", description = "test", permission = "fs_write""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
+const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -272,11 +298,7 @@ maki.api.register_tool({
     description = "reports the calling session",
     schema = { type = "object", properties = {}, additionalProperties = false },
     handler = function(_, ctx)
-        local id, err = ctx:session_id()
-        if err then
-            return "err:" .. err
-        end
-        return "id:" .. tostring(id)
+        return "id:" .. tostring(ctx:session_id())
     end,
 })
 "#;
@@ -326,6 +348,35 @@ fn handler_reads_the_calling_session() {
     );
 }
 
+const TASK_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "which_task",
+    description = "reports the calling task",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        return "task:" .. ctx:task_id()
+    end,
+})
+"#;
+
+const SUBAGENT_TASK_ID: &str = "toolu_sub";
+
+/// A subagent shares the parent's session id, so the task id is what a
+/// plugin keys per-chat state on.
+#[test_case::test_case(None, "task:main" ; "session_owner")]
+#[test_case::test_case(Some(SUBAGENT_TASK_ID), "task:toolu_sub" ; "subagent")]
+fn ctx_task_id_names_the_calling_chat(task_id: Option<&str>, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("task_plugin", TASK_PLUGIN).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.task_id = task_id.map(Arc::from);
+    assert_eq!(
+        exec_with_ctx(&reg, "which_task", json!({}), &ctx).unwrap(),
+        expected
+    );
+}
+
 #[test]
 fn handler_without_a_session_gets_nil_and_no_error() {
     let reg = fresh_registry();
@@ -362,6 +413,7 @@ const EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
     schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
     permission = "fs_write",
     permission_scopes = "path",
+    mutable_path = "path",
     handler = function() return "" end,
 })"#;
 
@@ -551,6 +603,7 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
 #[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
+#[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -724,6 +777,9 @@ fn restore_snapshot_text(
             theme_gen: None,
             clicks,
             state,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -1213,8 +1269,11 @@ fn incompatible_plugin_warns_instead_of_aborting_startup() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mut warnings = Vec::new();
-    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
-        .expect("an incompatible plugin must not abort startup");
+    host.load_init_files(
+        InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
+        &mut warnings,
+    )
+    .expect("an incompatible plugin must not abort startup");
 
     assert!(!reg.has("echo_"));
     let warning = warnings
@@ -1249,8 +1308,11 @@ fn init_file_taking_a_permission_keyed_tool_name_warns(tool: &str, expected: usi
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     let mut warnings = Vec::new();
-    host.load_init_files_or_skip(false, tmp.path(), &mut warnings)
-        .expect("init.lua must load");
+    host.load_init_files(
+        InitFiles::GlobalAndProject(maki_dir.join("init.lua")),
+        &mut warnings,
+    )
+    .expect("init.lua must load");
 
     assert!(reg.has(tool));
     assert_eq!(
@@ -1903,6 +1965,9 @@ fn warm_restore_item(id: &str, clicks: Vec<usize>) -> maki_lua::RestoreItem {
         theme_gen: None,
         clicks,
         state: None,
+        task_id: None,
+        session_id: None,
+        reason: maki_lua::RestoreReason::default(),
     }
 }
 
@@ -2266,6 +2331,72 @@ maki.api.register_tool({{
             "child_done/5 items stream_done/streamed line/1 lines \
              {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
         )
+    );
+}
+
+#[test]
+fn nested_load_instructions_surface_once_on_model_call() {
+    // `find_subdirectory_instructions` only walks directories under cwd.
+    let sub = tempfile::Builder::new()
+        .prefix(".load-instructions-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::write(sub.path().join("AGENTS.md"), INSTRUCTION_CONTENT).unwrap();
+
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+maki.api.register_tool({{
+    name = "instructed_child",
+    description = "loads a subdirectory's instructions",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        assert(ctx:load_instructions([[{dir}]]))
+        return "child_done"
+    end
+}})
+maki.api.register_tool({{
+    name = "driver",
+    description = "forwards the child's text verbatim",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function(input, ctx)
+        return (maki.agent.call_tool(ctx, "instructed_child", {{}}))
+    end
+}})
+"#,
+        dir = sub.path().display(),
+    );
+    host.load_source("load_instructions", &src).unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.registry = Arc::clone(&reg);
+    let dispatch = || {
+        smol::block_on(maki_agent::agent::tool_dispatch::run(
+            String::new(),
+            "driver",
+            &json!({}),
+            &ctx,
+            maki_agent::tools::CallOrigin::Model,
+        ))
+    };
+
+    let first = dispatch();
+    let text = first.output.as_text();
+    assert!(!first.is_error, "{text}");
+    assert_eq!(first.output.instructions().map(<[_]>::len), Some(1));
+    assert_eq!(
+        text.matches(INSTRUCTION_CONTENT).count(),
+        1,
+        "a block in the child's text would show twice"
+    );
+
+    let second = dispatch();
+    assert!(!second.is_error);
+    assert!(
+        second.output.instructions().is_none(),
+        "seen this session already"
     );
 }
 
@@ -3583,6 +3714,38 @@ fn builtin_opts_flow_from_setup_plugins() {
     assert!(!limit.desc.is_empty(), "declared desc surfaces");
 }
 
+fn websearch_config(provider: &str) -> PluginsConfig {
+    PluginsConfig {
+        enabled: true,
+        names: vec!["websearch".to_owned()],
+        packages: Vec::new(),
+        opts: HashMap::from([(
+            "websearch".to_owned(),
+            json_obj(serde_json::json!({ "provider": provider })),
+        )]),
+    }
+}
+
+/// The backend the plugin talks to is invisible from Rust, so we read it off
+/// the one thing it leaks: the description the model gets.
+#[test_case::test_case("exa", "Exa AI" ; "default_backend")]
+#[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
+fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
+    let (reg, _host) = builtins_host_with(&websearch_config(provider));
+    let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
+    assert!(description.contains(expected), "got: {description}");
+}
+
+#[test]
+fn websearch_unknown_provider_fails_the_load() {
+    let reg = fresh_registry();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let err = host
+        .load_builtins(&websearch_config("altavista"))
+        .expect_err("unknown provider should fail");
+    assert!(err.to_string().contains("unknown provider"), "got: {err}");
+}
+
 #[test_case::test_case(
     serde_json::json!({}),
     &["edit", "multiedit", "edit_lines"], &["insert_lines"]
@@ -3628,6 +3791,11 @@ fn whole_bundle() -> (Arc<ToolRegistry>, PluginHost) {
 /// Pins `FILE_WRITE_TOOLS` to the actual `permission = "fs_write"`
 /// declarations, so a new fs_write tool cannot quietly slip past the file
 /// write policies keyed off that list (plan mode, cwd allow rules).
+///
+/// The other half of that guard is a registration rule: `permission =
+/// "fs_write"` requires `mutable_path` (see `fs_write_without_mutable_path`),
+/// which is what makes the dispatcher serialize the write and check for a
+/// stale read.
 #[test]
 fn fs_write_tools_match_file_write_tools() {
     let (reg, _host) = whole_bundle();
@@ -3753,22 +3921,8 @@ fn disabled_builtin_hands_its_tool_name_to_a_user_plugin() {
     host.load_source(REPLACEMENT_PLUGIN, &shadow_src())
         .expect("a disabled builtin leaves its tool name free");
 
-    let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
-    let filter = ToolFilter::from_config(&config.agent, &model, &[]);
-    let ctx = DescriptionContext {
-        filter: &filter,
-        audience: ToolAudience::MAIN,
-        workflow: false,
-        mcp: false,
-    };
-    let defs = reg.definitions(&Vars::new(), &ctx, false);
-    let shadowed = defs
-        .as_array()
-        .expect("definitions returns an array")
-        .iter()
-        .find(|def| def["name"] == SHADOWED_TOOL)
-        .expect("the replacement must reach the model, not just `maki prompt --tools`");
-    assert_eq!(shadowed["description"], REPLACEMENT_DESC);
+    let shadowed = tool_description(&reg, &config.agent, SHADOWED_TOOL);
+    assert_eq!(shadowed, REPLACEMENT_DESC);
 }
 
 #[test]
@@ -5099,6 +5253,9 @@ fn restore_tool_async_ordering_and_delivery() {
         theme_gen: None,
         clicks: Vec::new(),
         state: None,
+        task_id: None,
+        session_id: None,
+        reason: maki_lua::RestoreReason::default(),
     };
     let unknown_item = maki_lua::RestoreItem {
         tool: Arc::from("definitely_not_a_tool"),
@@ -5110,6 +5267,9 @@ fn restore_tool_async_ordering_and_delivery() {
         theme_gen: None,
         clicks: Vec::new(),
         state: None,
+        task_id: None,
+        session_id: None,
+        reason: maki_lua::RestoreReason::default(),
     };
 
     handle.request_restore(unknown_item, event_tx.clone());
@@ -5177,6 +5337,9 @@ fn restore_rebuilds_body_from_input_content(
             theme_gen: None,
             clicks: vec![0],
             state: None,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         maki_agent::EventSender::new(tx, 0),
     );
@@ -5224,6 +5387,42 @@ fn bash_permission_scopes_never_falls_back_to_json(command: &str) {
         "fell back to raw JSON scope: {:?}",
         scopes.scopes
     );
+}
+
+/// Every command in a chain needs its own scope, otherwise one allow rule
+/// covers commands nobody approved. The redirect case is the one that used to
+/// slip: tree-sitter hangs a trailing `2>&1` off the whole chain, so the chain
+/// arrived as a single scope starting with `cd `, and a `cd *` rule took it.
+#[test_case::test_case(
+    "cd /tmp && cargo check 2>&1 | tail -3",
+    &["cd /tmp", "cargo check 2>&1", "tail -3"]
+    ; "chain_with_redirect_and_pipe"
+)]
+#[test_case::test_case(
+    "ls\n# a note\npwd",
+    &["ls", "pwd"]
+    ; "comments_are_not_scopes"
+)]
+#[test_case::test_case(
+    "if [ -f x ]; then rm x; fi",
+    &["if [ -f x ]; then rm x; fi"]
+    ; "block_stays_one_scope"
+)]
+#[test_case::test_case(
+    "cd /tmp && > log",
+    &["cd /tmp", "> log"]
+    ; "bodiless_redirect_is_its_own_scope"
+)]
+fn bash_permission_scopes_split_per_command(command: &str, expected: &[&str]) {
+    let (reg, _host) = builtins_host();
+
+    let input = serde_json::json!({ "command": command });
+    let entry = reg.get("bash").expect("bash registered");
+    let inv = entry.tool.parse(&input).expect("parse failed");
+    let scopes = smol::block_on(inv.permission_scopes()).expect("permission_scopes returned None");
+
+    assert!(!scopes.force_prompt, "command: {command}");
+    assert_eq!(scopes.scopes, expected, "command: {command}");
 }
 
 fn exec_tool_with_perms(

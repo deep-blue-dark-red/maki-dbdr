@@ -51,6 +51,21 @@ const PAINT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const PAINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Only a batch that never settles waits this long.
 const BATCH_RESULT_TIMEOUT: Duration = Duration::from_secs(10);
+const EDIT_TOOL: &str = "edit";
+const EDIT_TARGET: &str = "f.rs";
+const STATUS_SUCCESS: &str = "success";
+const STATUS_ERROR: &str = "error";
+const MARKER_A: &str = "AAA";
+const MARKER_B: &str = "BBB";
+const EDITED_A: &str = "aaa";
+const EDITED_B: &str = "bbb";
+/// Whichever of the two edits lands first erases the other's `old_string`.
+const OVERLAP_SOURCE: &str = "XYZ";
+const OVERLAP_HEAD: &str = "XY";
+const OVERLAP_HEAD_NEW: &str = "Q";
+const OVERLAP_TAIL: &str = "YZ";
+const OVERLAP_TAIL_NEW: &str = "R";
+
 const SPINNER_STYLE: &str = "spinner";
 const ERROR_STYLE: &str = "tool_error";
 const SUCCESS_STYLE: &str = "tool_success";
@@ -646,6 +661,9 @@ fn restore_snapshot_lines_opts(
             theme_gen: None,
             clicks,
             state,
+            task_id: None,
+            session_id: None,
+            reason: maki_lua::RestoreReason::default(),
         },
         EventSender::new(tx, 0),
     );
@@ -1051,8 +1069,7 @@ fn header_click_toggles_all_children() {
 /// and no line numbers read back from disk.
 #[test]
 fn edit_child_body_renders_diff_not_summary() {
-    let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    let (_reg, host) = real_builtins();
     let lines = restore_snapshot_lines(
         &host,
         json!({ "tool_calls": [{ "tool": "edit", "parameters": {
@@ -1066,16 +1083,16 @@ fn edit_child_body_renders_diff_not_summary() {
         ] })),
     );
     let spans: Vec<(String, SpanStyle)> = lines.into_iter().flatten().collect();
-    let old_span = (
-        "- let a = 1;".to_owned(),
-        SpanStyle::Named("diff_old".into()),
-    );
-    let new_span = (
-        "+ let a = 2;".to_owned(),
-        SpanStyle::Named("diff_new".into()),
-    );
-    assert!(spans.contains(&old_span), "old line in diff_old: {spans:?}");
-    assert!(spans.contains(&new_span), "new line in diff_new: {spans:?}");
+    let expected_spans = [
+        ("- ", "diff_old_sign"),
+        ("let a = 1;", "diff_old"),
+        ("+ ", "diff_new_sign"),
+        ("let a = 2;", "diff_new"),
+    ];
+    for (text, style) in expected_spans {
+        let span = (text.to_owned(), SpanStyle::Named(style.into()));
+        assert!(spans.contains(&span), "{text:?} in {style}: {spans:?}");
+    }
     assert!(
         !spans
             .iter()
@@ -1207,6 +1224,92 @@ fn exec_batch_live(
 
     barrier(host);
     (state, drain_snapshots(&rx))
+}
+
+/// Regression: two `edit` children on one file used to interleave their
+/// read-modify-write and silently lose one edit. The dispatcher now holds a
+/// per-file lock across each child's whole execution.
+#[test]
+fn parallel_edits_to_one_file_all_apply() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(EDIT_TARGET);
+    std::fs::write(&path, format!("{MARKER_A}\n{MARKER_B}\n")).unwrap();
+
+    let (reg, host) = real_builtins();
+    let (state, _) = exec_batch_live(
+        &host,
+        &reg,
+        json!([
+            edit_call(&path, MARKER_A, EDITED_A),
+            edit_call(&path, MARKER_B, EDITED_B),
+        ]),
+    );
+
+    assert_eq!(
+        child_statuses(&state),
+        vec![STATUS_SUCCESS, STATUS_SUCCESS],
+        "both edits must apply: {state}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{EDITED_A}\n{EDITED_B}\n")
+    );
+}
+
+/// Overlapping edits cannot both apply, so the contract is that the loser
+/// says so. Which one loses is `async_lock`'s business, not ours.
+#[test]
+fn overlapping_parallel_edits_fail_loudly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(EDIT_TARGET);
+    std::fs::write(&path, OVERLAP_SOURCE).unwrap();
+
+    let (reg, host) = real_builtins();
+    let (state, _) = exec_batch_live(
+        &host,
+        &reg,
+        json!([
+            edit_call(&path, OVERLAP_HEAD, OVERLAP_HEAD_NEW),
+            edit_call(&path, OVERLAP_TAIL, OVERLAP_TAIL_NEW),
+        ]),
+    );
+
+    let mut statuses = child_statuses(&state);
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        vec![STATUS_ERROR, STATUS_SUCCESS],
+        "exactly one edit may win, and the other must say so: {state}"
+    );
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        content == OVERLAP_SOURCE.replace(OVERLAP_HEAD, OVERLAP_HEAD_NEW)
+            || content == OVERLAP_SOURCE.replace(OVERLAP_TAIL, OVERLAP_TAIL_NEW),
+        "one whole edit, never a mix: {content}"
+    );
+}
+
+fn real_builtins() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    (reg, host)
+}
+
+fn edit_call(path: &std::path::Path, old_string: &str, new_string: &str) -> Value {
+    json!({ "tool": EDIT_TOOL, "parameters": {
+        "path": path.to_str().expect("utf-8 temp path"),
+        "old_string": old_string,
+        "new_string": new_string,
+    } })
+}
+
+fn child_statuses(state: &Value) -> Vec<&str> {
+    state["children"]
+        .as_array()
+        .expect("no children in batch state")
+        .iter()
+        .map(|child| child["status"].as_str().expect("child without status"))
+        .collect()
 }
 
 fn hl_child_src(tool: &str) -> String {

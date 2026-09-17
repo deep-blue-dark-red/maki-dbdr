@@ -9,6 +9,8 @@ use maki_config::{
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
+use crate::gen_folder_trust::POLICY_EXAMPLE;
+
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
 fn write_table(out: &mut String, fields: &[ConfigField]) {
@@ -124,12 +126,44 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "Themes use 24-bit colors, but not every terminal can show them. Maki \
-         checks the environment, terminfo, and the terminal itself, and when \
-         truecolor is missing it quietly falls back to the closest of the 256 \
-         classic terminal colors. If detection gets it wrong, set \
+        "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
+         `diff_old` and `diff_new`. These styles are applied after `code_block`, \
+         so their properties take precedence. Diff gutters use \
+         `diff_old_line_nr` and `diff_new_line_nr`, which default to \
+         `diff_line_nr`.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Themes use 24-bit colors by default, but not every terminal can show \
+         them. Maki checks the environment, terminfo, and the terminal itself, \
+         and when truecolor is missing it quietly falls back to the closest of \
+         the 256 classic terminal colors. If detection gets it wrong, set \
          `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force \
          the fallback.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "Theme files can also name terminal colors instead of giving hex \
+         values, using the same names as Helix: `default`, `black`, `red`, \
+         `green`, `yellow`, `blue`, `magenta`, `cyan`, `gray`, `light-red`, \
+         `light-green`, `light-yellow`, `light-blue`, `light-magenta`, \
+         `light-cyan`, `light-gray`, and `white`. Write them exactly as \
+         listed. `lightgray`, `light_gray` and `LIGHT-GRAY` are all rejected. \
+         `default` means the terminal default. Maki also takes a number from \
+         `0` to `255` to pick a palette entry by index, which Helix does \
+         not.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "These work everywhere a hex value does, including syntax \
+         highlighting scopes, so a theme can be written entirely against the \
+         palette your terminal already defines. Maki passes them through as \
+         palette references rather than resolving them to RGB, so the colors \
+         stay correct in terminals that mangle truecolor, such as nested tmux \
+         over ssh.\n"
     )
     .unwrap();
 }
@@ -163,6 +197,30 @@ maki.setup({{
          Every redirect hop is checked against the same list. \
          [Permissions](/docs/permissions/#network-addresses) covers what the \
          guard protects.\n"
+    )
+    .unwrap();
+}
+
+/// `paths` is a `Vec<String>`, which the `ConfigValue` table cannot describe,
+/// so this section is prose like `net.allowed_private_hosts`.
+fn write_trust_section(out: &mut String) {
+    writeln!(out, "### `trust`\n").unwrap();
+    writeln!(
+        out,
+        "Answers the folder trust question in advance. Read from the global \
+         `~/.config/maki/init.lua` only, since a project file that could set \
+         it would be trusting itself:\n"
+    )
+    .unwrap();
+    writeln!(out, "{POLICY_EXAMPLE}\n").unwrap();
+    writeln!(
+        out,
+        "`paths` is a list of globs matched against the project root, empty by \
+         default. `prompt` is a bool, `true` by default. Setting it to `false` \
+         drops the startup card and leaves the folder restricted unless a \
+         `paths` entry matches. \
+         [Folder Trust](/docs/folder-trust/#trust-policy) covers glob syntax \
+         and which run modes apply the policy.\n"
     )
     .unwrap();
 }
@@ -214,9 +272,12 @@ Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language
 Two places, both optional:
 
 - **Global**: `~/.config/maki/init.lua`
-- **Project**: `.maki/init.lua` (relative to your working directory)
+- **Project**: `.maki/init.lua` in the active Git checkout, or in the working
+  directory outside Git
 
 When both exist, project settings override global ones. Neither file is required.
+A project `init.lua` runs only once you trust that folder, see
+[Folder Trust](/docs/folder-trust/).
 
 ## Example
 
@@ -277,6 +338,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
     write_section(&mut out, "[storage]", StorageConfig::FIELDS);
     write_net_section(&mut out);
+    write_trust_section(&mut out);
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
@@ -341,7 +403,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\\maki\\` |
 | Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\\maki\\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
 `~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
 

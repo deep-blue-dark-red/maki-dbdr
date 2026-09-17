@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::providers::ResolvedAuth;
+use crate::providers::openai_compat::tool_parameters;
+use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -16,6 +17,7 @@ use crate::{
 };
 
 const RESPONSES_PATH: &str = "/responses";
+const FAILED_RESPONSE_STATUS: u16 = 500;
 
 pub(crate) fn build_body(
     model: &crate::model::Model,
@@ -145,7 +147,7 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
                     "type": "function",
                     "name": t.get("name")?,
                     "description": t.get("description")?,
-                    "parameters": t.get("input_schema")?,
+                    "parameters": tool_parameters(t),
                     "strict": false,
                 }))
             })
@@ -243,10 +245,7 @@ pub(crate) async fn parse_sse(
                 .as_str()
                 .unwrap_or("unknown error")
                 .to_string();
-            return Err(AgentError::Api {
-                status: 500,
-                message,
-            });
+            return Err(AgentError::api(500, message));
         }
 
         let parsed_event = if current_event.is_empty() {
@@ -484,13 +483,11 @@ pub(crate) async fn parse_sse(
                     .as_str()
                     .unwrap_or("response generation failed")
                     .to_string();
-                let code = error["code"].as_str().unwrap_or("server_error");
-                let status = match code {
-                    "rate_limit_exceeded" => 429,
-                    "server_error" => 500,
-                    _ => 500,
-                };
-                return Err(AgentError::Api { status, message });
+                let status = error["code"]
+                    .as_str()
+                    .and_then(sse_error_status)
+                    .unwrap_or(FAILED_RESPONSE_STATUS);
+                return Err(AgentError::api(status, message));
             }
 
             _ => {}
@@ -562,6 +559,25 @@ mod tests {
     use serde_json::json;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+
+    #[test]
+    fn convert_tools_defaults_missing_parameters() {
+        let tools = json!([{ "name": TOOL_NAME, "description": TOOL_DESCRIPTION }]);
+        let converted = convert_tools(&tools);
+        assert_eq!(
+            converted[0]["name"],
+            json!(TOOL_NAME),
+            "{TOOL_MUST_SURVIVE}"
+        );
+        assert_eq!(
+            converted[0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
@@ -657,7 +673,9 @@ data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\
 
             let (err, _) = run_sse(sse).await;
             match err.unwrap_err() {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Server overloaded");
                 }
@@ -676,7 +694,9 @@ data: {\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"R
 
             let (err, _) = run_sse(sse).await;
             match err.unwrap_err() {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 429);
                     assert_eq!(message, "Rate limit hit");
                 }

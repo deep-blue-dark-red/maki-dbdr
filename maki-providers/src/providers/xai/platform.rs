@@ -8,9 +8,9 @@ use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
-use crate::providers::ResolvedAuth;
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::{ResolvedAuth, refreshed_tokens};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, dialect,
 };
@@ -76,19 +76,15 @@ impl Xai {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
+        let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
         let resolved = smol::unblock(move || {
-            let tokens =
-                maki_storage::auth::load_tokens(&storage, auth::PROVIDER).ok_or_else(|| {
-                    AgentError::Api {
-                        status: 401,
-                        message: "xAI OAuth tokens not found on disk".into(),
-                    }
-                })?;
-            match auth::refresh_tokens(&tokens) {
-                Ok(fresh) => {
-                    maki_storage::auth::save_tokens(&storage, auth::PROVIDER, &fresh)?;
-                    auth::build_oauth_resolved(&fresh)
-                }
+            match refreshed_tokens(
+                &storage,
+                auth::PROVIDER,
+                rejected.as_deref(),
+                auth::refresh_tokens,
+            ) {
+                Ok(fresh) => auth::build_oauth_resolved(&fresh),
                 Err(e) => {
                     warn!(error = %e, "xAI OAuth refresh failed, clearing stale tokens");
                     let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
@@ -309,9 +305,11 @@ mod tests {
                 crate::model::ThinkingSupport::No
             }),
             supports_vision_override: Some(true),
+            supports_fast_override: None,
             pricing: ModelPricing::ZERO,
             discovered_free: false,
             max_output_tokens: Some(131_072),
+            turn_output_tokens: None,
             context_window: 500_000,
             thinking_fields: None,
         }

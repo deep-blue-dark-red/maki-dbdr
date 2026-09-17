@@ -478,6 +478,18 @@ pub mod key {
     pub const NEXT_CHAT: Bind = ctrl_bind!('n', "next_chat");
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u', "scroll_half_up");
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d', "scroll_half_down");
+    pub const SCROLL_PAGE_UP: Bind = Bind {
+        code: KeyCode::PageUp,
+        modifiers: KeyModifiers::NONE,
+        label: "PageUp",
+        name: None,
+    };
+    pub const SCROLL_PAGE_DOWN: Bind = Bind {
+        code: KeyCode::PageDown,
+        modifiers: KeyModifiers::NONE,
+        label: "PageDown",
+        name: None,
+    };
     pub const SCROLL_LINE_UP: Bind = ctrl_bind!('y', "scroll_line_up");
     pub const SCROLL_LINE_DOWN: Bind = ctrl_bind!('e', "scroll_line_down");
     pub const SCROLL_TOP: Bind = ctrl_bind!('g', "scroll_top");
@@ -871,6 +883,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt(key::SCROLL_PAGE_UP.label, key::SCROLL_PAGE_DOWN.label),
+        description: "Scroll page up / down",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Action("line_end"),
         description: "Jump to end of line",
         context: KeybindContext::Editing,
@@ -968,7 +986,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(key::SCROLL_HALF_UP.label, key::SCROLL_HALF_DOWN.label),
-        description: "Scroll page up / down",
+        description: "Scroll half page up / down",
         context: KeybindContext::Picker,
         platform: Platform::All,
     },

@@ -81,8 +81,11 @@ check "/checkpoint in palette" "$F" '"/checkpoint"'
 check "/export in palette"     "$F" '"/export"'
 check "/skills in palette"     "$F" '"/skills"'
 check "/plugins in palette"    "$F" '"/plugins"'
-check "/rewind in palette"     "$F" '"/rewind"'
-check "/rename in palette"     "$F" '"/rename"'
+check "/rewind in palette"    "$F" '"/rewind"'
+# /rename is owned by the sessions Lua plugin (upstream), not a builtin: the
+# fork's AI rename survives as the auto-name of a New session.
+check_not "no builtin /rename" "$F" 'name: "/rename"'
+check "plugin owns /rename"    "plugins/sessions/init.lua" 'name = "/rename"'
 
 # ── app/mod.rs struct fields + handlers ─────────────────────────────────────
 

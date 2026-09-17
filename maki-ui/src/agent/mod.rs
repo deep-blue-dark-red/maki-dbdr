@@ -1,6 +1,5 @@
 mod agent_loop;
-mod cancel_map;
-mod command_router;
+mod run_cancels;
 pub(crate) mod shared_queue;
 
 use std::mem;
@@ -10,14 +9,14 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
-    AgentConfig, CancelMap, CancelToken, Envelope, HistorySnapshot, McpCommand, McpConfigErrors,
-    McpHandle, McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
+    AgentConfig, CancelMap, Envelope, HistorySnapshot, McpCommand, McpConfigErrors, McpHandle,
+    McpSnapshotReader, SessionMailbox, SharedMessages, ToolOutputLines,
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
-use self::cancel_map::new_run_cancel_map;
+use self::run_cancels::RunCancels;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model};
 use tracing::{info, warn};
@@ -25,7 +24,6 @@ use tracing::{info, warn};
 use crate::app::App;
 
 use self::agent_loop::AgentLoop;
-use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 
 pub(crate) struct ModelSlot {
@@ -33,19 +31,12 @@ pub(crate) struct ModelSlot {
     pub(crate) provider: Arc<dyn Provider>,
 }
 
-pub(crate) enum AgentCommand {
-    Cancel { run_id: u64 },
-    CancelAll,
-    CancelSubagent { tool_use_id: String },
-}
-
-/// Input channels (`cmd_tx`, `answer_tx`, `queue`) are per-agent, so an old
-/// loop can never steal new input. The output channel (`agent_tx`/`agent_rx`)
-/// is per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
+/// Input channels (`answer_tx`, `queue`) are per-agent, so an old loop can
+/// never steal new input. The output channel (`agent_tx`/`agent_rx`) is
+/// per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
 /// restore reply, a click, an old agent winding down) can always deliver.
 /// Stale events are filtered by `run_id`, not by killing the channel.
 pub(crate) struct AgentHandles {
-    pub(crate) cmd_tx: flume::Sender<AgentCommand>,
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
@@ -55,6 +46,8 @@ pub(crate) struct AgentHandles {
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
     pub(crate) timeouts: maki_providers::Timeouts,
+    cancels: Arc<RunCancels>,
+    subagent_cancels: Arc<CancelMap<String>>,
     model_policy: Arc<ModelPolicy>,
     mailbox: Option<SessionMailbox>,
     task: smol::Task<()>,
@@ -67,6 +60,7 @@ impl AgentHandles {
     pub(crate) fn spawn(
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<Message>,
+        initial_context_size: u32,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -81,6 +75,7 @@ impl AgentHandles {
             flume::unbounded(),
             model_slot,
             initial_history,
+            initial_context_size,
             config,
             tool_output_lines,
             permissions,
@@ -102,7 +97,6 @@ impl AgentHandles {
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
         app.answer_tx = Some(self.answer_tx.clone());
-        app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
         app.queue.set_shared(self.queue.clone());
@@ -114,8 +108,19 @@ impl AgentHandles {
         }
     }
 
-    pub(crate) fn cancel(self) {
-        let _ = self.cmd_tx.try_send(AgentCommand::CancelAll);
+    /// Esc: stops {run_id} and everything queued behind it.
+    pub(crate) fn cancel_run(&self, run_id: u64) {
+        self.cancels.cancel(run_id);
+    }
+
+    pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
+        self.subagent_cancels.cancel(tool_use_id);
+    }
+
+    /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
+    pub(crate) fn cancel_all(&self) {
+        self.cancels.cancel_all();
+        self.subagent_cancels.cancel_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -154,6 +159,9 @@ impl AgentHandles {
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             history,
+            // A respawn carries the app's last reported count across, so the
+            // next request is not left guessing at its own prompt.
+            app.state.context_size,
             config,
             tool_output_lines,
             permissions,
@@ -169,7 +177,7 @@ impl AgentHandles {
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
         app.flush_restored_queue();
-        old.cancel();
+        old.cancel_all();
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -216,6 +224,7 @@ fn spawn_agent_internal(
     (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<Message>,
+    initial_context_size: u32,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     permissions: &Arc<PermissionManager>,
@@ -226,7 +235,6 @@ fn spawn_agent_internal(
     lua_handle: EventHandle,
     model_policy: Arc<ModelPolicy>,
 ) -> AgentHandles {
-    let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     let queue_rx = Arc::new(queue_rx);
@@ -235,24 +243,18 @@ fn spawn_agent_internal(
     let shared_history: SharedMessages =
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
-    let (init_trigger, init_cancel) = CancelToken::new();
-    let cancel_map = Arc::new(new_run_cancel_map(0, init_trigger));
+    let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = session_id
         .as_ref()
         .map(|session_id| SessionMailbox::register(session_id.id()));
-
-    spawn_command_router(
-        cmd_rx,
-        Arc::clone(&cancel_map),
-        Arc::clone(&subagent_cancels),
-    );
 
     let agent_loop = AgentLoop::new(
         Arc::clone(model_slot),
         config,
         tool_output_lines,
         initial_history,
+        initial_context_size,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
         mcp_handle.clone(),
@@ -260,20 +262,18 @@ fn spawn_agent_internal(
         agent_tx.clone(),
         answer_rx,
         queue_rx,
-        cancel_map,
-        init_cancel,
+        Arc::clone(&cancels),
         session_id,
         mailbox.clone(),
         timeouts,
         lua_handle,
-        subagent_cancels,
+        Arc::clone(&subagent_cancels),
         Arc::clone(&model_policy),
     );
 
     let task = smol::spawn(agent_loop.run());
 
     AgentHandles {
-        cmd_tx,
         agent_rx,
         agent_tx,
         answer_tx,
@@ -283,6 +283,8 @@ fn spawn_agent_internal(
         mcp_config_errors,
         queue: queue_tx,
         timeouts,
+        cancels,
+        subagent_cancels,
         model_policy,
         mailbox,
         task,
@@ -291,11 +293,11 @@ fn spawn_agent_internal(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     use maki_agent::AgentEvent;
-    use maki_config::PermissionsConfig;
+    use maki_config::{PermissionsConfig, ProjectConfig};
     use maki_providers::provider::BoxFuture;
     use maki_providers::{AgentError, ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -350,11 +352,13 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             PermissionsConfig::default(),
             PathBuf::from("/tmp"),
+            ProjectConfig::for_project(Path::new("/tmp")),
             Arc::default(),
         ));
         let handles = AgentHandles::spawn(
             &model_slot,
             initial_history,
+            0,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,

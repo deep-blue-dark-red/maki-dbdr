@@ -26,7 +26,9 @@ pub mod splash;
 mod storage_writer;
 mod text_buffer;
 mod theme;
+mod trust_card;
 pub use theme::BUNDLED_THEMES;
+pub use trust_card::ask_trust;
 pub mod update;
 pub mod wrap;
 
@@ -34,18 +36,25 @@ mod agent;
 mod event_loop;
 mod input;
 mod terminal;
+mod terminal_image;
 
 use std::time::Instant;
 
 use color_eyre::Result;
 use maki_agent::ToolOutput;
+use maki_lua::PackPlan;
 use maki_providers::Message;
 use maki_providers::TokenUsage;
 use maki_storage::id::MakiId;
 
 pub type AppSession = maki_storage::sessions::Session<Message, TokenUsage, ToolOutput>;
 
-pub(crate) use agent::AgentCommand;
+/// Width of the controlling terminal, if any. Answers even when stdout is
+/// redirected, so callers that care gate on [`std::io::IsTerminal`].
+pub fn terminal_width() -> Option<u16> {
+    crossterm::terminal::size().ok().map(|(w, _)| w)
+}
+
 pub use event_loop::EventLoopParams;
 
 /// How a UI generation ended. On `Reload`, each tab carries its in-memory
@@ -58,6 +67,7 @@ pub enum RunOutcome {
     Reload {
         tabs: Vec<AppSession>,
         focused: usize,
+        pack: Option<PackPlan>,
     },
 }
 
@@ -68,19 +78,29 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         let el = event_loop::EventLoop::new(&mut terminal, params)?;
         el.run(initial_prompt)?
     };
-    Ok(match report.exit {
+    let event_loop::ShutdownReport {
+        exit,
+        tabs,
+        focused,
+    } = report;
+    Ok(match exit {
         components::ExitRequest::Reload => RunOutcome::Reload {
-            tabs: report.tabs,
-            focused: report.focused,
+            tabs,
+            focused,
+            pack: None,
+        },
+        components::ExitRequest::Pack(request) => RunOutcome::Reload {
+            tabs,
+            focused,
+            pack: Some(request),
         },
         exit => {
-            let session_id = report
-                .tabs
-                .get(report.focused)
+            let session_id = tabs
+                .get(focused)
                 .filter(|s| app::session_has_content(s))
                 .map(|s| s.id);
             let started = Instant::now();
-            drop(report);
+            drop(tabs);
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "session buffers dropped"

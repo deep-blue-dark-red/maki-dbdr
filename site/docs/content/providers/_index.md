@@ -15,7 +15,7 @@ Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row t
 
 Maki re-reads auth from storage and environment variables each time a new agent spawns (`/new`, retry, session load). If you run `maki auth login` in another terminal or change an env var, the next session picks it up without a restart.
 
-You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`) and they rotate automatically on rate-limit or auth errors.
+You can set multiple API keys in one env var (`ANTHROPIC_API_KEY=sk-1,sk-2,sk-3`). On a rate-limit or auth error, maki switches to the next key right away, with no delay and without spending a retry. Each request walks the pool once before falling back to normal backoff. A plan quota error does not rotate keys, since the quota is per account and the others are just as spent.
 
 ## Base URL Overrides
 
@@ -80,7 +80,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 ### OpenAI
 
-- **Env var**: `OPENAI_API_KEY` (also supports OAuth device flow)
+- **Env var**: `OPENAI_API_KEY` (also supports OAuth via `maki auth login openai`)
 - **API**: `https://api.openai.com/v1`
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
@@ -95,6 +95,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
 | Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| Strong | gpt-6-astra | $10.00 / $50.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 | Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
@@ -104,6 +105,10 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Strong | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
 Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
+
+`maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
+
+With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped.
 
 ### Google
 
@@ -192,14 +197,17 @@ Defaults: mistral-medium-latest (strong), mistral-small-latest (medium), ministr
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
+| Weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
 | Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
 | Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-| Strong | glm-5.2 | $1.00 / $3.20 | 1000K ctx / 131K out |
-| Strong | glm-5.1, glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
+| Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |
+| Strong | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
 Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
@@ -212,10 +220,10 @@ Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Medium | **deepseek-v4-flash** (default) | $0.22 / $0.66 | 1000K ctx / 384K out |
+| Medium | **deepseek-flash, deepseek-v4-flash** (default) | $0.15 / $0.60 | 1000K ctx / 384K out |
 | Strong | **deepseek-v4-pro** (default) | $0.66 / $1.98 | 1000K ctx / 384K out |
 
-Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
+Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 ### OpenRouter
 
@@ -224,6 +232,14 @@ Defaults: deepseek-v4-flash (medium), deepseek-v4-pro (strong)
 - **Features**: 300+ models from all providers, prompt caching, provider routing
 
 OpenRouter aggregates models from many providers behind a single API key. Browse available models at [openrouter.ai/models](https://openrouter.ai/models). Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).
+
+### Requesty
+
+- **Env var**: `REQUESTY_API_KEY`
+- **API**: `https://router.requesty.ai/v1`
+- **Features**: 700+ models behind one key, curated managed routing policies, EU region via `REQUESTY_BASE_URL`
+
+Requesty routes 700+ models from many providers behind a single API key. Models are listed live from the API: curated managed policies first (short ids such as `requesty/claude-sonnet-4-5` or `requesty/gpt-5.4-mini`, `@eu` variants route only through EU providers), then the full `<vendor>/<model>` catalog (e.g. `requesty/openai/gpt-4o-mini`). Get a key at [app.requesty.ai/api-keys](https://app.requesty.ai/api-keys). Set `REQUESTY_BASE_URL=https://router.eu.requesty.ai/v1` to keep all traffic in the EU.
 
 ### Synthetic
 
@@ -327,6 +343,24 @@ zai/glm-4.7
 ```
 
 If the model name is unique across providers, the prefix can be omitted.
+
+### Models newer than your Maki version
+
+The tables above list the models Maki curates. Any other id a provider accepts works too: type it into `/model` or pass it to `--model`. The picker also lists what the provider's own model endpoint reports, so same-day releases are selectable there.
+
+For an id no table covers, rates, context window, vision and thinking support come from [models.dev](https://models.dev/), refreshed daily (`maki models --refresh` forces it). Maki reads each field on its own, so a row that lists a price but no context window still leaves the window to the sources below.
+
+Sources rank by how sure they are to describe the exact model you asked for:
+
+1. What the provider's own model endpoint reported this session.
+2. A curated row for that id, including its dated snapshots. `claude-sonnet-4-5-20250929` reads the `claude-sonnet-4-5` row.
+3. models.dev.
+4. A curated row for a close relative, reached by shared prefix. `glm-5.4` falls back to `glm-5` here, and takes its family and tier from it either way.
+5. The provider's defaults, with no cost estimate.
+
+A curated row is checked against the provider's own pricing page, so it wins for the id it names. For a relative it loses to models.dev, because a rate nobody checked against the id you typed is only a guess.
+
+New models start at the **medium** tier until you assign one in the picker.
 
 ## providers.toml
 
@@ -460,7 +494,7 @@ To add a custom provider or proxy, drop an executable script into the config `pr
 
 `resolve` is called each time a new agent spawns, so scripts should read tokens from disk instead of caching them in memory. That way auth changes from other processes get picked up.
 
-The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
+The `base` field specifies which built-in provider to inherit the model catalog from. Valid values: `anthropic`, `openai`, `google`, `copilot`, `ollama`, `llama-cpp`, `mistral`, `zai`, `deepseek`, `openrouter`, `requesty`, `synthetic`, `regolo`, `tensorx`, `opencode`, `xai`, `aperture`.
 
 If your provider serves models not in the base catalog, add a `models` subcommand returning:
 

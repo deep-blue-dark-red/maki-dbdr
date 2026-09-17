@@ -21,7 +21,7 @@ use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
-use super::KeyPool;
+use super::{KeyHeader, KeyPool, KeyRotation};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
@@ -454,13 +454,12 @@ impl Provider for Anthropic {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_key_header(&self.auth, API_KEY_HEADER, str::to_string)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Raw(API_KEY_HEADER),
+        ))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
@@ -1030,7 +1029,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 529);
                     assert_eq!(message, "Overloaded");
                 }
@@ -1048,7 +1049,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
                 .await
                 .unwrap_err();
             match err {
-                AgentError::Api { status, message } => {
+                AgentError::Api {
+                    status, message, ..
+                } => {
                     assert_eq!(status, 400);
                     assert_eq!(message, "not-json");
                 }

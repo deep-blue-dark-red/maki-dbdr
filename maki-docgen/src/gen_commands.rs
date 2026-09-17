@@ -83,12 +83,12 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
+        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. Config: `always_thinking`."
     )
     .unwrap();
     writeln!(
         out,
-        "- **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`."
+        "- **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`."
     )
     .unwrap();
     writeln!(

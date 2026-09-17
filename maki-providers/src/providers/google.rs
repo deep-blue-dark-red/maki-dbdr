@@ -16,7 +16,7 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
@@ -202,9 +202,9 @@ impl Google {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
 
-        thinking.apply_google_thinking(&mut body, max_thinking(model));
+        thinking.apply_google_thinking(&mut body, model, max_thinking(model));
 
-        if let Some(max_output) = model.max_output_tokens {
+        if let Some(max_output) = model.output_tokens() {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output);
         }
 
@@ -301,13 +301,12 @@ impl Provider for Google {
         })
     }
 
-    fn rotate_key(&self) -> BoxFuture<'_, Result<bool, AgentError>> {
-        Box::pin(async {
-            Ok(self
-                .key_pool
-                .as_ref()
-                .is_some_and(|p| p.rotate_key_header(&self.auth, API_KEY_HEADER, str::to_string)))
-        })
+    fn keys(&self) -> Option<KeyRotation<'_>> {
+        Some(KeyRotation::new(
+            self.key_pool.as_ref()?,
+            &self.auth,
+            KeyHeader::Raw(API_KEY_HEADER),
+        ))
     }
 }
 
@@ -440,17 +439,28 @@ fn convert_tools(tools: &Value) -> Vec<Value> {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?;
             let description = t.get("description")?.as_str().unwrap_or("");
-            let parameters = t
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-            Some(json!({
+            let mut decl = json!({
                 "name": name,
                 "description": description,
-                "parameters": strip_additional_properties(parameters),
-            }))
+            });
+            if let Some(parameters) = tool_parameters(t) {
+                decl["parameters"] = parameters;
+            }
+            Some(decl)
         })
         .collect()
+}
+
+/// Gemini turns down an object schema that lists no properties, while MiniMax
+/// turns down a bare `{}`, so no single payload pleases both. A tool that takes
+/// no arguments simply travels here without `parameters`.
+fn tool_parameters(tool: &Value) -> Option<Value> {
+    let schema = tool.get("input_schema")?;
+    let has_properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|props| !props.is_empty());
+    has_properties.then(|| strip_additional_properties(schema.clone()))
 }
 
 fn strip_additional_properties(value: Value) -> Value {
@@ -682,6 +692,11 @@ mod tests {
     use test_case::test_case;
 
     const GEMINI_API_KEY: &str = "test-key";
+    const TOOL_NAME: &str = "word_count";
+    const TOOL_DESCRIPTION: &str = "Count words.";
+    const PATH_PROP: &str = "path";
+    const EMPTY_PROPERTIES_REJECTED: &str =
+        "Gemini rejects a function whose parameters is an object with no properties";
 
     fn test_auth() -> Arc<Mutex<ResolvedAuth>> {
         Arc::new(Mutex::new(ResolvedAuth::for_test(
@@ -693,8 +708,7 @@ mod tests {
     fn test_timeouts() -> super::super::Timeouts {
         super::super::Timeouts {
             connect: Duration::from_secs(5),
-            low_speed: Duration::from_secs(30),
-            stream: Duration::from_secs(300),
+            ..Default::default()
         }
     }
 
@@ -705,14 +719,51 @@ mod tests {
             tier: ModelTier::Medium,
             family: ModelFamily::Gemini,
             supports_vision_override: Some(true),
+            supports_fast_override: None,
             supports_tool_examples_override: None,
             thinking_override: None,
             pricing: ModelPricing::default(),
             discovered_free: false,
             max_output_tokens: Some(8192),
+            turn_output_tokens: None,
             context_window: 1_048_576,
             thinking_fields: None,
         }
+    }
+
+    #[test_case(json!({"type": "object", "properties": {}}) ; "empty_properties")]
+    #[test_case(json!({"type": "object"}) ; "missing_properties")]
+    fn convert_tools_omits_empty_parameters(input_schema: Value) {
+        let tools = json!([{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": input_schema,
+        }]);
+        let decls = convert_tools(&tools);
+        assert_eq!(decls[0]["name"], json!(TOOL_NAME));
+        assert_eq!(
+            decls[0].get("parameters"),
+            None,
+            "{EMPTY_PROPERTIES_REJECTED}"
+        );
+    }
+
+    #[test]
+    fn convert_tools_keeps_populated_parameters() {
+        let tools = json!([{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": {
+                "type": "object",
+                "properties": { PATH_PROP: {"type": "string"} },
+                "additionalProperties": false,
+            },
+        }]);
+        let decls = convert_tools(&tools);
+        assert_eq!(
+            decls[0]["parameters"],
+            json!({"type": "object", "properties": { PATH_PROP: {"type": "string"} }})
+        );
     }
 
     #[test]

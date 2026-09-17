@@ -73,7 +73,10 @@ Fork commands that must be in `BUILTIN_COMMANDS`:
 - `/skills` — skills manager
 - `/plugins` — plugin enable/disable
 - `/rewind` — delete turns menu
-- `/rename` — AI-generate session name
+
+`/rename` is deliberately NOT a builtin any more: upstream's
+`plugins/sessions/init.lua` registers `/rename <title>`, so the fork's AI-naming
+stays only as the automatic rename of a `New session` (see `start_rename`).
 
 ---
 
@@ -97,8 +100,10 @@ pub show_token_stats: bool,
 "/skills"   => { self.skills_modal.open(...); vec![] }
 "/checkpoint" => { ... }
 "/rewind"   => { ... }
-"/rename"   => self.start_rename(),
 ```
+
+(`/rename` is upstream's Lua plugin command now; the fork's auto-name of a
+`New session` still goes through `start_rename`.)
 
 #### `overlays()` / `overlays_mut()` arrays
 All five fork components must be present.
@@ -280,6 +285,43 @@ cargo test -p maki-lua --test spec skill_plugin_spec
 ```
 
 ---
+
+## Upstream v0.5.5 merge notes (2026-09-17)
+
+Resolved on `merge/upstream-v0.5.5` (upstream `5da1b2a2`, v0.5.5; 49 conflicted
+files). Decisions taken, so the next merge does not re-litigate them:
+
+- `/rename` is upstream's Lua plugin command now. The fork's builtin is gone;
+  the AI naming survives as the automatic rename of a `New session`
+  (`App::start_rename`). `verify-fork.sh` checks the plugin owns the name.
+- MCP tools in plan mode are permission-gated (upstream), not hard-blocked.
+- `Segment::height()` keeps the fork's semantics (old width while stale,
+  `drawn_height()` is the truth); upstream's contradicting test was dropped.
+- The in-transcript search corpus uses the rendered `{n}‧ you ∙ ` prefix, so a
+  query for a turn number hits what the reader saw.
+- Both output knobs stay: the fork's `agent.max_output_tokens` (model cap
+  clamp) and upstream's `agent.max_turn_output` (per-turn budget).
+- Terminal focus uses upstream's `Focus` tri-state with the fork's
+  background-frame throttle ported onto it.
+- Late instruction segments keep the fork's anchor-based cache.
+
+Ported from upstream onto the fork's structures:
+
+- `ToolOutput::filterable_text_mut` + its test (upstream's output hooks need it).
+- `InflightGate::acquire_before_abandoned`: a tool call still queued for a slot
+  now ends its wait at cancel/deadline instead of parking until one frees.
+- `deliver_pending_job_events`: a finished task makes one bounded (256 event)
+  final drain under its scope, so events landing after the pump stops are not
+  lost with the scope.
+
+Not ported (upstream's parallel implementations of areas the fork replaced):
+upstream's `RowWalk`/`next_chunk` message renderer, its projection-based
+selection/model, and their tests.
+
+Known test failures inherited from upstream on macOS (verified on pristine
+`5da1b2a2`, not merge regressions): the `maki-pack`/`maki-lua` pack lock tests
+under parallel load, `trusted_folders::non_utf8_paths_are_refused`, and the
+`markdown::the_code_memo_follows_the_theme…` flake under a full-workspace run.
 
 ## Known gaps (not regressions, but broken)
 

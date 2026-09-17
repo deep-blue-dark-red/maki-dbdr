@@ -1,4 +1,31 @@
 return function(U)
+  local JSX_KINDS = {
+    jsx_element = true,
+    jsx_fragment = true,
+    jsx_self_closing_element = true,
+  }
+
+  -- Raw JSX is mostly markup noise, so keep only the tag that gets rendered.
+  local function jsx_summary(node, source)
+    local self_closing = node:type() == "jsx_self_closing_element"
+    -- A fragment carries no open tag node at all, so the name comes back empty
+    -- and it renders as `<>...</>`, which is what we want anyway.
+    local tag = self_closing and node or node:field("open_tag")[1]
+    local name_node = tag and tag:field("name")[1]
+    local name = name_node and U.get_text(name_node, source) or ""
+    if self_closing then
+      return "<" .. name .. " />"
+    end
+    return "<" .. name .. ">...</" .. name .. ">"
+  end
+
+  local function initializer(node, source)
+    if JSX_KINDS[node:type()] then
+      return jsx_summary(node, source)
+    end
+    return U.truncate(U.get_text(node, source), 60)
+  end
+
   local function return_type(node, source)
     local r = U.get_text(node, source)
     if r:sub(1, 1) == ":" then
@@ -149,7 +176,7 @@ return function(U)
     local type_node = decl:field("type")[1]
     local type_str = type_node and return_type(type_node, source) or ""
     local val_node = decl:field("value")[1]
-    local val_str = val_node and (" = " .. U.truncate(U.get_text(val_node, source), 60)) or ""
+    local val_str = val_node and (" = " .. initializer(val_node, source)) or ""
     return U.new_entry(U.SECTION.Constant, node, export_prefix(node) .. name .. type_str .. val_str)
   end
 

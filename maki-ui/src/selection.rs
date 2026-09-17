@@ -350,19 +350,21 @@ impl LineBreaks {
         let mut word_wraps = Vec::new();
         let mut row: u16 = 0;
         for line in lines {
-            if is_code_wrap_continuation(line) {
-                row += 1;
-                continue;
+            // Continuation rows belong to the line above, so they set no bits
+            // of their own. They are still walked at their real height: a stale
+            // segment holds code wrapped for a wider terminal, and counting one
+            // row each slides every later bit off its row.
+            let starts_line = !is_code_wrap_continuation(line);
+            if starts_line {
+                set_bit(&mut line_starts, row);
             }
-            set_bit(&mut line_starts, row);
-            let wrap_types = compute_wrap_types(line, width);
-            for is_word_wrap in &wrap_types {
-                row += 1;
-                if *is_word_wrap {
+            for is_word_wrap in compute_wrap_types(line, width) {
+                row = row.saturating_add(1);
+                if starts_line && is_word_wrap {
                     set_bit(&mut word_wraps, row);
                 }
             }
-            row += 1;
+            row = row.saturating_add(1);
         }
         Self::Bitmap {
             line_starts,
@@ -1198,17 +1200,37 @@ mod tests {
         assert!(lb.needs_space(1), "word-boundary continuation needs space");
     }
 
-    #[test]
-    fn from_lines_code_wrap_continuation_skipped() {
-        let wrap_line = Line::from(vec![ratatui::text::Span::raw(CODE_BAR_WRAP)]);
-        let lines = vec![Line::from("first"), wrap_line, Line::from("second")];
-        let lb = LineBreaks::from_lines(&lines, 80);
+    /// A code block wrapped for a wider terminal leaves continuation rows
+    /// behind. They belong to the line above, so they start no line of their
+    /// own, but they still have to be walked at their real height: assume one
+    /// row each and every later start bit slides off its row, which splices
+    /// newlines into the middle of copied prose.
+    #[test_case("" ; "continuation_fits_one_row")]
+    #[test_case("abcdefghij" ; "continuation_wraps_again")]
+    fn from_lines_walks_a_code_continuation_at_its_real_height(tail: &str) {
+        use ratatui::text::Span;
+
+        const WIDTH: u16 = 6;
+        let bar = Line::from(vec![Span::raw(CODE_BAR_WRAP), Span::raw(tail)]);
+        // The same geometry the renderer walks, so a copied selection cannot
+        // drift off the rows the screen painted.
+        let bar_rows =
+            crate::components::wrap::wrapped_line_count(std::slice::from_ref(&bar), WIDTH);
+        let next = 1 + bar_rows;
+        let lines = vec![Line::from("first"), bar, Line::from("second")];
+        let lb = LineBreaks::from_lines(&lines, WIDTH);
+
         assert!(lb.is_line_start(0));
+        for row in 1..next {
+            assert!(
+                !lb.is_line_start(row),
+                "continuation row {row} starts no line"
+            );
+        }
         assert!(
-            !lb.is_line_start(1),
-            "code wrap continuation is not a line start"
+            lb.is_line_start(next),
+            "the line after a {bar_rows} row continuation starts at row {next}"
         );
-        assert!(lb.is_line_start(2));
     }
 
     #[test]
