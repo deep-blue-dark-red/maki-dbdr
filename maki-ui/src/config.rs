@@ -1,7 +1,7 @@
 use crate::components::keybindings::{get_configured_bind, key_event_to_string, update_bind};
 use crate::components::settings_picker::UserSettings;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 thread_local! {
     static TEST_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -22,11 +22,7 @@ pub fn config_path() -> Result<PathBuf, std::io::Error> {
             cell.as_ref().unwrap().clone()
         }));
     }
-    let config_dir = maki_storage::paths::config_dir()?;
-    let parent = config_dir
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No parent config dir"))?;
-    Ok(parent.join("user.config"))
+    Ok(maki_storage::paths::config_dir()?.join("user.config"))
 }
 
 /// `user.config` is a flat one-line-per-setting format, so a value that
@@ -106,16 +102,8 @@ pub fn load_config() -> UserSettings {
 
     if !path.exists() {
         let mut settings = UserSettings::default();
-        if let Some(parent) = path.parent() {
-            // Migrate old maki.config → user.config
-            let old_maki_config = parent.join("maki.config");
-            if old_maki_config.exists() {
-                let _ = fs::rename(&old_maki_config, &path);
-                // Re-check after migration
-                if path.exists() {
-                    return load_config();
-                }
-            }
+        if migrate_legacy_config(&path) {
+            return load_config();
         }
         // Migrate legacy settings.json
         if let Ok(config_dir) = maki_storage::paths::config_dir() {
@@ -192,6 +180,27 @@ pub fn load_config() -> UserSettings {
     }
 
     settings
+}
+
+/// Moves the first legacy config file onto `path`: fork-era `user.config` and
+/// `maki.config` lived beside the config dir, upstream `maki.config` inside it.
+fn migrate_legacy_config(path: &Path) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let Some(legacy_dir) = dir.parent() else {
+        return false;
+    };
+    for old in [
+        legacy_dir.join("user.config"),
+        legacy_dir.join("maki.config"),
+        dir.join("maki.config"),
+    ] {
+        if old.exists() && fs::rename(&old, path).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn save_config(settings: &UserSettings) {
@@ -305,6 +314,39 @@ mod tests {
     #[test]
     fn unescape_leaves_unknown_escapes_untouched() {
         assert_eq!(unescape_config_value(r"\q"), r"\q");
+    }
+
+    #[test]
+    fn migrate_moves_user_config_from_legacy_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("cfg")).unwrap();
+        let path = dir.path().join("cfg").join("user.config");
+        let old = dir.path().join("user.config");
+        fs::write(&old, "show_reasoning = true").unwrap();
+
+        assert!(migrate_legacy_config(&path));
+
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "show_reasoning = true");
+    }
+
+    #[test]
+    fn migrate_falls_back_to_in_dir_maki_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.config");
+        let old = dir.path().join("maki.config");
+        fs::write(&old, "api_logging = true").unwrap();
+
+        assert!(migrate_legacy_config(&path));
+
+        assert!(!old.exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "api_logging = true");
+    }
+
+    #[test]
+    fn migrate_without_legacy_files_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!migrate_legacy_config(&dir.path().join("user.config")));
     }
 
     #[test]

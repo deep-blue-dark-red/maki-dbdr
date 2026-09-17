@@ -190,8 +190,8 @@ tearing down TUI, running a shell command, and restoring.
 
 ### 10. `maki-ui/src/config.rs`
 
-- Config file path: `user.config` (parent of `maki_storage::paths::config_dir()`)
-- Migration: `maki.config` → `user.config` on first load
+- Config file path: `user.config` inside `maki_storage::paths::config_dir()` (e.g. `~/.config/maki/user.config`)
+- Migration: legacy `user.config`/`maki.config` (beside the config dir) and in-dir `maki.config` → `user.config` on first load
 - `default_skills_dirs()` returns 5 paths including `~/.gemini/config/skills`
 
 ---
