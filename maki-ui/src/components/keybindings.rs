@@ -459,6 +459,8 @@ pub fn update_bind(action: &str, bind_str: &str) -> bool {
                 "sessions" => write.sessions = bind,
                 "shift_session_down" => write.shift_session_down = bind,
                 "shift_session_up" => write.shift_session_up = bind,
+                "delete_current_session" => write.delete_current_session = bind,
+                "toggle_global_sessions" => write.toggle_global_sessions = bind,
                 _ => return false,
             }
             return true;
@@ -1090,6 +1092,17 @@ mod tests {
         assert!(bind.matches(exact));
         assert!(!bind.matches(extra), "extra modifiers should not match");
         assert!(!bind.matches(wrong), "wrong modifier should not match");
+    }
+
+    #[test_case("sessions")]
+    #[test_case("shift_session_down")]
+    #[test_case("shift_session_up")]
+    #[test_case("delete_current_session")]
+    #[test_case("toggle_global_sessions")]
+    fn update_bind_routes_session_actions(action: &str) {
+        assert!(update_bind(action, "ctrl+shift+x"));
+        assert_eq!(get_configured_bind(action).unwrap().name, Some(action));
+        *CURRENT_BINDS.get().unwrap().write().unwrap() = ConfiguredKeybindings::default();
     }
 
     #[test]

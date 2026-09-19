@@ -34,6 +34,17 @@ file_exists() {
     fi
 }
 
+file_absent() {
+    local desc="$1"
+    local file="$2"
+    if [ ! -e "$REPO/$file" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        FAILURES+=("FAIL [unexpected] $file — $desc")
+    fi
+}
+
 check_not() {
     local desc="$1"
     local file="$2"
@@ -52,10 +63,13 @@ check_not() {
 file_exists "wire logger"      maki-providers/src/wire_log.rs
 file_exists "mlog binary"      maki-providers/src/bin/mlog.rs
 file_exists "tensorx provider" maki-providers/src/providers/tensorx.rs
-# maki-tool-macro and render_hints.rs were deleted on purpose in d952f8aa
-# ("plugins: batch: move the last native tool to Lua") — the macro existed to
-# declare native Rust tools and nothing declares those any more. Likewise
-# plugins/hackernews was dropped in efaefdb8. No checks here on purpose.
+# Deleted on purpose — must not come back: d952f8aa moved the last native tool
+# to Lua; efaefdb8 dropped hackernews; the Rust session_picker gave way to the
+# Lua /sessions plugin.
+file_absent "maki-tool-macro removed"     maki-tool-macro
+file_absent "render_hints removed"        maki-ui/src/components/render_hints.rs
+file_absent "hackernews plugin removed"  plugins/hackernews
+file_absent "rust session_picker removed" maki-ui/src/components/session_picker.rs
 file_exists "settings_picker"  maki-ui/src/components/settings_picker.rs
 file_exists "export_picker"    maki-ui/src/components/export_picker.rs
 file_exists "goto_picker"      maki-ui/src/components/goto_picker.rs
@@ -64,6 +78,7 @@ file_exists "ui config.rs"     maki-ui/src/config.rs
 file_exists "kanagawa theme"   maki-ui/src/themes/kanagawa_maki.toml
 file_exists "rose pine maki"   maki-ui/src/themes/rose_pine_maki.toml
 file_exists "dark daltonized"  maki-ui/src/themes/dark_daltonized.toml
+file_exists "bench harness"    skill-benchmarking/runner.py
 
 # ── view.rs render wiring (THE critical merge failure point) ─────────────────
 
@@ -118,6 +133,11 @@ check "sessions in get_configured_bind"  "$F" '"sessions" =>'
 check "shift_session_down in registry"   "$F" '"shift_session_down" =>'
 check "toggle_global in registry"        "$F" '"toggle_global_sessions" =>'
 check "plan_toggle in registry"          "$F" '"plan_toggle" =>'
+check "delete_current_session in registry" "$F" '"delete_current_session" => Some'
+# Declared, defaulted and listed in get_configured_bind() is not enough: an
+# action without an update_bind() arm silently ignores its user.config line.
+check "delete_current_session in update_bind" "$F" '"delete_current_session" => write.delete_current_session = bind,'
+check "toggle_global_sessions in update_bind" "$F" '"toggle_global_sessions" => write.toggle_global_sessions = bind,'
 
 # ── turn numbering ───────────────────────────────────────────────────────────
 
@@ -145,6 +165,7 @@ check_not "sessions must not steal ctrl+p" "$F" 'maki.keymap.set("n", "<C-p>"'
 F=maki-storage/src/sessions.rs
 check "context_size in SessionSummary"  "$F" "pub context_size: u32"
 check "context_size in ScanRecord"      "$F" "context_size: u32"
+check "read_last_meta returns context_size" "$F" "Option<(String, u64, u32)>"
 
 # ── /logs runs user command ──────────────────────────────────────────────────
 
@@ -160,6 +181,7 @@ check "run_shell_command fn" maki-ui/src/terminal.rs "pub(crate) fn run_shell_co
 
 check "user.config filename"     maki-ui/src/config.rs '"user.config"'
 check "maki.config migration"    maki-ui/src/config.rs '"maki.config"'
+check "gemini skills dir home-relative" maki-ui/src/config.rs 'home.join(".gemini/config/skills")'
 
 # ── UserSettings defaults ────────────────────────────────────────────────────
 
@@ -344,6 +366,14 @@ check "reasoning parsed (compat)"    "maki-providers/src/providers/openai_compat
 check "TurnStats carries thinking"   "maki-ui/src/components/status_bar.rs" "pub thinking_tokens: u32"
 check "status bar renders TH"        "maki-ui/src/components/status_bar.rs" '" | TH {}"'
 check "thinking wired from turn"     "maki-ui/src/app/mod.rs" "thinking_tokens: tc.usage.reasoning"
+
+# ── skill_test failure diagnostics ───────────────────────────────────────────
+
+F=plugins/skill/init.lua
+check "skill test stderr captured"     "$F" "on_stderr"
+check "skill test timeout override"    "$F" "tonumber(tc.timeout_ms) or 60000"
+check "skill test diagnostic tails"    "$F" "tail_oneline"
+check_not "no bare timeout error"      "$F" 'return nil, "timeout after 60s"'
 
 # ── Results ──────────────────────────────────────────────────────────────────
 

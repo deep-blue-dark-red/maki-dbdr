@@ -31,7 +31,7 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 - `maki-ui/src/themes/dark_daltonized.toml` + `dark_daltonized_v2.toml`
 
 ### Bench / tooling
-- `bench/` — Python benchmarking suite (runner, mutator, reporter, 20+ tasks)
+- `skill-benchmarking/` — Python benchmarking suite (runner, mutator, reporter)
 - `scripts/agent-test.sh`
 - `tests/agent/skill-test-*.sh`
 
@@ -326,6 +326,13 @@ Known test failures inherited from upstream on macOS (verified on pristine
 `5da1b2a2`, not merge regressions): the `maki-pack`/`maki-lua` pack lock tests
 under parallel load, `trusted_folders::non_utf8_paths_are_refused`, and the
 `markdown::the_code_memo_follows_the_theme…` flake under a full-workspace run.
+
+- Follow-up audit (2026-09-18) of `621a95a4`: all zones re-checked semantically
+  (verify-fork 131/131, `cargo check --workspace --tests` clean). Three
+  pre-existing gaps found and fixed in the follow-up commit: the stale `bench/`
+  path above, missing `update_bind` arms for `delete_current_session` /
+  `toggle_global_sessions`, and a hardcoded `~/.gemini` skills path.
+  `verify-fork.sh` now guards all three (145 checks).
 
 ## Known gaps (not regressions, but broken)
 

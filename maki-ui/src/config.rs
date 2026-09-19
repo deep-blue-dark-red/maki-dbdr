@@ -89,8 +89,12 @@ pub fn default_skills_dirs() -> Vec<String> {
                 .to_string_lossy()
                 .into_owned(),
         );
+        dirs.push(
+            home.join(".gemini/config/skills")
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
-    dirs.push("/Users/mcp/.gemini/config/skills".to_string());
     dirs
 }
 
