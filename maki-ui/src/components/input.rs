@@ -1180,6 +1180,7 @@ mod tests {
     #[test_case("--file=", "src/main.rs", "src/main.rs" ; "no_leading_after_equals")]
     #[test_case("/", "src/main.rs", "src/main.rs" ; "no_leading_after_slash")]
     #[test_case("\"", "src/main.rs", "src/main.rs" ; "no_leading_after_quote")]
+    #[test_case("@", "src/main.rs", "src/main.rs" ; "no_leading_after_at_mention")]
     #[test_case("'", "src/main.rs", "src/main.rs" ; "no_leading_after_squote")]
     #[test_case("foo_", "src/main.rs", " src/main.rs" ; "leading_after_underscore")]
     #[test_case("$(cmd)", "src/main.rs", " src/main.rs" ; "leading_after_closing_paren")]
