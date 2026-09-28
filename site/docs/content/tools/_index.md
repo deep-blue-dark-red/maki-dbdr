@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 22 built-in tools in this reference (21 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 23 built-in tools in this reference (22 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -131,6 +131,16 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `path` | string | yes | Path to the image file |
+
+### `create_plugin` {#create_plugin}
+
+Scaffold a new bundled plugin in the maki source tree, for developing maki itself.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `description` | string | no | What the scaffolded tool should do, in one sentence |
+| `name` | string | yes | New plugin name: lowercase letters, digits and underscores, starting with a letter |
+| `path` | string | yes | Absolute path to the plugins directory to create it in, the plugins/ of a maki checkout |
 
 ## Execution & Control
 

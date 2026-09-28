@@ -16,6 +16,7 @@ use test_case::test_case;
 #[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
 #[test_case("cronjob", include_str!("../../plugins/cronjob/tests/spec.lua") ; "cronjob_plugin_spec")]
+#[test_case("create_plugin", include_str!("../../plugins/create_plugin/tests/spec.lua") ; "create_plugin_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]
 #[test_case("write", include_str!("../../plugins/write/tests/spec.lua") ; "write_plugin_spec")]

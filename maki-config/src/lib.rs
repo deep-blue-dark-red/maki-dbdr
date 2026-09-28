@@ -99,6 +99,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "create_plugin",
     "edit",
     "glob",
     "grep",
@@ -133,7 +134,14 @@ pub const OPTIONAL_BUILTINS: &[&str] = &[];
 /// pointer to the new one.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
-pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
+pub const FILE_WRITE_TOOLS: &[&str] = &[
+    "write",
+    "edit",
+    "multiedit",
+    "edit_lines",
+    "insert_lines",
+    "create_plugin",
+];
 
 /// A capability a lua plugin can hold. Declared in `plugin.toml`, recorded in
 /// the package approval store, and named on every guarded `maki.*` function.

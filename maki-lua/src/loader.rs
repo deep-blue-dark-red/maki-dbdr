@@ -134,6 +134,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/edit"),
     },
     BundledPlugin {
+        name: "create_plugin",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/create_plugin"),
+    },
+    BundledPlugin {
         name: "memory",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
