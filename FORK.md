@@ -78,6 +78,12 @@ Fork commands that must be in `BUILTIN_COMMANDS`:
 `plugins/sessions/init.lua` registers `/rename <title>`, so the fork's AI-naming
 stays only as the automatic rename of a `New session` (see `start_rename`).
 
+Upstream now ships `plugins/completion/` (Lua `@` mention popup). The fork keeps
+the native `file_picker`: the `@` arm in `app/mod.rs` opens the window without
+printing anything, and the `@` is printed only if the picker closes without a
+pick (`mention_pending`), so a selected path reaches the message bare.
+On merge, disable the upstream plugin or the two popups double up.
+
 ---
 
 ### 3. `maki-ui/src/app/mod.rs`

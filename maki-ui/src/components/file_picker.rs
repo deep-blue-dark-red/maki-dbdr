@@ -200,6 +200,11 @@ impl FilePickerModal {
         self.session.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_matches(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| !s.matches.is_empty())
+    }
+
     pub fn contains(&self, pos: Position) -> bool {
         self.session
             .as_ref()

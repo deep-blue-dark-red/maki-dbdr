@@ -118,6 +118,7 @@ const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
 const IMPLEMENT_PARALLEL_HINT: &str = "Use batch+task to parallelize, assign each subagent a separate module and restrict its tests to that module to avoid interference.";
+const MENTION: char = '@';
 /// Idle time after which a prompt cache is likely evicted by the provider.
 const CACHE_MISS_IDLE: Duration = Duration::from_secs(300);
 
@@ -246,6 +247,9 @@ pub struct App {
     pub(super) float_mgr: FloatManager,
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
+    /// The `@` that opened the file picker, owed to the input only if the
+    /// picker closes without a pick.
+    mention_pending: bool,
     pub(super) pack_review: PackReview,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
@@ -391,6 +395,7 @@ impl App {
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
+            mention_pending: false,
             pack_review: PackReview::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
@@ -1003,6 +1008,7 @@ impl App {
                 }
                 FilePickerModalAction::Close => {
                     self.file_picker.close();
+                    self.print_deferred_mention();
                     vec![]
                 }
             });
@@ -1193,6 +1199,8 @@ impl App {
     pub(crate) fn run_builtin(&mut self, action: BuiltinAction) -> Vec<Action> {
         match action {
             BuiltinAction::FilePicker => {
+                // Only the `@` arm owes a mention prefix.
+                self.mention_pending = false;
                 self.file_picker.open(&self.state.session.cwd);
             }
             BuiltinAction::Search => {
@@ -1372,11 +1380,15 @@ impl App {
             CommandAction::Passthrough => {}
         }
 
-        if key.code == KeyCode::Char('@')
+        if key.code == KeyCode::Char(MENTION)
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
+            // The `@` is owed to the input only if the picker closes without a
+            // pick: a path must reach the message bare, or the model goes
+            // globbing for `@src/main.rs`.
+            self.mention_pending = true;
             self.file_picker.open(&self.state.session.cwd);
             return vec![];
         }
@@ -2493,8 +2505,21 @@ impl App {
         let (dirty, flash) = self.file_picker.tick();
         if let Some(flash) = flash {
             self.status_bar.flash(flash);
+            self.print_deferred_mention();
         }
         dirty
+    }
+
+    /// The picker went away with nothing picked, so the `@` that asked for it
+    /// goes into the input now rather than vanishing with the window.
+    fn print_deferred_mention(&mut self) {
+        if !self.mention_pending {
+            return;
+        }
+        self.mention_pending = false;
+        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(&MENTION.to_string()) {
+            self.command_palette.sync(&val);
+        }
     }
 
     /// What moves with the clock alone; changes that come from arriving data

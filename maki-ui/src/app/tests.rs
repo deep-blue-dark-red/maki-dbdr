@@ -54,6 +54,7 @@ const HINT_PLUGIN: &str = "statusline";
 const RESUMED_PROMPT: &str = "carry me over";
 const TEST_MODEL_SPEC: &str = "test-model";
 const TEST_CWD: &str = "/tmp/test";
+const PICKED_FILE: &str = "pick_me.rs";
 const PERMISSIONS_CWD: &str = "/tmp";
 const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
@@ -3484,7 +3485,24 @@ fn at_opens_file_picker() {
     assert!(!app.file_picker.is_open());
     app.update(Msg::Key(key(KeyCode::Char('@'))));
     assert!(app.file_picker.is_open());
-    assert!(app.input_box.buffer.value().is_empty());
+    assert_eq!(
+        app.input_box.buffer.value(),
+        "",
+        "the @ is owed to the input only when no file is picked"
+    );
+}
+
+#[test]
+fn at_defers_printing_mid_text() {
+    let mut app = test_app();
+    for c in "explain ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+
+    app.update(Msg::Key(key(KeyCode::Char('@'))));
+
+    assert!(app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "explain ");
 }
 
 #[test_case(KeyModifiers::CONTROL ; "ctrl_at_does_not_open")]
@@ -3493,6 +3511,63 @@ fn at_with_shortcut_modifier_does_not_open_picker(mods: KeyModifiers) {
     let mut app = test_app();
     app.update(Msg::Key(KeyEvent::new(KeyCode::Char('@'), mods)));
     assert!(!app.file_picker.is_open());
+}
+
+/// No file was picked, so the `@` that asked for one goes in now: the
+/// keypress must not vanish with the window.
+#[test]
+fn esc_without_a_pick_prints_the_deferred_at_sign() {
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('@'))));
+    assert!(app.file_picker.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(!app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), "@");
+}
+
+/// The keybinding path never printed an `@`, so closing it must not invent one.
+#[test]
+fn closing_the_keybinding_picker_prints_nothing() {
+    let mut app = test_app();
+    let _ = app.run_builtin(BuiltinAction::FilePicker);
+    assert!(app.file_picker.is_open());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// `@src/main.rs` sends the model looking for a file called `@src/main.rs`,
+/// so the picked path has to land bare. The picker only reports readiness
+/// through its matches, so the walk is what the loop waits on.
+#[test]
+fn picked_file_lands_without_the_at_sign() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join(PICKED_FILE), "").unwrap();
+    let mut app = spawned_app(
+        AppSession::new(TEST_MODEL_SPEC, &tmp.path().to_string_lossy()),
+        test_permissions(false),
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('@'))));
+    assert_eq!(app.input_box.buffer.value(), "");
+
+    let deadline = Instant::now() + WALK_TIMEOUT;
+    while !app.file_picker.has_matches() {
+        assert!(
+            Instant::now() < deadline,
+            "the picker never matched {PICKED_FILE}"
+        );
+        let _ = app.tick();
+        std::thread::yield_now();
+    }
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(!app.file_picker.is_open());
+    assert_eq!(app.input_box.buffer.value(), PICKED_FILE);
 }
 
 #[test]

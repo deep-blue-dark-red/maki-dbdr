@@ -97,6 +97,10 @@ check "/export in palette"     "$F" '"/export"'
 check "/skills in palette"     "$F" '"/skills"'
 check "/plugins in palette"    "$F" '"/plugins"'
 check "/rewind in palette"    "$F" '"/rewind"'
+# Upstream's plugins/completion is a Lua @ popup; the fork opens the native
+# file_picker and prints the @ only when no file was picked.
+check "@ defers the at-sign" "maki-ui/src/app/mod.rs" "self.mention_pending = true"
+check "@ opens the picker" "maki-ui/src/app/mod.rs" "self.file_picker.open(&self.state.session.cwd)"
 # /rename is owned by the sessions Lua plugin (upstream), not a builtin: the
 # fork's AI rename survives as the auto-name of a New session.
 check_not "no builtin /rename" "$F" 'name: "/rename"'
