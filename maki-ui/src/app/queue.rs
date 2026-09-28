@@ -31,6 +31,13 @@ impl MessageQueue {
         self.shared = Some(shared);
     }
 
+    /// Wake the agent loop without queueing anything.
+    pub(crate) fn wake(&self) {
+        if let Some(shared) = &self.shared {
+            shared.wake();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| s.is_empty())

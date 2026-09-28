@@ -4,7 +4,9 @@ mod run_cancels;
 pub(crate) mod shared_queue;
 
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -34,12 +36,24 @@ pub(crate) use maki_agent::ModelSlot;
 /// per-tab: `respawn` reuses it, so anyone still holding a sender (a Lua
 /// restore reply, a click, an old agent winding down) can always deliver.
 /// Stale events are filtered by `run_id`, not by killing the channel.
+/// What `/system_prompt` needs beside the assembled text: the instruction
+/// files behind `{{instructions}}` and the plugins contributing to
+/// `{{after_instructions}}`. Published alongside `btw_system` on every
+/// prompt rebuild.
+#[derive(Clone, Default)]
+pub(crate) struct PromptMeta {
+    pub(crate) instruction_files: Vec<PathBuf>,
+    pub(crate) after_sources: Vec<String>,
+}
+
 pub(crate) struct AgentHandles {
     pub(crate) agent_rx: flume::Receiver<Envelope>,
     pub(crate) agent_tx: flume::Sender<Envelope>,
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
+    pub(crate) prompt_meta: Arc<ArcSwap<PromptMeta>>,
+    pub(crate) prompt_dirty: Arc<AtomicBool>,
     pub(crate) mcp_handle: Option<McpHandle>,
     pub(crate) mcp_config_errors: McpConfigErrors,
     pub(crate) queue: QueueSender,
@@ -93,6 +107,8 @@ impl AgentHandles {
         app.answer_tx = Some(self.answer_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
+        app.prompt_meta = Some(Arc::clone(&self.prompt_meta));
+        app.prompt_dirty = Some(Arc::clone(&self.prompt_dirty));
         app.queue.set_shared(self.queue.clone());
         let restore_tx =
             maki_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
@@ -236,6 +252,9 @@ fn spawn_agent_internal(
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
+    let prompt_meta: Arc<ArcSwap<PromptMeta>> =
+        Arc::new(ArcSwap::from_pointee(PromptMeta::default()));
+    let prompt_dirty = Arc::new(AtomicBool::new(false));
     let cancels = RunCancels::new();
     let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
     let mailbox = SessionMailbox::register(resumed.id.id());
@@ -247,6 +266,8 @@ fn spawn_agent_internal(
         resumed,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
+        Arc::clone(&prompt_meta),
+        Arc::clone(&prompt_dirty),
         mcp_handle.clone(),
         Arc::clone(permissions),
         agent_tx.clone(),
@@ -268,6 +289,8 @@ fn spawn_agent_internal(
         answer_tx,
         history: shared_history,
         btw_system,
+        prompt_meta,
+        prompt_dirty,
         mcp_handle,
         mcp_config_errors,
         queue: queue_tx,

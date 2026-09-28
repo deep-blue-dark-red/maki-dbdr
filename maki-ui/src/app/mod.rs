@@ -40,6 +40,7 @@ use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
 use crate::components::keybindings::key;
+use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
@@ -55,6 +56,7 @@ use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, U
 use crate::components::skills_modal::{SkillsAction, SkillsModal};
 use crate::components::stats_modal::{StatsModal, TurnSnapshot};
 use crate::components::status_bar::StatusBar;
+use crate::components::system_prompt_modal::{SystemPromptAction, SystemPromptModal, WIDTH_PERCENT};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -111,6 +113,8 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
 const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
 const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";
+const FLASH_NO_INSTRUCTION_FILES: &str = "No instruction files loaded";
+const FLASH_NO_AFTER_SOURCES: &str = "No plugins contribute to {{after_instructions}}";
 /// What both plan waits add on top of the host's own budget. It covers the
 /// request queue a `/reload` or a long tool call holds, plus the executor
 /// getting round to the answer, neither of which the host's deadline starts
@@ -363,7 +367,9 @@ pub struct App {
     pub(super) mcp_picker: McpPicker,
     pub(super) rewind_picker: RewindPicker,
     pub(super) goto_picker: GotoPicker,
+    pub(super) prompt_file_picker: ListPicker<PathBuf>,
     pub(super) help_modal: HelpModal,
+    pub(super) system_prompt_modal: SystemPromptModal,
     pub(super) export_picker: ExportPicker,
     pub(super) plugins_modal: PluginsModal,
     pub(super) skills_modal: SkillsModal,
@@ -442,6 +448,8 @@ pub struct App {
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
+    pub(crate) prompt_meta: Option<Arc<ArcSwap<crate::agent::PromptMeta>>>,
+    pub(crate) prompt_dirty: Option<Arc<AtomicBool>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
     pub(crate) primary_paste_rx: Vec<flume::Receiver<Option<String>>>,
     storage_writer: Arc<StorageWriter>,
@@ -538,7 +546,9 @@ impl App {
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
             goto_picker: GotoPicker::new(),
+            prompt_file_picker: ListPicker::new().with_width_pct(WIDTH_PERCENT),
             help_modal: HelpModal::new(),
+            system_prompt_modal: SystemPromptModal::new(),
             export_picker: ExportPicker::new(),
             plugins_modal: PluginsModal::new(),
             skills_modal: SkillsModal::new(),
@@ -585,6 +595,8 @@ impl App {
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
+            prompt_meta: None,
+            prompt_dirty: None,
             image_paste_rx: vec![],
             primary_paste_rx: vec![],
             storage_writer,
@@ -1040,6 +1052,10 @@ impl App {
             self.help_modal.scroll(delta);
             return None;
         }
+        if self.system_prompt_modal.is_open() {
+            self.system_prompt_modal.scroll(delta);
+            return None;
+        }
         if self.usage_modal.is_open() {
             self.usage_modal.scroll(delta);
             return None;
@@ -1161,6 +1177,27 @@ impl App {
         if self.help_modal.is_open() {
             self.help_modal.handle_key(key);
             return Some(vec![]);
+        }
+
+        if self.system_prompt_modal.is_open() {
+            return Some(match self.system_prompt_modal.handle_key(key) {
+                SystemPromptAction::Edit => vec![Action::EditSystemPrompt],
+                SystemPromptAction::EditIdentity => {
+                    vec![Action::EditSlotOverride(maki_agent::prompt::Slot::Identity)]
+                }
+                SystemPromptAction::EditTone => {
+                    vec![Action::EditSlotOverride(maki_agent::prompt::Slot::Tone)]
+                }
+                SystemPromptAction::PickInstructions => {
+                    self.open_instruction_file_picker();
+                    vec![]
+                }
+                SystemPromptAction::OpenAfterSources => {
+                    self.open_after_sources_picker();
+                    vec![]
+                }
+                SystemPromptAction::None => vec![],
+            });
         }
 
         if self.plugins_modal.is_open() {
@@ -1356,6 +1393,18 @@ impl App {
             return Some(match self.theme_picker.handle_key(key) {
                 ThemePickerAction::Consumed => vec![],
                 ThemePickerAction::Closed => vec![],
+            });
+        }
+
+        if self.prompt_file_picker.is_open() {
+            return Some(match self.prompt_file_picker.handle_key(key) {
+                PickerAction::Consumed => vec![],
+                PickerAction::Select(path) => {
+                    self.prompt_file_picker.close();
+                    vec![Action::OpenEditor(path)]
+                }
+                PickerAction::Toggle(..) => vec![],
+                PickerAction::Close => vec![],
             });
         }
 
@@ -2602,7 +2651,17 @@ impl App {
                 vec![]
             }
             "/system_prompt" => {
-                vec![Action::EditSystemPrompt]
+                let built = self
+                    .btw_system
+                    .as_ref()
+                    .is_some_and(|s| !s.load().is_empty());
+                if built {
+                    let source = Arc::clone(self.btw_system.as_ref().unwrap());
+                    self.system_prompt_modal.open(source);
+                } else {
+                    self.flash("System prompt not built yet".into());
+                }
+                vec![]
             }
             "/logs" => {
                 vec![Action::RunLogsCommand]
@@ -2784,9 +2843,11 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 20] {
+    fn overlays(&self) -> [&dyn Overlay; 22] {
         [
             &self.help_modal,
+            &self.system_prompt_modal,
+            &self.prompt_file_picker,
             &self.export_picker,
             &self.plugins_modal,
             &self.skills_modal,
@@ -2809,9 +2870,11 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 20] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 22] {
         [
             &mut self.help_modal,
+            &mut self.system_prompt_modal,
+            &mut self.prompt_file_picker,
             &mut self.export_picker,
             &mut self.plugins_modal,
             &mut self.skills_modal,

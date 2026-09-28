@@ -554,6 +554,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 if let Err(e) = maki_agent::prompt::load_user_system_prompt() {
                     new_warnings.push(format!("could not read custom system prompt: {e}"));
                 }
+                if let Err(e) = maki_agent::prompt::load_user_slot_overrides() {
+                    new_warnings.push(format!("could not read identity/tone overrides: {e}"));
+                }
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let replacement = Resolved::fresh(&storage);

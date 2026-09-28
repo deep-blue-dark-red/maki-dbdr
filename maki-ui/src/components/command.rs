@@ -197,7 +197,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/system_prompt",
-        description: "Edit the system prompt template in default editor",
+        description: "Show the resolved system prompt (Ctrl+E edits system.md)",
         max_args: 0,
         bang: false,
     },

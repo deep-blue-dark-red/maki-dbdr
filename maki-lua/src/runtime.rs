@@ -2414,6 +2414,12 @@ impl LuaRuntime {
                 );
             }
         }
+        // User files outrank plugin claims on the singleton slots; inserted
+        // last because singleton rendering takes the final entry.
+        maki_agent::prompt::overlay_user_slots(
+            &mut slots,
+            &maki_agent::prompt::user_slot_overrides(),
+        );
         slots
     }
 

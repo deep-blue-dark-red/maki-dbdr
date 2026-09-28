@@ -1086,6 +1086,27 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Reload every prompt override after an `$EDITOR` session, ask the agent
+    /// loop to republish the resolved prompt, and put the float back up so the
+    /// edit is visible immediately. Instructions are session-captured, so
+    /// AGENTS.md edits only land on `/reload`.
+    fn refresh_prompt_overrides(&mut self, idx: usize) {
+        let app = &mut self.sessions[idx].app;
+        if let Err(e) = maki_agent::prompt::load_user_system_prompt() {
+            app.flash(format!("could not reload system prompt: {e}"));
+        }
+        if let Err(e) = maki_agent::prompt::load_user_slot_overrides() {
+            app.flash(format!("could not reload identity/tone overrides: {e}"));
+        }
+        if let Some(dirty) = &app.prompt_dirty {
+            dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        app.queue.wake();
+        if let Some(btw) = app.btw_system.as_ref().filter(|s| !s.load().is_empty()) {
+            app.system_prompt_modal.open(Arc::clone(btw));
+        }
+    }
+
     /// One diff per frame covers every path that finishes, cancels or errors a
     /// chat, so none of them has to remember to fire an event.
     fn emit_status_changes(&mut self) {
@@ -1795,7 +1816,7 @@ impl<'t> EventLoop<'t> {
             Action::Quit => {}
             Action::EditSystemPrompt => match maki_storage::paths::config_dir() {
                 Ok(config_dir) => {
-                    let path = config_dir.join("system.md");
+                    let path = config_dir.join(maki_agent::prompt::USER_SYSTEM_PROMPT_FILE);
                     if !path.exists()
                         && let Err(e) = std::fs::write(&path, maki_agent::prompt::SYSTEM_PROMPT)
                     {
@@ -1805,11 +1826,39 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     self.open_editor(idx, &path);
+                    self.refresh_prompt_overrides(idx);
                 }
                 Err(e) => self.sessions[idx]
                     .app
                     .flash(format!("Failed to get config directory: {e}")),
             },
+            Action::EditSlotOverride(slot) => {
+                let Some(file) = maki_agent::prompt::slot_override_file(slot) else {
+                    return;
+                };
+                match maki_storage::paths::config_dir() {
+                    Ok(config_dir) => {
+                        let path = config_dir.join(file);
+                        if !path.exists() {
+                            let seed = slot
+                                .default_content()
+                                .map(str::to_string)
+                                .unwrap_or_default();
+                            if let Err(e) = std::fs::write(&path, seed) {
+                                self.sessions[idx]
+                                    .app
+                                    .flash(format!("Failed to create {file}: {e}"));
+                                return;
+                            }
+                        }
+                        self.open_editor(idx, &path);
+                        self.refresh_prompt_overrides(idx);
+                    }
+                    Err(e) => self.sessions[idx]
+                        .app
+                        .flash(format!("Failed to get config directory: {e}")),
+                }
+            }
             Action::RunLogsCommand => {
                 let settings = crate::components::settings_picker::UserSettings::load();
                 let log_path = maki_storage::paths::logs_dir()

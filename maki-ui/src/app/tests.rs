@@ -58,6 +58,10 @@ const LATE_MODEL_SPEC: &str = "zai/glm-5";
 const PRIMARY_TEXT: &str = "selected text";
 const HINT_PLUGIN: &str = "statusline";
 const RESUMED_PROMPT: &str = "carry me over";
+const SYSTEM_PROMPT_TEXT: &str = "You are Maki.";
+const INSTRUCTION_FILE: &str = "/tmp/AGENTS.md";
+const AFTER_SOURCE_PLUGIN: &str = "memory";
+const PLUGIN_ENTRY_FILE: &str = "init.lua";
 const TEST_MODEL_SPEC: &str = "test-model";
 const TEST_CWD: &str = "/tmp/test";
 const PICKED_FILE: &str = "pick_me.rs";
@@ -4638,6 +4642,52 @@ fn alt_o_opens_editor_for_input() {
     app.input_box.buffer.insert_text("hello");
     let actions = app.update(Msg::Key(kb::EDIT_INPUT.to_key_event()));
     assert!(matches!(&actions[..], [Action::EditInputInEditor]));
+}
+
+#[test]
+fn system_prompt_p_picker_enter_opens_selected_file() {
+    let mut app = test_app();
+    let file = PathBuf::from(INSTRUCTION_FILE);
+    app.prompt_meta = Some(Arc::new(ArcSwap::from_pointee(crate::agent::PromptMeta {
+        instruction_files: vec![file.clone()],
+        after_sources: vec![],
+    })));
+    app.system_prompt_modal
+        .open(Arc::new(ArcSwap::from_pointee(SYSTEM_PROMPT_TEXT.to_string())));
+    app.update(Msg::Key(key(KeyCode::Char('p'))));
+    assert!(app.prompt_file_picker.is_open());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == &file));
+}
+
+#[test]
+fn system_prompt_p_without_instruction_files_flashes() {
+    let mut app = test_app();
+    app.system_prompt_modal
+        .open(Arc::new(ArcSwap::from_pointee(SYSTEM_PROMPT_TEXT.to_string())));
+    app.update(Msg::Key(key(KeyCode::Char('p'))));
+    assert!(!app.prompt_file_picker.is_open());
+    assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_NO_INSTRUCTION_FILES);
+}
+
+/// The editor must never be handed a plugin directory: `hx <dir>` opens
+/// helix's file selector instead of the source.
+#[test]
+fn system_prompt_a_picker_enter_opens_plugin_source_file() {
+    let mut app = test_app();
+    app.prompt_meta = Some(Arc::new(ArcSwap::from_pointee(crate::agent::PromptMeta {
+        instruction_files: vec![],
+        after_sources: vec![AFTER_SOURCE_PLUGIN.to_string()],
+    })));
+    app.system_prompt_modal
+        .open(Arc::new(ArcSwap::from_pointee(SYSTEM_PROMPT_TEXT.to_string())));
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    assert!(app.prompt_file_picker.is_open());
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    let [Action::OpenEditor(path)] = &actions[..] else {
+        panic!("expected one editor action, got {}", actions.len());
+    };
+    assert!(path.ends_with(PLUGIN_ENTRY_FILE), "{}", path.display());
 }
 
 #[test]

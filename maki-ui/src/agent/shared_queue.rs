@@ -210,6 +210,13 @@ impl QueueSender {
         let _ = self.notify_tx.try_send(());
     }
 
+    /// Wake the agent loop without queueing anything. The loop re-checks its
+    /// side state on every wake, so this is how out-of-band changes (an edited
+    /// system prompt) get republished while idle.
+    pub(crate) fn wake(&self) {
+        let _ = self.notify_tx.try_send(());
+    }
+
     pub(crate) fn remove(&self, index: usize) -> Option<QueueItem> {
         let mut items = lock(&self.items);
         (index < items.len()).then(|| items.remove(index)).flatten()

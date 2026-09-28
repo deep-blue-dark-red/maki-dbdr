@@ -30,7 +30,7 @@ pub use key::{Key, RESERVED_KEYS, is_reserved};
 pub use key_lint::KEY_WARNING;
 pub use loader::{
     EventHandle, InitFiles, PERMISSION_NAME_WARNING, PluginHost, SKIPPED_PLUGIN_WARNING,
-    bundled_plugins,
+    bundled_plugin_entry_file, bundled_plugins,
 };
 pub use maki_agent::SessionEndReason;
 pub use pack::{

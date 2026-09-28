@@ -298,6 +298,7 @@ impl App {
         }
 
         render_if_open!(self.rewind_picker);
+        render_if_open!(self.prompt_file_picker);
         render_if_open!(self.goto_picker);
         render_if_open!(self.theme_picker);
         render_if_open!(self.settings_picker);
@@ -323,6 +324,10 @@ impl App {
             overlay_rect = r;
         }
         let r = self.help_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
+        let r = self.system_prompt_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
         }

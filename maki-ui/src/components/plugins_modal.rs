@@ -85,8 +85,9 @@ impl PluginsModal {
                 PluginsAction::None
             }
             KeyCode::Char('e') => {
-                if let Some(plugin) = self.plugins.get(self.selected) {
-                    let path = plugin.source_path.clone();
+                if let Some(plugin) = self.plugins.get(self.selected)
+                    && let Some(path) = plugin_source_path(&plugin.name)
+                {
                     self.close();
                     return PluginsAction::EditPlugin(path);
                 }
@@ -250,6 +251,13 @@ impl Overlay for PluginsModal {
         self.plugins.clear();
         self.event_handle = None;
     }
+}
+
+/// Where a bundled plugin's source lives, for "open the source" flows. The
+/// display path `bundled_plugins()` reports is the plugin directory, which is
+/// not a file an editor can open.
+pub(crate) fn plugin_source_path(name: &str) -> Option<PathBuf> {
+    maki_lua::bundled_plugin_entry_file(name)
 }
 
 fn build_plugin_list() -> Vec<PluginInfo> {

@@ -47,6 +47,14 @@ impl LoadedInstructions {
         let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
         !set.insert(path)
     }
+
+    /// Every instruction file seen so far, sorted for stable display.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        let set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut paths: Vec<PathBuf> = set.iter().cloned().collect();
+        paths.sort();
+        paths
+    }
 }
 
 /// Instruction files found during one model call, at any nesting depth.

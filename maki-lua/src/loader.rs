@@ -161,6 +161,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
+    BundledPlugin {
+        name: "status",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/status"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
@@ -254,6 +258,22 @@ pub fn bundled_plugins() -> impl Iterator<Item = (&'static str, String)> {
         let path = format!("plugins/{}", p.name);
         (p.name, path)
     })
+}
+
+/// A bundled plugin's entry file in the source tree this binary was built
+/// from. Plugins ship embedded (`include_dir!`), so the file only exists for
+/// builds from a source checkout; `None` elsewhere.
+pub fn bundled_plugin_entry_file(name: &str) -> Option<PathBuf> {
+    BUNDLED_PLUGINS
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../plugins")
+                .join(p.name)
+                .join("init.lua")
+        })
+        .filter(|path| path.exists())
 }
 
 pub struct PluginHost {

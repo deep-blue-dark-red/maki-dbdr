@@ -18,11 +18,20 @@ pub const SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
 
 /// File under the config dir that `/system_prompt` opens for editing.
 pub const USER_SYSTEM_PROMPT_FILE: &str = "system.md";
+pub const USER_IDENTITY_FILE: &str = "identity.md";
+pub const USER_TONE_FILE: &str = "tone.md";
 
 /// User-authored replacement for [`SYSTEM_PROMPT`], populated by
 /// [`load_user_system_prompt`]. Empty until something loads it, so unit tests
 /// and library consumers never pick up whatever is on the host's disk.
 static USER_SYSTEM_PROMPT: ArcSwapOption<String> = ArcSwapOption::const_empty();
+
+/// User-authored overrides for the singleton slots, populated by
+/// [`load_user_slot_overrides`]. They outrank any plugin's `set_prompt`
+/// claim: an explicit file on disk is the user speaking, a plugin is a
+/// suggestion.
+static USER_IDENTITY: ArcSwapOption<String> = ArcSwapOption::const_empty();
+static USER_TONE: ArcSwapOption<String> = ArcSwapOption::const_empty();
 
 /// Read `<config_dir>/system.md` into the system prompt override.
 ///
@@ -32,7 +41,7 @@ static USER_SYSTEM_PROMPT: ArcSwapOption<String> = ArcSwapOption::const_empty();
 /// prompt. Returns whether an override is now active.
 pub fn load_user_system_prompt() -> Result<bool, std::io::Error> {
     let dir = maki_storage::paths::config_dir()?;
-    let text = read_user_system_prompt(&dir)?;
+    let text = read_user_prompt_file(&dir.join(USER_SYSTEM_PROMPT_FILE))?;
     if let Some(text) = text {
         tracing::info!(dir = %dir.display(), bytes = text.len(), "loaded user system prompt");
         USER_SYSTEM_PROMPT.store(Some(Arc::new(text)));
@@ -40,6 +49,76 @@ pub fn load_user_system_prompt() -> Result<bool, std::io::Error> {
     } else {
         USER_SYSTEM_PROMPT.store(None);
         Ok(false)
+    }
+}
+
+/// Read `<config_dir>/identity.md` and `tone.md` into singleton-slot
+/// overrides. Same semantics as [`load_user_system_prompt`]: a missing or
+/// blank file clears that override and restores the plugin/default chain.
+/// Returns how many overrides are active.
+pub fn load_user_slot_overrides() -> Result<u8, std::io::Error> {
+    let dir = maki_storage::paths::config_dir()?;
+    apply_user_slot_overrides_from(&dir)
+}
+
+fn apply_user_slot_overrides_from(dir: &std::path::Path) -> Result<u8, std::io::Error> {
+    let mut active = 0;
+    for (file, store) in [
+        (USER_IDENTITY_FILE, &USER_IDENTITY),
+        (USER_TONE_FILE, &USER_TONE),
+    ] {
+        match read_user_prompt_file(&dir.join(file))? {
+            Some(text) => {
+                store.store(Some(Arc::new(text)));
+                active += 1;
+            }
+            None => store.store(None),
+        }
+    }
+    Ok(active)
+}
+
+/// The singleton-slot overrides currently loaded from disk, paired with the
+/// slot they belong to.
+pub fn user_slot_overrides() -> Vec<(Slot, Arc<str>)> {
+    [(Slot::Identity, &USER_IDENTITY), (Slot::Tone, &USER_TONE)]
+        .into_iter()
+        .filter_map(|(slot, store)| {
+            store
+                .load_full()
+                .map(|text| (slot, Arc::from(text.as_str())))
+        })
+        .collect()
+}
+
+/// Insert user overrides as the winning entries for their singleton slots.
+/// Singleton rendering takes the last entry, so overlaying after plugin
+/// collection is what gives the user file priority.
+pub fn overlay_user_slots(slots: &mut ResolvedSlots, overrides: &[(Slot, Arc<str>)]) {
+    for &(slot, ref content) in overrides {
+        for &pid in PromptId::ALL {
+            if pid.has_slot(slot) {
+                slots.insert(
+                    pid,
+                    slot,
+                    SlotEntry {
+                        plugin: Arc::from(USER_PLUGIN_NAME),
+                        content: content.to_string(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+pub const USER_PLUGIN_NAME: &str = "user";
+
+/// The config file backing a user-editable slot, if it has one.
+pub fn slot_override_file(slot: Slot) -> Option<&'static str> {
+    match slot {
+        Slot::Identity => Some(USER_IDENTITY_FILE),
+        Slot::Tone => Some(USER_TONE_FILE),
+        _ => None,
     }
 }
 
@@ -52,12 +131,12 @@ pub fn is_user_supplied(id: PromptId) -> bool {
     id == PromptId::System && USER_SYSTEM_PROMPT.load().is_some()
 }
 
-/// Read `system.md` out of `dir`. `None` means "use the built-in prompt": the
-/// file is absent, or holds nothing but whitespace. Any other read failure is
-/// an error, so a permissions problem is reported rather than silently
-/// swapping the user's prompt back to the default.
-fn read_user_system_prompt(dir: &std::path::Path) -> Result<Option<String>, std::io::Error> {
-    match std::fs::read_to_string(dir.join(USER_SYSTEM_PROMPT_FILE)) {
+/// Read one user prompt file. `None` means "use the default": the file is
+/// absent, or holds nothing but whitespace. Any other read failure is an
+/// error, so a permissions problem is reported rather than silently swapping
+/// the user's content back to the default.
+fn read_user_prompt_file(path: &std::path::Path) -> Result<Option<String>, std::io::Error> {
+    match std::fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(None),
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -73,13 +152,13 @@ pub const CHECKPOINT_USER: &str = include_str!("prompts/checkpoint_user.md");
 
 pub const DEFAULT_IDENTITY: &str = r#"You are Maki, an interactive CLI coding agent. Use the tools available to assist the user with software engineering tasks. Complete tasks successfully while minimizing token usage and tool calls to avoid context bloat.
 
-You must NEVER generate or guess URLs unless they are for helping the user with programming."#;
+You must **never** generate or guess URLs unless they are for helping the user with programming."#;
 
 pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CLI rendered in monospace. Use GitHub-flavored markdown.
 - Only use emojis if explicitly requested.
 - Do not add comments to code unless asked.
-- Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
-- NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
+- Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. **never** use bash echo or other command-line tools to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
+- **never** create files unless absolutely necessary. **always** prefer editing existing files."#;
 
 const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "code_execution", "task"];
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
@@ -312,7 +391,10 @@ mod tests {
     #[test]
     fn absent_system_md_falls_back_to_builtin() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_user_system_prompt(dir.path()).unwrap(), None);
+        assert_eq!(
+            read_user_prompt_file(&dir.path().join(USER_SYSTEM_PROMPT_FILE)).unwrap(),
+            None
+        );
     }
 
     #[test_case("" ; "empty")]
@@ -320,7 +402,10 @@ mod tests {
     fn blank_system_md_falls_back_to_builtin(body: &str) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(USER_SYSTEM_PROMPT_FILE), body).unwrap();
-        assert_eq!(read_user_system_prompt(dir.path()).unwrap(), None);
+        assert_eq!(
+            read_user_prompt_file(&dir.path().join(USER_SYSTEM_PROMPT_FILE)).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -329,7 +414,9 @@ mod tests {
         let body = "You are Custom.\n\n{{instructions}}\n";
         std::fs::write(dir.path().join(USER_SYSTEM_PROMPT_FILE), body).unwrap();
         assert_eq!(
-            read_user_system_prompt(dir.path()).unwrap().as_deref(),
+            read_user_prompt_file(&dir.path().join(USER_SYSTEM_PROMPT_FILE))
+                .unwrap()
+                .as_deref(),
             Some(body)
         );
     }
@@ -568,7 +655,46 @@ mod tests {
             },
         );
         let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains("Never assume a library is available"));
+        assert!(out.contains("Confirm a library exists in the project's dependency files"));
         assert!(out.contains("- Extra rule"));
+    }
+
+    #[test]
+    fn user_slot_files_are_singleton_only() {
+        assert_eq!(slot_override_file(Slot::Identity), Some(USER_IDENTITY_FILE));
+        assert_eq!(slot_override_file(Slot::Tone), Some(USER_TONE_FILE));
+        assert_eq!(slot_override_file(Slot::ToolUsage), None);
+    }
+
+    #[test]
+    fn slot_override_files_override_plugins_and_blank_files_fall_through() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USER_IDENTITY_FILE), "You are Custom.\n").unwrap();
+        std::fs::write(dir.path().join(USER_TONE_FILE), "   \n").unwrap();
+        assert_eq!(apply_user_slot_overrides_from(dir.path()).unwrap(), 1);
+
+        let mut slots = ResolvedSlots::default();
+        slots.insert(
+            PromptId::System,
+            Slot::Tone,
+            SlotEntry {
+                plugin: Arc::from("plugin"),
+                content: "plugin tone".into(),
+            },
+        );
+        overlay_user_slots(&mut slots, &user_slot_overrides());
+
+        let identity: Vec<_> = slots
+            .get(PromptId::System, Slot::Identity)
+            .iter()
+            .map(|e| (e.plugin.to_string(), e.content.clone()))
+            .collect();
+        assert_eq!(identity.len(), 1);
+        assert_eq!(identity[0].0, USER_PLUGIN_NAME);
+        assert_eq!(identity[0].1, "You are Custom.\n");
+
+        let out = assemble(PromptId::System, &slots, "");
+        assert!(out.contains("You are Custom."));
+        assert!(out.contains("plugin tone"), "blank file must fall through");
     }
 }

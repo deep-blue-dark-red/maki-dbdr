@@ -189,6 +189,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     if let Err(e) = maki_agent::prompt::load_user_system_prompt() {
         eprintln!("warning: could not read custom system prompt: {e}");
     }
+    if let Err(e) = maki_agent::prompt::load_user_slot_overrides() {
+        eprintln!("warning: could not read identity/tone overrides: {e}");
+    }
 
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.

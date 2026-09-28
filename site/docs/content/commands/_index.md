@@ -41,7 +41,7 @@ Type `/` in the input box to open the command palette.
 | `/packdel` | Remove undeclared packages (++all, or a name) |
 | `/reload_config` | Reload configuration from disk without restarting |
 | `/verbose` | Toggle verbose output mode |
-| `/system_prompt` | Edit the system prompt template in default editor |
+| `/system_prompt` | Show the resolved system prompt (Ctrl+E edits system.md) |
 | `/logs` | Open logs directory |
 | `/export` | Export session transcript as Markdown or JSON |
 | `/skills` | Manage global and project AI agent skills |

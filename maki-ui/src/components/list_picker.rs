@@ -55,6 +55,19 @@ impl PickerItem for String {
     }
 }
 
+impl PickerItem for std::path::PathBuf {
+    fn label(&self) -> &str {
+        self.file_name()
+            .and_then(|n| n.to_str())
+            .or_else(|| self.to_str())
+            .unwrap_or("")
+    }
+
+    fn detail(&self) -> Option<&str> {
+        self.parent().and_then(|p| p.to_str())
+    }
+}
+
 pub enum PickerAction<T> {
     Consumed,
     Select(T),
@@ -66,6 +79,7 @@ pub struct ListPicker<T> {
     state: Option<State<T>>,
     title: String,
     max_visible: Option<u16>,
+    width_pct: Option<u16>,
     footer: Option<FooterSpec>,
     error_text: Option<String>,
 }
@@ -251,6 +265,7 @@ impl<T: PickerItem> ListPicker<T> {
             state: None,
             title: String::new(),
             max_visible: None,
+            width_pct: None,
             footer: None,
             error_text: None,
         }
@@ -258,6 +273,11 @@ impl<T: PickerItem> ListPicker<T> {
 
     pub fn with_max_visible(mut self, max: u16) -> Self {
         self.max_visible = Some(max);
+        self
+    }
+
+    pub fn with_width_pct(mut self, pct: u16) -> Self {
+        self.width_pct = Some(pct);
         self
     }
 
@@ -498,7 +518,13 @@ impl<T: PickerItem> ListPicker<T> {
                 frame,
                 area,
                 s,
-                &self.title,
+                Modal {
+                    title: &self.title,
+                    width_percent: self
+                        .width_pct
+                        .unwrap_or_else(|| width_percent(area.width)),
+                    max_height_percent: MAX_HEIGHT_PERCENT,
+                },
                 self.max_visible,
                 footer,
                 self.error_text.as_deref(),
@@ -525,7 +551,7 @@ fn render_ready<T: PickerItem>(
     frame: &mut Frame,
     area: Rect,
     s: &mut State<T>,
-    title: &str,
+    modal: Modal<'_>,
     max_visible: Option<u16>,
     footer: Option<FooterSpec>,
     error_text: Option<&str>,
@@ -541,11 +567,6 @@ fn render_ready<T: PickerItem>(
         }
     };
     let error_rows = error_text.is_some() as u16;
-    let modal = Modal {
-        title,
-        width_percent: width_percent(area.width),
-        max_height_percent: MAX_HEIGHT_PERCENT,
-    };
     let (popup, inner) = modal.render(
         frame,
         area,

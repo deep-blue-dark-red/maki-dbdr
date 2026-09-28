@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::agent::{self, AgentHooks};
@@ -54,6 +55,8 @@ pub(super) struct AgentLoop {
     /// every run over it, so the provider's own counts pile up between turns.
     gauge: ContextGauge,
     btw_system: Arc<ArcSwap<String>>,
+    prompt_meta: Arc<ArcSwap<super::PromptMeta>>,
+    prompt_dirty: Arc<AtomicBool>,
     cancels: Arc<RunCancels>,
     permissions: Arc<PermissionManager>,
     file_access: Arc<FileAccess>,
@@ -77,6 +80,8 @@ impl AgentLoop {
         resumed: Resumed,
         shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
+        prompt_meta: Arc<ArcSwap<super::PromptMeta>>,
+        prompt_dirty: Arc<AtomicBool>,
         mcp_handle: Option<McpHandle>,
         permissions: Arc<PermissionManager>,
         agent_tx: flume::Sender<Envelope>,
@@ -101,6 +106,8 @@ impl AgentLoop {
             history: History::restored(resumed.history).with_mirror(shared_history),
             gauge: ContextGauge::restored(resumed.context_size),
             btw_system,
+            prompt_meta,
+            prompt_dirty,
             cancels,
             permissions,
             file_access: FileAccess::fresh(),
@@ -121,6 +128,12 @@ impl AgentLoop {
         }
 
         while let Ok(()) = self.queue.recv_notify().await {
+            // An out-of-band change (an edited prompt override file) asks for
+            // a republish even with nothing queued to run.
+            if self.prompt_dirty.swap(false, Ordering::Relaxed) {
+                let slots = self.lua_handle.collect_prompt_slots_async().await;
+                self.publish_btw_system(&slots);
+            }
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
                 let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
@@ -199,7 +212,10 @@ impl AgentLoop {
         if teardown.is_cancelled() {
             return false;
         }
-        self.publish_btw_system(&maki_agent::prompt::ResolvedSlots::default());
+        // First point the prompt is fully resolved: instructions are on disk
+        // and the plugin host is up, so the slots are real rather than empty.
+        let slots = self.lua_handle.collect_prompt_slots_async().await;
+        self.publish_btw_system(&slots);
 
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
@@ -390,6 +406,17 @@ impl AgentLoop {
     fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         self.btw_system
             .store(Arc::new(self.system_prompt(prompt_slots)));
+        self.prompt_meta.store(Arc::new(super::PromptMeta {
+            instruction_files: self.instructions.loaded.paths(),
+            after_sources: prompt_slots
+                .get(
+                    maki_agent::prompt::PromptId::System,
+                    maki_agent::prompt::Slot::AfterInstructions,
+                )
+                .iter()
+                .map(|e| e.plugin.to_string())
+                .collect(),
+        }));
     }
 
     /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
