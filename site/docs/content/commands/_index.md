@@ -32,6 +32,8 @@ Type `/` in the input box to open the command palette.
 | `/exit` | Exit the application |
 | `/q` | Exit the application (shortcut for /exit) |
 | `/settings` | Open config file in editor |
+| `/config` | Open the settings panel (alias of /settings) |
+| `/resume` | Browse and switch sessions (alias of /sessions) |
 | `/goto` | Scroll to a specific turn |
 | `/reload` | Reload plugins and config |
 | `/trust` | Trust this folder and load its shared project config |

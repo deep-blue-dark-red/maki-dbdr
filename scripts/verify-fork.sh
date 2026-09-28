@@ -97,6 +97,9 @@ check "/export in palette"     "$F" '"/export"'
 check "/skills in palette"     "$F" '"/skills"'
 check "/plugins in palette"    "$F" '"/plugins"'
 check "/rewind in palette"    "$F" '"/rewind"'
+check "/config in palette"    "$F" 'name: "/config"'
+check "/resume in palette"    "$F" 'name: "/resume"'
+check "/resume runs sessions" "maki-ui/src/app/mod.rs" 'self.run_lua_command("/sessions", cmd.args, depth)'
 # Upstream's plugins/completion is a Lua @ popup; the fork opens the native
 # file_picker and prints the @ only when no file was picked.
 check "@ defers the at-sign" "maki-ui/src/app/mod.rs" "self.mention_pending = true"

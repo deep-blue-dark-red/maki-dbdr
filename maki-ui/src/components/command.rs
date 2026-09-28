@@ -142,6 +142,18 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/config",
+        description: "Open the settings panel (alias of /settings)",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
+        name: "/resume",
+        description: "Browse and switch sessions (alias of /sessions)",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/goto",
         description: "Scroll to a specific turn",
         max_args: 1,

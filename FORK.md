@@ -73,6 +73,8 @@ Fork commands that must be in `BUILTIN_COMMANDS`:
 - `/skills` — skills manager
 - `/plugins` — plugin enable/disable
 - `/rewind` — delete turns menu
+- `/config` — alias of `/settings`
+- `/resume` — alias of `/sessions` (dispatches to the sessions Lua plugin)
 
 `/rename` is deliberately NOT a builtin any more: upstream's
 `plugins/sessions/init.lua` registers `/rename <title>`, so the fork's AI-naming

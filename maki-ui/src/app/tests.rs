@@ -3086,6 +3086,32 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
     );
 }
 
+/// `/resume` is a builtin alias for the sessions plugin's `/sessions`, so it
+/// dispatches by the registered spelling even though the user typed the alias.
+#[test]
+fn resume_command_forwards_to_sessions_plugin() {
+    let dir = StateDir::from_path(env::temp_dir());
+    let mut app = build_app_with_lua(
+        dir.clone(),
+        Arc::new(test_writer(dir)),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: "/sessions".into(),
+            description: "Browse and switch sessions".into(),
+            plugin: "sessions".into(),
+            max_args: 0,
+        }]),
+    );
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.run_cmdline("/resume", 0).unwrap();
+
+    assert_eq!(
+        probe.try_recv_command(),
+        Some(("/sessions".to_string(), String::new(), 0))
+    );
+}
+
 #[test]
 fn slash_noncommand_sends_as_prompt() {
     let mut app = test_app();
@@ -5259,6 +5285,14 @@ fn settings_command_opens_picker() {
     let mut app = test_app();
     assert!(!app.settings_picker.is_open());
     app.execute_command(cmd("/settings"), 0);
+    assert!(app.settings_picker.is_open());
+}
+
+#[test]
+fn config_command_opens_settings_picker() {
+    let mut app = test_app();
+    assert!(!app.settings_picker.is_open());
+    app.execute_command(cmd("/config"), 0);
     assert!(app.settings_picker.is_open());
 }
 

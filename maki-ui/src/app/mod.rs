@@ -2127,7 +2127,7 @@ impl App {
                 self.queue.set_focus();
                 vec![]
             }
-            "/settings" => {
+            "/settings" | "/config" => {
                 let settings = UserSettings::load();
                 self.settings_picker.open(&settings);
                 vec![]
@@ -2212,6 +2212,10 @@ impl App {
             }
             "/logs" => {
                 vec![Action::RunLogsCommand]
+            }
+            "/resume" => {
+                self.run_lua_command("/sessions", cmd.args, depth);
+                vec![]
             }
             "/exit" | "/q" => self.quit(),
             "/reload" => self.quit_with(ExitRequest::Reload),
