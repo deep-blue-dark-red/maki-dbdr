@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
 use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::animation::{self, active_spinner_frame};
 use crate::components::Overlay;
@@ -29,11 +30,12 @@ use crate::theme;
 
 const TITLE: &str = " Files ";
 const TITLE_WALKING: &str = " Files (scanning…) ";
-const WIDTH_PERCENT: u16 = 50;
+const WIDTH_PERCENT: u16 = 60;
 const MAX_HEIGHT_PERCENT: u16 = 60;
 const SEARCH_ROW: u16 = 1;
 const NO_MATCHES: &str = "  No matches";
 const LABEL_INDENT: &str = "  ";
+const ELLIPSIS: &str = "…";
 /// Not "empty": a directory full of ignored files walks up just as short.
 const NOTHING_TO_PICK_MSG: &str = "Nothing to pick in the current directory";
 pub(crate) const UNREADABLE_DIR_MSG: &str = "Cannot list the current directory";
@@ -571,11 +573,34 @@ fn build_highlighted_line<'a>(
         .add_modifier(Modifier::BOLD);
 
     let mut spans = vec![Span::styled(LABEL_INDENT, base)];
+
+    // Paths are told apart by their tail (the filename), so an over-long entry
+    // drops its leading directories under an ellipsis, not its end. `skip` is
+    // a char index, so match indices stay valid as-is.
+    let total: usize = text.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+    let skip = if total <= max_width {
+        0
+    } else {
+        spans.push(Span::styled(ELLIPSIS, base));
+        let budget = max_width.saturating_sub(ELLIPSIS.width());
+        let mut width = 0usize;
+        let mut start = text.chars().count();
+        for ch in text.chars().rev() {
+            let cw = ch.width().unwrap_or(0);
+            if width + cw > budget {
+                break;
+            }
+            width += cw;
+            start -= 1;
+        }
+        start
+    };
+
     let mut in_match = false;
     let mut run = String::new();
     let mut width = 0usize;
 
-    for (i, ch) in text.chars().enumerate() {
+    for (i, ch) in text.chars().enumerate().skip(skip) {
         let cw = ch.width().unwrap_or(0);
         if width + cw > max_width {
             break;
@@ -938,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn build_highlighted_line_truncates_at_max_width() {
+    fn build_highlighted_line_truncates_from_the_tail() {
         let t = theme::current();
         let line = build_highlighted_line("verylongfilename.rs", &[], 5, false, &t);
         let text: String = line
@@ -947,7 +972,7 @@ mod tests {
             .skip(1)
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(text, "veryl");
+        assert_eq!(text, "…e.rs");
     }
 
     #[test]
@@ -960,7 +985,23 @@ mod tests {
             .skip(1)
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(text, "日本語");
+        assert_eq!(text, "…語.rs");
+    }
+
+    /// `indices` are positions in the full path; a cut head must not shift the
+    /// highlight onto the wrong characters of the kept tail.
+    #[test]
+    fn build_highlighted_line_keeps_matches_after_tail_cut() {
+        let t = theme::current();
+        let path = "dirs/preview.rs";
+        let line = build_highlighted_line(path, &[11, 12], 6, false, &t);
+
+        let highlighted: Vec<&str> = line.spans[1..]
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(highlighted.join(""), "…ew.rs");
+        assert!(line.spans.iter().any(|s| s.content.as_ref() == "w."));
     }
 
     #[test_case(0, -10, 0 ; "clamps_at_start")]
