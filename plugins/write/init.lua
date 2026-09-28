@@ -47,6 +47,10 @@ maki.api.register_tool({
         description = "The complete file content to write",
         required = true,
       },
+      append = {
+        type = "boolean",
+        description = "Add content to the end of the file instead of replacing it",
+      },
     },
   },
 
@@ -81,7 +85,8 @@ maki.api.register_tool({
       maki.fs.mkdir(parent, { parents = true })
     end
 
-    local _, write_err = maki.fs.write(path, content)
+    local write = input.append and maki.fs.append or maki.fs.write
+    local _, write_err = write(path, content)
     if write_err then
       return { llm_output = "write error: " .. tostring(write_err), is_error = true }
     end

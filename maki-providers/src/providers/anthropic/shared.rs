@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::model::{FastPricing, Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use crate::model::Model;
 use crate::{
     AgentError, ContentBlock, EMPTY_RESPONSE_MARKER, Message, ProviderEvent, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
@@ -149,7 +149,7 @@ pub(crate) struct SystemBlock<'a> {
 }
 
 #[derive(Serialize)]
-pub(super) struct WireContentBlock<'a> {
+pub(crate) struct WireContentBlock<'a> {
     #[serde(flatten)]
     pub inner: &'a ContentBlock,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,18 +157,28 @@ pub(super) struct WireContentBlock<'a> {
 }
 
 #[derive(Serialize)]
-pub(super) struct WireMessage<'a> {
+pub(crate) struct WireMessage<'a> {
     pub role: &'a Role,
     pub content: Vec<WireContentBlock<'a>>,
 }
 
-/// The API rejects blank text blocks, and messages with no block at all, so
-/// blanks go and a message left bare falls back to the marker.
+/// The API rejects blank text blocks and thinking it did not sign (e.g. an
+/// OpenAI reasoning summary from earlier in the session).
+fn is_replayable(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        ContentBlock::Thinking { signature, .. } => signature.is_some(),
+        _ => true,
+    }
+}
+
+/// A message left with no block at all is rejected too, so it falls back to
+/// the marker.
 fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
     let mut content: Vec<WireContentBlock<'_>> = msg
         .content
         .iter()
-        .filter(|block| !matches!(block, ContentBlock::Text { text } if text.trim().is_empty()))
+        .filter(|block| is_replayable(block))
         .map(|inner| WireContentBlock {
             inner,
             cache_control: None,
@@ -184,30 +194,31 @@ fn wire_content(msg: &Message) -> Vec<WireContentBlock<'_>> {
     content
 }
 
-pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
-    let len = messages.len();
-
+/// The single Anthropic-protocol message encoder; every provider speaking
+/// that protocol must go through it.
+pub(crate) fn wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
     messages
         .iter()
-        .enumerate()
-        .map(|(msg_idx, msg)| {
-            let mut content = wire_content(msg);
-
-            // The API rejects `cache_control` on thinking blocks, so walk back to
-            // the last block that can carry it. All thinking means no breakpoint,
-            // which beats a fatal one.
-            if msg_idx + MESSAGE_CACHE_BREAKPOINTS >= len
-                && let Some(block) = content.iter_mut().rfind(|b| !b.inner.is_thinking())
-            {
-                block.cache_control = Some(EPHEMERAL);
-            }
-
-            WireMessage {
-                role: &msg.role,
-                content,
-            }
+        .map(|msg| WireMessage {
+            role: &msg.role,
+            content: wire_content(msg),
         })
         .collect()
+}
+
+pub(super) fn build_wire_messages(messages: &[Message]) -> Vec<WireMessage<'_>> {
+    let mut wire = wire_messages(messages);
+    let first_cached = wire.len().saturating_sub(MESSAGE_CACHE_BREAKPOINTS);
+
+    // The API rejects `cache_control` on thinking blocks, so walk back to
+    // the last block that can carry it. All thinking means no breakpoint,
+    // which beats a fatal one.
+    for msg in &mut wire[first_cached..] {
+        if let Some(block) = msg.content.iter_mut().rfind(|b| !b.inner.is_thinking()) {
+            block.cache_control = Some(EPHEMERAL);
+        }
+    }
+    wire
 }
 
 pub(super) fn build_wire_tools(tools: &Value) -> Value {
@@ -367,6 +378,22 @@ impl EventParser {
                 if let Ok(ev) = serde_json::from_str::<MessageDeltaEvent>(data) {
                     if let Some(u) = ev.usage {
                         self.usage.output = u.output_tokens;
+                        // Gateways like Bifrost send zeros in message_start and the real
+                        // counts here. The first-party API often leaves these fields out, and
+                        // serde turns a missing field into 0, so a zero must not wipe what
+                        // message_start gave us.
+                        for (dst, src) in [
+                            (&mut self.usage.input, u.input_tokens),
+                            (&mut self.usage.cache_read, u.cache_read_input_tokens),
+                            (
+                                &mut self.usage.cache_creation,
+                                u.cache_creation_input_tokens,
+                            ),
+                        ] {
+                            if src > 0 {
+                                *dst = src;
+                            }
+                        }
                     }
                     if let Some(d) = ev.delta {
                         self.stop_reason = d
@@ -403,213 +430,6 @@ impl EventParser {
             upstream: None,
         }
     }
-}
-
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    const MODELS: &[ModelEntry] = &[
-        ModelEntry {
-            prefixes: &["claude-haiku-4-5"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 5.00,
-                cache_write: 1.25,
-                cache_read: 0.10,
-                fast: None,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4-6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            // Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: None,
-            },
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
-            },
-            max_output_tokens: Some(64000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-6"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                // Fast mode withdrawn on 2026-06-29.
-                fast: None,
-            },
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-7"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                // Fast mode withdrawn on 2026-07-24.
-                fast: None,
-            },
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-8"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 10.00,
-                    output: 50.00,
-                }),
-            },
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: Some(FastPricing {
-                    input: 10.00,
-                    output: 50.00,
-                }),
-            },
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-fable-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 10.00,
-                output: 50.00,
-                cache_write: 12.50,
-                cache_read: 1.00,
-                fast: None,
-            },
-            max_output_tokens: Some(128000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4-0", "claude-opus-4-1"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Claude,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 15.00,
-                output: 75.00,
-                cache_write: 18.75,
-                cache_read: 1.50,
-                fast: None,
-            },
-            max_output_tokens: Some(32000),
-            context_window: 200_000,
-        },
-    ];
-    MODELS
 }
 
 #[cfg(test)]

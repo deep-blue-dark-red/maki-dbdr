@@ -486,7 +486,7 @@ pub fn install_declared(
     // durability but not isolation: without this, two processes could each read
     // the same lockfile and the second write would discard the first's entries.
     let _guard = match lock_path.as_deref().map(maki_pack::paths::sidecar_lock) {
-        Some(path) => match maki_pack::lock::Lock::acquire(&path) {
+        Some(path) => match maki_pack::lock::Lock::acquire_retrying(&path) {
             Ok(guard) => Some(guard),
             Err(e) => {
                 // The kernel releases the lock when its process exits,
@@ -916,13 +916,14 @@ fn prepare_pack_ops_at(
     lock_path: &Path,
 ) -> PackPreparation {
     let mut report = PackReport::default();
-    let guard = match maki_pack::lock::Lock::acquire(&maki_pack::paths::sidecar_lock(lock_path)) {
-        Ok(guard) => guard,
-        Err(error) => {
-            report.failures.push(redact_error(&error));
-            return PackPreparation::Complete(report);
-        }
-    };
+    let guard =
+        match maki_pack::lock::Lock::acquire_retrying(&maki_pack::paths::sidecar_lock(lock_path)) {
+            Ok(guard) => guard,
+            Err(error) => {
+                report.failures.push(redact_error(&error));
+                return PackPreparation::Complete(report);
+            }
+        };
     let lock = match read_lockfile(Some(lock_path)) {
         Some(lock) => lock,
         None => {
@@ -1085,7 +1086,9 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
         lock_path,
         mut report,
     } = plan;
-    let _guard = match maki_pack::lock::Lock::acquire(&maki_pack::paths::sidecar_lock(&lock_path)) {
+    let _guard = match maki_pack::lock::Lock::acquire_retrying(&maki_pack::paths::sidecar_lock(
+        &lock_path,
+    )) {
         Ok(guard) => guard,
         Err(error) => {
             report.failures.push(redact_error(&error));

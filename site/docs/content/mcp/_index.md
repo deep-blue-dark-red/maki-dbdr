@@ -45,6 +45,10 @@ headers = { Authorization = "Bearer ${ANALYTICS_TOKEN}" }
 referenced variable that is unset or empty fails that server with the variable
 named in its status, instead of sending a dangling `Bearer ` and getting a 401.
 
+Maki does not pass provider API keys such as `ANTHROPIC_API_KEY` to the
+processes it starts, so a stdio server that needs one gets it through
+`environment = { ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}" }`.
+
 Some HTTP servers need OAuth but have no dynamic client registration. For those, give Maki a static client:
 
 ```toml
@@ -52,6 +56,16 @@ Some HTTP servers need OAuth but have no dynamic client registration. For those,
 url = "https://mcp.acme.example.com/mcp"
 oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3118, callback_path = "/callback", callback_hostname = "localhost" }
 ```
+
+For a server whose certificate comes from a private CA, point `ca_file` at a PEM bundle:
+
+```toml
+[mcp.internal]
+url = "https://mcp.corp.example.com/mcp"
+ca_file = "~/certs/corp-ca.pem"
+```
+
+On macOS, Maki uses its own OpenSSL, which does not read the keychain. The bundle replaces the default CAs for this server and its OAuth endpoints. If OAuth goes through a public provider, add the public CAs to the bundle too, for example `cat /etc/ssl/cert.pem corp-ca.pem > bundle.pem`. The path expands `${VAR}` and `~`, and a relative path starts from the folder of the `mcp.toml` that sets it. On macOS and Linux, you can instead trust a CA for every HTTPS request Maki makes by pointing `SSL_CERT_FILE` at a bundle that holds the public CAs as well.
 
 ### All options
 
@@ -62,6 +76,7 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 | `environment` | map | | Stdio only. Values expand `${VAR}` from the environment |
 | `headers` | map | | HTTP only. Values expand `${VAR}` from the environment |
 | `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
+| `ca_file` | path | | HTTP only. PEM bundle that replaces the default CAs for this server and its OAuth |
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
 | `always_load` | bool | false | Skip tool search, load all tools upfront |

@@ -22,6 +22,7 @@ maki-markdown = { workspace = true }
 maki-pack = { workspace = true }
 maki-providers = { workspace = true }
 mlua = { workspace = true }
+nucleo-matcher = { workspace = true }
 serde = { workspace = true }
 shell-words = { workspace = true }
 serde_json = { workspace = true }
@@ -50,6 +51,7 @@ toml = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tree-sitter-c = { workspace = true }
 tree-sitter-c-sharp = { workspace = true }
+tree-sitter-clojure-orchard = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 tree-sitter-elixir = { workspace = true }
 tree-sitter-gleam = { workspace = true }

@@ -6,6 +6,8 @@ pub enum InterpreterError {
     Runtime(String),
     #[error("tool call failed: {tool}: {message}")]
     ToolCall { tool: String, message: String },
+    #[error("file write failed: {0}")]
+    FileWrite(String),
     #[error("sandboxed: {0}")]
     Sandboxed(String),
 }

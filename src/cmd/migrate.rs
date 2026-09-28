@@ -12,6 +12,8 @@ use maki_storage::paths;
 #[cfg(unix)]
 const AUTH_FILE_MODE: u32 = 0o600;
 
+const TURN_STATS_FILE: &str = "turn_stats.jsonl";
+
 fn tilde(path: &Path) -> String {
     match paths::home() {
         Some(home) if path.starts_with(&home) => {
@@ -96,6 +98,67 @@ fn move_auth(legacy_dir: &Path, target_dir: &Path) -> Result<()> {
 
     let plural = if count == 1 { "" } else { "s" };
     log_move("auth/", target_dir, Some(&format!("{count} file{plural}")));
+    Ok(())
+}
+
+fn move_turn_stats(legacy: &Path, state: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(legacy) else {
+        return Ok(());
+    };
+    let target_dir = state.join("sessions").join("turnstats");
+    let mut count = 0u32;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let src = entry.path().join(TURN_STATS_FILE);
+        if !src.is_file() {
+            continue;
+        }
+        let dst = target_dir.join(format!("{}.jsonl", entry.file_name().to_string_lossy()));
+        move_file(&src, &dst)?;
+        fs::remove_dir(entry.path()).ok();
+        count += 1;
+    }
+    if count > 0 {
+        let plural = if count == 1 { "" } else { "s" };
+        log_move(
+            TURN_STATS_FILE,
+            &target_dir,
+            Some(&format!("{count} session log{plural}")),
+        );
+    }
+    Ok(())
+}
+
+fn move_wire_logs(legacy: &Path, state: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(legacy) else {
+        return Ok(());
+    };
+    let target_dir = state.join("sessions").join("mlogs");
+    let mut count = 0u32;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".mlog") || entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let dst = target_dir.join(&*name);
+        if dst.exists() {
+            println!("  {name} (skipped, already exists)");
+            continue;
+        }
+        move_file(&entry.path(), &dst)?;
+        count += 1;
+    }
+    if count > 0 {
+        let plural = if count == 1 { "" } else { "s" };
+        log_move(
+            "*.mlog",
+            &target_dir,
+            Some(&format!("{count} wire log{plural}")),
+        );
+    }
     Ok(())
 }
 
@@ -261,6 +324,9 @@ pub fn xdg() -> Result<()> {
     println!("Moving files from ~/.maki/ ...\n");
 
     move_auth(&legacy.join("auth"), &xdg.state.join("auth"))?;
+
+    move_turn_stats(&legacy, &xdg.state)?;
+    move_wire_logs(&legacy, &xdg.state)?;
 
     merge_dir(&legacy, &xdg.state, "sessions", false)?;
     merge_dir(&legacy, &xdg.state, "plans", false)?;

@@ -18,6 +18,14 @@ local function truncate(text, max_lines, max_bytes)
     end
     local new_bytes = bytes + #line + 1
     if new_bytes > max_bytes then
+      if #out == 0 then
+        -- Back off UTF-8 continuation bytes so no character is split in half.
+        local cut = max_bytes
+        while cut > 0 and line:find("^[\128-\191]", cut + 1) do
+          cut = cut - 1
+        end
+        out[1] = line:sub(1, cut)
+      end
       break
     end
     out[#out + 1] = line

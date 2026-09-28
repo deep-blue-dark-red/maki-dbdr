@@ -83,6 +83,10 @@ All fields are optional. Typos in field names cause an error right away.
 | `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `show_token_stats` | bool | `false` | - | Show token statistics (tokens/sec, cache rate) in status bar |
+| `warn_cache_miss` | bool | `true` | - | Ask for confirmation (y/n) before sending a turn that will likely miss the prompt cache: idle past cache_miss_warning_timeout_minutes, or after a model change, when the resend would cost more than cache_miss_warn_dollar_cost_threshold dollars or cache_miss_warning_token_threshold tokens as uncached input |
+| `cache_miss_warning_timeout_minutes` | u64 | `5` | - | Idle minutes after which the next turn likely misses the prompt cache |
+| `cache_miss_warning_token_threshold` | u32 | `100000` | - | Uncached input tokens above which a likely cache miss asks for confirmation |
+| `cache_miss_warn_dollar_cost_threshold` | f64 | `0.1` | - | Estimated uncached input dollars above which a likely cache miss asks for confirmation |
 
 ### `ui.theme`
 

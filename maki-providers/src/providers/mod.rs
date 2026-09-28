@@ -13,6 +13,7 @@ use tracing::{debug, warn};
 
 use maki_storage::StateDir;
 use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
+use maki_storage::sessions::wire_logs_dir;
 
 use crate::AgentError;
 use crate::retry::RetryPolicy;
@@ -387,20 +388,21 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
 /// there's no active session.
 #[allow(dead_code)]
 fn log_file_path() -> Option<std::path::PathBuf> {
-    let logs_dir = maki_storage::paths::logs_dir().ok()?;
     let session_id = maki_config::CURRENT_SESSION_ID
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
         .filter(|id| !id.is_empty())?;
-    Some(logs_dir.join(format!("{session_id}.mlog")))
+    let dir = wire_logs_dir(&StateDir::resolve().ok()?);
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join(format!("{session_id}.mlog")))
 }
 
 /// The `YYYYMMDD-<title>.mlog` symlink path for a session title, dated to the
 /// session's creation (`created_at`, Unix epoch seconds) so the link is stable
 /// across renames on later days. `None` for a placeholder/blank title.
 fn friendly_log_link(
-    logs_dir: &std::path::Path,
+    dir: &std::path::Path,
     name: &str,
     created_at: u64,
 ) -> Option<std::path::PathBuf> {
@@ -426,7 +428,7 @@ fn friendly_log_link(
         .unwrap_or_else(|_| jiff::Timestamp::now())
         .to_string()[..10]
         .replace('-', "");
-    Some(logs_dir.join(format!("{yyyymmdd}-{sanitized}.mlog")))
+    Some(dir.join(format!("{yyyymmdd}-{sanitized}.mlog")))
 }
 
 /// Remove `path` only if it is a symlink, never a real log file.
@@ -437,37 +439,37 @@ fn remove_if_symlink(path: &std::path::Path) {
 }
 
 /// Maintain a friendly-named symlink (`YYYYMMDD-<title>.mlog`, dated to session
-/// creation) pointing at a session's canonical id-based log, so the logs dir is
-/// browsable by title while the real file stays keyed by the stable session id.
-/// Best-effort: drops a stale link from the previous title, and skips silently
-/// if nothing has been logged yet (e.g. API logging disabled), on collision with
-/// a real file, or on FS error.
+/// creation) pointing at a session's canonical id-based log, so the wire-log
+/// dir is browsable by title while the real file stays keyed by the stable
+/// session id. Best-effort: drops a stale link from the previous title, and
+/// skips silently if nothing has been logged yet (e.g. API logging disabled),
+/// on collision with a real file, or on FS error.
 pub fn update_api_log_symlink(
     session_id: &str,
     old_name: Option<&str>,
     new_name: &str,
     created_at: u64,
 ) {
-    let Ok(logs_dir) = maki_storage::paths::logs_dir() else {
+    let Some(dir) = StateDir::resolve().ok().map(|state| wire_logs_dir(&state)) else {
         return;
     };
 
-    if let Some(old) = old_name.and_then(|n| friendly_log_link(&logs_dir, n, created_at)) {
+    if let Some(old) = old_name.and_then(|n| friendly_log_link(&dir, n, created_at)) {
         remove_if_symlink(&old);
     }
 
-    let target = logs_dir.join(format!("{session_id}.mlog"));
+    let target = dir.join(format!("{session_id}.mlog"));
     if !target.exists() {
         return; // nothing logged for this session yet
     }
-    let Some(link) = friendly_log_link(&logs_dir, new_name, created_at) else {
+    let Some(link) = friendly_log_link(&dir, new_name, created_at) else {
         return;
     };
     if link == target {
         return;
     }
     remove_if_symlink(&link);
-    // Relative target so the link survives moving the logs directory.
+    // Relative target so the link survives moving the sessions directory.
     #[cfg(unix)]
     let _ = std::os::unix::fs::symlink(format!("{session_id}.mlog"), &link);
 }

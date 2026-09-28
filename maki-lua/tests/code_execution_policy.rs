@@ -21,6 +21,7 @@ const ERROR_PREFIX: &str = "[ERROR] ";
 const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
+const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
 const INTERP_ECHO_SIG: &str = "- interp_echo(msg: str, count: int = None, flag: bool = None, items: list = None, raw: any = None) -> str";
 const WF_TASK_SIG: &str = "- wf_task(prompt: str, model_tier: str = None) -> str";
 const SUB_TOOL_SIG: &str = "- sub_tool() -> str";
@@ -45,6 +46,22 @@ const MARKER_A: &str = "AAA";
 const MARKER_B: &str = "BBB";
 const EDITED_A: &str = "aaa";
 const EDITED_B: &str = "bbb";
+const OPEN_TARGET: &str = "notes.txt";
+const OPEN_ORIGINAL: &str = "hello\n";
+const PLAN_FILE: &str = "plan.md";
+const FILE_WRITE_FAILED: &str = "file write failed";
+const OPEN_REFUSED: &str = "refused";
+const BLOCKING_READ_HOOK: &str =
+    r#"maki.api.set_slot("tool.read.input", function() return nil, "blocked" end)"#;
+/// Points reads at a file that exists, so the read tool says yes.
+const REWRITING_READ_HOOK: &str = concat!(
+    r#"maki.api.set_slot("tool.read.input", function(prev, input) input.path = ""#,
+    env!("CARGO_MANIFEST_DIR"),
+    r#"/Cargo.toml" return input end)"#
+);
+const WILDCARD_INPUT_HOOK: &str =
+    r#"maki.api.set_slot("tool.*.input", function(prev, input) return input end)"#;
+const NO_POLICY: &str = "";
 
 fn fixture_plugin() -> String {
     format!(
@@ -211,7 +228,8 @@ fn describe_main_hides_workflow_and_sub_tools() {
         desc.lines().any(|l| l == INTERP_ECHO_SIG),
         "expected exact line {INTERP_ECHO_SIG:?} in: {desc}"
     );
-    assert!(!desc.contains("wf_task"), "got: {desc}");
+    assert!(!desc.contains(WF_TASK_SIG), "got: {desc}");
+    assert!(desc.lines().any(|l| l == WF_TASK_GATED_LINE), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
     assert!(!desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
 }
@@ -222,6 +240,7 @@ fn describe_workflow_adds_workflow_tools_and_note() {
     let desc = describe(&reg, &ToolFilter::All, ToolAudience::MAIN, true);
     assert!(desc.contains(WF_TASK_SIG), "got: {desc}");
     assert!(desc.contains(WORKFLOW_NOTE_SUBSTR), "got: {desc}");
+    assert!(!desc.contains(WF_TASK_GATED_LINE), "got: {desc}");
     assert!(!desc.contains("sub_tool"), "got: {desc}");
 }
 
@@ -234,12 +253,13 @@ fn describe_general_sub_scopes_to_sub_audience() {
     assert!(!desc.contains("wf_task"), "got: {desc}");
 }
 
-#[test]
-fn except_filter_removes_tool_from_description() {
+#[test_case::test_case("interp_echo" ; "callable")]
+#[test_case::test_case("wf_task" ; "workflow_gated")]
+fn except_filter_removes_tool_from_description(name: &str) {
     let (reg, _host) = setup();
-    let filter = ToolFilter::AllExcept(vec!["interp_echo".to_owned()]);
+    let filter = ToolFilter::AllExcept(vec![name.to_owned()]);
     let desc = describe(&reg, &filter, ToolAudience::MAIN, false);
-    assert!(!desc.contains("interp_echo"), "got: {desc}");
+    assert!(!desc.contains(name), "got: {desc}");
 }
 
 #[test]
@@ -292,6 +312,62 @@ fn parallel_edits_to_one_file_all_apply() {
         std::fs::read_to_string(&path).unwrap(),
         format!("{EDITED_A}\n{EDITED_B}\n")
     );
+}
+
+/// Binds `path` to a file holding [`OPEN_ORIGINAL`] and returns the script's
+/// result with what the file holds afterwards. `policy` is Lua loaded next to
+/// the builtins.
+fn run_on_file(
+    code: &str,
+    policy: &str,
+    shape: fn(&mut ToolContext),
+) -> (Result<String, String>, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join(OPEN_TARGET);
+    std::fs::write(&path, OPEN_ORIGINAL).unwrap();
+    let quoted = path.to_str().expect("utf-8 temp path");
+
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::with_all_builtins(Arc::clone(&reg)).unwrap();
+    host.load_source("policy", policy).unwrap();
+    let out = exec_code(
+        &reg,
+        &shaped_ctx(&reg, shape),
+        &format!("path = '{quoted}'\n{code}"),
+    );
+    (out, std::fs::read_to_string(&path).unwrap())
+}
+
+#[test_case::test_case("text = open(path).read()\nwith open(path, 'w') as f:\n    f.write(text.upper())", "HELLO\n" ; "read_then_write")]
+#[test_case::test_case("with open(path, 'a') as f:\n    f.write('world\\n')\n    f.write('!')", "hello\nworld\n!" ; "append")]
+fn open_reads_and_writes_through_the_file_tools(code: &str, expected: &str) {
+    let (out, content) = run_on_file(code, NO_POLICY, |_| {});
+    out.expect("open must be served");
+    assert_eq!(content, expected);
+}
+
+/// `open()` reads the file itself, so it cannot follow a hook that points the
+/// read somewhere else. Refusing is the only answer that never hands the
+/// script a file the hook steered it away from.
+#[test_case::test_case(BLOCKING_READ_HOOK ; "blocking_hook")]
+#[test_case::test_case(REWRITING_READ_HOOK ; "rewriting_hook")]
+#[test_case::test_case(WILDCARD_INPUT_HOOK ; "wildcard_hook")]
+fn open_reads_are_refused_while_the_read_tool_is_hooked(policy: &str) {
+    let code = format!(
+        "try:\n    out = open(path).read()\nexcept OSError:\n    out = '{OPEN_REFUSED}'\nout"
+    );
+    let (out, _) = run_on_file(&code, policy, |_| {});
+    let out = out.expect("the refusal must reach the script as OSError");
+    assert!(out.contains(OPEN_REFUSED), "got: {out}");
+}
+
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB ; "write_tool_not_callable")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()) ; "plan_mode_blocks_the_write_tool")]
+fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContext)) {
+    let (out, content) = run_on_file("open(path, 'w').write('x')", NO_POLICY, shape);
+    let err = out.expect_err("the write must be refused");
+    assert!(err.contains(FILE_WRITE_FAILED), "got: {err}");
+    assert_eq!(content, OPEN_ORIGINAL);
 }
 
 /// Only a failed tool call belongs in the results. The script's own mistake

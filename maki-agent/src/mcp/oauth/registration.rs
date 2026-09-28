@@ -1,4 +1,4 @@
-use std::io::Read;
+use futures_lite::AsyncReadExt;
 
 use isahc::HttpClient;
 use isahc::http::Request;
@@ -30,19 +30,14 @@ pub async fn register_client(
         .body(serde_json::to_vec(&body).map_err(|e| OAuthError::Other(e.to_string()))?)
         .map_err(|e| OAuthError::Other(e.to_string()))?;
 
-    let mut response = smol::unblock({
-        let client = client.clone();
-        move || {
-            client
-                .send(req)
-                .map_err(|e| OAuthError::Network(e.to_string()))
-        }
-    })
-    .await?;
+    let mut response = client
+        .send_async(req)
+        .await
+        .map_err(|e| OAuthError::Network(e.to_string()))?;
 
     if !response.status().is_success() {
         let mut body_str = String::new();
-        let _ = response.body_mut().read_to_string(&mut body_str);
+        let _ = response.body_mut().read_to_string(&mut body_str).await;
         return Err(OAuthError::ServerRejected {
             status: response.status().as_u16(),
             body: body_str,
@@ -53,6 +48,7 @@ pub async fn register_client(
     response
         .body_mut()
         .read_to_string(&mut body_str)
+        .await
         .map_err(|e| OAuthError::Network(e.to_string()))?;
 
     let resp: serde_json::Value =

@@ -57,13 +57,12 @@ impl From<CachedModel> for ModelInfo {
             id: model.id,
             context_window: Some(model.context_window),
             max_output_tokens: Some(model.max_tokens),
-            pricing: Some(ModelPricing {
-                input: model.pricing.input,
-                output: model.pricing.output,
-                cache_write: model.pricing.cache_write,
-                cache_read: model.pricing.cache_read,
-                fast: None,
-            }),
+            pricing: Some(ModelPricing::per_million(
+                model.pricing.input,
+                model.pricing.output,
+                model.pricing.cache_write,
+                model.pricing.cache_read,
+            )),
             supports_thinking: Some(model.reasoning),
             supports_vision: Some(model.vision),
             tier: None,
@@ -160,7 +159,8 @@ fn select_models(access: Option<&str>, force: bool) -> Result<Vec<CachedModel>, 
 }
 
 fn curated_fallback() -> Vec<CachedModel> {
-    super::models()
+    super::SPEC
+        .models()
         .iter()
         .filter_map(|entry| {
             let id = *entry.prefixes.first()?;
@@ -337,7 +337,8 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
         }
     };
 
-    let known = super::models()
+    let known = super::SPEC
+        .models()
         .iter()
         .find(|entry| entry.prefixes.iter().any(|p| normalized.starts_with(p)));
     let vision = first_bool(obj, meta, &["acceptsImages"])
@@ -385,7 +386,8 @@ fn normalize_entry(value: &serde_json::Value) -> EntryResult {
 }
 
 fn known_max_tokens(model_id: &str) -> Option<u32> {
-    super::models()
+    super::SPEC
+        .models()
         .iter()
         .find(|entry| entry.prefixes.iter().any(|p| model_id.starts_with(p)))
         .and_then(|entry| entry.max_output_tokens)

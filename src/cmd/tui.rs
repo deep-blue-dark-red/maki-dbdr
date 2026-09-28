@@ -15,10 +15,10 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
-use maki_storage::id::MakiId;
-use maki_ui::{AppSession, RunOutcome};
+use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
+use crate::resume::{self, Resolved};
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
@@ -182,7 +182,10 @@ fn build_stack(
 
     let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
     let (model, needs_login) = match (model_result, fallback_model) {
-        (Ok(m), _) => (m, false),
+        (Ok((m, warning)), _) => {
+            warnings.extend(warning);
+            (m, false)
+        }
         (Err(e), Some(last_model)) => {
             warnings.push(format!("{MODEL_FALLBACK_WARNING}: {e:#}"));
             (last_model, false)
@@ -206,38 +209,16 @@ fn build_stack(
     ))
 }
 
-fn resolve_session(
-    continue_session: bool,
-    session_id: Option<&str>,
-    model: &str,
-    cwd: &str,
-    storage: &StateDir,
-) -> Result<AppSession> {
-    if let Some(raw) = session_id {
-        let id: MakiId = raw
-            .parse()
-            .map_err(|e| color_eyre::eyre::eyre!("invalid session id {raw:?}: {e}"))?;
-        let session = AppSession::load(id, storage).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
-        setup::report_session_start(maki_otel::emit::START_RESUME, Some(session.id));
-        return Ok(session);
+/// The tab a run opens on. Which session that is lives in [`crate::resume`],
+/// and the only step left here is the TUI-only one: an explicit `--model` is a
+/// choice about the session being opened, and a session's own spec is what
+/// every later switch reads.
+fn open_tab(resolved: Resolved, model: &str, explicit_model: bool, cwd: &str) -> OpenSession {
+    let mut tab = resolved.into_session(model, cwd);
+    if explicit_model {
+        tab.session.set_model(model.to_owned());
     }
-    if continue_session {
-        match AppSession::latest(cwd, storage) {
-            Ok(Some(session)) => {
-                setup::report_session_start(maki_otel::emit::START_CONTINUE, Some(session.id));
-                return Ok(session);
-            }
-            Ok(None) => {
-                tracing::info!("no previous session found for this directory, starting new");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to load latest session, starting new");
-            }
-        }
-    }
-    let session = AppSession::new(model, cwd);
-    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-    Ok(session)
+    tab
 }
 
 fn read_initial_prompt(cli_prompt: Option<String>) -> Result<Option<String>> {
@@ -409,11 +390,22 @@ pub fn run(mut cli: Cli) -> Result<()> {
         }
     }
 
+    // Resolved before the modes diverge, so `--print`, the SDK and the UI
+    // cannot pick different sessions, different ids or a different cwd to look
+    // in, and all three report the same start to telemetry.
+    let cwd_str = cwd.to_string_lossy().into_owned();
+    let resolved = resume::resolve(&cli, &cwd_str, &storage)?;
+    setup::report_session_start(resolved.start_type, Some(&resolved.id));
+
     if cli.is_sdk_mode() {
+        let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
+            resumed,
+            claim,
+            storage: storage.clone(),
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
@@ -428,7 +420,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
         .context("run sdk mode")?;
         return Ok(());
     }
+
     if cli.print {
+        let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
         crate::print::run(crate::print::PrintParams {
             model: stack.model,
@@ -444,19 +438,20 @@ pub fn run(mut cli: Cli) -> Result<()> {
             model_policy: Arc::new(stack.config.provider.model_policy.clone()),
             plugin_rules: stack.plugin_host.plugin_rules(),
             project_config: trust.project_config.clone(),
+            resumed,
+            claim,
+            storage: storage.clone(),
         })
         .context("run print mode")?;
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy().into_owned();
-    let mut tabs = vec![resolve_session(
-        cli.continue_session,
-        cli.session.as_deref(),
+    let mut tabs = vec![open_tab(
+        resolved,
         &stack.model.spec(),
+        cli.model.is_some(),
         &cwd_str,
-        &storage,
-    )?];
+    )];
     let mut focused = 0;
     let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
@@ -468,27 +463,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
 
     loop {
-        for session in &mut tabs {
+        for OpenSession { session, .. } in &mut tabs {
             if session.messages().is_empty() {
                 stack.config.session_defaults.seed(&mut session.meta);
             }
         }
-        let focused_tab = &tabs[focused];
-        let model = if focused_tab.messages().is_empty()
-            || !stack
-                .config
-                .provider
-                .model_policy
-                .allows(&focused_tab.model)
-        {
-            stack.model.clone()
-        } else {
-            Model::from_spec(&focused_tab.model).unwrap_or_else(|_| stack.model.clone())
-        };
 
         let outcome = maki_ui::run(
             maki_ui::EventLoopParams {
-                model,
+                // The startup default only (`--model`, then last-used, then
+                // config). It seeds `ModelSlots` and catches a session whose
+                // model will not resolve. Otherwise each tab runs on its own
+                // recorded spec.
+                model: stack.model.clone(),
                 needs_login: stack.needs_login,
                 commands: std::mem::take(&mut stack.commands),
                 sessions: std::mem::take(&mut tabs),
@@ -511,6 +498,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
+                ui_wake_rx: stack.plugin_host.ui_wake_rx(),
                 ui_attachment: stack.plugin_host.ui_attachment(),
                 lua_event_handle: stack.plugin_host.event_handle(),
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
@@ -524,7 +512,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -s {session_id}");
+                    eprintln!("Resume session:\n\n  maki -r {session_id}");
                 }
                 let started = Instant::now();
                 drop(stack);
@@ -568,9 +556,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 }
                 tabs = reloaded;
                 if tabs.is_empty() {
-                    let session = AppSession::new(&new_stack.model.spec(), &cwd_str);
-                    setup::report_session_start(maki_otel::emit::START_FRESH, Some(session.id));
-                    tabs.push(session);
+                    let replacement = Resolved::fresh(&storage);
+                    setup::report_session_start(replacement.start_type, Some(&replacement.id));
+                    tabs.push(replacement.into_session(&new_stack.model.spec(), &cwd_str));
                 }
                 stack = new_stack;
                 if let Some(report) = pack_report {
@@ -610,12 +598,23 @@ fn warn_stale_config_toml(project_config: &ProjectConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use color_eyre::eyre::eyre;
+    use maki_agent::tools::ToolRegistry;
     use maki_config::RawConfig;
+    use maki_providers::Message;
+    use maki_storage::sessions::SessionClaim;
+    use maki_ui::AppSession;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::tempdir;
     use test_case::test_case;
+
+    const STARTUP_SPEC: &str = "anthropic/claude-sonnet-4-5";
+    const STORED_SPEC: &str = "zai/glm-4.6";
+    const CWD: &str = "/project";
+    const STORED_MESSAGE: &str = "the turn the stored session already had";
 
     fn no_names(_: &PluginHost) -> Result<Vec<String>> {
         Ok(Vec::new())
@@ -705,10 +704,6 @@ mod tests {
     /// `init.lua` must not be executed in that mode.
     #[test]
     fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
-        use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
-
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).expect("mkdir .maki");
@@ -750,10 +745,6 @@ mod tests {
     /// cannot silently regress into a tautology.
     #[test]
     fn broken_init_lua_errors_without_no_plugins() {
-        use clap::Parser;
-        use maki_agent::tools::ToolRegistry;
-        use tempfile::tempdir;
-
         let dir = tempdir().expect("tempdir");
         let maki_dir: PathBuf = dir.path().join(".maki");
         fs::create_dir_all(&maki_dir).expect("mkdir .maki");
@@ -782,5 +773,58 @@ mod tests {
         }
 
         plugin_host.begin_shutdown();
+    }
+
+    /// A session's recorded spec is the single source of truth for the model
+    /// its tab runs on, so both directions matter. An explicit `--model` used
+    /// to be ignored on a resumed session, and without one the startup default
+    /// must not overwrite the recorded spec, or per tab models die on every
+    /// restart.
+    #[test_case(false, STORED_SPEC ; "a resumed tab keeps its own spec")]
+    #[test_case(true, STARTUP_SPEC ; "explicit model wins over a resumed spec")]
+    fn explicit_model_overrides_only_a_resumed_spec(explicit_model: bool, expected_spec: &str) {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let mut stored = AppSession::new(STORED_SPEC, &cwd);
+        stored.push_message(Message::user(STORED_MESSAGE.to_owned()));
+        let stored_id = stored.id;
+        stored
+            .save(
+                &SessionClaim::acquire(stored_id, &storage).expect("claim"),
+                &storage,
+            )
+            .expect("write session to disk");
+        let resolved = resume::resolve(&Cli::parse_from(["maki", "-c"]), &cwd, &storage)
+            .expect("continue resolves");
+
+        let session = open_tab(resolved, STARTUP_SPEC, explicit_model, &cwd).session;
+
+        assert_eq!(session.id, stored_id);
+        assert_eq!(
+            session
+                .messages()
+                .iter()
+                .filter_map(|m| m.user_text())
+                .collect::<Vec<_>>(),
+            vec![STORED_MESSAGE]
+        );
+        assert_eq!(session.model, expected_spec);
+    }
+
+    /// A fresh tab opens on the startup spec, which already folded in
+    /// `--model`, and under the id the resolver picked, so what the run
+    /// reports is what it writes.
+    #[test]
+    fn a_fresh_tab_opens_on_the_resolved_id_and_the_startup_spec() {
+        let dir = tempdir().expect("tempdir");
+        let storage = StateDir::from_path(dir.path().join("state"));
+        let resolved = Resolved::fresh(&storage);
+        let id = resolved.id.id();
+        let session = open_tab(resolved, STARTUP_SPEC, false, CWD).session;
+
+        assert_eq!(session.id, id);
+        assert!(session.messages().is_empty());
+        assert_eq!(session.model, STARTUP_SPEC);
     }
 }

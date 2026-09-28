@@ -184,6 +184,7 @@ mod tests {
                     config_path: PathBuf::from("/home/.config/maki/config.toml"),
                     url: None,
                     oauth: None,
+                    ca_file: None,
                 },
                 McpServerInfo {
                     name: "github".into(),
@@ -194,6 +195,7 @@ mod tests {
                     config_path: PathBuf::from("/project/.maki/config.toml"),
                     url: None,
                     oauth: None,
+                    ca_file: None,
                 },
             ],
             prompts: vec![],

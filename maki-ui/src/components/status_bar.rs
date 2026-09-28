@@ -1,6 +1,8 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{RetryInfo, Status};
@@ -30,6 +32,12 @@ pub struct UsageStats {
     pub global_cost: Option<f64>,
     pub context_size: u32,
     pub cost: Option<f64>,
+    /// What this chat's turns would have cost at the provider's published list
+    /// price, shown next to `cost` only when the model is subsidised.
+    pub list_cost: Option<f64>,
+    /// Name of the subscription covering the bill (e.g. `"Max"`). `None`
+    /// on every non-subsidised model, which keeps the list-price figure hidden.
+    pub subsidy_source: Option<Arc<str>>,
     pub context_window: u32,
     pub show_global: bool,
 }
@@ -94,6 +102,8 @@ pub struct StatusBarContext<'a> {
 
 pub struct StatusBar {
     flash: Option<(String, Instant)>,
+    /// Messages waiting for the line, oldest first.
+    queued: VecDeque<String>,
     cwd_branch: String,
     pub flash_duration: Duration,
     branch_update_rx: Option<flume::Receiver<()>>,
@@ -103,13 +113,27 @@ impl StatusBar {
     pub fn new(flash_duration: Duration) -> Self {
         Self {
             flash: None,
+            queued: VecDeque::new(),
             cwd_branch: cwd_branch_label(),
             flash_duration,
             branch_update_rx: spawn_branch_watcher(),
         }
     }
 
+    /// Shows {msg} now, replacing whatever was showing. It answers something
+    /// the user just did, and they want the latest state, not the one before.
     pub fn flash(&mut self, msg: String) {
+        self.flash = Some((msg, Instant::now()));
+    }
+
+    /// Shows {msg} once the line is free, behind anything already waiting.
+    /// Startup warnings come in a batch, and [`Self::flash`] would keep only
+    /// the last of them.
+    pub fn queue_flash(&mut self, msg: String) {
+        if self.flash.is_some() {
+            self.queued.push_back(msg);
+            return;
+        }
         self.flash = Some((msg, Instant::now()));
     }
 
@@ -135,8 +159,11 @@ impl StatusBar {
         Dirty::from(changed)
     }
 
+    /// Takes down what is showing and hands the line to the next waiting
+    /// message. The queue is kept on purpose: a turn ending makes a hint like
+    /// "press esc again" stale, but not a startup warning nobody read yet.
     pub fn clear_flash(&mut self) {
-        self.flash = None;
+        self.show_next();
     }
 
     pub fn clear_expired_hint(&mut self) -> Dirty {
@@ -147,16 +174,25 @@ impl StatusBar {
         {
             return Dirty::NO;
         }
-        self.flash = None;
+        self.show_next();
         Dirty::YES
+    }
+
+    /// The one way a message leaves the line, so none can leave it without
+    /// handing it to the next.
+    fn show_next(&mut self) {
+        self.flash = self.queued.pop_front().map(|msg| (msg, Instant::now()));
     }
 
     /// The bar spins for a whole turn, again while a restore is in flight, and
     /// it counts a retry down by the second. It sits next to [`Self::view`] so
     /// a new moving span cannot forget to claim its frames.
-    pub fn cadence(status: &Status, restoring: bool, retrying: bool) -> Cadence {
+    ///
+    /// A queue claims frames too. Startup fills it and then the UI sits idle,
+    /// so without frames the next message would never get its turn.
+    pub fn cadence(&self, status: &Status, restoring: bool, retrying: bool) -> Cadence {
         Cadence::when(
-            *status == Status::Streaming || restoring || retrying,
+            *status == Status::Streaming || restoring || retrying || !self.queued.is_empty(),
             Cadence::SPINNER,
         )
     }
@@ -351,9 +387,16 @@ impl StatusBar {
                 format_tokens(ctx.stats.context_window),
                 pct,
             );
-            let rest_text = match ctx.stats.cost {
-                Some(cost) => format!("{context_text} ${cost:.3}  "),
-                None => format!("{context_text}  "),
+            let rest_text = match (
+                ctx.stats.cost,
+                ctx.stats.list_cost,
+                &ctx.stats.subsidy_source,
+            ) {
+                (Some(cost), Some(list), Some(source)) if list > 0.0 => {
+                    format!("{context_text} ${cost:.3} (~${list:.3} {source})  ")
+                }
+                (Some(cost), _, _) => format!("{context_text} ${cost:.3}  "),
+                (None, _, _) => format!("{context_text}  "),
             };
             right_spans.push(Span::styled(rest_text, context_style));
 
@@ -555,6 +598,15 @@ fn find_git_dir(cwd: &Path) -> Option<std::path::PathBuf> {
         if git.is_dir() {
             return Some(git);
         }
+        if let Ok(contents) = std::fs::read_to_string(&git) {
+            let path = contents.trim().strip_prefix("gitdir: ")?.trim_start();
+            let path = Path::new(path);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            });
+        }
         dir = dir.parent()?;
     }
 }
@@ -593,6 +645,12 @@ mod tests {
 
     const FLASH_TTL: Duration = Duration::from_secs(3600);
     const FLASH_MSG: &str = "Copied";
+    const EXPECT_FLASH: &str = "a queued message has to reach the bar";
+    const EXPECT_EVERY_MESSAGE: &str = "every flashed message has to be shown, in order";
+    const EXPECT_DRAINS: &str = "the bar has to end up empty";
+    const EXPECT_IDLE: &str = "nothing waiting means no frames to claim";
+    const EXPECT_TICKING: &str = "a waiting message has to claim the frames that advance it";
+    const EXPECT_NEWEST: &str = "a flash answers the user's last action, not an earlier one";
     const STALE_BRANCH: &str = "/nowhere:gone";
     const BAR_WIDTH: u16 = 120;
     const MODEL_ID: &str = "test-model";
@@ -634,6 +692,8 @@ mod tests {
                 global_cost,
                 context_size: CONTEXT_SIZE,
                 cost: Some(CHAT_COST),
+                list_cost: None,
+                subsidy_source: None,
                 context_window: crate::components::TEST_CONTEXT_WINDOW,
                 show_global,
             },
@@ -696,6 +756,22 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn detect_branch_from_worktree() {
+        let dir = TempDir::new().unwrap();
+        let wt_head = dir.path().join("main/.git/worktrees/wt");
+        fs::create_dir_all(&wt_head).unwrap();
+        fs::write(dir.path().join("main/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(wt_head.join("HEAD"), "ref: refs/heads/db/worktree-branch\n").unwrap();
+        let wt = dir.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_head.display())).unwrap();
+        assert_eq!(
+            detect_branch(&wt.to_string_lossy()),
+            Some("db/worktree-branch".to_string())
+        );
+    }
+
     #[test_case(Some("ref: refs/heads/feature/foo\n"), Some("feature/foo") ; "regular_ref")]
     #[test_case(Some("abc1234deadbeef\n"),            Some("abc1234")      ; "detached_head")]
     #[test_case(None,                                 None                 ; "no_git_dir")]
@@ -731,6 +807,79 @@ mod tests {
         let first = bar.clear_expired_hint();
         assert_eq!(bar.clear_expired_hint(), Dirty::NO, "{QUIET}");
         first
+    }
+
+    /// A toggle says what just happened, and the user is looking when it
+    /// does. Queuing these would answer the press before last.
+    #[test]
+    fn flashing_replaces_what_is_showing() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+
+        bar.flash("enabled".into());
+        bar.flash("disabled".into());
+
+        assert_eq!(bar.flash_text(), Some("disabled"), "{EXPECT_NEWEST}");
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::IDLE,
+            "{EXPECT_IDLE}"
+        );
+    }
+
+    #[test]
+    fn every_queued_message_gets_its_turn() {
+        let mut bar = StatusBar::new(Duration::ZERO);
+        let msgs = ["first", "second", "third"];
+
+        for msg in msgs {
+            bar.queue_flash((*msg).into());
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..msgs.len() {
+            seen.push(bar.flash_text().expect(EXPECT_FLASH).to_owned());
+            let _ = bar.clear_expired_hint();
+        }
+
+        assert_eq!(seen, msgs, "{EXPECT_EVERY_MESSAGE}");
+        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
+    }
+
+    #[test]
+    fn a_queue_claims_frames() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.queue_flash(FLASH_MSG.into());
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::IDLE,
+            "{EXPECT_IDLE}"
+        );
+
+        bar.queue_flash(FLASH_MSG.into());
+
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::SPINNER,
+            "{EXPECT_TICKING}"
+        );
+    }
+
+    #[test]
+    fn clearing_hands_the_line_to_what_is_waiting() {
+        let mut bar = StatusBar::new(FLASH_TTL);
+        bar.queue_flash("first".into());
+        bar.queue_flash("second".into());
+
+        bar.clear_flash();
+        assert_eq!(bar.flash_text(), Some("second"), "{EXPECT_EVERY_MESSAGE}");
+
+        bar.clear_flash();
+        assert_eq!(bar.flash_text(), None, "{EXPECT_DRAINS}");
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false),
+            Cadence::IDLE,
+            "{EXPECT_IDLE}"
+        );
     }
 
     /// The watcher fires for any write near `.git/HEAD`, most of which leave

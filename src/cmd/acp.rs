@@ -53,7 +53,8 @@ pub fn run(
 
     let timeouts = maki_providers::Timeouts::from(&config.provider);
 
-    let model = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    let (model, warning) = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
+    super::report_warnings(Vec::from_iter(warning));
 
     setup::init_logging(&config.storage);
     setup::init_telemetry(&config.telemetry);

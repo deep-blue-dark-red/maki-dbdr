@@ -19,8 +19,8 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, McpSession, RunLedger,
-    SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
+    RunLedger, SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -43,6 +43,7 @@ use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
+const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -896,10 +897,12 @@ async fn prompt(
         mode: AgentMode::Build,
         images: Vec::new(),
         preamble: Vec::new(),
+        earlier: Vec::new(),
         thinking: s.opts.thinking,
         fast: s.opts.fast,
         workflow: false,
         prompt: None,
+        source: InputSource::Plugin,
     };
     let result = agent.run(input).await;
     drop(agent);
@@ -911,11 +914,18 @@ async fn prompt(
     let turn = &s.history.as_slice()[history_len.min(s.history.len())..];
     // A subagent can be cancelled on its own, and its caller should hear about
     // that instead of taking a half-finished answer for a real one, so cancel
-    // reads like an error here even though the run ended normally.
+    // reads like an error here even though the run ended normally. A dropped
+    // prompt never reached the model, so an empty answer would be a lie.
     let cut_short = match &result {
         Err(e) => Some(e.to_string()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
-        Ok(_) => None,
+        Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
+        Ok(
+            DoneReason::EndTurn
+            | DoneReason::MaxTokens
+            | DoneReason::MaxTurns
+            | DoneReason::Compact,
+        ) => None,
     };
     if let Some(err) = cut_short {
         let partial = turn
@@ -1066,6 +1076,7 @@ mod tests {
             usage,
             model: "test-model".into(),
             cost: Some(cost),
+            subsidised_list_cost: None,
             context_size: None,
             context_window: 0,
             cache_miss: false,

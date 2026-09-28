@@ -30,6 +30,7 @@ getrandom = { workspace = true }
 open = { workspace = true }
 keyring = { workspace = true }
 url = { workspace = true }
+toml = { workspace = true }
 
 [[bin]]
 name = "mlog"
@@ -38,4 +39,3 @@ path = "src/bin/mlog.rs"
 [dev-dependencies]
 test-case = { workspace = true }
 tempfile = { workspace = true }
-toml = { workspace = true }

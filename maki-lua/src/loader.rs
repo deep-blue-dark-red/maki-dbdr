@@ -8,11 +8,14 @@ use std::time::{Duration, Instant};
 use include_dir::{Dir, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 
-use crate::api::keymap::KeymapReader;
+use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, LuaCommandReader, UiAction, UiAttachment};
+use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::util::command::{
+    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
+};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
@@ -302,6 +305,12 @@ impl PluginHost {
         })
     }
 
+    /// One status bar line summing up the wrong key spellings found since the
+    /// last take. Each finding is in the log already.
+    pub fn take_key_warning(&self) -> Option<String> {
+        self.inner.key_lint.take_summary()
+    }
+
     /// The store that `maki.api.register_permission_rule` writes into. Hand
     /// it to every [`maki_agent::permissions::PermissionManager`] so plugin
     /// rules apply to all sessions.
@@ -323,12 +332,25 @@ impl PluginHost {
         self.inner.prio_tx = flume::unbounded().0;
     }
 
-    /// Boots the runtime and loads every default bundled plugin into `registry`.
-    /// For callers like tests and docgen that want the full builtin set
-    /// without building a config.
+    /// Boots the runtime and loads every bundled plugin into `registry`, the
+    /// ones that ship switched off included. For callers like tests and
+    /// docgen that want the full builtin set without building a config, and
+    /// which have to document an opt-in plugin's options too.
     pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let opt_in: HashMap<String, PluginFileConfig> = maki_config::OPTIONAL_BUILTINS
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    PluginFileConfig {
+                        enabled: Some(true),
+                        ..PluginFileConfig::default()
+                    },
+                )
+            })
+            .collect();
         let mut host = Self::new(registry)?;
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
+        host.load_builtins(&PluginsConfig::from_plugins(opt_in))?;
         Ok(host)
     }
 
@@ -485,7 +507,7 @@ impl PluginHost {
                 .unwrap_or_default();
             self.send_load(
                 Arc::clone(&name),
-                vec![LoadChunk::new(name.as_ref(), init)],
+                vec![LoadChunk::bundled(name.as_ref(), init)],
                 LoadContext {
                     opts,
                     ..LoadContext::plain(None, permissions)
@@ -937,6 +959,7 @@ impl PluginHost {
         EventHandle {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
+            layered: Arc::clone(&self.inner.layered),
         }
     }
 
@@ -956,6 +979,11 @@ impl PluginHost {
         self.inner.ui_action_rx.clone()
     }
 
+    /// Rings when a plugin changes a window or what one shows.
+    pub fn ui_wake_rx(&self) -> flume::Receiver<()> {
+        self.inner.ui_wake_rx.clone()
+    }
+
     /// The bit every `maki.ui` and `maki.fn` roundtrip consults. The event
     /// loop attaches while it drains [`Self::ui_action_rx`] and detaches
     /// before teardown runs `SessionEnd`, since that receiver is a clone and
@@ -970,6 +998,9 @@ pub struct EventHandle {
     tx: flume::Sender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
+    /// Published by the Lua thread and read without touching it: whether
+    /// asking a chain can change the answer at all.
+    layered: Arc<LayeredTools>,
 }
 
 impl EventHandle {
@@ -977,12 +1008,69 @@ impl EventHandle {
         Self {
             tx,
             prio_tx: flume::unbounded().0,
+            layered: Arc::default(),
         }
     }
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
         Self::from_tx(flume::unbounded().0)
+    }
+
+    /// Whether a plugin is layering either of the plan form slots. False on a
+    /// stock install, where the form opens in the frame the plan lands in: a
+    /// request loop busy with a `/reload` or a long tool call would otherwise
+    /// keep the user waiting for an answer that cannot differ.
+    pub fn plan_form_layered(&self) -> bool {
+        self.layered.layers_surface(PLAN_FORM_SLOT)
+            || self.layered.layers_surface(PLAN_FORM_ACTIONS_SLOT)
+    }
+
+    /// Runs the handler behind a plugin row of {session}'s plan form, named
+    /// by its position in the menu [`Self::open_plan_form`] built and the
+    /// {generation} that menu was published with.
+    ///
+    /// The receiver answers whether the row's built-in action still runs, and
+    /// disconnects when the pick never reached the host, so the caller can
+    /// tell the user instead of going quiet.
+    pub fn run_plan_action(
+        &self,
+        session: String,
+        generation: u64,
+        row: usize,
+        path: String,
+        parallel: bool,
+    ) -> flume::Receiver<PlanActionOutcome> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+            session,
+            generation,
+            row,
+            path,
+            parallel,
+            reply,
+        });
+        rx
+    }
+
+    /// Asks the `ui.plan_form*` chains what to draw for a draft that just
+    /// landed, starting from the {rows} the host proposes. The receiver
+    /// answers `None` when a layer took the form over, and disconnects when
+    /// the host is gone, which leaves the caller the built-in form.
+    pub fn open_plan_form(
+        &self,
+        path: String,
+        session: String,
+        rows: Vec<PlanFormRow>,
+    ) -> flume::Receiver<Option<PlanMenu>> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
+            path,
+            session,
+            rows,
+            reply,
+        });
+        rx
     }
 
     /// True when no runtime is draining requests. Production handles stay
@@ -1002,7 +1090,15 @@ impl EventHandle {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
+            layered: Arc::default(),
         }
+    }
+
+    /// The same handle, reporting {slots} as layered, for a test that drives
+    /// the UI without a host.
+    pub(crate) fn layering(mut self, slots: &[&str]) -> Self {
+        self.layered = Arc::new(LayeredTools::with_surfaces(slots));
+        self
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
@@ -1176,9 +1272,12 @@ impl EventHandle {
         });
     }
 
-    pub fn run_keybind_callback(&self, id: u64) -> bool {
+    /// Whether the keystroke reached the Lua thread's queue. `false` says the
+    /// host is gone, which the caller answers by running the built-in binding
+    /// for the key in the same keystroke.
+    pub fn run_keybind_callback(&self, ticket: KeybindTicket) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { id })
+            .try_send(Request::RunKeybindCallback { ticket })
             .is_ok()
     }
 
@@ -1204,7 +1303,9 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
@@ -1340,7 +1441,11 @@ mod tests {
     fn run_command_sends_correct_request() {
         let (prio_tx, prio_rx) = flume::bounded(8);
         let (tx, _rx) = flume::bounded(8);
-        let handle = EventHandle { tx, prio_tx };
+        let handle = EventHandle {
+            tx,
+            prio_tx,
+            layered: Arc::default(),
+        };
         handle.run_command(
             Arc::from("myplugin"),
             Arc::from("/greet"),
@@ -1426,53 +1531,172 @@ mod tests {
         assert!(reader.load().generation > 0);
     }
 
-    /// End-to-end: a plugin registers a keymap override, the override is published
-    /// to the snapshot, EventHandle::run_keybind_callback dispatches the request,
-    /// the runtime resolves the Function by id from the registry, and the callback
-    /// executes with an observable side effect. This is the load-bearing path the
-    /// dispatch reorder and the dead-host fallback rest on; unit tests only cover
-    /// the layers in isolation.
+    const FIRED_COMMAND: &str = "/fired";
+    const KEYBIND_NEVER_RAN: &str = "the keybind callback never registered its command";
+    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Waits for the command a keybind callback registers, which is how a test
+    /// on this side of the channel sees that the handler ran.
+    fn wait_for_fired_command(host: &PluginHost) {
+        let deadline = Instant::now() + KEYBIND_TIMEOUT;
+        while !host
+            .command_reader()
+            .load()
+            .commands
+            .iter()
+            .any(|c| c.name.as_ref() == FIRED_COMMAND)
+        {
+            assert!(Instant::now() < deadline, "{KEYBIND_NEVER_RAN}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// End-to-end: a plugin registers a keymap override, the override is
+    /// published to the snapshot, `dispatch` hands the binding it matched to
+    /// `run_keybind_callback`, and the runtime calls it with an observable
+    /// side effect. Unit tests only cover the pieces in isolation.
     #[test]
     fn keybind_callback_runs_end_to_end() {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "kb",
-            r#"
+            &format!(
+                r#"
             maki.keymap.set("n", "<C-g>", function()
-                maki.api.register_command({
-                    name = "/fired",
+                maki.api.register_command({{
+                    name = "{FIRED_COMMAND}",
                     description = "callback ran",
                     handler = function() end,
-                })
-            end, { desc = "test override" })
-            "#,
+                }})
+            end, {{ desc = "test override" }})
+            "#
+            ),
         )
         .unwrap();
 
-        let snap = host.keymap_reader().load();
-        assert_eq!(snap.entries.len(), 1, "override published to snapshot");
-        let entry = &snap.entries[0];
-        assert_eq!(entry.desc, "test override");
+        let reader = host.keymap_reader();
+        let key = {
+            let snap = reader.load();
+            assert_eq!(snap.entries.len(), 1, "override published to snapshot");
+            let entry = &snap.entries[0];
+            assert_eq!(entry.desc, "test override");
+            entry.key
+        };
         assert!(
             host.command_reader().load().commands.is_empty(),
             "callback has not fired yet"
         );
 
         let handle = host.event_handle();
-        handle.run_keybind_callback(entry.id);
+        assert!(reader.dispatch(key, |ticket| handle.run_keybind_callback(ticket)));
+        wait_for_fired_command(&host);
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let cmds = &host.command_reader().load().commands;
-            if cmds.iter().any(|c| c.name.as_ref() == "/fired") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "keybind callback did not register /fired within 2s"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    /// `<C-c>` never reaches a binding, so accepting one publishes a mapping
+    /// with a `desc` in the keymap list that can never fire.
+    #[test]
+    fn binding_a_key_the_host_reserves_is_refused() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(
+                "kb",
+                r#"maki.keymap.set("n", "<C-c>", function() end, { desc = "quit" })"#,
+            )
+            .expect_err("Ctrl+C is the host's");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    /// `unique` is a plugin saying the key is no good to it shared, so the
+    /// call has to fail where the author reads it and name who to go look at.
+    #[test]
+    fn a_unique_bind_fails_on_a_key_another_plugin_holds() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        let err = host
+            .load_source(
+                "second",
+                r#"maki.keymap.set("n", "<C-g>", function() end, { unique = true })"#,
+            )
+            .expect_err("the key is taken");
+        let err = err.to_string();
+        assert!(
+            err.contains(&format!("{TAKEN_ERR} first")),
+            "the error has to name the owner, got: {err}"
+        );
+        assert_eq!(
+            host.keymap_reader().load().entries.len(),
+            1,
+            "the refused bind stored nothing"
+        );
+    }
+
+    #[test]
+    fn del_from_another_plugin_leaves_the_key_alone() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("first", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+
+        host.load_source("second", r#"maki.keymap.del("n", "<C-g>")"#)
+            .unwrap();
+
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
+    }
+
+    /// A handler that raises is logged and its key is spent: handing the key
+    /// back seconds later lands it in a UI the user never pressed it against.
+    /// What the host owes is that the raise wedges nothing.
+    #[test]
+    fn a_keybind_that_raises_leaves_the_plugin_dispatching() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "kb",
+            &format!(
+                r#"
+            maki.keymap.set("n", "<C-g>", function() error("boom") end)
+            maki.keymap.set("n", "<C-h>", function()
+              maki.api.register_command({{
+                name = "{FIRED_COMMAND}",
+                description = "the next key still ran",
+                handler = function() end,
+              }})
+            end)
+            "#
+            ),
+        )
+        .unwrap();
+
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let key_of = |code: char| {
+            let snap = reader.load();
+            let entry = snap
+                .entries
+                .iter()
+                .find(|e| e.key.code() == KeyCode::Char(code))
+                .expect("both keys published");
+            entry.key
+        };
+
+        assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));
+        assert!(reader.dispatch(key_of('h'), |t| handle.run_keybind_callback(t)));
+
+        wait_for_fired_command(&host);
+    }
+
+    /// Unloading has to take the bindings with it, or a `/reload` leaves keys
+    /// claimed by callbacks that are gone.
+    #[test]
+    fn clearing_a_plugin_takes_its_bindings() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("kb", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
+
+        host.unload("kb").unwrap();
+        assert!(host.keymap_reader().load().entries.is_empty());
     }
 
     #[test]
@@ -2109,10 +2333,9 @@ mod bundled_manifests {
         let mut drift = Vec::new();
         // `lib` is the one bundled directory that never loads on its own, so it
         // ships no manifest and its modules answer to whoever requires them.
-        for plugin in BUNDLED_PLUGINS
-            .iter()
-            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
-        {
+        for plugin in BUNDLED_PLUGINS.iter().filter(|p| {
+            DEFAULT_BUILTINS.contains(&p.name) || maki_config::OPTIONAL_BUILTINS.contains(&p.name)
+        }) {
             let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
             // Each permission paired with the usage demanding it, so a failure
             // points at something to go look at.
@@ -2144,5 +2367,44 @@ mod bundled_manifests {
             }
         }
         assert!(drift.is_empty(), "plugin.toml drift:\n{}", drift.join("\n"));
+    }
+
+    fn collect_lua_files(dir: &'static Dir<'static>, out: &mut Vec<&'static File<'static>>) {
+        for entry in dir.entries() {
+            match entry {
+                DirEntry::Dir(sub) => collect_lua_files(sub, out),
+                DirEntry::File(file) if file.path().extension() == Some(LUA_EXT.as_ref()) => {
+                    out.push(file);
+                }
+                DirEntry::File(_) => {}
+            }
+        }
+    }
+
+    /// Bundled Lua ships in the binary, so it is linted here instead of at
+    /// every start. Every file counts, specs and modules too, because key
+    /// handling rarely lives in `init.lua`.
+    #[test]
+    fn bundled_lua_has_no_wrong_key_spellings() {
+        let mut linted = 0;
+        let mut findings = Vec::new();
+        for plugin in BUNDLED_PLUGINS {
+            let mut files = Vec::new();
+            collect_lua_files(&plugin.dir, &mut files);
+            for file in files {
+                let Some(source) = file.contents_utf8() else {
+                    continue;
+                };
+                let name = format!("{}/{}", plugin.name, file.path().display());
+                findings.extend(crate::key_lint::lint(&name, source));
+                linted += 1;
+            }
+        }
+
+        assert!(
+            linted > BUNDLED_PLUGINS.len(),
+            "the walk reached past init.lua"
+        );
+        assert!(findings.is_empty(), "{findings:#?}");
     }
 }

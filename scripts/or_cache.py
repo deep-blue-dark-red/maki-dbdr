@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnose OpenRouter prompt-cache misses from maki's turn_stats.jsonl logs.
+"""Diagnose OpenRouter prompt-cache misses from maki's turn-stats logs.
 
 OpenRouter load balances across every upstream serving a model unless the
 request pins one, and each upstream keeps its own prompt cache. The symptom is
@@ -50,10 +50,10 @@ def load(path):
 
 
 def sessions(root):
-    """Every session log under `root`, or `root` itself if it is one."""
+    """Every session turn-stats log under `root`, or `root` itself if it is one."""
     if root.is_file():
         return [root]
-    return sorted(root.glob("*/turn_stats.jsonl"))
+    return sorted(root.glob("turnstats/*.jsonl"))
 
 
 def analyze(turns):
@@ -177,14 +177,14 @@ def report(path, rows, verbose):
 
 
 def main():
-    default_root = Path.home() / ".local/logs/maki"
+    default_root = Path.home() / ".local/state/maki/sessions"
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
         "path",
         nargs="?",
         type=Path,
         default=default_root,
-        help=f"session dir, log root, or a turn_stats.jsonl (default: {default_root})",
+        help=f"session dir, log root, or a turn-stats jsonl (default: {default_root})",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="per-request detail")
     p.add_argument(
@@ -199,7 +199,7 @@ def main():
 
     logs = sessions(args.path)
     if not logs:
-        sys.exit(f"error: no turn_stats.jsonl under {args.path}")
+        sys.exit(f"error: no turn-stats logs under {args.path}")
 
     key = None if args.no_fetch else os.environ.get("OPENROUTER_API_KEY")
     for log in logs:

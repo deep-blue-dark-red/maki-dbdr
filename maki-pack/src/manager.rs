@@ -266,7 +266,7 @@ impl Manager {
             });
         }
 
-        let _guard = Lock::acquire(&paths::package_lock(&self.site, &spec.name))?;
+        let _guard = Lock::acquire_retrying(&paths::package_lock(&self.site, &spec.name))?;
         let hooks = self.hooks_dir()?;
 
         // A recorded revision wins over `version`, even when nothing is on disk
@@ -331,7 +331,7 @@ impl Manager {
             });
         }
 
-        let _guard = Lock::acquire(&paths::package_lock(&self.site, &spec.name))?;
+        let _guard = Lock::acquire_retrying(&paths::package_lock(&self.site, &spec.name))?;
         let hooks = self.hooks_dir()?;
         // Restoring already knows the commit it wants, so a clone that still has
         // it can skip the fetch. Resolving `version` always needs fresh refs.
@@ -382,7 +382,7 @@ impl Manager {
             });
         }
 
-        let _guard = Lock::acquire(&paths::package_lock(&self.site, &prepared.spec.name))?;
+        let _guard = Lock::acquire_retrying(&paths::package_lock(&self.site, &prepared.spec.name))?;
         let hooks = self.hooks_dir()?;
         let work = self
             .ensure_work(&hooks, &prepared.spec, Want::Commit(&prepared.new_rev))

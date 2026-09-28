@@ -4,86 +4,85 @@ use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier};
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+
+const SLUG: &str = "synthetic";
+const DISPLAY_NAME: &str = "Synthetic";
+const ENV_VAR: &str = "SYNTHETIC_API_KEY";
+const BASE_URL: &str = "https://api.synthetic.new/openai/v1";
+const DEFAULT_MODEL: &str = "synthetic/hf:moonshotai/Kimi-K2.5";
+const LOGIN_URL: &str = "https://synthetic.new";
+const MAX_TOKENS_FIELD: &str = "max_completion_tokens";
+const FEATURES: &str = "Reasoning effort support (low/medium/high), open-weight models";
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "synthetic",
-    api_key_env: "SYNTHETIC_API_KEY",
-    base_url: "https://api.synthetic.new/openai/v1",
-    max_tokens_field: "max_completion_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: false,
-    provider_name: "Synthetic",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "synthetic",
-    display_name: "Synthetic",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://api.synthetic.new/openai/v1",
-    default_api_key_env: "SYNTHETIC_API_KEY",
-    default_model: "synthetic/hf:moonshotai/Kimi-K2.5",
-    plans: None,
-    login_url: Some("https://synthetic.new"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Synthetic,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(32_000),
+    fallback_context_window: 128_000,
+    models_toml: include_str!("../../models/synthetic.toml"),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
 
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["hf:moonshotai/Kimi-K2.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.45,
-                output: 3.40,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:deepseek-ai/DeepSeek-V3.2"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.56,
-                output: 1.68,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["hf:zai-org/GLM-4.7-Flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Synthetic,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.10,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-    ]
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Synthetic::new(timeouts)?))
 }
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Synthetic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 pub struct Synthetic {
     compat: OpenAiCompatProvider,
@@ -94,11 +93,11 @@ pub struct Synthetic {
 
 impl Synthetic {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
-        let pool = KeyPool::resolve("synthetic", CONFIG.api_key_env)?;
+        let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
-                "synthetic",
+                CONFIG.slug,
                 pool.current(),
             )?)),
             key_pool: Some(pool),

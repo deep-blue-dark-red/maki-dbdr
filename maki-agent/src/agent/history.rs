@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 use arc_swap::ArcSwap;
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use maki_storage::id::MakiId;
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
@@ -11,10 +13,36 @@ pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
 
+/// Weak, so a session that ends takes its transcript with it. The dead entries
+/// it leaves behind get swept on the next publish.
+static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakiId, Weak<ArcSwap<HistorySnapshot>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// A second publish for the same id wins, which is what a reloaded tab wants.
+pub fn publish_live_history(session: MakiId, mirror: &SharedMessages) {
+    let mut live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    live.retain(|_, mirror| mirror.strong_count() > 0);
+    live.insert(session, Arc::downgrade(mirror));
+}
+
+pub fn live_history(session: MakiId) -> Option<Arc<Vec<Message>>> {
+    let live = LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mirror = live.get(&session)?.upgrade()?;
+    Some(Arc::clone(&mirror.load().messages))
+}
+
 pub struct History {
     messages: Vec<Message>,
     epoch: u64,
     mirror: Option<SharedMessages>,
+    /// Set by every change and cleared only once a save lands, so a failed
+    /// write is retried by the next turn instead of lost. [`Self::restored`]
+    /// leaves it clear: its repair alone is not worth rewriting the file for.
+    unsaved: bool,
 }
 
 impl History {
@@ -23,12 +51,21 @@ impl History {
             messages,
             epoch: next_epoch(),
             mirror: None,
+            unsaved: false,
         }
     }
 
     pub fn restored(mut messages: Vec<Message>) -> Self {
         sanitize_restored(&mut messages);
         Self::new(messages)
+    }
+
+    pub fn has_unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.unsaved = false;
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
@@ -42,8 +79,7 @@ impl History {
     }
 
     pub fn push(&mut self, msg: Message) {
-        self.messages.push(msg);
-        self.publish();
+        self.edit(|msgs| msgs.push(msg));
     }
 
     pub fn len(&self) -> usize {
@@ -93,16 +129,18 @@ impl History {
     }
 
     /// An append: whatever a consumer already holds of the list stays good.
+    /// Every change goes through here, [`Self::rewrite`] too, so this is the
+    /// one place that has to mark the list unsaved.
     fn edit(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         f(&mut self.messages);
+        self.unsaved = true;
         self.publish();
     }
 
     /// Any other change, so a consumer has to start the list over.
     fn rewrite(&mut self, f: impl FnOnce(&mut Vec<Message>)) {
         self.epoch = next_epoch();
-        f(&mut self.messages);
-        self.publish();
+        self.edit(f);
     }
 
     /// The mirror gets the messages as they are. Closing dangling tool calls

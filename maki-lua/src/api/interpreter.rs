@@ -10,10 +10,10 @@ use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::interpreter_bridge::build_tool_input;
 use maki_interpreter::error::InterpreterError;
-use maki_interpreter::runner::{self, ToolFn};
+use maki_interpreter::runner::{self, FileFn, FileOp, ToolFn};
 use maki_interpreter::{AsyncResolver, PendingCall};
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Function, Lua, Result as LuaResult, Table};
+use mlua::{Function, IntoLuaMulti, Lua, Result as LuaResult, Table};
 use serde_json::Value;
 
 use crate::api::util::convert::{json_to_lua, lua_tool_result};
@@ -22,12 +22,15 @@ use crate::plugin_permissions::PluginPermissions;
 use crate::runtime::{TaskHandle, lock_cell};
 
 const BRIDGE_CLOSED: &str = "tool bridge closed (cancelled)";
+const FILE_OP_DENIED: &str = "not permitted in this sandbox";
 
 type CallResults = Vec<(u32, Result<Value, String>)>;
+type FileResult = Result<String, String>;
 
 enum BridgeMsg {
     Line(String),
     Calls(Vec<PendingCall>, flume::Sender<CallResults>),
+    File(FileOp, flume::Sender<FileResult>),
 }
 
 fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
@@ -45,6 +48,17 @@ fn forward_calls(
     reply_rx
         .recv()
         .map_err(|_| InterpreterError::Runtime(BRIDGE_CLOSED.into()))
+}
+
+async fn call_lua_file_fn(f: Option<&Function>, args: impl IntoLuaMulti) -> FileResult {
+    let Some(f) = f else {
+        return Err(FILE_OP_DENIED.to_owned());
+    };
+    let values = f
+        .call_async::<mlua::MultiValue>(args)
+        .await
+        .map_err(|e| e.to_string())?;
+    lua_tool_result(values)
 }
 
 async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Result<Value, String> {
@@ -81,6 +95,13 @@ async fn call_lua_tool(lua: Lua, f: Option<Function>, pc: &PendingCall) -> Resul
 ///   `tools` (table?) - map of `name -> function` for tools the sandbox may call.
 ///     Each function receives the tool input table and must return `(string)` or
 ///     `(nil, err)`. Tool calls are batched and dispatched concurrently.
+///   `files` (table?) - serves text file access from `open()` and `pathlib`.
+///     `read(path)` returns `(content)`, `write(path, content, append)` returns
+///     `(string)`, and both return `(nil, err)` on failure. Leave one out to
+///     refuse that access. Writes wait and go out as one `write` per file right
+///     before a tool call, a read of that path, or the end of the run, and a
+///     cancelled run drops the ones still waiting. A failed write ends the run,
+///     unless a read sent it, then it raises `OSError` just like a failed read.
 /// @return (table, string?) Result table, plus an error string on failure.
 /// @example
 /// local result, err = maki.interpreter.run("print(2 + 2)", {
@@ -97,6 +118,11 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
     let on_output: Function = required(&opts, "on_output")?;
     let preamble: String = opts.get::<Option<String>>("preamble")?.unwrap_or_default();
     let tools_tbl: Option<Table> = opts.get("tools")?;
+    let (read_fn, write_fn): (Option<Function>, Option<Function>) =
+        match opts.get::<Option<Table>>("files")? {
+            Some(t) => (t.get("read")?, t.get("write")?),
+            None => (None, None),
+        };
 
     let mut fns: HashMap<String, Function> = HashMap::new();
     if let Some(t) = tools_tbl {
@@ -143,6 +169,15 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
             let tx = tx.clone();
             Box::new(move |pending| forward_calls(&tx, pending))
         };
+        let files: FileFn = {
+            let tx = tx.clone();
+            Box::new(move |op| {
+                let (reply_tx, reply_rx) = flume::bounded(1);
+                tx.send(BridgeMsg::File(op, reply_tx))
+                    .map_err(|_| BRIDGE_CLOSED.to_owned())?;
+                reply_rx.recv().map_err(|_| BRIDGE_CLOSED.to_owned())?
+            })
+        };
 
         let mut flushed = 0usize;
         let result = runner::run(
@@ -150,6 +185,7 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
             &preamble,
             &tools,
             Some(&resolver),
+            Some(&files),
             limits,
             &mut |chunk| {
                 flushed += chunk.len();
@@ -183,6 +219,15 @@ async fn interpreter_run(lua: Lua, code: String, opts: Table) -> LuaResult<Pair<
                         }
                     });
                     let _ = reply.send(join_all(futs).await);
+                }
+                BridgeMsg::File(op, reply) => {
+                    let result = match op {
+                        FileOp::Read(path) => call_lua_file_fn(read_fn.as_ref(), path).await,
+                        FileOp::Write(w) => {
+                            call_lua_file_fn(write_fn.as_ref(), (w.path, w.content, w.append)).await
+                        }
+                    };
+                    let _ = reply.send(result);
                 }
             }
         }

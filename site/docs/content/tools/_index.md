@@ -20,6 +20,7 @@ Commands run in <cwd> by default.
 |-----------|------|----------|---------|-------------|
 | `command` | string | yes |  | The bash command to execute |
 | `description` | string | no |  | Short description (3-5 words) of what the command does |
+| `tail` | integer | no |  | Return only the last N lines |
 | `timeout` | integer | no | 120 | Timeout in seconds |
 | `workdir` | string | no | cwd | Working directory |
 
@@ -47,6 +48,7 @@ Write content to a file, replacing existing content.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `append` | boolean | no | Add content to the end of the file instead of replacing it |
 | `content` | string | yes | The complete file content to write |
 | `path` | string | yes | Absolute path to the file |
 
@@ -142,7 +144,7 @@ Run independent tool calls in parallel (1-25). Not for dependent or output-filte
 
 ### `code_execution` {#code_execution}
 
-Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. No imports, no network. 30s default timeout.
+Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. `open()` reads and writes text files. No imports, no network. 30s default timeout.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

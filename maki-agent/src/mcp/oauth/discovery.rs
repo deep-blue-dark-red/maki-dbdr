@@ -1,4 +1,4 @@
-use std::io::Read;
+use futures_lite::AsyncReadExt;
 
 use isahc::HttpClient;
 use isahc::http::Request;
@@ -231,19 +231,14 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .body(())
         .map_err(|e| OAuthError::Other(e.to_string()))?;
 
-    let mut response = smol::unblock({
-        let client = client.clone();
-        move || {
-            client
-                .send(req)
-                .map_err(|e| OAuthError::Network(e.to_string()))
-        }
-    })
-    .await?;
+    let mut response = client
+        .send_async(req)
+        .await
+        .map_err(|e| OAuthError::Network(e.to_string()))?;
 
     if !response.status().is_success() {
         let mut body = String::new();
-        let _ = response.body_mut().read_to_string(&mut body);
+        let _ = response.body_mut().read_to_string(&mut body).await;
         return Err(OAuthError::ServerRejected {
             status: response.status().as_u16(),
             body,
@@ -255,6 +250,7 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
         .body_mut()
         .take(MAX_RESPONSE_BODY as u64)
         .read_to_string(&mut body)
+        .await
         .map_err(|e| OAuthError::Network(e.to_string()))?;
     serde_json::from_str(&body).map_err(|e| OAuthError::InvalidResponse(e.to_string()))
 }

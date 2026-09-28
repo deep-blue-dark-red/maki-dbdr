@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -468,14 +468,14 @@ impl PermissionManager {
         // Plan file auto-allow: fires AFTER deny rules have been evaluated.
         // Only triggers if ALL pending scopes match the plan file path.
         // A single non-plan scope means we must prompt for the rest.
+        // Compared the way the write lands: `link/../plan.md` is the plan
+        // file lexically but somewhere else once `link` is followed.
         if !force_prompt && !pending.is_empty() {
             let is_plan_write = plan_path.is_some_and(|pp| {
                 matches!(tool, ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()))
                     && {
-                        let normalized_plan = normalize_scope_path(&pp.display().to_string());
-                        pending
-                            .iter()
-                            .all(|s| normalize_scope_path(s) == normalized_plan)
+                        let plan = normalize_scope_prefix(pp);
+                        pending.iter().all(|s| normalize_scope_prefix(s) == plan)
                     }
             });
             if is_plan_write {
@@ -668,6 +668,29 @@ impl PermissionManager {
         }
     }
 
+    /// For a call a plugin escalated. Allow rules, defaults and yolo all turn
+    /// into a question for the user. Only a deny still answers on its own, so
+    /// escalating can make a call harder to run but never easier.
+    fn check_escalated(
+        &self,
+        tool: &ToolKey,
+        scopes: &[&str],
+        plan_path: Option<&Path>,
+    ) -> PermissionCheck {
+        match self.check_inner(tool, scopes, true, plan_path) {
+            PermissionCheck::Denied => PermissionCheck::Denied,
+            PermissionCheck::Allowed | PermissionCheck::NeedsPrompt { .. } => {
+                PermissionCheck::NeedsPrompt {
+                    tool: tool.clone(),
+                    scopes: scopes.iter().map(|s| s.to_string()).collect(),
+                    force_prompt: true,
+                }
+            }
+        }
+    }
+
+    /// `ask` is a plugin's reason to show this call to the user whatever the
+    /// rules say. See [`Self::check_escalated`].
     #[allow(clippy::too_many_arguments)]
     pub async fn enforce(
         &self,
@@ -678,7 +701,12 @@ impl PermissionManager {
         request_id: &str,
         cancel: &crate::CancelToken,
         plan_path: Option<&Path>,
+        ask: Option<&str>,
     ) -> Result<(), PermissionError> {
+        let check = |tool: &ToolKey, scopes: &[&str], force_prompt: bool| match ask {
+            Some(_) => self.check_escalated(tool, scopes, plan_path),
+            None => self.check_inner(tool, scopes, force_prompt, plan_path),
+        };
         let scope_refs: Vec<&str> = scopes.scopes.iter().map(|s| s.as_str()).collect();
         let tool_string = tool.to_string();
         let scope_display = || scopes.scopes.join("; ");
@@ -703,16 +731,15 @@ impl PermissionManager {
             }
         };
 
-        let (pt, ps, force_prompt) =
-            match self.check_inner(tool, &scope_refs, scopes.force_prompt, plan_path) {
-                PermissionCheck::Allowed => return allowed(by_rule()),
-                PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
-                PermissionCheck::NeedsPrompt {
-                    tool,
-                    scopes,
-                    force_prompt,
-                } => (tool, scopes, force_prompt),
-            };
+        let (pt, ps, force_prompt) = match check(tool, &scope_refs, scopes.force_prompt) {
+            PermissionCheck::Allowed => return allowed(by_rule()),
+            PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
+            PermissionCheck::NeedsPrompt {
+                tool,
+                scopes,
+                force_prompt,
+            } => (tool, scopes, force_prompt),
+        };
 
         let Some(rx) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
@@ -721,7 +748,7 @@ impl PermissionManager {
 
         let guard = rx.lock().await;
         let refs: Vec<&str> = ps.iter().map(|s| s.as_str()).collect();
-        let (t2, s2) = match self.check_inner(&pt, &refs, force_prompt, plan_path) {
+        let (t2, s2) = match check(&pt, &refs, force_prompt) {
             PermissionCheck::Allowed => return allowed(by_rule()),
             PermissionCheck::Denied => return Err(deny(DECISION_SOURCE_RULE, None)),
             PermissionCheck::NeedsPrompt { tool, scopes, .. } => (tool, scopes),
@@ -731,6 +758,7 @@ impl PermissionManager {
             id: request_id.to_owned(),
             tool: t2.clone(),
             scopes: s2.clone(),
+            reason: ask.map(str::to_owned),
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the
@@ -799,32 +827,43 @@ fn rule_reach(rule_key: &ToolKey, actual: &ToolKey) -> Option<Approval> {
     }
 }
 
+/// A deny fails closed: a pattern refused as a blanket allow also denies
+/// every scope, even where [`scope_matches`] reads it as a narrower subtree.
 fn rule_matches_scope(rule: &PermissionRule, scope: &str) -> bool {
     match &rule.scope {
         None => true,
-        Some(pattern) => scope_matches(pattern, scope),
+        Some(pattern) => {
+            (rule.effect == Effect::Deny && is_universal_scope(pattern))
+                || scope_matches(pattern, scope)
+        }
     }
 }
 
 /// A rule and the path it is matched against have to agree on what file they
 /// name, including for a relative rule like `dist/**` written before the dir
 /// exists — both are `canonical_key`'s job.
-fn normalize_scope_prefix(path: &str) -> PathBuf {
-    maki_storage::paths::canonical_key(Path::new(path))
+fn normalize_scope_prefix(path: impl AsRef<Path>) -> PathBuf {
+    maki_storage::paths::canonical_key(path.as_ref())
 }
 
-/// A pattern with nothing left once its trailing glob is taken off covers
-/// every scope: `*` and `**`, but also `/*` and `/**`, which reduce to a
-/// prefix every absolute path starts with. [`scope_matches`] short-circuits on
-/// these and a plugin allow is refused for them, off the same answer.
+/// Whether a pattern might cover every scope, the question behind refusing a
+/// plugin allow. `*`, `**`, `/*` and `/**` do by their text. A `/**` prefix
+/// counts when either reading of it is the root: the canonical one
+/// (`canonical_key`: expands `~`, follows symlinks), which is how
+/// [`scope_matches`] grants, or the lexical one (`normalize_path`: collapses
+/// `.` and `..` textually), which catches `//**`, `/./**` and `/tmp/../**`
+/// even where `/tmp` is a symlink and the canonical reading lands elsewhere.
 ///
-/// A `/**` prefix is normalized before the answer, the way the matcher reads
-/// it, not compared as text. `//**`, `/./**` and `/tmp/../**` all name the
-/// root once normalized, and going by their spelling would let a plugin
-/// smuggle in the everything rule this refuses.
+/// Refusing is the safe direction, so this reads broadly on purpose. The
+/// invariant is one way: a pattern [`scope_matches`] treats as matching
+/// everything is always universal here, a pattern universal here need not
+/// match everything there.
 pub fn is_universal_scope(pattern: &str) -> bool {
     match pattern.strip_suffix("/**") {
-        Some(prefix) => universal_prefix_root(prefix),
+        Some(prefix) => {
+            is_root(&normalize_scope_prefix(prefix))
+                || is_root(&maki_storage::paths::normalize_path(Path::new(prefix)))
+        }
         None => {
             let stem = pattern.trim_end_matches('*');
             stem.len() < pattern.len() && matches!(stem, "" | "/")
@@ -836,15 +875,6 @@ fn is_root(path: &Path) -> bool {
     path.parent().is_none()
 }
 
-/// The root decision for a `/**` prefix, settled lexically: `..` collapses
-/// before any symlink is followed, so `/tmp/../**` reads as the root it
-/// spells rather than the sibling the symlinks park it in. This is the
-/// conservative answer for the everything-rule refusal, and it keeps
-/// [`scope_matches`] and [`is_universal_scope`] in agreement.
-fn universal_prefix_root(prefix: &str) -> bool {
-    is_root(&maki_storage::paths::normalize_path(Path::new(prefix)))
-}
-
 /// Glob matcher for permission scopes. The boundary suffixes (`/**`, `" *"`)
 /// must be tried before the bare `*`, otherwise a plain prefix would swallow
 /// them. `" *"` is the bash form `<command> *`: it has to match the bare
@@ -853,16 +883,17 @@ fn universal_prefix_root(prefix: &str) -> bool {
 /// For the `/**` path pattern, `Path::starts_with` is used to compare
 /// components rather than characters, which handles both `/` and `\`
 /// transparently on all platforms.
+///
+/// A `/**` prefix is read one way only, canonically, the way the write tools
+/// follow symlinks. A lexical root like `link/../../**` is the subtree the
+/// filesystem resolves it to here, never everything; [`is_universal_scope`]
+/// still refuses it.
 pub fn scope_matches(pattern: &str, value: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix("/**") {
         let norm_prefix = normalize_scope_prefix(prefix);
         // A root prefix covers every scope, bash commands included. Those are
         // not paths, so a plain prefix test would miss them.
-        if universal_prefix_root(prefix) {
-            return true;
-        }
-        let norm_value = normalize_scope_prefix(value);
-        return norm_value == norm_prefix || norm_value.starts_with(&norm_prefix);
+        return is_root(&norm_prefix) || normalize_scope_prefix(value).starts_with(&norm_prefix);
     }
     if is_universal_scope(pattern) {
         return true;
@@ -874,18 +905,6 @@ pub fn scope_matches(pattern: &str, value: &str) -> bool {
         return value.starts_with(prefix);
     }
     pattern == value
-}
-
-/// Lexical normalization for scope paths. Resolves `..` and `.` without
-/// hitting the filesystem and without producing `\\?\` prefixes on Windows.
-/// Use this for display, logging, and scope matching.
-///
-/// For symlink-aware security checks, use [`physical_boundary_check`].
-pub fn normalize_scope_path(path: &str) -> String {
-    let resolved = crate::tools::resolve_path(path).unwrap_or_else(|_| path.to_string());
-    maki_storage::paths::normalize_path(Path::new(&resolved))
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Check whether `child` is physically inside `parent`, following symlinks.
@@ -938,13 +957,7 @@ fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
     match tool {
         ToolKey::Native(name) if name.as_ref() == BASH_TOOL => generalize_bash_segment(scope),
         ToolKey::Native(name) if FILE_WRITE_TOOLS.contains(&name.as_ref()) => {
-            let p = Path::new(scope);
-            match p.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => {
-                    format!("{}/**", parent.display())
-                }
-                _ => "**".to_string(),
-            }
+            format!("{}/**", write_rule_dir(scope).display())
         }
         // MCP tool calls have a scope equal to the JSON-stringified input.
         // "Allow always" should whitelist the tool regardless of its arguments,
@@ -952,6 +965,26 @@ fn generalize_scope(tool: &ToolKey, scope: &str) -> String {
         // which MCP tool it applies to, keeping distinct tools distinct.
         ToolKey::McpTool { .. } | ToolKey::McpServer { .. } => "*".to_string(),
         _ => scope.to_string(),
+    }
+}
+
+/// The directory a write rule names: where the write lands, resolved the way
+/// [`scope_matches`] resolves it, so the rule never holds `..` for the lexical
+/// reading to collapse into something wider. The path as the model spelled it
+/// is kept when its parent already names that directory, so ordinary rules
+/// stay readable (`node_modules/react/**`, relative or through a symlink).
+fn write_rule_dir(scope: &str) -> PathBuf {
+    let landing = normalize_scope_prefix(scope);
+    let landing_dir = landing.parent().unwrap_or(&landing);
+    match Path::new(scope).parent() {
+        Some(spelled)
+            if !spelled.as_os_str().is_empty()
+                && !spelled.components().any(|c| c == Component::ParentDir)
+                && normalize_scope_prefix(spelled) == landing_dir =>
+        {
+            spelled.to_path_buf()
+        }
+        _ => landing_dir.to_path_buf(),
     }
 }
 
@@ -976,6 +1009,9 @@ mod tests {
     const PROMPTS: &str = "prompts";
     const PROJECT_DIR: &str = ".maki";
     const PROJECT_PERMISSIONS: &str = ".maki/permissions.toml";
+    #[cfg(unix)]
+    const OUTSIDE_WRITES: [&str; 2] = ["/etc/passwd", "~/.bashrc"];
+    const OUTSIDE_SCOPES: [&str; 3] = ["/etc/passwd", "~/.bashrc", "cargo test"];
 
     fn outcome(check: PermissionCheck) -> &'static str {
         match check {
@@ -1068,6 +1104,134 @@ mod tests {
     #[test_case("" => false ; "empty")]
     fn universal_scope(pattern: &str) -> bool {
         is_universal_scope(pattern)
+    }
+
+    /// The canonical half of `prefix_is_universal`. Lexically the prefix is just
+    /// a tempdir; only resolving the symlink reaches the root. A `~/../..`
+    /// spelling would prove the same branch but assumes `$HOME` is set and
+    /// exactly two levels deep.
+    #[test]
+    #[cfg(unix)]
+    fn universal_scope_through_symlink_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("root");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(is_universal_scope(&format!("{}/**", link.display())));
+        assert_universal_invariant(&format!("{}/**", link.display()));
+    }
+
+    fn matches_everything(pattern: &str) -> bool {
+        OUTSIDE_SCOPES.iter().all(|s| scope_matches(pattern, s))
+    }
+
+    fn assert_universal_invariant(pattern: &str) {
+        assert!(
+            !matches_everything(pattern) || is_universal_scope(pattern),
+            "{pattern:?} matches everything but a plugin allow for it would not be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    fn normal_depth(path: &Path) -> usize {
+        path.components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count()
+    }
+
+    /// Enough `..` after `path` to reach the root lexically, whatever the
+    /// filesystem makes of them.
+    #[cfg(unix)]
+    fn climb_to_lexical_root(path: &Path) -> String {
+        format!("{}{}", path.display(), "/..".repeat(normal_depth(path)))
+    }
+
+    #[test_case("*" ; "star")]
+    #[test_case("**" ; "double_star")]
+    #[test_case("/*" ; "root_star")]
+    #[test_case("/**" ; "root_double_star")]
+    #[test_case("//**" ; "doubled_root_slash")]
+    #[test_case("/./**" ; "root_dot")]
+    #[test_case("/tmp/../**" ; "root_by_parent")]
+    #[test_case("/etc/../../**" ; "parent_past_root")]
+    #[test_case("~/**" ; "home")]
+    #[test_case("~/../../../../../../../../**" ; "home_climbed_past_root")]
+    #[test_case("../../../../../../../../../../../../**" ; "relative_climbed_past_root")]
+    #[test_case("/tmp/**" ; "directory_subtree")]
+    #[test_case("cargo *" ; "bash_command")]
+    fn universal_scope_invariant(pattern: &str) {
+        assert_universal_invariant(pattern);
+    }
+
+    /// `link` points four levels deeper, so the `..` that reach the root
+    /// lexically stop inside the tempdir once the symlink is followed. Allowing
+    /// it grants only that subtree, denying it still denies everything.
+    #[test]
+    #[cfg(unix)]
+    fn lexical_root_through_symlink_is_refused_but_grants_only_its_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("a/b/c/d");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let pattern = format!("{}/**", climb_to_lexical_root(&link));
+
+        assert!(is_universal_scope(&pattern), "{pattern}");
+        for scope in OUTSIDE_SCOPES {
+            assert!(!scope_matches(&pattern, scope), "{pattern} matched {scope}");
+        }
+        for (rule, expected) in [
+            (allow_rule(&pattern), PROMPTS),
+            (deny_rule(&pattern), DENIED),
+        ] {
+            let mgr = mgr_with(make_config(vec![rule]), dir.path().to_path_buf());
+            assert_eq!(
+                outcome(mgr.check(&ToolKey::native(BASH_TOOL), "cargo test", None)),
+                expected
+            );
+        }
+    }
+
+    /// The pnpm layout from the bug: `node_modules/react` links deeper into the
+    /// store, so a write path climbing to the root lexically lands inside the
+    /// project. The session rule has to name that directory, not the root.
+    #[test]
+    #[cfg(unix)]
+    fn write_rule_through_pnpm_symlink_stays_in_landing_dir() {
+        let project = tempfile::tempdir().unwrap();
+        let link = project.path().join("node_modules/react");
+        let store = project
+            .path()
+            .join(".pnpm/react@18/node_modules/react")
+            .join("pad/".repeat(normal_depth(&link).saturating_sub(4)));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        let scope = format!("{}/x", climb_to_lexical_root(&link));
+        let write = ToolKey::native("write");
+
+        let rule = generalized_scopes(&write, std::slice::from_ref(&scope)).remove(0);
+        let rule_dir = rule.strip_suffix("/**").unwrap();
+        assert!(
+            !Path::new(rule_dir)
+                .components()
+                .any(|c| c == Component::ParentDir),
+            "{rule}"
+        );
+        assert!(
+            normalize_scope_prefix(rule_dir).starts_with(normalize_scope_prefix(project.path())),
+            "{rule}"
+        );
+        assert!(scope_matches(&rule, &scope), "{rule} misses {scope}");
+
+        let mgr = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
+        mgr.apply_decision(&write, &[scope], &PermissionAnswer::AllowSession);
+        for outside in OUTSIDE_WRITES {
+            assert_eq!(
+                outcome(mgr.check(&write, outside, None)),
+                PROMPTS,
+                "{outside}"
+            );
+        }
     }
 
     #[test_case(vec!["cd /tmp", "cargo test"], vec!["cd *", "cargo *"], true ; "all_allowed")]
@@ -1186,9 +1350,8 @@ mod tests {
 
     #[test]
     fn path_traversal_prompts() {
-        let path = normalize_scope_path("/tmp/../etc/passwd");
         assert!(matches!(
-            default_mgr().check(&ToolKey::native("write"), &path, None),
+            default_mgr().check(&ToolKey::native("write"), "/tmp/../etc/passwd", None),
             PermissionCheck::NeedsPrompt { .. }
         ));
     }
@@ -2062,5 +2225,36 @@ mod tests {
             ),
             PermissionCheck::NeedsPrompt { .. }
         ));
+    }
+
+    /// `away/..` spells the plan file, but `away` is a symlink, so the write
+    /// lands beside its target instead. A symlinked spelling of the plan file
+    /// itself still is the plan file.
+    #[test]
+    #[cfg(unix)]
+    fn plan_auto_allow_follows_symlinks_like_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let plans = dir.path().join("plans");
+        let elsewhere = dir.path().join("elsewhere/deep");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, plans.join("away")).unwrap();
+        std::os::unix::fs::symlink(&plans, dir.path().join("alias")).unwrap();
+        let plan = plans.join("plan.md");
+        let mgr = mgr_with(PermissionsConfig::default(), cwd.path().to_path_buf());
+        let write = ToolKey::native("write");
+
+        for (scope, expected) in [
+            (plans.join("away/../plan.md"), PROMPTS),
+            (dir.path().join("alias/plan.md"), ALLOWED),
+        ] {
+            let scope = scope.to_string_lossy();
+            assert_eq!(
+                outcome(mgr.check(&write, &scope, Some(&plan))),
+                expected,
+                "{scope}"
+            );
+        }
     }
 }

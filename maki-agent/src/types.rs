@@ -2,7 +2,8 @@ use std::any::Any;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use flume::{Receiver, Sender};
 use maki_config::ToolKey;
@@ -489,6 +490,17 @@ pub struct ToolDoneEvent {
     pub is_error: bool,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
+    /// Only dispatch fills this, so an event made up anywhere else (a
+    /// doom-loop refusal, a restored transcript) has none.
+    #[serde(skip)]
+    pub call: Option<Box<CallRecord>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallRecord {
+    /// After every input hook had its say.
+    pub input: serde_json::Value,
+    pub duration: Duration,
 }
 
 const UNKNOWN_TOOL: &str = "unknown";
@@ -503,6 +515,7 @@ impl ToolDoneEvent {
             is_error: true,
             annotation: None,
             written_path: None,
+            call: None,
         }
     }
 
@@ -590,6 +603,9 @@ pub enum DoneReason {
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
     Compact,
+    /// An `agent.user_message` layer dropped the message before the model saw
+    /// it.
+    Dropped,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -601,6 +617,15 @@ impl From<Option<StopReason>> for DoneReason {
             Some(StopReason::EndTurn | StopReason::ToolUse) | None => Self::EndTurn,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerKind {
+    MessageRewritten,
+    MessageDropped,
+    /// `agent.stop` kept the run going after the model ended its turn.
+    Continued,
 }
 
 /// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
@@ -660,7 +685,10 @@ pub enum AgentEvent {
         usage: TokenUsage,
         /// Billed cost for the whole run, `None` while nothing was priced.
         cost: Option<f64>,
-        /// List-price reference cost, for subsidised models.
+        /// What the run would have billed at the provider's published list
+        /// price, un-subsidised. Equals `cost` on an ordinary metered run and
+        /// stands beside a `$0` one, so a budget plugin can charge against
+        /// either. `None` only when no model in the run had a price table.
         list_cost: Option<f64>,
         context_size: u32,
         context_window: u32,
@@ -680,6 +708,8 @@ pub enum AgentEvent {
         context_size_before: u32,
         context_size_after: u32,
         context_window: u32,
+        /// So a plugin can check the summary kept what matters.
+        summary: String,
     },
     /// Emitted by the rename subagent with the LLM-generated session title.
     RenameResult {
@@ -697,9 +727,19 @@ pub enum AgentEvent {
         id: String,
         tool: ToolKey,
         scopes: Vec<String>,
+        /// Why a plugin escalated this call to the user, if one did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     AuthRequired,
     Nudge,
+    /// A plugin changed the run in a way the transcript alone would not show.
+    /// `text` is the message as sent, the reason for a drop, or the message
+    /// that kept the run going.
+    Steered {
+        kind: SteerKind,
+        text: String,
+    },
     SubagentHistory {
         tool_use_id: String,
         messages: Vec<Message>,
@@ -744,11 +784,32 @@ pub enum AgentEvent {
     StreamClosed,
 }
 
+/// Wakes the UI loop so a change made on another thread is painted now, not on
+/// the loop's next timed poll. Wakes pile up into one until the loop looks, so
+/// a plugin writing in a tight loop costs one frame, not one per write.
+#[derive(Clone)]
+pub struct UiWaker(Sender<()>);
+
+impl UiWaker {
+    pub fn new() -> (Self, Receiver<()>) {
+        let (tx, rx) = flume::bounded(1);
+        (Self(tx), rx)
+    }
+
+    pub fn wake(&self) {
+        let _ = self.0.try_send(());
+    }
+}
+
 /// Append-only buffer for streaming tool output to the UI. Writers append
 /// under a Mutex, readers get a cheap Arc clone via `read_if_dirty()`.
 pub struct SharedBuf {
     committed: Mutex<Arc<Vec<SnapshotLine>>>,
     dirty: AtomicBool,
+    /// Only a buffer shown in a plugin window gets one, since the UI reads
+    /// those on a tick. A tool body is repainted by the agent events that
+    /// carry it.
+    waker: OnceLock<UiWaker>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Opaque click handler owned by the Lua layer. It lives on the buffer
     /// itself, not on any one handle, so every handle wrapping this buf,
@@ -762,6 +823,7 @@ impl SharedBuf {
         Self {
             committed: Mutex::new(Arc::new(Vec::new())),
             dirty: AtomicBool::new(false),
+            waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
             notifying: AtomicBool::new(false),
@@ -794,7 +856,16 @@ impl SharedBuf {
         *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// There is one waker per process, so the first window to show the buffer
+    /// sets it for good.
+    pub fn wake_on_change(&self, waker: &UiWaker) {
+        let _ = self.waker.set(waker.clone());
+    }
+
     fn notify_change(&self) {
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
         if self.notifying.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -985,6 +1056,16 @@ pub struct TurnCompleteEvent {
     pub model: String,
     #[serde(skip)]
     pub cost: Option<f64>,
+    /// What the same turn would have cost at the provider's published list
+    /// price, `Some` only when the model is subsidised by a flat
+    /// subscription and `cost` is therefore always `$0`. Narrower than the
+    /// ledger's `list_cost`, which banks the list price on every model: this
+    /// one exists to be shown beside a `$0` bill, so a metered turn has
+    /// nothing to add. See [`maki_providers::Model::subsidised_list_cost`].
+    #[serde(skip)]
+    pub subsidised_list_cost: Option<f64>,
+    /// Tokens the next request would carry. This is the one context number
+    /// the host reports, so `Done` and the compaction trigger agree with it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_size: Option<u32>,
     /// The model's context window, so consumers can gauge `context_size`
@@ -1019,6 +1100,9 @@ pub struct TurnCompleteEvent {
 pub struct RunTotals {
     pub usage: TokenUsage,
     pub cost: Option<f64>,
+    /// Un-subsidised list price, banked for metered and subsidised models
+    /// alike so the total is never a partial sum of whichever turns happened
+    /// to be subsidised.
     pub list_cost: Option<f64>,
 }
 
@@ -1384,6 +1468,7 @@ mod tests {
     fn tool_results_builds_message_with_tool_result_blocks() {
         let msg = tool_results(vec![
             ToolDoneEvent {
+                call: None,
                 id: "t1".into(),
                 tool: Arc::from("bash"),
                 output: Arc::new(ToolOutput::Plain("ok".into())),
@@ -1392,6 +1477,7 @@ mod tests {
                 written_path: None,
             },
             ToolDoneEvent {
+                call: None,
                 id: "t2".into(),
                 tool: Arc::from("read"),
                 output: Arc::new(ToolOutput::Plain("fail".into())),
@@ -1420,6 +1506,7 @@ mod tests {
             text: "[image: pic.png 1KB]".into(),
         };
         let done = |id: &str, output: ToolOutput| ToolDoneEvent {
+            call: None,
             id: id.into(),
             tool: Arc::from("t"),
             output: Arc::new(output),
@@ -1502,6 +1589,7 @@ mod tests {
     #[test]
     fn wrote_to_checks_path_and_error_flag() {
         let ok_event = ToolDoneEvent {
+            call: None,
             id: "id".into(),
             tool: Arc::from("write"),
             output: Arc::new(ToolOutput::Plain("wrote 10 bytes".into())),
@@ -1512,6 +1600,7 @@ mod tests {
         assert!(!ok_event.wrote_to(Path::new("/plans/other.md")));
 
         let err_event = ToolDoneEvent {
+            call: None,
             is_error: true,
             ..ok_event
         };
@@ -1760,6 +1849,7 @@ mod tests {
         expected: Option<&str>,
     ) {
         let event = ToolDoneEvent {
+            call: None,
             id: "id".into(),
             tool: Arc::from("tool"),
             output: Arc::new(output),

@@ -23,7 +23,36 @@ pub struct TextBuffer {
     lines: Vec<String>,
     raw_x: usize,
     cursor_y: usize,
-    revision: u64,
+    version: u64,
+}
+
+/// Refuses an offset that splits a character. Rounding it would move an edit
+/// a plugin asked for onto text it never read.
+fn check_boundary(value: &str, what: &str, idx: usize) -> Result<(), String> {
+    if value.is_char_boundary(idx) {
+        return Ok(());
+    }
+    Err(format!("{what} {idx} is inside a character"))
+}
+
+/// A tab is one column to the width math and [`TAB_SPACES`] wide to the
+/// terminal, and a bare `\r` is a line break the wrapping never sees, so both
+/// are spent here before they throw the caret cell off. Every other control
+/// character goes the same way: the terminal draws it as nothing while the
+/// width math counts it as one column, which shifts every later cell on the
+/// row and lands a click on the wrong character. It would also reach the
+/// model inside text nobody could see.
+///
+/// Text a plugin writes and text the user pastes go through this. Text the
+/// user composed elsewhere, in `$EDITOR` or a restored draft, lands verbatim
+/// through [`TextBuffer::set_value`]: expanding the tabs of a tab-indented
+/// prompt on its way back in would send the model something the user never
+/// wrote.
+fn sanitize(text: &str) -> String {
+    text.replace('\t', TAB_SPACES)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace(|c: char| c.is_control() && c != '\n', "")
 }
 
 impl TextBuffer {
@@ -33,34 +62,41 @@ impl TextBuffer {
             lines,
             raw_x: 0,
             cursor_y: 0,
-            revision: 0,
+            version: 0,
         }
     }
 
+    /// The counter the input render cache and the session draft memoize
+    /// against: the same count [`Self::version`] exposes to plugins.
     pub fn revision(&self) -> u64 {
-        self.revision
+        self.version
     }
 
-    /// Replace the contents in place, moving the revision on.
+    /// Replaces the whole value verbatim and parks the cursor at the start.
     ///
-    /// Assigning a freshly built `TextBuffer` instead would restart the
-    /// revision at zero, and anything memoizing against it — the input
-    /// render cache, the session draft — would go on showing what the old
-    /// buffer held. Two history entries of the same length landed on the
-    /// same cache key exactly this way.
-    pub fn set_value(&mut self, input: String) {
-        self.lines = input.split('\n').map(str::to_string).collect();
+    /// The version keeps climbing across the swap: assigning a freshly built
+    /// `TextBuffer` instead would restart it at zero, and anything memoizing
+    /// against it — the input render cache, the session draft — would go on
+    /// showing what the old buffer held. Two history entries of the same
+    /// length landed on the same cache key exactly this way. A plugin
+    /// holding a version from before a history entry was recalled cannot
+    /// mistake the entry for the value it read.
+    pub fn set_value(&mut self, value: String) {
+        self.lines = value.split('\n').map(str::to_string).collect();
         self.raw_x = 0;
         self.cursor_y = 0;
-        self.bump();
-    }
-
-    fn bump(&mut self) {
-        self.revision = self.revision.wrapping_add(1);
+        self.version += 1;
     }
 
     pub fn value(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// Counts every change to the value, never a cursor move. `maki.ui.input`
+    /// hands it to Lua so an edit planned against an older value fails instead
+    /// of landing on text the user has typed since.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn lines(&self) -> &[String] {
@@ -101,11 +137,11 @@ impl TextBuffer {
         let bx = self.byte_x();
         self.lines[self.cursor_y].insert(bx, c);
         self.raw_x = self.x() + 1;
-        self.bump();
+        self.version += 1;
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        let sanitized = text.replace('\t', TAB_SPACES);
+        let sanitized = sanitize(text);
         for (i, chunk) in sanitized.split('\n').enumerate() {
             if i > 0 {
                 self.add_line();
@@ -114,7 +150,7 @@ impl TextBuffer {
                 let bx = self.byte_x();
                 self.lines[self.cursor_y].insert_str(bx, chunk);
                 self.raw_x = self.x() + chunk.chars().count();
-                self.bump();
+                self.version += 1;
             }
         }
     }
@@ -127,7 +163,7 @@ impl TextBuffer {
         self.lines.insert(self.cursor_y + 1, right);
         self.raw_x = 0;
         self.cursor_y += 1;
-        self.bump();
+        self.version += 1;
     }
 
     pub fn remove_char(&mut self) {
@@ -138,7 +174,7 @@ impl TextBuffer {
             let bx = Self::char_to_byte(self.current_line(), x - 1);
             self.lines[self.cursor_y].remove(bx);
             self.raw_x = x - 1;
-            self.bump();
+            self.version += 1;
         }
     }
 
@@ -149,7 +185,7 @@ impl TextBuffer {
         } else {
             let bx = self.byte_x();
             self.lines[self.cursor_y].remove(bx);
-            self.bump();
+            self.version += 1;
         }
     }
 
@@ -208,13 +244,13 @@ impl TextBuffer {
         let byte_start = Self::char_to_byte(self.current_line(), x);
         let byte_end = Self::char_to_byte(self.current_line(), new_x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
-        self.bump();
+        self.version += 1;
     }
 
     pub fn kill_to_end_of_line(&mut self) {
         let bx = self.byte_x();
         self.lines[self.cursor_y].truncate(bx);
-        self.bump();
+        self.version += 1;
     }
 
     pub fn remove_word_before_cursor(&mut self) {
@@ -229,7 +265,7 @@ impl TextBuffer {
         let byte_end = Self::char_to_byte(line, x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
         self.raw_x = new_x;
-        self.bump();
+        self.version += 1;
     }
 
     pub fn move_word_left(&mut self) {
@@ -292,7 +328,84 @@ impl TextBuffer {
         self.lines = vec![String::new()];
         self.raw_x = 0;
         self.cursor_y = 0;
-        self.bump();
+        self.version += 1;
+    }
+
+    /// Bytes in the whole buffer, newlines counted as one each. The unit
+    /// `maki.ui.input` speaks, because Lua string functions index bytes, so a
+    /// plugin slices the value it read with the offsets it was handed.
+    pub fn byte_len(&self) -> usize {
+        let bytes: usize = self.lines.iter().map(String::len).sum();
+        bytes + self.lines.len().saturating_sub(1)
+    }
+
+    /// The cursor as a flat byte offset into [`Self::byte_len`].
+    pub fn cursor_byte(&self) -> usize {
+        let before: usize = self.lines[..self.cursor_y]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum();
+        before + Self::char_to_byte(self.current_line(), self.x())
+    }
+
+    /// Clamps past the end of the buffer, the way every other cursor move
+    /// here does, and refuses an offset inside a character.
+    pub fn set_cursor_byte(&mut self, idx: usize) -> Result<(), String> {
+        let mut left = idx.min(self.byte_len());
+        for (y, line) in self.lines.iter().enumerate() {
+            if left <= line.len() {
+                check_boundary(line, "cursor", left)?;
+                self.cursor_y = y;
+                self.raw_x = line[..left].chars().count();
+                return Ok(());
+            }
+            left -= line.len() + 1;
+        }
+        self.move_to_end();
+        Ok(())
+    }
+
+    /// Replaces a flat byte range, leaving the cursor after the inserted text
+    /// unless {cursor} names another offset.
+    ///
+    /// Errors instead of clamping: these ranges come from async plugin
+    /// handlers, so a range that no longer fits means the buffer moved under
+    /// the caller and the edit would land somewhere it was never meant to.
+    /// The cursor is checked against the value the edit produces, so a bad one
+    /// refuses the whole edit instead of leaving half applied.
+    ///
+    /// {text} is sanitized the way typed and pasted text is, so the default
+    /// cursor lands at the end of what was really inserted.
+    pub fn replace_byte_range(
+        &mut self,
+        start: usize,
+        stop: usize,
+        text: &str,
+        cursor: Option<usize>,
+    ) -> Result<(), String> {
+        if start > stop {
+            return Err(format!("start {start} is past stop {stop}"));
+        }
+        let len = self.byte_len();
+        if stop > len {
+            return Err(format!("stop {stop} is past the end of the input ({len})"));
+        }
+        let value = self.value();
+        check_boundary(&value, "start", start)?;
+        check_boundary(&value, "stop", stop)?;
+
+        let text = sanitize(text);
+        let mut next = String::with_capacity(value.len() - (stop - start) + text.len());
+        next.push_str(&value[..start]);
+        next.push_str(&text);
+        next.push_str(&value[stop..]);
+
+        let caret = cursor.unwrap_or(start + text.len()).min(next.len());
+        check_boundary(&next, "cursor", caret)?;
+
+        self.lines = next.split('\n').map(str::to_string).collect();
+        self.version += 1;
+        self.set_cursor_byte(caret)
     }
 
     pub fn set_cursor(&mut self, y: usize, x: usize) {
@@ -309,7 +422,7 @@ impl TextBuffer {
         if self.cursor_y + 1 < self.lines.len() {
             let next = self.lines.remove(self.cursor_y + 1);
             self.lines[self.cursor_y].push_str(&next);
-            self.bump();
+            self.version += 1;
         }
     }
 
@@ -326,7 +439,7 @@ impl TextBuffer {
         let byte_x = Self::char_to_byte(&self.lines[self.cursor_y], self.x());
         self.lines[self.cursor_y].drain(..byte_x);
         self.raw_x = 0;
-        self.bump();
+        self.version += 1;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditResult {
@@ -453,7 +566,7 @@ impl TextBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditResult, TextBuffer};
+    use super::{EditResult, TAB_SPACES, TextBuffer};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use test_case::test_case;
 
@@ -528,6 +641,30 @@ mod tests {
         let mut buf = TextBuffer::new(String::new());
         buf.insert_text("\tindented\n\t\tdouble");
         assert_eq!(buf.lines(), &["  indented", "    double"]);
+    }
+
+    /// The terminal gives a control character no cells while the input box
+    /// counts it as one column wide, so one left in the value shifts every
+    /// later cell of the row and a click lands on the wrong character. It is
+    /// invisible in the box and still sent to the model, so both ways in
+    /// spend it.
+    #[test_case("\u{c}\u{c}abc",   "abc"      ; "form_feeds")]
+    #[test_case("a\u{1b}[31mb",    "a[31mb"   ; "escape_sequence")]
+    #[test_case("a\0b\u{7f}c",     "abc"      ; "nul_and_delete")]
+    #[test_case("a\u{b}b",         "ab"       ; "vertical_tab")]
+    fn pasted_and_plugin_text_lose_their_control_characters(text: &str, expected: &str) {
+        let mut pasted = TextBuffer::new(String::new());
+        pasted.insert_text(text);
+        assert_eq!(pasted.value(), expected);
+
+        let mut written = TextBuffer::new(String::new());
+        written.replace_byte_range(0, 0, text, None).unwrap();
+        assert_eq!(written.value(), expected);
+        assert_eq!(
+            written.cursor_byte(),
+            expected.len(),
+            "the default cursor counts what was really inserted"
+        );
     }
 
     #[test]
@@ -722,5 +859,146 @@ mod tests {
         buf.kill_to_start_of_line();
         assert_eq!(buf.value(), "hello world");
         assert_eq!(buf.x(), 0);
+    }
+
+    #[test_case("",              0, 0, 0  ; "empty")]
+    #[test_case("abc",           0, 2, 2  ; "single_line")]
+    #[test_case("ab\ncd",        1, 1, 4  ; "newline_counts_as_one")]
+    #[test_case("日本\n語",       1, 1, 10 ; "multi_byte")]
+    #[test_case("a\n\nb",        2, 0, 3  ; "blank_line")]
+    fn cursor_byte_counts_newlines(value: &str, y: usize, x: usize, expected: usize) {
+        let mut buf = TextBuffer::new(value.into());
+        buf.set_cursor(y, x);
+        assert_eq!(buf.cursor_byte(), expected);
+    }
+
+    #[test_case("",        0 ; "empty")]
+    #[test_case("abc",     3 ; "single_line")]
+    #[test_case("ab\ncd",  5 ; "two_lines")]
+    #[test_case("🦀\n🦀",  9 ; "emoji")]
+    fn byte_len_matches_flat_length(value: &str, expected: usize) {
+        assert_eq!(TextBuffer::new(value.into()).byte_len(), expected);
+    }
+
+    #[test_case(0, 0, 0 ; "start")]
+    #[test_case(3, 1, 0 ; "line_start")]
+    #[test_case(5, 1, 2 ; "end")]
+    #[test_case(99, 1, 2 ; "past_end_clamps")]
+    fn set_cursor_byte_round_trips(idx: usize, y: usize, x: usize) {
+        let mut buf = TextBuffer::new("ab\ncd".into());
+        buf.set_cursor_byte(idx).unwrap();
+        assert_eq!((buf.y(), buf.x()), (y, x));
+    }
+
+    /// Rounding down to the character that offset is inside of would silently
+    /// move the cursor somewhere the plugin never asked for.
+    #[test_case(1 ; "inside_the_first_char")]
+    #[test_case(8 ; "inside_a_char_on_the_second_line")]
+    fn set_cursor_byte_refuses_an_offset_inside_a_char(idx: usize) {
+        let mut buf = TextBuffer::new("日本\n語".into());
+        assert!(buf.set_cursor_byte(idx).is_err());
+        assert_eq!((buf.y(), buf.x()), (0, 0));
+    }
+
+    #[test]
+    fn replace_byte_range_spans_lines() {
+        let mut buf = TextBuffer::new("hello\nworld".into());
+        buf.replace_byte_range(3, 8, "X", None).unwrap();
+        assert_eq!(buf.value(), "helXrld");
+        assert_eq!(buf.cursor_byte(), 4);
+    }
+
+    #[test]
+    fn replace_byte_range_inserts_newlines() {
+        let mut buf = TextBuffer::new("ab".into());
+        buf.replace_byte_range(1, 1, "\nX\n", None).unwrap();
+        assert_eq!(buf.lines(), &["a", "X", "b"]);
+        assert_eq!((buf.y(), buf.x()), (2, 0));
+    }
+
+    #[test]
+    fn replace_byte_range_is_byte_indexed_not_char_indexed() {
+        let mut buf = TextBuffer::new("日本語".into());
+        buf.replace_byte_range(3, 6, "🦀", None).unwrap();
+        assert_eq!(buf.value(), "日🦀語");
+        assert_eq!(buf.cursor_byte(), 7);
+    }
+
+    #[test]
+    fn replace_byte_range_on_empty_buffer_inserts() {
+        let mut buf = TextBuffer::new(String::new());
+        buf.replace_byte_range(0, 0, "hi", None).unwrap();
+        assert_eq!(buf.value(), "hi");
+        assert_eq!(buf.cursor_byte(), 2);
+    }
+
+    #[test]
+    fn replace_byte_range_honours_an_explicit_cursor() {
+        let mut buf = TextBuffer::new("日本語".into());
+        buf.replace_byte_range(0, 3, "🦀", Some(0)).unwrap();
+        assert_eq!(buf.value(), "🦀本語");
+        assert_eq!(buf.cursor_byte(), 0);
+    }
+
+    #[test_case(3, 2,  None    ; "inverted")]
+    #[test_case(0, 99, None    ; "past_end")]
+    #[test_case(1, 3,  None    ; "start_inside_a_char")]
+    #[test_case(0, 4,  None    ; "stop_inside_a_char")]
+    #[test_case(0, 3,  Some(2) ; "cursor_inside_a_char")]
+    fn replace_byte_range_refuses_an_offset_it_cannot_honour(
+        start: usize,
+        stop: usize,
+        cursor: Option<usize>,
+    ) {
+        let mut buf = TextBuffer::new("日本語".into());
+        let before = buf.version();
+        assert!(buf.replace_byte_range(start, stop, "x", cursor).is_err());
+        assert_eq!(buf.value(), "日本語");
+        assert_eq!(
+            buf.version(),
+            before,
+            "a refused edit must not bump the version"
+        );
+    }
+
+    /// `$EDITOR` output, a restored draft and a rewind prompt all come back
+    /// through here, and none of them is a plugin write. A tab-indented
+    /// prompt has to reach the model as the user wrote it.
+    #[test_case("a\tb"    ; "tabs")]
+    #[test_case("a\r\nb"  ; "crlf")]
+    #[test_case("a\rb"    ; "lone_cr")]
+    fn set_value_keeps_the_text_verbatim(value: &str) {
+        let mut buf = TextBuffer::new(String::new());
+        buf.set_value(value.into());
+        assert_eq!(buf.value(), value);
+    }
+
+    /// The cursor defaults to the end of the inserted text, so it counts the
+    /// expanded tab, not the one byte that was asked for.
+    #[test]
+    fn replace_byte_range_sanitizes_and_leaves_the_cursor_past_it() {
+        let mut buf = TextBuffer::new("ab".into());
+        buf.replace_byte_range(1, 1, "\t", None).unwrap();
+        assert_eq!(buf.value(), format!("a{TAB_SPACES}b"));
+        assert_eq!(buf.cursor_byte(), 1 + TAB_SPACES.len());
+    }
+
+    #[test]
+    fn version_counts_value_changes_and_ignores_cursor_moves() {
+        let mut buf = TextBuffer::new("ab".into());
+        let start = buf.version();
+        buf.move_home();
+        buf.move_right();
+        assert_eq!(buf.version(), start, "moving the cursor changes no value");
+
+        buf.push_char('c');
+        let typed = buf.version();
+        assert!(typed > start);
+
+        buf.set_value("recalled".into());
+        assert!(
+            buf.version() > typed,
+            "a whole-value swap has to keep the counter climbing"
+        );
     }
 }

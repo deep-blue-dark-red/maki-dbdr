@@ -1,11 +1,13 @@
 //! `maki.model`. The event loop owns the model slot and the per-session
-//! request options, so every call has to round-trip to it.
+//! request options, so most calls round-trip to it; `info` resolves
+//! locally and works without a UI.
 
 use maki_lua_macro::{lua_fn, lua_table};
-use mlua::{Error as LuaError, Lua, Result as LuaResult, Value};
+use maki_providers::Model;
+use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
-use crate::api::util::pair::Pair;
+use crate::api::util::pair::{Pair, err_pair};
 
 const SET_ARG_ERR: &str = "expected a model spec string or an options table";
 
@@ -19,6 +21,75 @@ async fn roundtrip(
         reply_tx,
     })
     .await
+}
+
+fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
+    let tbl = lua.create_table()?;
+    tbl.set("spec", model.spec())?;
+    tbl.set("id", model.id.clone())?;
+    tbl.set("provider", model.provider.to_string())?;
+    tbl.set("provider_display", model.provider_display_name())?;
+    tbl.set("tier", model.tier.to_string())?;
+    tbl.set("context_window", model.context_window)?;
+    if let Some(max) = model.max_output_tokens {
+        tbl.set("max_output_tokens", max)?;
+    }
+    // `None` writes nil, which is the third state: a plugin reads false as
+    // "metered" and nil as "we never learned a price".
+    tbl.set("free", model.free())?;
+    // Top level, not under `pricing`: the subsidy is a property of the route
+    // to the provider, and `pricing` is absent on exactly the subsidised
+    // models whose rates never resolved, which is the case it exists for.
+    tbl.set("subsidised_by", model.subsidy_source())?;
+    if !model.pricing.is_zero() {
+        let pricing = lua.create_table()?;
+        pricing.set("input", model.pricing.input)?;
+        pricing.set("output", model.pricing.output)?;
+        pricing.set("cache_write", model.pricing.cache_write)?;
+        pricing.set("cache_read", model.pricing.cache_read)?;
+        if let Some(fast) = &model.pricing.fast {
+            let f = lua.create_table()?;
+            f.set("input", fast.input)?;
+            f.set("output", fast.output)?;
+            pricing.set("fast", f)?;
+        }
+        tbl.set("pricing", pricing)?;
+    }
+    Ok(tbl)
+}
+
+/// Resolve a model spec to everything maki knows about it: identity, tier,
+/// context window, and the price table the session would be billed by --
+/// including rates resolved from provider config or the bundled catalog
+/// (e.g. subsidised custom providers), which the provider's own /v1/models
+/// endpoint may never report. Purely local -- no UI round-trip, no network
+/// -- so it also works from slash commands and headless embeddings.
+///
+/// @param spec string `"provider/id"`, as listed by `available()`.
+/// @return (table|nil, string|nil) `{spec, id, provider, provider_display,
+///   tier, subsidised_by?, context_window, max_output_tokens?, free?,
+///   pricing?}`, or nil and an error.
+///
+///   `free` has three states: `true` when the model is known to cost nothing,
+///   `false` when it is metered, and nil when no source ever quoted a rate.
+///   Check `~= nil` before trusting it.
+///
+///   `subsidised_by` names the subscription prepaying this provider (billed
+///   cost is $0, the rates are the list-price reference). It sits at the top
+///   level because it holds whether or not rates resolved.
+///
+///   `pricing` is present only when rates are known:
+///   `{input, output, cache_write, cache_read}` in USD per million tokens,
+///   plus optional `fast = {input, output}`.
+/// @example
+/// local m, err = maki.model.info("anthropic/claude-opus-4-6")
+/// if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
+#[lua_fn]
+fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
+    match Model::from_spec(&spec) {
+        Ok(model) => Ok((Some(model_info_table(lua, &model)?), None)),
+        Err(e) => Ok(err_pair(e)),
+    }
 }
 
 /// Reads the focused session's model, thinking level, and fast mode.
@@ -104,7 +175,7 @@ lua_table! {
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.model" => pub(crate) fn create_model_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [get(tx), available(tx), set(tx)]
+    DOCS [get(tx), available(tx), set(tx), info()]
 }
 
 #[cfg(test)]
@@ -193,6 +264,69 @@ mod tests {
             eval(&lua, "return model.get()"),
             (Json::Null, Some(expected.to_owned()))
         );
+    }
+
+    /// `info` resolves locally: no UI required, and a builtin model answers
+    /// with its identity and price table.
+    #[test]
+    fn info_resolves_a_builtin_model_without_a_ui() {
+        let lua = lua_with_model(None);
+        let (val, err) = eval(&lua, "return model.info('deepseek/deepseek-v4-pro')");
+        assert_eq!(err, None);
+        assert_eq!(val["spec"], json!("deepseek/deepseek-v4-pro"));
+        assert_eq!(val["provider"], json!("deepseek"));
+        assert!(val["context_window"].as_u64().unwrap() > 0);
+        assert!(val["pricing"]["input"].as_f64().unwrap() > 0.0);
+        assert!(val["pricing"]["output"].as_f64().unwrap() > 0.0);
+        assert_eq!(val["subsidised_by"], Json::Null);
+        assert_eq!(val["free"], json!(false));
+    }
+
+    /// The three states have to read apart: a known `$0`, a metered model, and
+    /// one nothing ever quoted a price for.
+    #[test_case("zai/glm-4.7-flash",       json!(true)  ; "builtin_zero_priced_is_free")]
+    #[test_case("deepseek/deepseek-v4-pro", json!(false) ; "metered_is_not_free")]
+    #[test_case("deepseek/my-custom-model", Json::Null   ; "no_price_table_is_unknown")]
+    fn info_free_separates_zero_from_unknown(spec: &str, expected: Json) {
+        let lua = lua_with_model(None);
+        let (val, err) = eval(&lua, &format!("return model.info('{spec}')"));
+        assert_eq!(err, None);
+        assert_eq!(val["free"], expected);
+    }
+
+    /// An unresolvable spec answers `(nil, err)` instead of throwing.
+    #[test]
+    fn info_unknown_provider_returns_an_error_pair() {
+        let lua = lua_with_model(None);
+        let (val, err) = eval(&lua, "return model.info('no-such-provider/nope')");
+        assert_eq!(val, Json::Null);
+        assert!(err.is_some());
+    }
+
+    /// The subsidy sits at the top level so pickers can render "$0 (Max)"
+    /// rows without re-deriving it.
+    #[test]
+    fn info_table_carries_the_subsidy_source() {
+        let lua = Lua::new();
+        let mut model = Model::from_spec("deepseek/deepseek-v4-pro").unwrap();
+        model.subsidised_by = Some(std::sync::Arc::from("Max"));
+        let tbl = model_info_table(&lua, &model).unwrap();
+        let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
+        assert_eq!(json["subsidised_by"], json!("Max"));
+    }
+
+    /// The case the feature exists for: a subsidised provider whose rates
+    /// never resolved. Nesting the source under `pricing` hid it exactly
+    /// here, because `pricing` is omitted at zero rates.
+    #[test]
+    fn info_table_reports_a_subsidy_with_no_price_table() {
+        let lua = Lua::new();
+        let mut model = Model::from_spec("deepseek/my-custom-model").unwrap();
+        model.subsidised_by = Some(std::sync::Arc::from("Max"));
+        let tbl = model_info_table(&lua, &model).unwrap();
+        let json = lua_to_json(&lua, &Value::Table(tbl)).unwrap();
+        assert_eq!(json["pricing"], Json::Null);
+        assert_eq!(json["subsidised_by"], json!("Max"));
     }
 
     /// A non-spec argument is a programmer error, so it throws instead of

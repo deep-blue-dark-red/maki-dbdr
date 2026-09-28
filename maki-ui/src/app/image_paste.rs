@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use crate::image;
+use flume::Receiver;
 use maki_agent::{ImageMediaType, ImageSource};
 
 use crate::repaint::Dirty;
@@ -9,6 +10,27 @@ use crate::repaint::Dirty;
 use super::App;
 
 const IMAGE_NOT_SUPPORTED_MSG: &str = "Model does not support image input";
+
+/// Runs a blocking read on its own thread: a clipboard owner may be slow or
+/// hung, and the UI thread must not wait on it.
+pub(super) fn spawn_read<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Receiver<T> {
+    let (tx, rx) = flume::bounded(1);
+    thread::spawn(move || {
+        let _ = tx.send(read());
+    });
+    rx
+}
+
+pub(super) fn take_ready<T>(receivers: &mut Vec<Receiver<T>>) -> Option<T> {
+    let (i, value) = receivers
+        .iter()
+        .enumerate()
+        .find_map(|(i, rx)| rx.try_recv().ok().map(|value| (i, value)))?;
+    receivers.swap_remove(i);
+    Some(value)
+}
 
 impl App {
     pub(super) fn start_file_image_paste(&mut self, path: PathBuf, media_type: ImageMediaType) {
@@ -33,23 +55,13 @@ impl App {
         flash: String,
         f: impl FnOnce() -> Result<ImageSource, String> + Send + 'static,
     ) {
-        let (tx, rx) = flume::bounded(1);
-        thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        self.image_paste_rx.push(rx);
+        self.image_paste_rx.push(spawn_read(f));
         self.status_bar.flash(flash);
     }
 
     pub fn poll_image_paste(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
-        let mut i = 0;
-        while i < self.image_paste_rx.len() {
-            let Ok(result) = self.image_paste_rx[i].try_recv() else {
-                i += 1;
-                continue;
-            };
-            self.image_paste_rx.swap_remove(i);
+        while let Some(result) = take_ready(&mut self.image_paste_rx) {
             dirty = Dirty::YES;
             match result {
                 Ok(source) => {

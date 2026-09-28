@@ -1407,7 +1407,7 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
     }
 }
 
-fn permission_keys() -> String {
+pub(crate) fn permission_keys() -> String {
     Permission::ALL
         .iter()
         .map(|p| p.manifest_key())

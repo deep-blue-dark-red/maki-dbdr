@@ -15,13 +15,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::model::Model;
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::NO_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
@@ -34,22 +40,86 @@ const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
 
+pub(crate) const SLUG: &str = "anthropic";
+pub(crate) const DISPLAY_NAME: &str = "Anthropic";
 const ENV_VAR: &str = "ANTHROPIC_API_KEY";
 const API_KEY_HEADER: &str = "x-api-key";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-6";
+const LOGIN_URL: &str = "https://console.anthropic.com/settings/keys";
+/// The messages endpoint, which is what the docs quote; the provider itself
+/// builds it from [`API_ORIGIN`] plus [`MESSAGES_PATH`].
+const DOC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const FEATURES: &str = "Prompt caching, thinking mode (adaptive/budgeted), advanced tool use";
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "anthropic",
-    display_name: "Anthropic",
-    protocol: maki_config::providers::Protocol::Anthropic,
-    default_base_url: API_ORIGIN,
-    default_api_key_env: ENV_VAR,
-    default_model: "anthropic/claude-sonnet-4-6",
-    plans: None,
-    login_url: Some("https://console.anthropic.com/settings/keys"),
-    needs_url: false,
-});
+const LONG_CONTEXT_NOTE: &str = r#"Add `-1m` to any Claude model, like `claude-sonnet-4-6-1m`, to use the 1M token context window."#;
 
-pub(crate) use shared::models;
+const BEDROCK_NOTE: &str = r#"#### Amazon Bedrock
+
+If you already use Claude through AWS Bedrock, you can point Maki at it instead of the direct Anthropic API. Set `CLAUDE_CODE_USE_BEDROCK=1` and Maki will route all Anthropic requests through Bedrock. The same models, the same features, just a different door.
+
+You will need `AWS_REGION` and one of the following for auth:
+
+| Method | Env vars |
+|--------|----------|
+| IAM credentials | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and optionally `AWS_SESSION_TOKEN`) |
+| Credentials file | `AWS_PROFILE` (defaults to `default`), reads `~/.aws/credentials` |
+| Bearer token | `AWS_BEARER_TOKEN_BEDROCK` |
+| Gateway proxy | `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` (skips signing, useful behind a proxy that handles auth) |
+
+You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROPIC_BEDROCK_BASE_URL`. These env var names match Claude Code, so if you were already using Bedrock there, the same setup works here."#;
+
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Claude,
+    supports_thinking: true,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
+    models_toml: include_str!("../../../models/anthropic.toml"),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: NO_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Anthropic,
+        default_base_url: API_ORIGIN,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[DOC_API_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[LONG_CONTEXT_NOTE, BEDROCK_NOTE],
+    },
+};
+
+inventory::submit!(SPEC.config_row());
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    if bedrock::is_enabled() {
+        Ok(Box::new(bedrock::Bedrock::new(timeouts)?))
+    } else {
+        Ok(Box::new(Anthropic::new(timeouts)?))
+    }
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
 
 /// Returns whether the fast-mode beta header must be attached. We re-check
 /// `supports_fast()` here rather than trusting `opts.fast` alone, so a stale UI
@@ -368,14 +438,7 @@ impl Anthropic {
             let body_text = response.text().await?;
             let page: ModelsPage = serde_json::from_str(&body_text)?;
             for m in page.data {
-                if m.max_input_tokens >= shared::LONG_CONTEXT_WINDOW {
-                    models.push(crate::model::ModelInfo::id_only(format!(
-                        "{}{}",
-                        m.id,
-                        shared::LONG_CONTEXT_SUFFIX
-                    )));
-                }
-                models.push(crate::model::ModelInfo::id_only(m.id));
+                models.extend(discovered_model_infos(m));
             }
 
             if !page.has_more {
@@ -489,6 +552,42 @@ struct ApiModelInfo {
     id: String,
     #[serde(default)]
     max_input_tokens: u32,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+/// Discovery entries for one /v1/models item: a synthesised `-1m` variant
+/// (when the reported input window reaches 1M) followed by the base model.
+/// The variant pins `context_window` to [`shared::LONG_CONTEXT_WINDOW`] --
+/// that is what the suffix asserts -- while the base keeps whatever
+/// discovery reported; zero-valued fields are treated as unreported.
+///
+/// The base id deliberately drops a window at or past 1M. Reaching it needs
+/// the [`shared::LONG_CONTEXT_BETA`] header, which is gated on the `-1m`
+/// suffix, so the base id would gauge against a million tokens the request
+/// never asks for: compaction would never fire and the API would reject the
+/// turn at 200K. Unreported lets the curated entry answer instead.
+fn discovered_model_infos(m: ApiModelInfo) -> Vec<crate::model::ModelInfo> {
+    let mut models = Vec::new();
+    let context_window = (m.max_input_tokens > 0
+        && m.max_input_tokens < shared::LONG_CONTEXT_WINDOW)
+        .then_some(m.max_input_tokens);
+    let max_output_tokens = m.max_tokens.filter(|&v| v > 0);
+    if m.max_input_tokens >= shared::LONG_CONTEXT_WINDOW {
+        models.push(crate::model::ModelInfo {
+            id: format!("{}{}", m.id, shared::LONG_CONTEXT_SUFFIX),
+            context_window: Some(shared::LONG_CONTEXT_WINDOW),
+            max_output_tokens,
+            ..Default::default()
+        });
+    }
+    models.push(crate::model::ModelInfo {
+        id: m.id,
+        context_window,
+        max_output_tokens,
+        ..Default::default()
+    });
+    models
 }
 
 #[derive(Deserialize)]
@@ -543,6 +642,7 @@ mod tests {
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
+    const THINKING_SIGNATURE: &str = "sig";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -676,8 +776,8 @@ mod tests {
         assert_eq!(origin(input), expected);
     }
 
-    fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from_bytes_static(data);
+    fn mock_response(data: impl Into<Vec<u8>>) -> isahc::Response<isahc::AsyncBody> {
+        let body = isahc::AsyncBody::from(data.into());
         isahc::Response::builder().status(200).body(body).unwrap()
     }
 
@@ -734,6 +834,46 @@ data: {\"type\":\"message_stop\"}\n";
                 }
             }
             assert_eq!(deltas, vec!["Hello", " world"]);
+        })
+    }
+
+    #[test_case(
+        r#"{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}"# ;
+        "zeros_in_message_start"
+    )]
+    #[test_case(
+        r#"{"input_tokens":42,"cache_creation_input_tokens":5,"cache_read_input_tokens":8}"# ;
+        "same_counts_in_message_start"
+    )]
+    fn parse_sse_usage_in_message_delta(start_usage: &str) {
+        smol::block_on(async {
+            let sse_data = format!(
+                "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{start_usage}}}}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"input_tokens\":42,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":8,\"output_tokens\":10}}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n"
+            );
+
+            let (tx, _rx) = flume::unbounded();
+            let resp = parse_sse(mock_response(sse_data), &tx, TEST_STREAM_TIMEOUT)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resp.usage,
+                TokenUsage {
+                    input: 42,
+                    output: 10,
+                    cache_creation: 5,
+                    cache_read: 8,
+                    reasoning: 0,
+                    cost: None,
+                }
+            );
         })
     }
 
@@ -820,6 +960,13 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
     fn thinking_block(thinking: &str) -> ContentBlock {
         ContentBlock::Thinking {
             thinking: thinking.into(),
+            signature: Some(THINKING_SIGNATURE.into()),
+        }
+    }
+
+    fn unsigned_thinking_block(thinking: &str) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: thinking.into(),
             signature: None,
         }
     }
@@ -895,6 +1042,31 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         assert_eq!(json[0]["content"][0]["text"], "kept");
         assert_eq!(json[1]["content"].as_array().unwrap().len(), 1);
         assert_eq!(json[1]["content"][0]["text"], EMPTY_RESPONSE_MARKER);
+    }
+
+    #[test_case(
+        vec![unsigned_thinking_block("summary"), text_block("reply")],
+        json!([{"type": "text", "text": "reply"}])
+        ; "unsigned_thinking_dropped"
+    )]
+    #[test_case(
+        vec![thinking_block("hmm"), text_block("reply")],
+        json!([
+            {"type": "thinking", "thinking": "hmm", "signature": THINKING_SIGNATURE},
+            {"type": "text", "text": "reply"},
+        ])
+        ; "signed_thinking_kept"
+    )]
+    #[test_case(
+        vec![unsigned_thinking_block("summary")],
+        json!([{"type": "text", "text": EMPTY_RESPONSE_MARKER}])
+        ; "only_unsigned_thinking_falls_back"
+    )]
+    fn wire_messages_replay_only_signed_thinking(content: Vec<ContentBlock>, expected: Value) {
+        let messages = vec![message(Role::Assistant, content)];
+        let json: Value = serde_json::to_value(shared::wire_messages(&messages)).unwrap();
+
+        assert_eq!(json[0]["content"], expected);
     }
 
     #[test]
@@ -1187,5 +1359,81 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
                 matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hi")
             );
         })
+    }
+
+    #[test]
+    fn api_model_info_deserializes_discovery_metadata() {
+        let m: ApiModelInfo = serde_json::from_value(json!({
+            "id": "claude-x",
+            "max_input_tokens": 200_000,
+            "max_tokens": 64_000,
+        }))
+        .unwrap();
+        assert_eq!(m.max_input_tokens, 200_000);
+        assert_eq!(m.max_tokens, Some(64_000));
+
+        // Fields absent from the response must not fail deserialization.
+        let m: ApiModelInfo = serde_json::from_value(json!({ "id": "claude-x" })).unwrap();
+        assert_eq!(m.max_input_tokens, 0);
+        assert_eq!(m.max_tokens, None);
+    }
+
+    #[test]
+    fn discovered_metadata_flows_into_model_info() {
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-x".into(),
+            max_input_tokens: 200_000,
+            max_tokens: Some(64_000),
+        });
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].context_window, Some(200_000));
+        assert_eq!(infos[0].max_output_tokens, Some(64_000));
+
+        // Zero means the API did not report the field.
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-x".into(),
+            max_input_tokens: 0,
+            max_tokens: Some(0),
+        });
+        assert_eq!(infos[0].context_window, None);
+        assert_eq!(infos[0].max_output_tokens, None);
+    }
+
+    #[test]
+    fn long_context_model_gets_pinned_1m_variant() {
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-x".into(),
+            max_input_tokens: shared::LONG_CONTEXT_WINDOW,
+            max_tokens: Some(64_000),
+        });
+        assert_eq!(infos.len(), 2);
+        assert_eq!(
+            infos[0].id,
+            format!("claude-x{}", shared::LONG_CONTEXT_SUFFIX)
+        );
+        assert_eq!(infos[0].context_window, Some(shared::LONG_CONTEXT_WINDOW));
+        assert_eq!(infos[0].max_output_tokens, Some(64_000));
+        // Only the suffixed id may claim 1M; the base leaves the window
+        // unreported so the curated 200K stands and compaction still fires.
+        assert_eq!(infos[1].id, "claude-x");
+        assert_eq!(infos[1].context_window, None);
+    }
+
+    /// The window the gauge trusts must match the window the request gets:
+    /// the 1M beta header is suffix-gated, so a base id that inherited a
+    /// discovered 1M would overrun the API's 200K cap with no compaction.
+    #[test]
+    fn discovered_1m_does_not_widen_the_base_id() {
+        let infos = discovered_model_infos(ApiModelInfo {
+            id: "claude-sonnet-4-5".into(),
+            max_input_tokens: shared::LONG_CONTEXT_WINDOW,
+            max_tokens: Some(64_000),
+        });
+        crate::model_registry::set_known_models("anthropic", infos);
+        let base = Model::from_spec("anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(base.context_window, 200_000);
+        let long = Model::from_spec("anthropic/claude-sonnet-4-5-1m").unwrap();
+        assert_eq!(long.context_window, shared::LONG_CONTEXT_WINDOW);
+        crate::model_registry::set_known_models("anthropic", Vec::new());
     }
 }

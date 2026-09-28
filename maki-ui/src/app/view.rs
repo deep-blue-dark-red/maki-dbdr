@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
-use crate::components::input::Placeholder;
+use crate::components::input::{BORDER_ROWS, Placeholder};
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -32,28 +32,61 @@ struct ViewLayout {
 
 impl App {
     fn prompt_open(&self) -> bool {
-        self.pack_review.is_open() || self.permission_prompt.is_open()
+        self.pack_review.is_open()
+            || self.permission_prompt.is_open()
+            || self.cache_miss_prompt.is_open()
     }
 
-    fn form_visible(&self) -> bool {
+    pub(super) fn form_visible(&self) -> bool {
         self.prompt_open() || self.plan_form_active()
     }
 
-    /// Returns the cell the input box reversed for its cursor, if any.
+    /// Whether the chat input is the widget the user's keys reach. It decides
+    /// the block cursor and the terminal cursor, never where the caret was
+    /// drawn.
+    fn input_has_keyboard(&self) -> bool {
+        !self.any_overlay_open()
+    }
+
+    /// Whether a plugin writing to the chat input would land in a box the
+    /// user can see: nothing covering it, the main chat in front, no form in
+    /// the bottom panel, and a {area} tall enough to leave the box a text
+    /// row. An overlay counts even when it only takes the keyboard, because
+    /// the user is reading it and not the draft.
+    ///
+    /// Worked out from state on every ask rather than recorded while
+    /// painting: a whole batch of wakes is handled between two frames, so a
+    /// permission prompt and a plugin's edit can arrive in the same one and
+    /// the edit has to meet the prompt that is already open.
+    pub(crate) fn input_live(&self, area: Rect) -> bool {
+        self.is_main_chat()
+            && !self.any_overlay_open()
+            && !self.plan_form_active()
+            && self.compute_layout(area).input_area.height > BORDER_ROWS
+    }
+
+    /// Returns the cell the terminal cursor belongs on, the cell the input box
+    /// reversed. An overlay owning the keyboard leaves none, so there is
+    /// nothing to park an IME on.
+    ///
+    /// Where the caret was drawn is a separate question, and a caret-anchored
+    /// float is placed from that: the caret outlives an overlay taking focus,
+    /// or a window on it would jump to the middle of the screen the moment it
+    /// started reading keys.
     pub fn view(&mut self, frame: &mut Frame) -> Option<Position> {
         let layout = self.compute_layout(frame.area());
         let render_chat = self.active_chat;
 
         self.render_background(frame);
         self.render_messages(frame, &layout, render_chat);
-        let cursor = self.render_bottom_panel(frame, &layout);
+        let caret = self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
         let mut overlay_rect = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
+        overlay_rect = self.render_top_modals(frame, overlay_rect, caret);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
-        cursor
+        caret.filter(|_| self.input_has_keyboard())
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
@@ -80,12 +113,14 @@ impl App {
         let max_bottom = inner.height.saturating_sub(MIN_CHAT_ROWS);
         let bottom_height = if self.permission_prompt.is_open() {
             self.permission_prompt.height(inner.width).min(max_bottom)
+        } else if self.cache_miss_prompt.is_open() {
+            self.cache_miss_prompt.height(inner.width).min(max_bottom)
         } else if self.pack_review.is_open() {
             self.pack_review.height(inner.width).min(max_bottom)
         } else if below_active {
             0
         } else if self.form_visible() {
-            self.plan_form.height().min(max_bottom)
+            self.plan_form.height(max_bottom).min(max_bottom)
         } else if self.is_main_chat() {
             let panel_h: u16 = self.float_mgr.panel_reqs().iter().map(|(_, h)| *h).sum();
             queue_panel::height(self.queue.panel_len())
@@ -158,9 +193,15 @@ impl App {
         );
     }
 
+    /// Returns the cell the input box drew its caret in, when it drew one at
+    /// all: a prompt, a form, a `below` split or a focused subagent chat all
+    /// take the box off screen, and a box scrolled off its own viewport draws
+    /// without a caret.
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
+        } else if self.cache_miss_prompt.is_open() {
+            self.cache_miss_prompt.view(frame, layout.bottom_area);
         } else if self.pack_review.is_open() {
             self.pack_review.view(frame, layout.bottom_area);
         } else if !self.is_main_chat() {
@@ -211,16 +252,16 @@ impl App {
                 .then(|| self.plan_form.hint_line())
                 .flatten()
                 .or_else(|| self.lua_hint_line());
-            let cursor = self.input_box.view(
+            let caret = self.input_box.view(
                 frame,
                 layout.input_area,
                 placeholder,
                 self.separator_style(),
-                !self.any_overlay_open(),
+                self.input_has_keyboard(),
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
-            return cursor;
+            return caret;
         }
         None
     }
@@ -268,7 +309,14 @@ impl App {
         overlay_rect
     }
 
-    fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+    /// {caret} is the cell `render_bottom_panel` just drew the input caret in,
+    /// so a float anchored to it is placed against the frame being painted.
+    fn render_top_modals(
+        &mut self,
+        frame: &mut Frame,
+        mut overlay_rect: Rect,
+        caret: Option<Position>,
+    ) -> Rect {
         let full = frame.area();
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {
@@ -290,6 +338,7 @@ impl App {
             let ctx = UsageModalContext {
                 total: &self.state.token_usage,
                 total_cost: self.state.cost,
+                total_list_cost: self.state.subsidised_list_cost,
                 by_model: self.state.session.usage_by_model(),
                 model: &self.state.model,
                 fast: self.state.fast,
@@ -306,7 +355,7 @@ impl App {
                 overlay_rect = r;
             }
         }
-        let r = self.float_mgr.view(frame, full);
+        let r = self.float_mgr.view(frame, full, caret);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -370,6 +419,8 @@ impl App {
                 cost: chat
                     .cost
                     .or_else(|| (!self.state.model.pricing.is_zero()).then_some(0.0)),
+                list_cost: chat.list_cost,
+                subsidy_source: self.state.model.subsidised_by.clone(),
                 context_window: self.state.model.context_window,
                 show_global: self.chats.len() > 1,
             },

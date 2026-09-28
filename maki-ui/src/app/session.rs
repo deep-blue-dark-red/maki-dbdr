@@ -4,18 +4,18 @@ use std::time::{Duration, Instant};
 
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
+use crate::components::Action;
 use crate::components::rewind_picker::{RewindEntry, display_msg_index_for_turn};
 use crate::components::settings_picker::UserSettings;
-use crate::components::{Action, LoadedSession};
 use maki_agent::ToolOutput;
 use maki_lua::SessionEndReason;
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, TokenUsage, estimate_message_tokens,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionMeta, StoredSubagent};
+use maki_storage::sessions::{SessionMeta, StoredMode, StoredSubagent};
 
-use crate::AppSession;
+use crate::{AppSession, OpenSession};
 
 use super::session_state::{SessionState, rules_to_stored, stored_to_rules};
 use super::{App, Mode, PendingInput, PlanState, Status};
@@ -35,19 +35,25 @@ pub(super) struct Sent {
     pub at: Instant,
 }
 
-/// The one content check: `App::checkpoint` saves a session only when this
-/// holds, and the shutdown report reuses it to say which tabs were saved, so
-/// the report and the disk can never disagree.
+/// The one content check. `App::checkpoint` saves a session only when this
+/// holds, and the shutdown report asks the same question, so the report and the
+/// disk never disagree. A draft, a queue or plan mode used to count too, and
+/// every tab that had one showed up in the picker as another empty session.
 pub(crate) fn session_has_content(session: &AppSession) -> bool {
     !session.messages().is_empty()
-        || session.meta.input_draft.is_some()
-        || !session.meta.queued_messages.is_empty()
-        || session.meta.mode != Some(maki_storage::sessions::StoredMode::Build)
 }
 
 impl App {
-    pub(crate) fn has_content(&self) -> bool {
-        session_has_content(&self.state.session)
+    /// Stricter than `session_has_content`. A draft or plan mode is not worth a
+    /// file, but it is still worth keeping when the picker wants this tab for
+    /// another session.
+    pub(crate) fn is_blank(&self) -> bool {
+        let session = &self.state.session;
+        let meta = &session.meta;
+        !session_has_content(session)
+            && meta.input_draft.is_none()
+            && meta.queued_messages.is_empty()
+            && meta.mode == Some(StoredMode::Build)
     }
 
     /// The event loop runs this once per frame per session. It syncs whatever
@@ -75,15 +81,14 @@ impl App {
             self.state.token_usage,
         );
         self.publish_session_name();
-        if !self.has_content() {
-            // A draft typed and then deleted is already on disk, and a file with
-            // nothing in it is a session the picker still offers to resume. Idle
-            // only: submitting empties the draft a frame before the agent mirrors
-            // the prompt back, and that gap is not an abandoned session.
+
+        if !session_has_content(&self.state.session) {
+            // A rewind to the first prompt empties a session already on disk,
+            // which the picker would otherwise still offer to resume.
             let id = self.state.session.id;
-            if self.status == Status::Idle && self.last_sent.take_if(|last| last.id == id).is_some()
-            {
-                self.storage_writer.delete(id, |_| {});
+            if self.last_sent.take_if(|last| last.id == id).is_some() {
+                self.storage_writer
+                    .delete(id, Some(self.state.claim.clone()), |_| {});
             }
             return;
         }
@@ -109,7 +114,8 @@ impl App {
             }
         }
 
-        self.storage_writer.send(Arc::clone(&self.state.session));
+        self.storage_writer
+            .send(Arc::clone(&self.state.session), self.state.claim.clone());
         self.last_sent = Some(sent);
     }
 
@@ -213,7 +219,7 @@ impl App {
     }
 
     pub(super) fn save_input_history(&self) {
-        if let Err(e) = self.input_box.history().save(&self.storage) {
+        if let Err(e) = self.input_box.history().save() {
             tracing::warn!(error = %e, "input history save failed");
         }
     }
@@ -233,7 +239,7 @@ impl App {
         self.chats.push(main);
         self.active_chat = 0;
         self.chat_index.clear();
-        self.status = super::Status::Idle;
+        self.status = Status::Idle;
         self.clear_exit_request();
         self.queue.clear();
         self.recoverable_queue.clear();
@@ -243,6 +249,11 @@ impl App {
         self.last_esc = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
+        // The draft this chrome belonged to is gone, and the Lua thread still
+        // owes answers about it. Retiring them here is what keeps a handler
+        // that comes back after a `/new`, a rewind or a tab switch from
+        // implementing a plan in a session the user never picked in.
+        self.plan_answers.abandon();
     }
 
     pub(crate) fn restore_display(&mut self) {
@@ -346,12 +357,9 @@ impl App {
     /// agent did not give it (rewind, load, new session), the mirror handle
     /// goes away in the same breath, so no later checkpoint can bring the
     /// agent's stale copy back. Only `respawn_agent` hands a live mirror in.
-    fn install_local_history(&mut self) -> LoadedSession {
+    fn install_local_history(&mut self) -> Vec<Message> {
         self.shared_history = None;
-        LoadedSession {
-            messages: self.state.session.messages().to_vec(),
-            model_spec: self.state.session.model.clone(),
-        }
+        self.state.session.messages().to_vec()
     }
 
     /// `/new` swaps a fresh session under this tab, `Ctrl-N` spawns a new tab
@@ -360,9 +368,13 @@ impl App {
     /// `SessionMeta` field has to pick a side: settings that say how the user
     /// works ride along, anything a finished turn produced stays behind, or the
     /// new session writes over work it never did.
-    pub(crate) fn blank_session(&self) -> AppSession {
-        let mut session = AppSession::new(&self.state.model.spec(), &self.state.session.cwd);
-        session.meta = SessionMeta {
+    pub(crate) fn blank_session(&self) -> OpenSession {
+        let mut open = OpenSession::fresh(
+            &self.state.model.spec(),
+            &self.state.session.cwd,
+            &self.storage,
+        );
+        open.session.meta = SessionMeta {
             mode: Some(self.state.mode.into()),
             thinking: Some(self.state.thinking.into()),
             fast: self.state.fast_intent(),
@@ -375,7 +387,7 @@ impl App {
             queued_messages: Vec::new(),
             yolo: self.permissions.persisted_yolo(),
         };
-        session
+        open
     }
 
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
@@ -395,16 +407,18 @@ impl App {
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         self.lua_event_handle
             .end_session(self.state.session.id, SessionEndReason::Reset);
-        let session = self.blank_session();
+        // Swapping the claim is what gives the old session back: the snapshot
+        // `checkpoint_now` just queued holds its own clone until it lands.
+        let OpenSession { session, claim } = self.blank_session();
         self.apply_stored_permissions(&session.meta);
         self.state.session = Arc::new(session);
+        self.state.claim = claim;
         self.reset_ui_chrome();
         maki_otel::emit::session_started(
             maki_otel::emit::START_FRESH,
             Some(&self.state.session.id.to_string()),
         );
-        self.install_local_history();
-        vec![Action::NewSession]
+        vec![Action::RestartAgent(self.install_local_history())]
     }
 
     pub(super) fn open_goto_picker(&mut self) -> Vec<Action> {
@@ -457,7 +471,7 @@ impl App {
         self.input_box.set_input(entry.prompt_text);
         self.input_box.buffer.move_to_end();
 
-        vec![Action::LoadSession(Box::new(self.install_local_history()))]
+        vec![Action::RestartAgent(self.install_local_history())]
     }
 
     pub(super) fn goto_turn(&mut self, turn_str: &str) -> Vec<Action> {
@@ -485,16 +499,17 @@ impl App {
         vec![]
     }
 
+    /// The event loop owns the policy and the providers, so it resolves the
+    /// model and this only adopts it.
     pub(crate) fn apply_loaded_session(
         &mut self,
-        session: AppSession,
-        fallback_model: &Model,
-    ) -> LoadedSession {
+        open: OpenSession,
+        model: &Model,
+    ) -> Vec<Message> {
         let previous = self.state.session.id;
         self.checkpoint_now();
-        self.apply_stored_permissions(&session.meta);
-        self.state =
-            SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
+        self.apply_stored_permissions(&open.session.meta);
+        self.state = SessionState::from_session(open, model, &self.storage);
         if previous != self.state.session.id {
             self.lua_event_handle
                 .end_session(previous, SessionEndReason::Load);
@@ -509,16 +524,16 @@ impl App {
     }
 
     pub(crate) fn load_session(&mut self, session_id: MakiId) -> Vec<Action> {
-        let session = match AppSession::load(session_id, &self.storage) {
-            Ok(s) => s,
+        let open = match OpenSession::load(session_id, &self.storage) {
+            Ok(open) => open,
             Err(e) => {
                 self.status_bar
                     .flash(format!("Failed to load session: {e}"));
                 return vec![];
             }
         };
-        let loaded = self.apply_loaded_session(session, &self.state.model.clone());
-        vec![Action::LoadSession(Box::new(loaded))]
+        let loaded = self.apply_loaded_session(open, &self.state.model.clone());
+        vec![Action::RestartAgent(loaded)]
     }
 
     pub(super) fn shift_session(&mut self, delta: i32) -> Vec<Action> {
@@ -731,11 +746,11 @@ mod tests {
         assert!(!app.state.fast);
         assert_eq!(app.state.pending_fast, !cancel);
         assert_eq!(app.build_meta().fast, !cancel);
-        assert_eq!(app.blank_session().meta.fast, !cancel);
+        assert_eq!(app.blank_session().session.meta.fast, !cancel);
 
         let mut model = app.state.model.clone();
         model.supports_fast_override = Some(FastSupport::Supported);
-        app.update_model(&model);
+        app.state.update_model(&model);
         assert_eq!(app.state.fast, !cancel);
         assert!(!app.state.pending_fast);
         assert_eq!(app.build_meta().fast, !cancel);

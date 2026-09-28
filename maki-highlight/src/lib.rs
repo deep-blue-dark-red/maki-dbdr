@@ -35,6 +35,19 @@ pub enum SegmentColor {
     Default,
 }
 
+/// Shaped like a plugin span style, so a lookup goes straight back to Lua.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiStyle {
+    pub fg: Option<SegmentColor>,
+    pub bg: Option<SegmentColor>,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub dim: bool,
+    pub strikethrough: bool,
+    pub reversed: bool,
+}
+
 impl SegmentColor {
     pub fn from_syntect(c: syntect::highlighting::Color) -> Self {
         match c.a {
@@ -109,7 +122,7 @@ pub fn ansi_color_index(name: &str) -> Option<u8> {
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static THEME: OnceLock<RwLock<ThemeState>> = OnceLock::new();
-static UI_COLORS: OnceLock<RwLock<HashMap<String, SegmentColor>>> = OnceLock::new();
+static UI_STYLES: OnceLock<RwLock<HashMap<String, UiStyle>>> = OnceLock::new();
 static BLOCK_CACHE: OnceLock<RwLock<BlockCache>> = OnceLock::new();
 static THEME_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -268,22 +281,24 @@ pub fn theme() -> Arc<Theme> {
     Arc::clone(&theme_lock().read().unwrap_or_else(|e| e.into_inner()).theme)
 }
 
-fn ui_colors_lock() -> &'static RwLock<HashMap<String, SegmentColor>> {
-    UI_COLORS.get_or_init(RwLock::default)
+fn ui_styles_lock() -> &'static RwLock<HashMap<String, UiStyle>> {
+    UI_STYLES.get_or_init(RwLock::default)
 }
 
-pub fn set_ui_colors(colors: HashMap<String, SegmentColor>) {
-    *ui_colors_lock().write().unwrap_or_else(|e| e.into_inner()) = colors;
+pub fn set_ui_styles(styles: HashMap<String, UiStyle>) {
+    *ui_styles_lock().write().unwrap_or_else(|e| e.into_inner()) = styles;
 }
 
-pub fn theme_color(name: &str) -> Option<SegmentColor> {
-    if let Some(&c) = ui_colors_lock()
+pub fn ui_style(name: &str) -> Option<UiStyle> {
+    ui_styles_lock()
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(name)
-    {
-        return Some(c);
-    }
+        .cloned()
+}
+
+/// Colors the syntax theme names itself. UI styles live in [`ui_style`].
+pub fn theme_color(name: &str) -> Option<SegmentColor> {
     let settings = &theme().settings;
     // Field names match `ThemeSettings`' serde representation, which is what
     // this used to go through `serde_json::to_value` to reach. Non-colour

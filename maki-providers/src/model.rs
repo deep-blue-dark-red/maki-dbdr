@@ -15,11 +15,12 @@ use maki_config::ModelPolicy;
 use maki_storage::sessions::{Effort, MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, dynamic};
-use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF, ThinkingFields};
+use crate::spec::{ProviderRegistry, ProviderSpec};
+use crate::types::{FALLBACK_MAX_THINKING_BUDGET, THINKING_ADAPTIVE, THINKING_OFF};
+use maki_config::providers::ThinkingFields;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
@@ -41,6 +42,9 @@ pub enum ModelError {
     NotAllowed(String),
 }
 
+/// Also the shape of a rate in `models/<slug>.toml`. None of the four rates may
+/// ever gain a `#[serde(default)]`: a curated row that forgets one has to fail
+/// loudly instead of quietly billing the user zero.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelPricing {
     pub input: f64,
@@ -73,13 +77,7 @@ impl ModelInfo {
     pub fn id_only(id: String) -> Self {
         Self {
             id,
-            context_window: None,
-            max_output_tokens: None,
-            pricing: None,
-            supports_thinking: None,
-            supports_vision: None,
-            tier: None,
-            provider_info: None,
+            ..Self::default()
         }
     }
 }
@@ -94,6 +92,19 @@ pub struct FastPricing {
 }
 
 impl ModelPricing {
+    /// Rates in USD per 1M tokens, with no fast tier and no subsidy -- the shape of
+    /// every static catalog entry. `const` so provider catalogs can call it;
+    /// it also spares each entry from spelling out fields it never sets.
+    pub const fn per_million(input: f64, output: f64, cache_write: f64, cache_read: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_write,
+            cache_read,
+            fast: None,
+        }
+    }
+
     pub const ZERO: Self = Self {
         input: 0.0,
         output: 0.0,
@@ -125,7 +136,8 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ModelFamily {
     Claude,
     Generic,
@@ -224,8 +236,17 @@ impl From<maki_config::providers::Tier> for ModelTier {
     }
 }
 
-#[derive(Debug)]
+/// One curated row, deserialized straight from `models/<slug>.toml`, so the
+/// file and this struct cannot drift apart. `max_output_tokens` is the only
+/// field allowed a serde default: TOML has no null, and an absent limit really
+/// does mean "the provider never published one". Everything else missing, or
+/// spelled wrong, is a mistake worth hearing about.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelEntry {
+    /// `'static` because the rest of the crate hands these out as model ids
+    /// that outlive any borrow; [`crate::manifest::leak_prefixes`] pays for it.
+    #[serde(deserialize_with = "crate::manifest::leak_prefixes")]
     pub prefixes: &'static [&'static str],
     pub tier: ModelTier,
     pub family: ModelFamily,
@@ -233,6 +254,7 @@ pub struct ModelEntry {
     pub vision: bool,
     pub default: bool,
     pub pricing: ModelPricing,
+    #[serde(default)]
     pub max_output_tokens: Option<u32>,
     pub context_window: u32,
 }
@@ -292,14 +314,14 @@ struct ModelSources<'a> {
 }
 
 impl<'a> ModelSources<'a> {
-    fn resolve(manifest: &'a ProviderManifest, model_id: &str) -> Self {
-        let entry = lookup_entry(manifest.models, model_id).ok();
+    fn resolve(spec: &'a ProviderSpec, model_id: &str) -> Self {
+        let entry = lookup_entry(spec.models(), model_id).ok();
         let exact = entry.is_some_and(|entry| names_exactly(entry, model_id));
         Self {
             entry,
             exact,
             catalog: (!exact)
-                .then(|| catalog::model_meta_if_available(manifest.slug, model_id))
+                .then(|| catalog::model_meta_if_available(spec.slug, model_id))
                 .flatten(),
         }
     }
@@ -335,6 +357,36 @@ impl ModelFamily {
 }
 
 const FAST_PROVIDER: &str = "anthropic";
+
+/// The thinking keys a `providers.toml` entry may lend a builtin local model
+/// (see [`maki_config::providers::overlays_local_thinking`]). Everything else
+/// about those slugs stays compiled in, so this reads no base URLs and no
+/// keys, and leaves auth wiring alone.
+fn local_thinking_overlay(
+    slug: &str,
+    model_id: &str,
+) -> (Option<ThinkingSupport>, Option<Box<ThinkingFields>>) {
+    if !maki_config::providers::overlays_local_thinking(slug) {
+        return (None, None);
+    }
+    let config = maki_config::providers::ProvidersConfig::load();
+    let Some(declared) = config
+        .get(slug)
+        .and_then(|def| def.models.iter().find(|m| m.id == model_id))
+    else {
+        return (None, None);
+    };
+    let supports = declared
+        .supports_thinking
+        // Spelling out how a model thinks is as good as saying that it does.
+        // Otherwise the ollama spec answers "no", every request is clamped
+        // back to off, and the fragments the user wrote are dead weight.
+        .or_else(|| declared.thinking_fields.is_some().then_some(true));
+    (
+        ThinkingSupport::from_flags(supports, declared.requires_thinking.unwrap_or(false)),
+        declared.thinking_fields.clone().map(Box::new),
+    )
+}
 
 /// `Required` marks APIs that reject requests with thinking disabled;
 /// [`crate::RequestOptions::clamped`] raises `Off` to minimal effort for them.
@@ -386,16 +438,25 @@ pub struct Model {
     pub supports_tool_examples_override: Option<bool>,
     /// Resolved thinking support, used by gateway providers (e.g. Aperture)
     /// that stream through a native provider chosen at runtime. `None` falls
-    /// back to discovery, then the provider manifest.
+    /// back to discovery, then the provider spec.
     pub thinking_override: Option<ThinkingSupport>,
     pub supports_vision_override: Option<bool>,
     pub supports_fast_override: Option<FastSupport>,
     pub pricing: ModelPricing,
+    /// Set when this route to the model is prepaid via a flat subscription
+    /// (e.g. Claude Max through cliproxy), so the billed cost is always `$0`
+    /// even though [`Self::pricing`] still reflects the provider's published
+    /// list price. Holds the subscription's display name (e.g. `"Max"`),
+    /// shown next to the list-price reference. It lives on the model rather
+    /// than the rate table because it describes the route to the provider,
+    /// not a per-token rate. `Arc<str>` so the status bar can clone the name
+    /// into its per-frame stats without allocating a fresh string.
+    pub subsidised_by: Option<Arc<str>>,
     /// Discovery reported an explicit all-zero price. Distinct from a zero
     /// `pricing`, which also covers "no price is known".
     pub discovered_free: bool,
     /// What the model declares it can generate, `None` when unknown (see
-    /// [`ProviderKind::fallback_max_output`]). Stays the same across requests,
+    /// [`ProviderSpec::fallback_max_output`]). Stays the same across requests,
     /// because [`Self::max_thinking_budget`] scales effort levels off it.
     pub max_output_tokens: Option<u32>,
     /// What this one request may generate, when a caller trimmed the cap to a
@@ -411,16 +472,16 @@ impl Model {
     /// Family and tier are about which dialect a model speaks and what role it
     /// plays, which a relative answers just as well, so they read the curated
     /// row whether or not it was an exact match.
-    fn from_base(manifest: &ProviderManifest, slug: &str, model_id: &str) -> Self {
-        let sources = ModelSources::resolve(manifest, model_id);
+    fn from_base(base: &ProviderSpec, slug: &str, model_id: &str) -> Self {
+        let sources = ModelSources::resolve(base, model_id);
         let entry = sources.entry;
         let spec = format!("{slug}/{model_id}");
         // Discovery keys `known_models` by the builtin slug, so a dynamic or
         // custom slug reads positional tiers and metadata through its base.
-        let discovered = model_registry::discovered(manifest.slug, model_id);
+        let discovered = model_registry::discovered(base.slug, model_id);
         let discovered = discovered.as_ref();
-        let tier = model_registry::tier_for(&spec, manifest.slug, entry.map(|e| e.tier));
-        let family = entry.map_or(manifest.family, |entry| entry.family);
+        let tier = model_registry::tier_for(&spec, base.slug, entry.map(|e| e.tier));
+        let family = entry.map_or(base.family, |entry| entry.family);
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
         let pricing = discovered_pricing
             .cloned()
@@ -434,27 +495,29 @@ impl Model {
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
             .or_else(|| sources.pick(|entry| entry.max_output_tokens, |meta| meta.output))
-            .or(manifest.fallback_max_output);
+            .or(base.fallback_max_output);
         let context_window = discovered
             .and_then(|info| info.context_window)
             .or_else(|| anthropic::shared::long_context_window(model_id))
             .or_else(|| sources.pick(|entry| Some(entry.context_window), |meta| meta.context))
-            .unwrap_or(manifest.fallback_context_window);
+            .unwrap_or(base.fallback_context_window);
+        let (thinking_override, thinking_fields) = local_thinking_overlay(slug, model_id);
         Self {
             id: model_id.to_string(),
             provider: Arc::from(slug),
             tier,
             family,
             supports_tool_examples_override: None,
-            thinking_override: None,
+            thinking_override,
             supports_vision_override: None,
             supports_fast_override: None,
             pricing,
+            subsidised_by: None,
             discovered_free: discovered_pricing.is_some_and(ModelPricing::is_zero),
             max_output_tokens,
             turn_output_tokens: None,
             context_window,
-            thinking_fields: None,
+            thinking_fields,
         }
     }
 
@@ -475,6 +538,7 @@ impl Model {
             supports_vision_override: meta.supports_vision,
             supports_fast_override: None,
             pricing: meta.pricing.unwrap_or_default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(max_output_tokens),
             turn_output_tokens: None,
@@ -488,18 +552,18 @@ impl Model {
             return thinking != ThinkingSupport::No;
         }
         // Discovery keys `known_models` by the builtin slug; resolve dynamic
-        // and custom slugs through their base manifest before looking up.
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        // and custom slugs through their base spec before looking up.
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
             return false;
         };
-        model_registry::discovered(manifest.slug, &self.id)
+        model_registry::discovered(spec.slug, &self.id)
             .and_then(|d| d.supports_thinking)
             .or_else(|| {
-                ModelSources::resolve(manifest, &self.id)
+                ModelSources::resolve(spec, &self.id)
                     .catalog?
                     .supports_thinking
             })
-            .unwrap_or(manifest.supports_thinking)
+            .unwrap_or(spec.supports_thinking)
     }
 
     pub fn requires_thinking(&self) -> bool {
@@ -512,13 +576,13 @@ impl Model {
         if let Some(vision) = self.supports_vision_override {
             return vision;
         }
-        let Some(manifest) = ManifestRegistry::for_slug(&self.provider) else {
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
             return self.family.supports_vision();
         };
-        model_registry::discovered(manifest.slug, &self.id)
+        model_registry::discovered(spec.slug, &self.id)
             .and_then(|d| d.supports_vision)
             .or_else(|| {
-                ModelSources::resolve(manifest, &self.id)
+                ModelSources::resolve(spec, &self.id)
                     .pick(|entry| Some(entry.vision), |meta| meta.supports_vision)
             })
             .unwrap_or_else(|| self.family.supports_vision())
@@ -602,14 +666,14 @@ impl Model {
     /// subscription bills a flat rate, so there is no fast per-token price to
     /// read. Everyone else falls back to fast-tier pricing, so capability and
     /// billing can never disagree. The provider gate keeps that path to
-    /// Anthropic-based providers, resolved through the base manifest so oauth
+    /// Anthropic-based providers, resolved through the base spec so oauth
     /// scripts keep it; Bedrock separately ignores `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
         match self.supports_fast_override {
             Some(support) => support == FastSupport::Supported,
             None => {
                 self.pricing.fast.is_some()
-                    && ManifestRegistry::for_slug(&self.provider)
+                    && ProviderRegistry::for_slug(&self.provider)
                         .is_some_and(|m| m.slug == FAST_PROVIDER)
             }
         }
@@ -639,10 +703,16 @@ impl Model {
     /// of zero, which is all a free model ever sends, and free has always shown
     /// no cost rather than "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        if self.subsidised_by.is_some() {
+            // Prepaid via a flat subscription: the turn ran, but nothing was
+            // billed per-token. Still require a real price table so an
+            // unpriced model does not report a false "$0.000".
+            return self.list_cost(usage, fast).map(|_| 0.0);
+        }
         usage.cost.filter(|bill| *bill > 0.0).or_else(|| {
             let cost = self.list_cost(usage, fast)?;
             let schedule =
-                ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
+                ProviderRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
             Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
         })
     }
@@ -661,15 +731,32 @@ impl Model {
             .then(|| usage.estimate(&self.pricing, fast && self.supports_fast()))
     }
 
+    /// What a subsidised turn *would* have cost at [`list_cost`]
+    /// (Self::list_cost) rates, kept as a reference next to the `$0` it
+    /// actually billed. `None` for every model that is not subsidised, so
+    /// callers do not show a redundant list-price figure next to a real bill.
+    pub fn subsidised_list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
+        self.subsidised_by
+            .is_some()
+            .then(|| self.list_cost(usage, fast))
+            .flatten()
+    }
+
+    /// Name of the subscription covering this model's cost (e.g. `"Max"`),
+    /// or `None` when the model is billed per-token as usual.
+    pub fn subsidy_source(&self) -> Option<&str> {
+        self.subsidised_by.as_deref()
+    }
+
     pub fn provider_display_name(&self) -> &'static str {
-        ManifestRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
+        ProviderRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
         if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);
         }
-        let entry = ManifestRegistry::find_default_for_tier(slug, tier)
+        let entry = ProviderRegistry::find_default_for_tier(slug, tier)
             .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
         let model_id = entry.prefixes[0];
         Self::from_spec(&format!("{slug}/{model_id}"))
@@ -686,11 +773,10 @@ impl Model {
             return Ok(model);
         }
 
-        let Some(manifest) = ManifestRegistry::for_slug(slug) else {
+        let Some(spec) = ProviderRegistry::for_slug(slug) else {
             return Err(ModelError::NoAllowedModel(slug.to_string(), tier));
         };
-        manifest
-            .models
+        spec.models()
             .iter()
             .filter(|entry| entry.tier == tier)
             .flat_map(|entry| entry.prefixes)
@@ -712,20 +798,18 @@ impl Model {
         match custom::resolve_tier(slug, tier) {
             custom::TierLookup::Model(model) => return Ok(model),
             custom::TierLookup::NoModelForTier(base) => {
-                let manifest = ManifestRegistry::get(&base.to_string())
-                    .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                let entry = manifest
-                    .models
+                let entry = base
+                    .models()
                     .iter()
                     .find(|e| e.default && e.tier == tier)
                     .ok_or_else(|| ModelError::NoDefault(slug.to_string(), tier))?;
-                return Ok(Self::from_base(manifest, slug, entry.prefixes[0]));
+                return Ok(Self::from_base(base, slug, entry.prefixes[0]));
             }
             custom::TierLookup::Unknown => {}
         }
         // Builtin or dynamic slug: resolve the base default under the slug
         // (dynamic slugs route through `base_for_slug`).
-        if ManifestRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
+        if ProviderRegistry::get(slug).is_some() || dynamic::base_for_slug(slug).is_some() {
             return Self::from_tier(slug, tier);
         }
         Err(ModelError::UnsupportedProvider(slug.to_string()))
@@ -745,18 +829,16 @@ impl Model {
         // then models.dev catalogue sub-provider.
         // Discovery drops any script slug a builtin or custom entry already owns,
         // so a script and a custom provider can never share a slug here.
-        if let Some(manifest) = ManifestRegistry::get(slug) {
-            return Ok(Self::from_base(manifest, slug, model_id));
+        if let Some(spec) = ProviderRegistry::get(slug) {
+            return Ok(Self::from_base(spec, slug, model_id));
         }
 
         if let Some(model) = dynamic::lookup_model(slug, model_id) {
             return Ok(model);
         }
 
-        if let Some(base) = dynamic::base_for_slug(slug)
-            && let Some(manifest) = ManifestRegistry::get(&base.to_string())
-        {
-            return Ok(Self::from_base(manifest, slug, model_id));
+        if let Some(base) = dynamic::base_for_slug(slug) {
+            return Ok(Self::from_base(base, slug, model_id));
         }
 
         if let Some(model) = custom::lookup_model(slug, model_id) {
@@ -773,13 +855,40 @@ impl Model {
     /// Free public models surfaced through the OpenCode provider (Zen/Go),
     /// using the catalog's definition of free (zero input and output price),
     /// the same one that gates `enable_free_models`, plus models a provider's
-    /// `/models` call reported at an explicit zero price.
+    /// `/models` call reported at an explicit zero price, plus a curated row
+    /// that quotes zero for this exact id.
     ///
     /// Queries the live catalog rather than `self.pricing`, which may not yet
     /// reflect catalog prices when discovery hasn't seeded the registry, and
     /// which reads zero for "price unknown" too.
     pub fn is_free(&self) -> bool {
-        self.discovered_free || catalog::free_model_if_available(&self.provider, &self.id)
+        self.discovered_free
+            || catalog::free_model_if_available(&self.provider, &self.id)
+            || self.curated_free()
+    }
+
+    /// A curated row that names this id was checked against the provider's own
+    /// pricing page, so its zero is a real `$0` (zai's free glm rows) and not
+    /// an empty table. A row reached by prefix prices a relative and says
+    /// nothing about this id.
+    fn curated_free(&self) -> bool {
+        let Some(spec) = ProviderRegistry::for_slug(&self.provider) else {
+            return false;
+        };
+        let sources = ModelSources::resolve(spec, &self.id);
+        sources.exact && sources.entry.is_some_and(|entry| entry.pricing.is_zero())
+    }
+
+    /// Free, metered, or unknown. Three states rather than [`Self::is_free`]'s
+    /// two, because a zero [`Self::pricing`] covers both "$0" and "nobody ever
+    /// quoted a rate": a caller that has to render the difference (the Lua
+    /// model table) would otherwise publish "not free" for a model it knows
+    /// nothing about.
+    pub fn free(&self) -> Option<bool> {
+        if self.is_free() {
+            return Some(true);
+        }
+        (!self.pricing.is_zero()).then_some(false)
     }
 }
 
@@ -833,12 +942,24 @@ impl TokenUsage {
     /// purpose: a caller that forgets the cost quietly loses money from the
     /// session total, so saying it out loud is mandatory.
     pub fn billed(&self, cost: Option<f64>) -> StoredTokenUsage {
+        self.billed_with_subsidised_list_cost(cost, None)
+    }
+
+    /// Like [`billed`](Self::billed), but also records what a subsidised
+    /// turn would have cost at the provider's list rates. `subsidised_list_cost`
+    /// is `None` for every non-subsidised turn.
+    pub fn billed_with_subsidised_list_cost(
+        &self,
+        cost: Option<f64>,
+        subsidised_list_cost: Option<f64>,
+    ) -> StoredTokenUsage {
         StoredTokenUsage {
             input: self.input,
             output: self.output,
             cache_creation: self.cache_creation,
             cache_read: self.cache_read,
             cost,
+            subsidised_list_cost,
         }
     }
 
@@ -980,13 +1101,7 @@ mod tests {
     const FREE_MEANS_A_KNOWN_ZERO: &str = "only a price discovery reported as zero means free";
     const TABLE_MUST_NOT_AGREE_BY_LUCK: &str =
         "the table has to disagree, or preferring the bill proves nothing";
-    const PAID_PRICING: ModelPricing = ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 0.0,
-        cache_read: 0.0,
-        fast: None,
-    };
+    const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
 
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5"; "the id itself")]
     #[test_case(&["claude-sonnet-4-5"], "claude-sonnet-4-5-20250929"; "anthropic snapshot")]
@@ -1158,13 +1273,7 @@ mod tests {
 
     #[test]
     fn estimate_computes_all_token_types() {
-        let pricing = ModelPricing {
-            input: 3.00,
-            output: 15.00,
-            cache_write: 3.75,
-            cache_read: 0.30,
-            fast: None,
-        };
+        let pricing = ModelPricing::per_million(3.00, 15.00, 3.75, 0.30);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 100_000,
@@ -1215,14 +1324,11 @@ mod tests {
     #[test]
     fn fast_mode_applies_premium_rates() {
         let pricing = ModelPricing {
-            input: 5.00,
-            output: 25.00,
-            cache_write: 6.25,
-            cache_read: 0.50,
             fast: Some(FastPricing {
                 input: 30.00,
                 output: 150.00,
             }),
+            ..ModelPricing::per_million(5.00, 25.00, 6.25, 0.50)
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -1239,13 +1345,7 @@ mod tests {
 
     #[test]
     fn fast_flag_ignored_without_fast_tier() {
-        let pricing = ModelPricing {
-            input: 3.00,
-            output: 15.00,
-            cache_write: 3.75,
-            cache_read: 0.30,
-            fast: None,
-        };
+        let pricing = ModelPricing::per_million(3.00, 15.00, 3.75, 0.30);
         let usage = TokenUsage {
             input: 1_000_000,
             output: 1_000_000,
@@ -1261,15 +1361,15 @@ mod tests {
 
     #[test]
     fn fast_pricing_is_always_a_premium() {
-        for manifest in ManifestRegistry::builtins() {
-            for entry in manifest.models {
+        for spec in ProviderRegistry::builtins() {
+            for entry in spec.models() {
                 let Some(fast) = &entry.pricing.fast else {
                     continue;
                 };
                 assert!(
                     fast.input >= entry.pricing.input && fast.output >= entry.pricing.output,
                     "{}/{}: fast pricing must not be cheaper than standard",
-                    manifest.slug,
+                    spec.slug,
                     entry.prefixes[0],
                 );
             }
@@ -1278,11 +1378,11 @@ mod tests {
 
     #[test]
     fn spec_roundtrip() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+        for spec in ProviderRegistry::builtins() {
+            if spec.accepts_arbitrary_models {
                 continue;
             }
-            let model = Model::from_tier(manifest.slug, ModelTier::Medium).unwrap();
+            let model = Model::from_tier(spec.slug, ModelTier::Medium).unwrap();
             let round = Model::from_spec(&model.spec()).unwrap();
             assert_eq!(round.id, model.id);
             assert_eq!(round.provider, model.provider);
@@ -1309,21 +1409,21 @@ mod tests {
 
     #[test]
     fn from_tier_covers_all_providers() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+        for spec in ProviderRegistry::builtins() {
+            if spec.accepts_arbitrary_models {
                 continue;
             }
-            let slug: Arc<str> = Arc::from(manifest.slug);
+            let slug: Arc<str> = Arc::from(spec.slug);
             for &tier in &TIERS {
                 // DeepSeek has no Weak tier model
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
+                if spec.slug == "deepseek" && tier == ModelTier::Weak {
                     continue;
                 }
                 // Compaction is user-assigned only, not in static registry
                 if tier == ModelTier::Compaction {
                     continue;
                 }
-                let model = Model::from_tier(manifest.slug, tier).unwrap();
+                let model = Model::from_tier(spec.slug, tier).unwrap();
                 assert_eq!(model.provider, slug);
                 assert_eq!(model.tier, tier);
                 let max_output = model.max_output_tokens.unwrap();
@@ -1391,13 +1491,13 @@ mod tests {
 
     #[test]
     fn exactly_one_default_per_provider_tier() {
-        for manifest in ManifestRegistry::builtins() {
-            if manifest.accepts_arbitrary_models {
+        for spec in ProviderRegistry::builtins() {
+            if spec.accepts_arbitrary_models {
                 continue;
             }
-            let entries = manifest.models;
+            let entries = spec.models();
             for &tier in &TIERS {
-                if manifest.slug == "deepseek" && tier == ModelTier::Weak {
+                if spec.slug == "deepseek" && tier == ModelTier::Weak {
                     continue;
                 }
                 // Compaction is user-assigned only, not in static registry
@@ -1411,7 +1511,7 @@ mod tests {
                 assert_eq!(
                     count, 1,
                     "{}/{}: expected exactly 1 default, found {count}",
-                    manifest.slug, tier
+                    spec.slug, tier
                 );
             }
         }
@@ -1428,15 +1528,15 @@ mod tests {
         let model = Model::from_spec(spec).unwrap();
         assert_eq!(model.provider, Arc::<str>::from(expected_slug));
         assert_eq!(model.id, expected_id);
-        let manifest = ManifestRegistry::get(expected_slug).unwrap();
-        assert_eq!(model.family, manifest.family);
+        let spec = ProviderRegistry::get(expected_slug).unwrap();
+        assert_eq!(model.family, spec.family);
     }
 
     #[test]
     fn from_base_unknown_model_uses_provider_fallbacks() {
         // Deliberately fake id so this stays valid when the model table changes.
         let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
+            ProviderRegistry::get("anthropic").unwrap(),
             "anthropic",
             "claude-nonexistent-99",
         );
@@ -1475,7 +1575,7 @@ mod tests {
     #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
     fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
         let model = Model::from_base(
-            ManifestRegistry::get("anthropic").unwrap(),
+            ProviderRegistry::get("anthropic").unwrap(),
             "anthropic",
             model_id,
         );
@@ -1517,7 +1617,7 @@ mod tests {
     #[test]
     fn fast_pricing_on_a_non_anthropic_model_stays_inert() {
         let mut model = Model::from_base(
-            ManifestRegistry::get("google").unwrap(),
+            ProviderRegistry::get("google").unwrap(),
             "google",
             "gemini-2.5-pro",
         );
@@ -1570,12 +1670,12 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model = Model::from_base(ProviderRegistry::get("ollama").unwrap(), "ollama", model_id);
         assert_eq!(model.context_window, expected_window);
 
         // A dynamic/custom slug shares its base provider's discovery.
         let wrapped = Model::from_base(
-            ManifestRegistry::get("ollama").unwrap(),
+            ProviderRegistry::get("ollama").unwrap(),
             "my-ollama-wrap",
             model_id,
         );
@@ -1641,15 +1741,24 @@ mod tests {
             }],
         );
 
-        let model = Model::from_base(ManifestRegistry::get("ollama").unwrap(), "ollama", model_id);
+        let model = Model::from_base(ProviderRegistry::get("ollama").unwrap(), "ollama", model_id);
         assert_eq!(model.is_free(), expected, "{FREE_MEANS_A_KNOWN_ZERO}");
     }
 
-    /// A schedule hung on the wrong manifest silently doubles every turn of a
+    /// The tri-state is the public one: a plugin has to be able to tell a `$0`
+    /// model from one nothing ever priced, which the boolean collapses.
+    #[test_case("zai/glm-4.7-flash",                   Some(true)  ; "curated_zero_is_free")]
+    #[test_case(DEEPSEEK_SPEC,                         Some(false) ; "priced_is_not_free")]
+    #[test_case(UNPRICED_DEEPSEEK_SPEC,                None        ; "no_price_table_is_unknown")]
+    fn free_separates_zero_from_unknown(spec: &str, expected: Option<bool>) {
+        assert_eq!(Model::from_spec(spec).unwrap().free(), expected);
+    }
+
+    /// A schedule hung on the wrong spec silently doubles every turn of a
     /// provider that bills flat.
     #[test]
     fn only_deepseek_bills_by_the_clock() {
-        let scheduled: Vec<&str> = ManifestRegistry::builtins()
+        let scheduled: Vec<&str> = ProviderRegistry::builtins()
             .iter()
             .filter(|m| m.pricing_schedule.is_some())
             .map(|m| m.slug)
@@ -1658,13 +1767,13 @@ mod tests {
     }
 
     /// Nothing else pins the wiring: a real DeepSeek model has to pick the
-    /// schedule up out of its manifest, and `list_cost` has to stay out of it.
+    /// schedule up out of its spec, and `list_cost` has to stay out of it.
     /// `billed_cost` reads the real clock, so the expectation is sampled either
     /// side of the call in case the hour ticks over mid-test.
     #[test]
     fn deepseek_bills_its_peak_surcharge_on_top_of_the_table() {
         let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
-        let schedule = ManifestRegistry::for_slug(&model.provider)
+        let schedule = ProviderRegistry::for_slug(&model.provider)
             .and_then(|m| m.pricing_schedule)
             .expect("deepseek bills by the clock");
 
@@ -1708,6 +1817,7 @@ mod tests {
                 cache_creation: COUNTERS.cache_creation,
                 cache_read: COUNTERS.cache_read,
                 cost: Some(RECORDED_COST),
+                subsidised_list_cost: None,
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);
@@ -1735,6 +1845,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens,
             turn_output_tokens: None,
@@ -1772,5 +1883,40 @@ mod tests {
             .collect();
         let expected: Vec<Option<u32>> = [None, None].into_iter().chain(levels.map(Some)).collect();
         assert_eq!(tokens, expected);
+    }
+
+    /// A subsidy zeroes the bill while the list price stays visible as a
+    /// reference, so "covered by the subscription" and "free" read apart.
+    #[test]
+    fn subsidised_pricing_bills_zero_and_keeps_the_list_price() {
+        let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        model.pricing = PAID_PRICING;
+        model.subsidised_by = Some(Arc::from("Max"));
+        let list = model.list_cost(&INPUT_ONLY, false).unwrap();
+        assert!(list > 0.0);
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), Some(0.0));
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), Some(list));
+        assert_eq!(model.subsidy_source(), Some("Max"));
+    }
+
+    /// A subsidy must not turn "no price table" into a false `$0.000`: with
+    /// zero rates there is nothing to reference, so both costs stay `None`.
+    #[test]
+    fn subsidised_but_unpriced_model_stays_unpriced() {
+        let mut model = Model::from_spec(UNPRICED_DEEPSEEK_SPEC).unwrap();
+        assert!(model.pricing.is_zero());
+        model.subsidised_by = Some(Arc::from("Max"));
+        assert_eq!(model.billed_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
+    }
+
+    /// An ordinary metered model has no list-price reference to show; the
+    /// figure only appears next to a subsidised `$0` bill.
+    #[test]
+    fn metered_model_has_no_subsidised_list_cost() {
+        let model = Model::from_spec(DEEPSEEK_SPEC).unwrap();
+        assert!(model.billed_cost(&INPUT_ONLY, false).is_some());
+        assert_eq!(model.subsidised_list_cost(&INPUT_ONLY, false), None);
+        assert_eq!(model.subsidy_source(), None);
     }
 }

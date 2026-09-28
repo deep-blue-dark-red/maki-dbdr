@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 
 use crate::AgentError;
 
-const TOKEN_ENV_VARS: &[&str] = &["GH_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN"];
+pub(crate) const TOKEN_ENV_VARS: &[&str] = &["GH_COPILOT_TOKEN", "COPILOT_GITHUB_TOKEN"];
 const DEFAULT_HOST: &str = "github.com";
 const PROVIDER: &str = "copilot";
 const KEYRING_SERVICE_PREFIX: &str = "gh:";

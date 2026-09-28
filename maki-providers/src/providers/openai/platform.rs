@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 use crate::model::{FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
-use crate::types::EffortDialect;
+use crate::types::{EffortDialect, ThinkingFallback};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
     dialect,
@@ -22,7 +22,7 @@ use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::providers::{ResolvedAuth, refreshed_tokens};
 
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "openai",
+    slug: super::SLUG,
     api_key_env: "OPENAI_API_KEY",
     base_url: "https://api.openai.com/v1",
     max_tokens_field: "max_completion_tokens",
@@ -34,6 +34,8 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // Codex models match by their `-codex` substring in
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-6-astra",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
@@ -48,8 +50,9 @@ const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // The backend hides models newer than this Codex CLI version, so bump it when
-// a fresh model is missing from the list.
-const CODEX_CLIENT_VERSION: &str = "0.153.4";
+// a fresh model is missing from the list. 0.156.1 is the first line that
+// surfaces GPT-6 Sol / Luna in the picker; 0.157.1 is latest as of 2026-09-26.
+const CODEX_CLIENT_VERSION: &str = "0.157.1";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -242,7 +245,8 @@ fn apply_plan_fast(
 }
 
 fn static_plan_models() -> Vec<ModelInfo> {
-    super::models()
+    super::SPEC
+        .models()
         .iter()
         .flat_map(|e| e.prefixes.iter())
         .filter(|id| is_codex_model(id))
@@ -460,7 +464,7 @@ fn parse_usage(response: &str) -> Result<ProviderUsage, AgentError> {
 
 fn resolve_openai_base_url() -> Option<String> {
     let config = maki_config::providers::ProvidersConfig::load();
-    maki_config::providers::configured_base_url("openai", config.get("openai"))
+    maki_config::providers::configured_base_url(super::SLUG, config.get(super::SLUG))
 }
 
 // Codex models and GPT-6 drop `minimal` and never take an explicit "none", so
@@ -529,8 +533,11 @@ impl Provider for OpenAi {
             }
 
             let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking
-                .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
+            opts.thinking.apply_thinking(
+                &mut body,
+                model,
+                ThinkingFallback::Dialect(&dialect::STANDARD),
+            );
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
@@ -634,6 +641,8 @@ mod tests {
         assert!(is_codex_model(model_id));
     }
 
+    #[test_case("gpt-6-sol", Some(272_000))]
+    #[test_case("gpt-6-luna", Some(272_000))]
     #[test_case("gpt-6-astra", Some(272_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
@@ -664,6 +673,10 @@ mod tests {
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-sol", "max" ; "max_passes_through_on_5_6_sol")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-terra", "max" ; "max_passes_through_on_5_6_terra")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-5.6-luna", "max" ; "max_passes_through_on_5_6_luna")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-sol", "max" ; "max_passes_through_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-sol", "low" ; "minimal_snaps_to_low_on_6_sol")]
+    #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-luna", "max" ; "max_passes_through_on_6_luna")]
+    #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-luna", "low" ; "minimal_snaps_to_low_on_6_luna")]
     #[test_case(ThinkingConfig::Effort(Effort::Max), "gpt-6-astra", "max" ; "max_passes_through_on_6_astra")]
     #[test_case(ThinkingConfig::Effort(Effort::Minimal), "gpt-6-astra", "low" ; "minimal_snaps_to_low_on_6_astra")]
     #[test_case(ThinkingConfig::Adaptive, "gpt-6-astra", "medium" ; "adaptive_on_6_astra")]
@@ -682,6 +695,8 @@ mod tests {
     #[test]
     fn plan_models_have_a_reviewed_dialect() {
         const EXPECTED: &[(&str, &EffortDialect)] = &[
+            ("gpt-6-sol", &dialect::GPT_6),
+            ("gpt-6-luna", &dialect::GPT_6),
             ("gpt-6-astra", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
             ("gpt-5.6-terra", &dialect::GPT_5_6),
@@ -703,6 +718,8 @@ mod tests {
     }
 
     #[test_case("gpt-5.3-codex")]
+    #[test_case("gpt-6-sol")]
+    #[test_case("gpt-6-luna")]
     #[test_case("gpt-6-astra")]
     fn responses_reasoning_omits_effort_when_disabled(model_id: &str) {
         let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();

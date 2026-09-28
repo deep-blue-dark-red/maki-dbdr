@@ -37,8 +37,8 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use self::config::{
-    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, OauthClientConfig, RawServerConfig,
-    RawTransport, ServerConfig, Transport, load_config, parse_server, transport_kind,
+    McpConfig, McpConfigErrors, McpServerInfo, McpServerStatus, RawServerConfig, RawTransport,
+    ServerConfig, Transport, load_config, parse_server, transport_kind,
 };
 use self::error::McpError;
 use self::http::HttpTransport;
@@ -901,12 +901,18 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
             environment,
             config.timeout,
         )?),
-        Transport::Http { url, headers, .. } => Arc::new(HttpTransport::new(
+        Transport::Http {
+            url,
+            headers,
+            ca_file,
+            ..
+        } => Arc::new(HttpTransport::new(
             &config.name,
             url,
             headers,
             config.timeout,
             maki_storage::StateDir::resolve().ok(),
+            ca_file.as_deref(),
         )?),
     };
     let capabilities = transport::initialize(transport.as_ref()).await?;
@@ -948,7 +954,7 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
         let transport_kind = transport_kind(&raw.transport);
         let origin = origins.get(&name).cloned().unwrap_or_default();
         let disabled = !raw.enabled;
-        let (config, status) = match parse_server(name.clone(), raw) {
+        let (config, status) = match parse_server(name.clone(), raw, &origin) {
             Ok(sc) if disabled => (Some(sc), McpServerStatus::Disabled),
             Ok(sc) => (Some(sc), McpServerStatus::Connecting),
             Err(e) => {
@@ -1029,14 +1035,15 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
     let mut pids = Vec::new();
 
     for entry in &inner.entries {
-        let url = entry
-            .config
-            .as_ref()
-            .and_then(|c| transport_url(&c.transport));
-        let oauth = entry
-            .config
-            .as_ref()
-            .and_then(|c| transport_oauth(&c.transport));
+        let (url, oauth, ca_file) = match entry.config.as_ref().map(|c| &c.transport) {
+            Some(Transport::Http {
+                url,
+                oauth,
+                ca_file,
+                ..
+            }) => (Some(url.clone()), oauth.clone(), ca_file.clone()),
+            _ => (None, None, None),
+        };
 
         if let Some(ref transport) = entry.transport
             && entry.status != McpServerStatus::Disabled
@@ -1083,6 +1090,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
             config_path: entry.origin.clone(),
             url,
             oauth,
+            ca_file,
         });
     }
 
@@ -1262,20 +1270,6 @@ fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
     })
 }
 
-fn transport_url(transport: &Transport) -> Option<String> {
-    match transport {
-        Transport::Http { url, .. } => Some(url.clone()),
-        Transport::Stdio { .. } => None,
-    }
-}
-
-fn transport_oauth(transport: &Transport) -> Option<OauthClientConfig> {
-    match transport {
-        Transport::Http { oauth, .. } => oauth.clone(),
-        _ => None,
-    }
-}
-
 fn spawn_persist_enabled(path: PathBuf, name: String, enabled: bool) {
     let log_name = name.clone();
     smol::spawn(async move {
@@ -1317,7 +1311,7 @@ fn intern(name: String) -> Arc<str> {
 mod tests {
     use super::*;
     use async_lock::Mutex as AsyncMutex;
-    use config::{RawServerConfig, RawStdioFields, RawTransport};
+    use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
     use maki_providers::Role;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -1326,6 +1320,7 @@ mod tests {
 
     const DEFAULT_TIMEOUT_MS: u64 = 30_000;
     const MISSING_PROGRAM: &str = "/nonexistent/definitely-not-here";
+    const MISSING_CA_FILE: &str = "/nonexistent/ca.pem";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -1490,11 +1485,24 @@ mod tests {
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
 
+    #[test]
+    fn disabled_server_with_missing_ca_file_stays_disabled() {
+        let mut raw = RawServerConfig::runtime(RawTransport::Http(RawHttpFields {
+            url: "https://mcp.example.com/mcp".into(),
+            headers: HashMap::new(),
+            oauth: None,
+            ca_file: Some(MISSING_CA_FILE.into()),
+        }));
+        raw.enabled = false;
+        let inner = parse_entries(make_config(vec![("srv", raw)]));
+        assert_eq!(inner.entries[0].status, McpServerStatus::Disabled);
+    }
+
     fn always_load_entry(name: &str, transport: Arc<dyn McpTransport>) -> ServerEntry {
         let mut raw = stdio_raw(&["echo"]);
         raw.always_load = true;
         let mut entry = fake_entry(name, transport);
-        entry.config = Some(parse_server(name.into(), raw).unwrap());
+        entry.config = Some(parse_server(name.into(), raw, Path::new("")).unwrap());
         entry
     }
 

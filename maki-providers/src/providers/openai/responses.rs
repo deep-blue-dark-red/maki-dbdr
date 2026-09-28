@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
@@ -13,7 +15,7 @@ use crate::providers::{ResolvedAuth, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
-    ThinkingConfig, TokenUsage,
+    ThinkingConfig, TokenUsage, dialect,
 };
 
 const RESPONSES_PATH: &str = "/responses";
@@ -48,7 +50,11 @@ pub(crate) fn apply_responses_reasoning(
     dialect: &EffortDialect,
 ) {
     if let Some(effort) = thinking.effort_str(dialect, model) {
-        body["reasoning"] = json!({ "effort": effort });
+        let mut reasoning = json!({ "effort": effort });
+        if effort != dialect::OFF {
+            reasoning["summary"] = json!("auto");
+        }
+        body["reasoning"] = reasoning;
     }
 }
 
@@ -155,6 +161,35 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
     )
 }
 
+static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
+    SUMMARY_REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn summary_rejected(base: &str) -> bool {
+    init_summary_rejected().lock().unwrap().contains(base)
+}
+
+fn reject_summary(base: &str) {
+    init_summary_rejected()
+        .lock()
+        .unwrap()
+        .insert(base.to_owned());
+}
+
+fn has_summary(body: &Value) -> bool {
+    body.get("reasoning")
+        .and_then(|reasoning| reasoning.get("summary"))
+        .is_some()
+}
+
+fn strip_summary(body: &mut Value) {
+    if let Some(reasoning) = body.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.remove("summary");
+    }
+}
+
 pub(crate) async fn do_stream(
     client: &HttpClient,
     model: &crate::model::Model,
@@ -166,6 +201,31 @@ pub(crate) async fn do_stream(
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
     })?;
+    let mut body = Cow::Borrowed(body);
+    if summary_rejected(base) && has_summary(&body) {
+        strip_summary(body.to_mut());
+    }
+    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    match result {
+        Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
+            reject_summary(base);
+            strip_summary(body.to_mut());
+            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_responses(
+    client: &HttpClient,
+    model: &crate::model::Model,
+    body: &Value,
+    event_tx: &Sender<ProviderEvent>,
+    auth: &ResolvedAuth,
+    base: &str,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
     let request = auth
@@ -564,6 +624,23 @@ mod tests {
     const TOOL_NAME: &str = "word_count";
     const TOOL_DESCRIPTION: &str = "Count words.";
     const TOOL_MUST_SURVIVE: &str = "a tool without a schema still belongs in the request";
+
+    #[test]
+    fn strip_summary_keeps_effort() {
+        let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        assert!(has_summary(&body));
+        strip_summary(&mut body);
+        assert!(!has_summary(&body));
+        assert_eq!(body, json!({"reasoning": {"effort": "high"}}));
+    }
+
+    #[test]
+    fn summary_memo_records_rejection_once() {
+        let base = "https://summary-memo.test/v1";
+        assert!(!summary_rejected(base));
+        reject_summary(base);
+        assert!(summary_rejected(base));
+    }
 
     #[test]
     fn convert_tools_defaults_missing_parameters() {

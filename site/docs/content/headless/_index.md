@@ -37,7 +37,54 @@ maki "fix the tests" --print --output-format json
 
 JSON output includes `type`, `subtype`, `is_error`, `duration_ms`, `num_turns`, `result`, `stop_reason`, `session_id`, `total_cost_usd`, and `usage`.
 
+`usage` totals the whole run rather than the last turn. On a multi-turn run
+`input_tokens` is near zero and `cache_read_input_tokens` carries the volume,
+because every turn after the first reads the prompt from cache.
+
 Add `--verbose` to include full turn-by-turn messages in the output.
+
+## Sessions
+
+A `--print` run stores its session, so `maki session list` shows it and the next
+run can resume it with `-c` or `-r <id>`. `text` output prints `session: <id>`
+on stderr to keep stdout clean for pipes. `json` and `stream-json` return it as
+`session_id`.
+
+Maki saves at the end of each turn, so a run that dies before its first turn
+stores nothing. If a save fails, for example on a full disk, Maki prints
+`maki: failed to save session <id>` on stderr. The exit code ignores save
+failures, so check stderr before a script resumes with `-c`.
+
+`--session-id <ID>` picks the id up front. It fails if a session already exists
+under that id. To build on a session that exists:
+
+| Goal | Flags |
+|------|-------|
+| Continue it in place | `-r <id>` |
+| Copy its history under a generated id | `-r <id> --fork-session` |
+| Copy its history under an id you choose | `-r <old> --session-id <new>` |
+
+A copy belongs to the directory you run it in, so `maki -c` there continues the
+copy rather than the session it came from.
+
+The `session_id` in output messages is the id string you passed, so a hex uuid
+comes back as that hex uuid rather than the base58 form Maki generates.
+
+### One process per session
+
+Only one Maki process can have a session open, so two runs cannot overwrite
+each other's turns. A second process that resumes a busy session with `-c` or
+`-r` exits before it sends any request:
+
+```
+session <id> is open in another maki process
+  --fork-session  work on a copy of it
+  or drop -c/-r to start a new session here
+```
+
+The lock is released when the process exits, even after a crash. On a filesystem
+without file locks, such as some NFS mounts, Maki logs a warning and runs
+unlocked.
 
 ## Claude Code Compatibility
 
@@ -76,11 +123,11 @@ your orchestrator                     maki --print --input-format stream-json
 
 Inbound messages (`user`, `control_request`, `control_response`, `control_cancel_request`) drive the agent; outbound messages match the Claude Code SDK shape. Under the hood it reuses the same driver as the TUI and ACP server, so sessions, tools, and permissions all work the same way.
 
-SDK-only flags (`--system-prompt`, `--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path).
+SDK-only flags (`--system-prompt`, `--max-turns`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path).
 
 Two caveats:
 
-- One-shot `--print` always starts a **new** session in **build** mode. Plan mode and session resume need the SDK path (or the TUI).
+- One-shot `--print` always runs in **build** mode. Plan mode needs the SDK path (or the TUI).
 - The plan file for SDK `--permission-mode plan` is `./plan.md` under cwd, not the state-dir `plans/<slug>.md` files the TUI uses.
 
 ### Quick example

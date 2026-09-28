@@ -20,6 +20,7 @@ use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 
+pub(crate) const BEARER_TOKEN_ENV: &str = "AWS_BEARER_TOKEN_BEDROCK";
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
 const CONTAINER_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,7 +63,7 @@ fn resolve_bedrock_auth() -> Result<BedrockAuth, AgentError> {
         message: "AWS_REGION must be set when using Bedrock".into(),
     })?;
 
-    let kind = if let Ok(token) = env::var("AWS_BEARER_TOKEN_BEDROCK") {
+    let kind = if let Ok(token) = env::var(BEARER_TOKEN_ENV) {
         debug!("using Bedrock bearer token auth");
         AuthKind::Bearer { token }
     } else if env::var("CLAUDE_CODE_SKIP_BEDROCK_AUTH").is_ok_and(|v| v == "1") {
@@ -678,7 +679,8 @@ impl Provider for Bedrock {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            let models: Vec<crate::model::ModelInfo> = shared::models()
+            let models: Vec<crate::model::ModelInfo> = super::SPEC
+                .models()
                 .iter()
                 .map(|entry| crate::model::ModelInfo::id_only(entry.prefixes[0].to_string()))
                 .collect();

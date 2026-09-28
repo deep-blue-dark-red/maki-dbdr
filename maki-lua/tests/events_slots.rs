@@ -2,10 +2,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::{AgentCall, AgentSlot};
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::{CallOrigin, ToolRegistry};
-use maki_lua::{Permission, PluginHost, PluginPermissions, SessionEndReason};
+use maki_lua::{
+    Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
+    PluginPermissions, SessionEndReason,
+};
 use maki_storage::id::MakiId;
 use test_case::test_case;
 
@@ -376,6 +380,8 @@ fn call_of<'a>(
     HookCall {
         tool,
         tool_id: TOOL_ID,
+        tool_kind: None,
+        input: None,
         session_id: None,
         origin,
         authority,
@@ -454,6 +460,7 @@ fn input_from(
         Verdict::Unchanged => (None, None),
         Verdict::Replaced(v) => (Some(v[COMMAND_FIELD].as_str().unwrap().to_owned()), None),
         Verdict::Denied(reason) => (None, Some(reason)),
+        Verdict::Ask { reason, .. } => unreachable!("no layer here escalates, got {reason}"),
     }
 }
 
@@ -466,6 +473,9 @@ fn output(reg: &ToolRegistry, tool: &str, text: &str, is_error: bool) -> Option<
             v[hook::OUTPUT_TEXT].as_str().unwrap().to_owned(),
             v[hook::OUTPUT_IS_ERROR].as_bool().unwrap_or(is_error),
         )),
+        Verdict::Ask { reason, .. } => {
+            unreachable!("an output layer cannot escalate, got {reason}")
+        }
     }
 }
 
@@ -536,6 +546,12 @@ fn load_granted(host: &PluginHost, plugin: &str, source: &str, granted: PluginPe
 fn only_run() -> PluginPermissions {
     let mut permissions = PluginPermissions::denied();
     permissions.set(Permission::Run, true);
+    permissions
+}
+
+fn only_net() -> PluginPermissions {
+    let mut permissions = PluginPermissions::denied();
+    permissions.set(Permission::Net, true);
     permissions
 }
 
@@ -807,16 +823,517 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
     );
 }
 
-#[test]
-fn host_slot_names_are_reserved() {
+#[test_case("tool.bash.input" ; "tool_stage")]
+#[test_case("ui.plan_form" ; "ui_surface")]
+#[test_case("ui.plan_form.actions" ; "ui_menu")]
+#[test_case("agent.stop" ; "agent_slot")]
+fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
         .load_source(
             "squatter",
-            r#"maki.api.declare_slot("tool.bash.input", function(i) return i end)"#,
+            &format!(r#"maki.api.declare_slot("{name}", function(i) return i end)"#),
         )
         .expect_err("declaring a host slot must fail");
-    assert!(format!("{err}").contains("host owned"), "{err}");
+    // A plugin that used to declare one meets this message, so it has to name
+    // the prefix and what to do instead.
+    let err = format!("{err}");
+    for expected in ["host owned", "reserved", "set_slot"] {
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+// ------------------------------------------------------ ui.plan_form slots
+
+const PLAN_PATH: &str = "/tmp/plan.md";
+const PLAN_SESSION: &str = "s1";
+const PLANNER: &str = "planner";
+const BUILTIN_ID: &str = "implement";
+const BUILTIN_LABEL: &str = "Implement plan";
+const PLUGIN_ID: &str = "commit_and_implement";
+const PLUGIN_LABEL: &str = "Commit and implement";
+/// Longer than the window the host gives the plan form chains, so a layer
+/// parked on it can only answer after the form has given up on it.
+const PLAN_PARKED_FOR: Duration = Duration::from_secs(15);
+const NO_PICK: &str = "none";
+
+/// Stands in for what the UI proposes: one row it knows how to run itself.
+fn builtin_rows() -> Vec<PlanFormRow> {
+    vec![PlanFormRow {
+        id: BUILTIN_ID.to_owned(),
+        label: BUILTIN_LABEL.to_owned(),
+        desc: String::new(),
+        action: Some(PlanRowAction::Implement),
+        plugin: None,
+    }]
+}
+
+fn plan_slot_source(slot: &str, body: &str) -> String {
+    format!(r#"maki.api.set_slot("{slot}", function(prev, ev) {body} end)"#)
+}
+
+fn plan_slot_layer(host: &PluginHost, plugin: &str, slot: &str, body: &str) {
+    load(host, plugin, &plan_slot_source(slot, body));
+}
+
+fn plan_form_layer(host: &PluginHost, plugin: &str, body: &str) {
+    plan_slot_layer(host, plugin, "ui.plan_form", body);
+}
+
+fn actions_layer(host: &PluginHost, plugin: &str, body: &str) {
+    plan_slot_layer(host, plugin, "ui.plan_form.actions", body);
+}
+
+/// A layer that never comes back, for the slot it is handed to.
+fn parked_layer_body() -> String {
+    format!(
+        r#"maki.fn.jobwait(maki.fn.jobstart({{ "sleep", "{}" }}), {})
+           return prev(ev)"#,
+        PLAN_PARKED_FOR.as_secs(),
+        PLAN_PARKED_FOR.as_millis()
+    )
+}
+
+/// The row a layer adds, with whatever extra fields the case needs.
+fn plugin_row(extra: &str) -> String {
+    format!(r#"{{ id = "{PLUGIN_ID}", label = "{PLUGIN_LABEL}", {extra} }}"#)
+}
+
+fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
+    host.event_handle()
+        .open_plan_form(
+            PLAN_PATH.to_owned(),
+            PLAN_SESSION.to_owned(),
+            builtin_rows(),
+        )
+        .recv_timeout(DISPATCH_TIMEOUT)
+        .expect("the plan form chains must answer")
+}
+
+fn plan_menu(host: &PluginHost) -> PlanMenu {
+    ask_plan_form(host).expect("the built-in form must open")
+}
+
+fn menu_labels(host: &PluginHost) -> Vec<String> {
+    plan_menu(host)
+        .rows
+        .into_iter()
+        .map(|row| row.label)
+        .collect()
+}
+
+/// Picks {row} of {menu} and waits for the host to say what became of it.
+fn pick_row(host: &PluginHost, menu: &PlanMenu, row: usize) -> PlanActionOutcome {
+    host.event_handle()
+        .run_plan_action(
+            PLAN_SESSION.to_owned(),
+            menu.generation,
+            row,
+            PLAN_PATH.to_owned(),
+            true,
+        )
+        .recv_timeout(DISPATCH_TIMEOUT)
+        .expect("a pick must be answered")
+}
+
+fn plugin_row_index(menu: &PlanMenu) -> usize {
+    menu.rows
+        .iter()
+        .position(|r| r.plugin.is_some())
+        .expect("the layer's row must carry a handler")
+}
+
+/// The chain decides whether the built-in form opens. Deferring to `prev`
+/// reaches the host default, and answering without it takes the surface over.
+/// A layer that throws never costs the user the form.
+#[test_case("return false", false ; "layer_owns_the_surface")]
+#[test_case("return", false ; "layer_answers_with_nothing")]
+#[test_case("return prev(ev)", true ; "layer_defers_to_the_builtin")]
+#[test_case("error('boom')", true ; "broken_layer_leaves_the_builtin")]
+fn the_plan_form_slot_decides_whether_the_builtin_opens(body: &str, opens: bool) {
+    let (_reg, host) = host();
+    plan_form_layer(&host, PLANNER, body);
+    assert_eq!(ask_plan_form(&host).is_some(), opens);
+}
+
+/// A layer parked in an await runs no Lua for the watchdog to interrupt, so
+/// without a deadline the draft would sit there with no surface at all.
+#[test_case("ui.plan_form" ; "the_form_chain")]
+#[test_case("ui.plan_form.actions" ; "the_actions_chain")]
+fn a_parked_plan_form_layer_falls_back_to_the_builtin(slot: &str) {
+    let (_reg, host) = host();
+    plan_slot_layer(&host, PLANNER, slot, &parked_layer_body());
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// Taking the form over decides what the user is shown once a plan lands, so
+/// it is priced like layering a call nobody declared the reach of: a plugin
+/// short of one grant is skipped and the built-in form opens.
+#[test]
+fn an_ungranted_layer_cannot_take_the_plan_form_over() {
+    let (_reg, host) = host();
+    load_granted(
+        &host,
+        PLANNER,
+        &plan_slot_source("ui.plan_form", "return false"),
+        all_but_run(),
+    );
+    assert!(
+        ask_plan_form(&host).is_some(),
+        "the layer must not have been asked"
+    );
+}
+
+/// The same price for the menu, and for the sharper reason: a row may keep a
+/// built-in row's wording and swap the outcome under it, so pressing Enter on
+/// what reads like "Refine plan" would start a build-mode turn.
+#[test]
+fn an_ungranted_actions_layer_cannot_reach_the_menu() {
+    let (_reg, host) = host();
+    load_granted(
+        &host,
+        PLANNER,
+        &plan_slot_source(
+            "ui.plan_form.actions",
+            &format!("return {{ {} }}", plugin_row(r#"action = "implement""#)),
+        ),
+        all_but_run(),
+    );
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// Plan state is per session, so the layer is told which one it is answering
+/// for.
+#[test]
+fn the_plan_form_slot_carries_the_path_and_session() {
+    let (_reg, host) = host();
+    plan_form_layer(
+        &host,
+        PLANNER,
+        &format!(r#"return ev.path == "{PLAN_PATH}" and ev.session == "{PLAN_SESSION}""#),
+    );
+    assert!(
+        ask_plan_form(&host).is_some(),
+        "the layer saw the wrong event"
+    );
+}
+
+/// Nothing layered means nothing to ask, and the default answer is the
+/// built-in form with the rows the host proposed.
+#[test]
+fn an_unlayered_plan_form_opens_the_builtin() {
+    let (_reg, host) = host();
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// Form suppression is a slot, so unloading the plugin that took the form
+/// over tears the layer down and the built-in comes back.
+#[test]
+fn unloading_the_plan_form_owner_hands_the_form_back() {
+    let (_reg, host) = host();
+    plan_form_layer(&host, PLANNER, "return false");
+    assert!(ask_plan_form(&host).is_none());
+
+    host.unload(PLANNER).unwrap();
+    assert_eq!(
+        menu_labels(&host),
+        [BUILTIN_LABEL],
+        "the built-in form has to come back with the layer gone"
+    );
+}
+
+/// A layer that appends to what `prev` gave it lands its row next to the
+/// built-in ones.
+#[test]
+fn an_actions_layer_adds_its_row_to_the_menu() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {})
+               return rows"#,
+            plugin_row("handler = function() end")
+        ),
+    );
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL, PLUGIN_LABEL]);
+}
+
+/// The rows `prev` hands back are the plugin's to reorder or drop.
+#[test]
+fn an_actions_layer_can_reorder_and_drop_builtin_rows() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!("return {{ {} }}", plugin_row("handler = function() end")),
+    );
+    assert_eq!(menu_labels(&host), [PLUGIN_LABEL]);
+}
+
+/// A reload clears the plugin's layers before its source runs again, so the
+/// same row registered twice is still one row.
+#[test]
+fn reloading_an_actions_layer_does_not_stack_duplicates() {
+    let (_reg, host) = host();
+    let source = format!(
+        r#"maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+               local rows = prev(ev)
+               table.insert(rows, {})
+               return rows
+           end)"#,
+        plugin_row("handler = function() end")
+    );
+    load(&host, PLANNER, &source);
+    load(&host, PLANNER, &source);
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL, PLUGIN_LABEL]);
+}
+
+/// Unload the plugin and the host's own rows are what is left.
+#[test]
+fn unloading_an_actions_layer_restores_the_builtin_rows() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {})
+               return rows"#,
+            plugin_row("handler = function() end")
+        ),
+    );
+    assert_eq!(menu_labels(&host).len(), 2);
+
+    host.unload(PLANNER).unwrap();
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// An off-contract answer leaves the host's own rows.
+#[test_case("return prev(ev) and 42" ; "not_a_table")]
+#[test_case(r#"return { { id = "x", label = "nope" } }"# ; "row_with_no_handler_or_action")]
+#[test_case(r#"return { { label = "nope", action = "implement" } }"# ; "row_with_no_id")]
+#[test_case(r#"local rows = prev(ev) table.insert(rows, rows[1]) return rows"# ; "duplicate_ids")]
+fn a_broken_actions_layer_leaves_the_builtin_menu(body: &str) {
+    let (_reg, host) = host();
+    actions_layer(&host, PLANNER, body);
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// A plugin cannot hand out more rows than the form can draw.
+#[test]
+fn an_actions_layer_cannot_grow_the_menu_without_bound() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        r#"local rows = prev(ev)
+           for i = 1, 5000 do
+               table.insert(rows, { id = "r" .. i, label = "row", handler = function() end })
+           end
+           return rows"#,
+    );
+    let drawn = plan_menu(&host).rows.len();
+    assert!(drawn > 1, "the layer's rows are not all dropped: {drawn}");
+    assert!(drawn < 5000, "the menu has to be capped: {drawn}");
+}
+
+/// The handler runs on the Lua thread when the user picks the row, told which
+/// session's plan it is acting on so it can name it back to `maki.plan.read`
+/// and `maki.session.*`.
+#[test]
+fn a_picked_row_runs_its_handler_with_the_plan_context() {
+    let (reg, host) = host();
+    load(
+        &host,
+        PLANNER,
+        &format!(
+            r#"
+local seen = nil
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+    local rows = prev(ev)
+    table.insert(rows, {})
+    return rows
+end)
+{}
+"#,
+            plugin_row("handler = function(opts) seen = opts end"),
+            probe_tool(
+                "probe_plan_row",
+                &format!(
+                    r#"
+if not seen then return "{NO_PICK}" end
+return table.concat({{ seen.session, seen.path, tostring(seen.parallel) }}, "|")
+"#
+                )
+            )
+        ),
+    );
+
+    let menu = plan_menu(&host);
+    pick_row(&host, &menu, plugin_row_index(&menu));
+
+    assert_eq!(
+        exec_tool(&reg, "probe_plan_row"),
+        format!("{PLAN_SESSION}|{PLAN_PATH}|true")
+    );
+}
+
+/// Handler-then-action: a row that kept a built-in outcome runs the handler
+/// first and the outcome after, unless the handler said otherwise.
+///
+/// A handler that declines and one that failed are told apart, since only the
+/// second is worth showing the user.
+#[test_case("", PlanActionOutcome::Proceed ; "a_handler_that_says_nothing_keeps_the_action")]
+#[test_case("return true", PlanActionOutcome::Proceed ; "a_handler_that_agrees")]
+#[test_case("return false", PlanActionOutcome::Vetoed ; "a_handler_that_declines")]
+#[test_case("error('boom')", PlanActionOutcome::Failed ; "a_handler_that_fails")]
+fn a_handler_runs_before_the_action_it_kept(body: &str, outcome: PlanActionOutcome) {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               rows[1].handler = function() {body} end
+               return rows"#
+        ),
+    );
+
+    let menu = plan_menu(&host);
+    assert_eq!(menu.rows[0].action, Some(PlanRowAction::Implement));
+    assert_eq!(menu.rows[0].plugin.as_deref(), Some(PLANNER));
+    assert_eq!(pick_row(&host, &menu, 0), outcome);
+}
+
+/// The menu is every layer's work. A row one layer got wrong costs that row,
+/// not the rows every other layer put there: dropping the whole menu would
+/// hand any plugin a way to suppress every other plugin's.
+#[test]
+fn one_bad_row_does_not_cost_the_other_layers_theirs() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {})
+               return rows"#,
+            plugin_row("handler = function() end")
+        ),
+    );
+    actions_layer(
+        &host,
+        "broken",
+        r#"local rows = prev(ev)
+           table.insert(rows, { id = "", label = "" })
+           return rows"#,
+    );
+
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL, PLUGIN_LABEL]);
+}
+
+/// Attribution is by handler, not by row id. A layer that lifts another
+/// plugin's handler out of `prev(ev)` and files it under an id that plugin
+/// never used would otherwise own it, and the unload meant to reap it would
+/// walk straight past it. The re-keyed row goes, the rest of the menu stays.
+#[test]
+fn a_layer_cannot_refile_another_plugins_handler_under_a_new_id() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {})
+               return rows"#,
+            plugin_row("handler = function() end")
+        ),
+    );
+    actions_layer(
+        &host,
+        "thief",
+        &format!(
+            r#"local rows = prev(ev)
+               for _, row in ipairs(rows) do
+                   if row.id == "{PLUGIN_ID}" then row.id = "stolen" end
+               end
+               return rows"#
+        ),
+    );
+
+    assert_eq!(
+        menu_labels(&host),
+        [BUILTIN_LABEL],
+        "the re-keyed row is the only one dropped"
+    );
+}
+
+/// The handler holds the plugin's permissions, so an unload takes it with
+/// everything else and a pick after that reaches nothing.
+#[test]
+fn unloading_a_plugin_reaps_the_handlers_of_a_drawn_menu() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {})
+               return rows"#,
+            plugin_row("handler = function() end, action = \"implement\"")
+        ),
+    );
+
+    let menu = plan_menu(&host);
+    let row = plugin_row_index(&menu);
+    assert_eq!(
+        pick_row(&host, &menu, row),
+        PlanActionOutcome::Proceed,
+        "the handler answers while loaded"
+    );
+
+    host.unload(PLANNER).unwrap();
+    assert_eq!(
+        pick_row(&host, &menu, row),
+        PlanActionOutcome::Failed,
+        "a reaped handler cannot answer for the row, and a pick that reached \
+         nothing is a failure, not a veto"
+    );
+}
+
+/// A chain that parked and resumed installs its handlers over a menu already
+/// on screen, and the generation keeps a pick out of a menu the user never
+/// saw.
+#[test]
+fn a_pick_from_a_replaced_menu_reaches_no_handler() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {})
+               return rows"#,
+            plugin_row("handler = function() end")
+        ),
+    );
+
+    let drawn = plan_menu(&host);
+    let row = plugin_row_index(&drawn);
+    let replacement = plan_menu(&host);
+    assert_ne!(drawn.generation, replacement.generation);
+
+    assert_eq!(
+        pick_row(&host, &drawn, row),
+        PlanActionOutcome::Failed,
+        "a pick from the replaced menu must not reach the new one's handlers"
+    );
+    assert_eq!(
+        pick_row(&host, &replacement, row),
+        PlanActionOutcome::Proceed
+    );
 }
 
 /// A layer answering off contract costs what no layer costs: dispatch keeps the
@@ -863,6 +1380,41 @@ fn an_output_layer_stops_the_call_with_its_reason() {
     );
 }
 
+/// Nothing can ask the user about an output, so an outer layer asking anyway
+/// must not throw away the redaction an inner plugin made.
+#[test]
+fn an_output_ask_keeps_the_rewrite_under_it() {
+    const REDACTED: &str = "[redacted]";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        INNER_LAYER,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            &format!(
+                r#"value.{text} = "{REDACTED}"; return value"#,
+                text = hook::OUTPUT_TEXT
+            ),
+        ),
+    );
+    load(
+        &host,
+        OUTER_LAYER,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Output,
+            r#"return prev(value, ctx), { ask = "why not" }"#,
+        ),
+    );
+
+    assert_eq!(
+        output(&reg, SLOT_TOOL, "secret", false),
+        Some((REDACTED.to_owned(), false))
+    );
+}
+
 /// One plugin's broken layer must not take the seam down or swallow the layers
 /// another plugin registered underneath it.
 #[test]
@@ -895,6 +1447,145 @@ fn layers_compose_with_the_last_registered_outermost() {
     assert_eq!(
         input(&reg, SLOT_TOOL, COMMAND),
         (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+}
+
+const ANY_TOOL: &str = "*";
+
+/// The wildcard is loaded first, so load order alone would put it inside.
+#[test]
+fn wildcard_layers_wrap_every_tool_outside_the_specific_ones() {
+    let (reg, host) = host();
+    slotted_tool(&host);
+    guarded_tool(&host);
+    load(&host, OUTER_LAYER, &marking_layer(ANY_TOOL, OUTER_MARK));
+    load(&host, INNER_LAYER, &marking_layer(SLOT_TOOL, INNER_MARK));
+
+    assert_eq!(
+        input(&reg, SLOT_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}{INNER_MARK}")), None)
+    );
+    assert_eq!(
+        input(&reg, GUARDED_TOOL, COMMAND),
+        (Some(format!("{COMMAND}{OUTER_MARK}")), None)
+    );
+}
+
+#[test]
+fn output_ctx_carries_the_input_and_kind() {
+    const KIND: &str = "execute";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            ANY_TOOL,
+            HookStage::Output,
+            &format!(
+                r#"value.{text} = ctx.tool_kind .. ":" .. ctx.input.{COMMAND_FIELD}; return prev(value, ctx)"#,
+                text = hook::OUTPUT_TEXT
+            ),
+        ),
+    );
+    let cancel = CancelToken::none();
+    let tool_input = serde_json::json!({ COMMAND_FIELD: COMMAND });
+    let call = HookCall {
+        tool_kind: Some(KIND),
+        input: Some(&tool_input),
+        ..call_of(SLOT_TOOL, Authority::Unbounded, CallOrigin::Model, &cancel)
+    };
+
+    let verdict = fire_call(
+        &reg,
+        &call,
+        HookStage::Output,
+        serde_json::json!({ hook::OUTPUT_TEXT: "out", hook::OUTPUT_IS_ERROR: false }),
+    );
+    let Verdict::Replaced(value) = verdict else {
+        panic!("the layer rewrote the output, got {verdict:?}");
+    };
+    assert_eq!(value[hook::OUTPUT_TEXT], format!("{KIND}:{COMMAND}"));
+}
+
+/// Handing the value back untouched is a pass through and not a rewrite, so
+/// the prompt shows the call as the model made it.
+#[test_case("nil",                               None                  ; "ask_alone")]
+#[test_case("value",                             None                  ; "ask_after_a_pass_through_is_no_rewrite")]
+#[test_case(r#"{ command = "rm -rf /tmp/x" }"#, Some("rm -rf /tmp/x") ; "ask_with_a_rewrite")]
+fn input_layer_may_ask_the_user(answer: &str, rewritten: Option<&str>) {
+    const WHY: &str = "touches files outside the project";
+    let (reg, host) = host();
+    slotted_tool(&host);
+    load(
+        &host,
+        LAYER_PLUGIN,
+        &layer(
+            SLOT_TOOL,
+            HookStage::Input,
+            &format!(r#"return {answer}, {{ ask = "{WHY}" }}"#),
+        ),
+    );
+
+    let verdict = fire(
+        &reg,
+        SLOT_TOOL,
+        CallOrigin::Model,
+        HookStage::Input,
+        serde_json::json!({ COMMAND_FIELD: COMMAND }),
+    );
+    let Verdict::Ask { reason, input } = verdict else {
+        panic!("the layer asked, got {verdict:?}");
+    };
+    assert_eq!(reason, WHY);
+    assert_eq!(
+        input,
+        rewritten.map(|r| serde_json::json!({ COMMAND_FIELD: r }))
+    );
+}
+
+const AGENT_MODEL: &str = "anthropic/claude-sonnet-4";
+const KEEP_GOING: &str = "keep going";
+const CONTINUE_FIELD: &str = "continue";
+
+fn stop_layer() -> String {
+    format!(
+        r#"maki.api.set_slot("agent.stop", function(prev, value, ctx)
+    assert(ctx.model == "{AGENT_MODEL}", ctx.model)
+    return {{ {CONTINUE_FIELD} = "{KEEP_GOING}" }}
+end)"#
+    )
+}
+
+/// Steering the agent is priced like a tool with no declared reach, so only a
+/// fully trusted plugin's layer runs.
+#[test_case(PluginPermissions::trusted, true  ; "trusted_layer_runs")]
+#[test_case(all_but_run,                false ; "almost_trusted_is_skipped")]
+fn agent_slot_layers_need_full_trust(granted: fn() -> PluginPermissions, runs: bool) {
+    let (reg, host) = host();
+    let hook = reg
+        .agent_hook()
+        .expect("the plugin host installs one at boot");
+    assert!(!hook.wraps(AgentSlot::Stop));
+    load_granted(&host, LAYER_PLUGIN, &stop_layer(), granted());
+    assert!(hook.wraps(AgentSlot::Stop));
+    assert!(!hook.wraps(AgentSlot::UserMessage));
+
+    let cancel = CancelToken::none();
+    let call = AgentCall {
+        session_id: None,
+        task_id: None,
+        model: AGENT_MODEL,
+        context_size: 0,
+        context_window: 0,
+        cancel: &cancel,
+        deadline: Instant::now() + DISPATCH_TIMEOUT,
+    };
+    let verdict = within(hook.run(AgentSlot::Stop, serde_json::json!({}), &call));
+    let kept_going = serde_json::json!({ CONTINUE_FIELD: KEEP_GOING });
+    assert_eq!(
+        matches!(verdict, Verdict::Replaced(value) if value == kept_going),
+        runs
     );
 }
 
@@ -1282,15 +1973,228 @@ fn get_slots_reports_owner_fillers_and_orphans() {
 maki.api.set_slot("orphan_slot", function(prev) return prev() end)
 maki.api.declare_slot("gs", function() return 1 end)
 maki.api.set_slot("gs", function(prev) return prev() end)
+maki.api.declare_slot("priced", function() return 1 end, { capability = { "net" } })
 local slots = maki.api.get_slots()
 local gs = slots["gs"]
 assert(gs.declared == true and gs.owner == "slots_introspect", tostring(gs.owner))
 assert(#gs.fillers == 1 and gs.fillers[1] == "slots_introspect")
+assert(gs.capability == nil, "naming no price is not the same as naming an empty one")
+local priced = slots["priced"].capability
+assert(#priced == 1 and priced[1] == "net", tostring(priced[1]))
 local orphan = slots["orphan_slot"]
 assert(orphan.declared == false and orphan.owner == nil)
 assert(orphan.fillers[1] == "slots_introspect")
 "#,
     );
+}
+
+/// The owner hands its callable out, because a slot is only observable from
+/// the far end of a call.
+const RENDER_OWNER: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end)
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// The owner prices the slot at what its default actually reaches, so a layer
+/// pays for that and not for everything.
+const RENDER_OWNER_NET: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end, {
+  capability = { "net" },
+})
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// Nothing the default does with {text} borrows anything, and the owner is the
+/// one who can say so.
+const RENDER_OWNER_FREE: &str = r#"
+local render = maki.api.declare_slot("owner.render", function(text) return text end, {
+  capability = {},
+})
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+/// `set_slot` before `declare_slot`, from a plugin granted nothing: the shape
+/// `init.lua` has, since a config with no `plugin.toml` beside it is denied.
+const RENDER_SELF_LAYER_FIRST: &str = r#"
+maki.api.set_slot("owner.render", function(prev, text) return prev(text) .. "+self" end)
+local render = maki.api.declare_slot("owner.render", function(text) return text end)
+maki.api.exec_autocmds("SlotShare", { data = { callable = render } })
+"#;
+
+fn render_layer(mark: &str) -> String {
+    format!(
+        r#"maki.api.set_slot("owner.render", function(prev, text) return prev(text) .. "+{mark}" end)"#
+    )
+}
+
+/// The hole: a plugin nobody trusted steering a chain the owner's callers do.
+/// Registering it is free, and the chain drops it when it fires.
+#[test]
+fn a_foreign_layer_on_a_plugin_slot_costs_full_trust() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER);
+
+    load_granted(
+        &host,
+        "attacker",
+        &render_layer("attacker"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "a layer nobody trusted never steers another plugin's chain"
+    );
+
+    load_granted(
+        &host,
+        "trusted_wrapper",
+        &render_layer("trusted"),
+        PluginPermissions::trusted(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world+trusted",
+        "full trust buys the layer, and the skipped one stays skipped"
+    );
+}
+
+/// Every permission is what a slot that named no price costs, not what every
+/// slot costs: the owner knows whether its default does anything with the
+/// arguments, so the owner sets the toll.
+#[test]
+fn an_owner_prices_its_slot_at_the_capability_it_names() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER_NET);
+
+    load_granted(
+        &host,
+        "attacker",
+        &render_layer("attacker"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "a narrower price is still a price"
+    );
+
+    load_granted(&host, "netonly", &render_layer("net"), only_net());
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world+net",
+        "the named capability is the whole toll, not a floor"
+    );
+}
+
+/// A slot whose arguments are inert costs nothing, which is the case full
+/// trust priced wrong before the owner had any way to say so.
+#[test]
+fn an_owner_can_declare_its_slot_free_to_layer() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER_FREE);
+    load_granted(
+        &host,
+        "stranger",
+        &render_layer("free"),
+        PluginPermissions::denied(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+free");
+}
+
+/// Pricing is not a way to advertise reach nobody granted you.
+#[test]
+fn a_plugin_cannot_price_a_slot_in_a_capability_it_lacks() {
+    let (_reg, host) = host();
+    let err = host
+        .load_source_with_permissions("poor", RENDER_OWNER_NET, PluginPermissions::denied())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("prices layers at") && err.contains("not granted"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Otherwise the price is advisory: wait for the owner to unload, re-declare
+/// its name free, and inherit the layers, and the callers, that trusted the
+/// old one.
+#[test]
+fn an_unloaded_owner_keeps_its_slot_name() {
+    let (_reg, host) = host();
+    load(&host, "owner", RENDER_OWNER);
+    host.unload("owner").unwrap();
+
+    let err = host
+        .load_source("squatter", RENDER_OWNER_FREE)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("already declared by 'owner'"),
+        "unexpected error: {err}"
+    );
+    load(&host, "owner", RENDER_OWNER_FREE);
+}
+
+/// Fire time reads what the last load granted the plugin, so narrowing a
+/// layer's reach costs a reload rather than a restart.
+#[test]
+fn narrowing_a_layers_grant_drops_it_from_the_next_call() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load(&host, "owner", RENDER_OWNER);
+    load_granted(
+        &host,
+        "wrapper",
+        &render_layer("wrap"),
+        PluginPermissions::trusted(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+wrap");
+
+    load_granted(&host, "wrapper", &render_layer("wrap"), all_but_run());
+    assert_eq!(
+        exec_tool(&reg, "call_slot"),
+        "ok:world",
+        "almost all is not all, and the next call is where it shows"
+    );
+}
+
+/// Registration says nothing about entitlement, for host slots and plugin
+/// slots alike: what the plugin holds is read when the chain fires.
+#[test]
+fn a_denied_plugin_registers_a_host_slot_layer() {
+    let (_reg, host) = host();
+    load_granted(
+        &host,
+        "denied_host_layer",
+        &format!(
+            r#"
+{}
+local fillers = maki.api.get_slots()["tool.bash.input"].fillers
+assert(#fillers == 1 and fillers[1] == "denied_host_layer", tostring(fillers[1]))
+"#,
+            layer("bash", HookStage::Input, "return prev(value, ctx)")
+        ),
+        PluginPermissions::denied(),
+    );
+}
+
+/// Registration order stops mattering: by the time the chain fires, the plugin
+/// that filled the orphan owns it, and an owner steers its own chain for free.
+#[test]
+fn a_denied_plugin_wraps_the_slot_it_declares_afterwards() {
+    let (reg, host) = host();
+    load(&host, "caller", SLOT_CALLER);
+    load_granted(
+        &host,
+        "owner",
+        RENDER_SELF_LAYER_FIRST,
+        PluginPermissions::denied(),
+    );
+    assert_eq!(exec_tool(&reg, "call_slot"), "ok:world+self");
 }
 
 const SLOT_CALLER: &str = r#"

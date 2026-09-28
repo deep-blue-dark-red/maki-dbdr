@@ -36,7 +36,7 @@ Cheapest first, and scope to the crate you touched while iterating:
 
 - `just check` (or `cargo check -p <crate> --tests`)
 - `just lint` - `cargo clippy --all --tests -- -D warnings`
-- `just test` - `cargo nextest run --workspace`
+- `just test` - `cargo test run --workspace`
 
 Read `justfile` for more.
 

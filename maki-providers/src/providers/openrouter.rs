@@ -6,44 +6,97 @@ use flume::Sender;
 use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
-use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
+use maki_config::providers::Protocol;
+
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::DEFAULT_PATH_PREFIX;
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, NO_CURATED_MODELS, Native,
+    ProviderSpec,
+};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
     Upstream, dialect,
 };
 
 use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const REFERER: &str = "https://maki.sh";
 const APP_TITLE: &str = "maki";
 const PER_MILLION: f64 = 1_000_000.0;
 
+const SLUG: &str = "openrouter";
+const DISPLAY_NAME: &str = "OpenRouter";
+const ENV_VAR: &str = "OPENROUTER_API_KEY";
+const BASE_URL: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_MODEL: &str = "openrouter/openai/gpt-5.5";
+const LOGIN_URL: &str = "https://openrouter.ai/keys";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const FEATURES: &str = "300+ models from all providers, prompt caching, provider routing";
+
+const DISCOVERY_NOTE: &str = "OpenRouter aggregates models from many providers behind a single API key. \
+     Browse available models at [openrouter.ai/models](https://openrouter.ai/models). \
+     Use any model ID directly (e.g. `openrouter/anthropic/claude-sonnet-4`).";
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "openrouter",
-    api_key_env: "OPENROUTER_API_KEY",
-    base_url: "https://openrouter.ai/api/v1",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: true,
-    provider_name: "OpenRouter",
+    provider_name: DISPLAY_NAME,
 };
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "openrouter",
-    display_name: "OpenRouter",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: "https://openrouter.ai/api/v1",
-    default_api_key_env: "OPENROUTER_API_KEY",
-    default_model: "openrouter/openai/gpt-5.5",
-    plans: None,
-    login_url: Some("https://openrouter.ai/keys"),
-    needs_url: false,
-});
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: true,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(128_000),
+    fallback_context_window: 200_000,
+    models_toml: NO_CURATED_MODELS,
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: DEFAULT_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVar,
+        catalog: CatalogDoc::Discovered(DISCOVERY_NOTE),
+        trailing_notes: &[],
+    },
+};
 
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[]
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(OpenRouter::new(timeouts)?))
 }
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(OpenRouter::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 
 #[derive(Debug)]
 struct OpenRouterModelInfo {
@@ -265,24 +318,25 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
 
     // Parse with OpenRouter-specific pricing field names. OpenRouter reports
     // per-token prices; scale to $/M as `ModelPricing` expects. A missing or
-    // unparsable price stays `None` so it never reads as free.
+    // unparsable price stays `None` so it never reads as free. Routers like
+    // `openrouter/auto` report `-1` because the price depends on the pick.
     let id = m["id"].as_str()?;
     let context_window = m["context_length"]
         .as_u64()
         .and_then(|v| u32::try_from(v).ok());
-    let per_token =
-        |p: &Value| -> Option<f64> { Some(p.as_str()?.parse::<f64>().ok()? * PER_MILLION) };
+    let per_token = |p: &Value| -> Option<f64> {
+        let price = p.as_str()?.parse::<f64>().ok()?;
+        (price >= 0.0).then_some(price * PER_MILLION)
+    };
     let pricing = m["pricing"].as_object().and_then(|p| {
-        Some(ModelPricing {
-            input: per_token(p.get("prompt")?)?,
-            output: per_token(p.get("completion")?)?,
-            cache_write: p
-                .get("input_cache_write")
+        Some(ModelPricing::per_million(
+            per_token(p.get("prompt")?)?,
+            per_token(p.get("completion")?)?,
+            p.get("input_cache_write")
                 .and_then(per_token)
                 .unwrap_or(0.0),
-            cache_read: p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
-            fast: None,
-        })
+            p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
+        ))
     });
 
     let reasoning = m
@@ -352,10 +406,8 @@ impl Provider for OpenRouter {
                 body["provider"] = routing;
             }
 
-            let reasoning_info = crate::model_registry::provider_info::<OpenRouterModelInfo>(
-                "openrouter",
-                &model.id,
-            );
+            let reasoning_info =
+                crate::model_registry::provider_info::<OpenRouterModelInfo>(CONFIG.slug, &model.id);
 
             let effort_dialect = effort_dialect(reasoning_info.as_deref());
             if model.supports_thinking()
@@ -458,6 +510,7 @@ mod tests {
     #[test_case(json!(null)                                       ; "no_pricing_object")]
     #[test_case(json!({"prompt": "0.000003"})                     ; "no_completion")]
     #[test_case(json!({"prompt": "n/a", "completion": "0.000015"}) ; "unparsable_prompt")]
+    #[test_case(json!({"prompt": "-1", "completion": "-1"})         ; "variable_price_router")]
     fn parse_model_keeps_unusable_pricing_unknown(pricing: Value) {
         let mut m = kimi_k3_json();
         m["pricing"] = pricing;
@@ -496,6 +549,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,

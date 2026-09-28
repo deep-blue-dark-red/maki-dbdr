@@ -23,7 +23,7 @@ use maki_agent::tools::hook::{Authority, Verdict};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
-use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
+use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker};
 use maki_storage::id::{MakiId, SessionRef};
 use mlua::{
     Chunk, ChunkMode, Compiler, Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue,
@@ -37,24 +37,35 @@ use maki_config::RawConfig;
 use crate::api::autocmd::AutocmdStore;
 use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
+use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
-use crate::api::keymap::{KeymapStore, KeymapWriter};
+use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
-use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
+use crate::api::plan::{
+    PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
+    install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
+};
+use crate::api::slot::{
+    ChainObserver, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, SlotStore, layer_plugins,
+    run_host_chain, run_host_chain_with,
+};
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission,
 };
-use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
+use crate::api::ui::{HintStore, WinStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
-    LuaCommandReader, LuaCommandWriter, UiAction, UiAttachment, install_ui_attachment,
+    LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
+    UiAttachment, install_ui_attachment,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::key_lint::KeyLint;
+use crate::loader::EventHandle;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -100,6 +111,12 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a keystroke waits for its handler before the host stops holding
+/// one of the plugin's in-flight slots and one drain-barrier slot for it. Long
+/// enough for a handler that makes a round-trip or two, short enough that eight
+/// parked ones do not take the plugin's keys away for the rest of the run, nor
+/// a picker left open hold up a `/reload`.
+const KEYBIND_TICKET_HOLD: Duration = Duration::from_secs(10);
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -113,7 +130,32 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
 const TURN_END_EVENT: &str = "TurnEnd";
+const ASK_FIELD: &str = "ask";
 const SESSION_END_EVENT: &str = "SessionEnd";
+/// Wall clock the `ui.plan_form*` chains get, together, before the host stops
+/// waiting and opens the built-in form, generous because a layer may shell out
+/// or fetch before it decides. It rules out a parked layer stranding the user
+/// with a finished plan and no surface for it.
+///
+/// One budget covers both chains a draft fires, so this is also the whole
+/// wait the user can see and the number the UI's own fallback is derived
+/// from. Two budgets would add up to a host worst case no reader of either
+/// constant could predict.
+pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
+/// What layering either `ui.plan_form*` chain costs. A layer decides what the
+/// menu says and what pressing Enter on a row does, up to a build-mode turn
+/// with every tool behind it, and it can keep a built-in row's wording while
+/// swapping the outcome under it. No narrower price would be honest.
+const PLAN_FORM_AUTHORITY: Authority = Authority::Unbounded;
+/// Wall clock a picked plan row's handler gets. The row's built-in action
+/// waits behind it, so a handler that parks for good would cost the user the
+/// outcome the row promised as well as the one the plugin wanted.
+///
+/// The whole budget a pick can take here, so the UI derives its own fallback
+/// from it rather than from a number of its own.
+pub const PLAN_ROW_HANDLER_DEADLINE: Duration = Duration::from_secs(30);
+const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
+const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -152,15 +194,47 @@ pub struct LoadChunk {
     /// wrote rather than at the package.
     pub name: String,
     pub source: String,
+    origin: ChunkOrigin,
+}
+
+/// Where a chunk's source came from, which decides whether it goes through
+/// [`load_user_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkOrigin {
+    /// Shipped in the binary and checked by its tests.
+    Bundled,
+    /// Anything a user can change: a config file, a package, a plugin file.
+    User,
 }
 
 impl LoadChunk {
+    /// Source a user can change. The default, so a new load path cannot skip
+    /// the checks user source gets by forgetting to ask for them.
     pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             source: source.into(),
+            origin: ChunkOrigin::User,
         }
     }
+
+    /// Source that ships in the binary.
+    pub(crate) fn bundled(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            origin: ChunkOrigin::Bundled,
+            ..Self::new(name, source)
+        }
+    }
+}
+
+/// Where user Lua enters the VM, for chunk loads and `require` alike, so the
+/// key lint sees every user file that runs. A new load path of user source
+/// should call this instead of `lua.load`.
+fn load_user_source<'a>(lua: &'a Lua, name: &str, source: &'a str) -> Chunk<'a> {
+    if let Some(key_lint) = lua.app_data_ref::<KeyLint>() {
+        key_lint.check(name, source);
+    }
+    lua.load(source).set_name(name)
 }
 
 /// Everything a load needs besides the code itself.
@@ -226,7 +300,8 @@ enum PluginLoad<'a> {
 
 /// One firing of a host-owned slot, as the call being filtered described it.
 pub(crate) struct HookRun {
-    pub slot: String,
+    /// Innermost first, run as one chain. See [`run_host_chain`].
+    pub slots: Vec<String>,
     pub authority: Authority,
     /// The filtered call's own cancellation and window. The chain runs on the
     /// Lua thread, so without them nothing here knows when the caller stopped
@@ -235,6 +310,9 @@ pub(crate) struct HookRun {
     pub deadline: Instant,
     pub value: Value,
     pub call: Value,
+    /// Only a tool input can be put in front of the user, so anywhere else an
+    /// `ask` is dropped and a rewrite next to it still lands.
+    pub may_ask: bool,
 }
 
 /// Load/clear drain in-flight tools first so we never mutate a
@@ -286,6 +364,33 @@ pub enum Request {
         /// The caller already holds the in-flight slot, so this call rides it
         /// instead of taking one of its own (see [`under_inflight_slot`]).
         nested: bool,
+    },
+    /// Fires when the user picks a plugin row on the plan form. The row is
+    /// named by its position in the menu the chain built for that session,
+    /// plus the generation that menu was published with, so a pick only ever
+    /// reaches the handlers of the menu the user was looking at.
+    RunPlanAction {
+        session: String,
+        generation: u64,
+        row: usize,
+        /// Absolute plan path.
+        path: String,
+        /// Value of the form's "parallel" checkbox when the user picked the row.
+        parallel: bool,
+        /// Whether the row's built-in action still runs, and if not, whether
+        /// that was the handler's decision or the host failing to take the
+        /// pick at all.
+        reply: flume::Sender<PlanActionOutcome>,
+    },
+    /// Fires the two `ui.plan_form*` chains for a session whose plan just
+    /// landed: whether the built-in form opens, and with which rows.
+    OpenPlanForm {
+        path: String,
+        session: String,
+        /// The rows the host proposes, i.e. the bottom of the actions chain.
+        rows: Vec<PlanFormRow>,
+        /// The menu to draw, or `None` when a layer took the form over.
+        reply: flume::Sender<Option<PlanMenu>>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -363,7 +468,7 @@ pub enum Request {
         fallback: Option<Box<ClickFallback>>,
     },
     RunKeybindCallback {
-        id: u64,
+        ticket: KeybindTicket,
     },
     Describe {
         plugin: Arc<str>,
@@ -892,7 +997,7 @@ impl ModuleLoader {
         if func.is_none() {
             for rel_path in &candidates {
                 if let Some(source) = self.plugin_source(rel_path, modname)? {
-                    func = Some(self.bind(lua.load(source.as_str()), modname)?);
+                    func = Some(self.bind(load_user_source(lua, modname, &source), modname)?);
                     break;
                 }
             }
@@ -1809,6 +1914,78 @@ fn spawn_deferred_callback(
     .detach();
 }
 
+/// Runs a keybind callback. The host consumed the key to get here, and the key
+/// is spent whatever the handler does with it.
+///
+/// The return value is not read, and a handler that raises is logged and
+/// nothing more. Replaying a key because a plugin has a bug is strictly worse
+/// than dropping it: seconds later the UI is not the one the user pressed it
+/// against, and a `<CR>` landing on the permission prompt that opened in the
+/// meantime approves its default answer. Fall-through is the host's decision,
+/// taken on the UI thread before any of this runs.
+///
+/// The budget slot and the handler are two tasks, because they are two
+/// lifetimes. A key that opens a float and loops on `win:recv()` runs for as
+/// long as the user keeps it up, and a deadline on the handler would close the
+/// session browser under them. The ticket goes once the handler is done or
+/// after [`KEYBIND_TICKET_HOLD`], whichever is first: holding it to the end
+/// means eight presses that park take every key the plugin binds away for the
+/// rest of the run.
+///
+/// A [`GateGuard`] rides along with the ticket, the way [`run_host_hook`] takes
+/// one, so a `/reload` waiting on [`drain_barrier`] cannot land in the middle
+/// of a handler. It is bounded by the same hold rather than by the handler,
+/// because a picker the user left open would otherwise hold the barrier for as
+/// long as it is on screen - which is why a command handler takes no guard at
+/// all.
+fn spawn_keybind_callback(
+    lua: &Lua,
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    ticket: KeybindTicket,
+) {
+    let key = ticket.key();
+    if !ticket.plugin_live() {
+        tracing::warn!(?key, plugin = %ticket.plugin(), "keybind key dropped: plugin unloaded");
+        return;
+    }
+    let func = match lua.registry_value::<Function>(ticket.callback()) {
+        Ok(func) => func,
+        Err(e) => {
+            tracing::warn!(?key, error = %e, "keybind key dropped: callback missing");
+            return;
+        }
+    };
+    // Dropped when the handler returns, which is how the task below learns it
+    // may hand the slot back before the hold lapses.
+    let (done_tx, done_rx) = flume::bounded::<()>(1);
+    let handler_lua = lua.clone();
+    let plugin = Arc::clone(ticket.plugin());
+    ex.spawn(async move {
+        let _done = done_tx;
+        if let Err(e) = run_detached(&handler_lua, func.call_async::<LuaValue>(())).await {
+            tracing::warn!(?key, plugin = %plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
+        }
+    })
+    .detach();
+    let gate = Rc::clone(gate);
+    ex.spawn(async move {
+        let _guard = GateGuard::new(&gate);
+        let _ticket = ticket;
+        futures_lite::future::or(
+            async {
+                let _ = done_rx.recv_async().await;
+            },
+            async {
+                smol::Timer::after(KEYBIND_TICKET_HOLD).await;
+                tracing::warn!(?key, "keybind handler outlived its budget slot");
+            },
+        )
+        .await;
+    })
+    .detach();
+}
+
 fn spawn_async_task(
     lua: &Lua,
     ex: &Rc<smol::LocalExecutor<'_>>,
@@ -1941,6 +2118,7 @@ impl LuaRuntime {
         hint_writer: HintWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
+        layered: Arc<LayeredTools>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let compiler = install_compiler(&lua, jit);
@@ -1978,16 +2156,21 @@ impl LuaRuntime {
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
         lua.set_app_data(AutocmdStore::default());
-        let layered: Arc<LayeredTools> = Arc::default();
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
+            tx: tx.clone(),
+            layered: Arc::clone(&layered),
+        });
+        registry.set_agent_hook(crate::hook::SlotHook {
             tx: tx.clone(),
             layered,
         });
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
+        lua.set_app_data(WinStore::default());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(PlanRowHandlers::default());
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
@@ -1996,6 +2179,12 @@ impl LuaRuntime {
             let plugins = Rc::clone(&plugins);
             crate::api::tool::set_local_describe(move |plugin, tool, dctx| {
                 run_describe(&lua, &plugins, plugin, tool, dctx)
+            });
+        }
+        {
+            let plugins = Rc::clone(&plugins);
+            crate::api::slot::set_layer_delegation(move |plugin, authority, slot| {
+                layer_delegation(&plugins, authority, slot)(plugin)
             });
         }
         {
@@ -2073,6 +2262,9 @@ impl LuaRuntime {
         if let Some(mut store) = self.lua.app_data_mut::<SlotStore>() {
             store.clear_plugin(name);
         }
+        // A row stays on screen with the layer that drew it gone, but its
+        // handler captured the permissions the user just revoked.
+        clear_plugin_rows(&self.lua, name);
         let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             revision_guard = owner.revision_guard;
@@ -2361,6 +2553,12 @@ impl LuaRuntime {
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
 
         drop(self.drop_plugin_keys(&name));
+        // The one place a name `clear_plugin` tombstoned comes back live, so
+        // a handler of the load being replaced cannot publish bindings that
+        // fire for a load that is gone.
+        if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
+            store.revive(&name);
+        }
 
         // Chunks run in order against one environment, so a later file sees
         // what an earlier one registered. The first failure stops the rest.
@@ -2368,12 +2566,17 @@ impl LuaRuntime {
             PluginLoad::Chunks(chunks) => {
                 let mut result = Ok(());
                 for chunk in chunks {
-                    let main_fn = self
-                        .lua
-                        .load(chunk.source.as_str())
-                        .set_name(chunk.name.as_str())
-                        .set_environment(env.clone())
-                        .into_function();
+                    let main_fn = match chunk.origin {
+                        ChunkOrigin::Bundled => self
+                            .lua
+                            .load(chunk.source.as_str())
+                            .set_name(chunk.name.as_str()),
+                        ChunkOrigin::User => {
+                            load_user_source(&self.lua, &chunk.name, &chunk.source)
+                        }
+                    }
+                    .set_environment(env.clone())
+                    .into_function();
                     result = match main_fn {
                         Ok(function) => {
                             queue_codegen(&self.codegen_queue, &function);
@@ -2496,16 +2699,14 @@ impl LuaRuntime {
             queue.cancel_plugin(plugin);
         }
         crate::api::top::clear_notify_handler(&self.lua, plugin);
+        crate::api::fs::clear_plugin_files(plugin);
         let revision_guard = self.drop_plugin_keys(plugin);
         with_packs(&self.lua, |packs| packs.active.remove(plugin));
         drop(revision_guard);
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
-            let keys = store.clear_plugin(plugin);
+            store.clear_plugin(plugin);
             let entries = store.snapshot_entries();
             drop(store);
-            for key in keys {
-                let _ = self.lua.remove_registry_value(key);
-            }
             if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
                 writer.publish(entries);
             }
@@ -2517,6 +2718,12 @@ impl LuaRuntime {
             if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
                 writer.publish(entries);
             }
+        }
+        // Last of the revocations, and the only one the user can see: a float
+        // left up by an unloaded plugin still holds the keys it claimed, with
+        // the loop that answered them cancelled along with the load.
+        if let Some(mut store) = self.lua.app_data_mut::<WinStore>() {
+            store.close_plugin(plugin);
         }
     }
 
@@ -2909,15 +3116,20 @@ async fn dispatch_async(
     }
 }
 
-/// Whether a plugin may layer this host slot at all.
+/// Whether a plugin may layer this slot at all.
 ///
 /// A layer on `tool.<name>.input` rewrites the call the tool then makes, so it
 /// borrows that call's [`Authority`] and has to already hold it. Without this,
-/// a plugin denied `run` could turn any bash command into its own.
+/// a plugin denied `run` could turn any bash command into its own. A layer on
+/// a slot another plugin declared arrives here as the price that slot's owner
+/// named at `declare_slot`: once per capability it listed, or as
+/// [`Authority::Unbounded`] when it listed none.
 ///
 /// Decided when the chain fires rather than when the layer is registered,
 /// because a layer may legitimately be set before its target tool exists, and
-/// permissions a reload narrows take effect on the very next call.
+/// permissions a reload narrows take effect on the very next call. Host slots
+/// reach it through [`run_host_chain`], plugin slots through the gate the
+/// runtime installs for them, so both kinds gate in one place.
 fn layer_delegation<'a>(
     plugins: &'a PluginMap,
     authority: Authority,
@@ -2941,9 +3153,203 @@ fn layer_delegation<'a>(
     }
 }
 
+/// The event both `ui.plan_form*` chains see: which draft landed, and whose.
+fn plan_form_event(lua: &Lua, path: &str, session: &str) -> mlua::Result<MultiValue> {
+    let ev = lua.create_table()?;
+    ev.set("path", path)?;
+    ev.set("session", session)?;
+    Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
+}
+
+/// A `ui.plan_form*` chain that ended without an answer, logged with the
+/// plugins layering it, since a chain that never came back cannot say which
+/// of them parked.
+fn plan_chain_abandoned(lua: &Lua, slot: &str, reason: &str) {
+    tracing::warn!(
+        slot,
+        plugins = %layer_plugins(lua, slot),
+        reason,
+        "plan form slot chain abandoned, falling back to the built-in form"
+    );
+}
+
+/// Asks the `ui.plan_form` chain whether the built-in plan form should open
+/// for the draft that just landed. `true` means every layer deferred and the
+/// chain reached the host default.
+///
+/// Layering costs [`PLAN_FORM_AUTHORITY`], and a layer that throws or parks
+/// for good leaves the built-in form, never a dead surface.
+async fn plan_form_opens(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    deadline: Instant,
+    args: MultiValue,
+) -> bool {
+    let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_SLOT);
+    let chain = run_host_chain(lua, &[PLAN_FORM_SLOT], args, &allow_layer);
+    match run_awaited(lua, gate, CancelToken::none(), deadline, chain).await {
+        // `None` is "nothing layered it", so there is nobody else to draw it.
+        Ok(Ok(None)) => true,
+        // The host default hands the event table back, so a chain every layer
+        // deferred through answers truthy. A layer that returns nothing, or
+        // `false`, keeps the form closed and owns the surface.
+        Ok(Ok(Some(values))) => values
+            .into_iter()
+            .next()
+            .is_some_and(|v| !matches!(v, LuaValue::Nil | LuaValue::Boolean(false))),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot = PLAN_FORM_SLOT,
+                plugins = %layer_plugins(lua, PLAN_FORM_SLOT),
+                error = %strip_traceback(&e),
+                "plan form slot chain failed"
+            );
+            true
+        }
+        Err(reason) => {
+            plan_chain_abandoned(lua, PLAN_FORM_SLOT, reason);
+            true
+        }
+    }
+}
+
+/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and
+/// stashes the handlers of the plugin rows that came back so a pick can find
+/// them, under the generation the form has to echo back.
+///
+/// The default answers with {proposed}, the host's own rows, which is also
+/// what a layer that throws, parks for good, or answers off contract leaves
+/// behind. Layering costs [`PLAN_FORM_AUTHORITY`], since a row decides what
+/// the agent does next.
+async fn plan_form_rows(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    deadline: Instant,
+    session: &str,
+    args: MultiValue,
+    proposed: Vec<PlanFormRow>,
+) -> PlanMenu {
+    let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_ACTIONS_SLOT);
+    let host_rows = proposed.clone();
+    // Which layer put which handler in the menu, the one thing the answered
+    // table cannot say on its own.
+    let owners: Arc<Mutex<RowOwners>> = Arc::default();
+    let observer = Arc::clone(&owners);
+    let observe: ChainObserver = Arc::new(move |plugin: &Arc<str>, values: &MultiValue| {
+        if let Some(LuaValue::Table(table)) = values.iter().next() {
+            observer.lock().expect("row owners").observe(plugin, table);
+        }
+    });
+    let answered =
+        match lua.create_function(move |lua, _: MultiValue| rows_to_table(lua, &host_rows)) {
+            Ok(default) => {
+                let chain = run_host_chain_with(
+                    lua,
+                    &[PLAN_FORM_ACTIONS_SLOT],
+                    default,
+                    args,
+                    &allow_layer,
+                    Some(observe),
+                );
+                run_awaited(lua, gate, CancelToken::none(), deadline, chain).await
+            }
+            Err(e) => Ok(Err(e)),
+        };
+    let answered = match answered {
+        Ok(Ok(Some(values))) => match values.into_iter().next() {
+            Some(LuaValue::Table(table)) => {
+                let owners = owners.lock().expect("row owners");
+                rows_from_table(lua, table, &owners)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            slot = PLAN_FORM_ACTIONS_SLOT,
+                            plugins = %layer_plugins(lua, PLAN_FORM_ACTIONS_SLOT),
+                            error = %e,
+                            "plan form actions slot answered off contract"
+                        );
+                    })
+                    .ok()
+            }
+            _ => None,
+        },
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot = PLAN_FORM_ACTIONS_SLOT,
+                plugins = %layer_plugins(lua, PLAN_FORM_ACTIONS_SLOT),
+                error = %strip_traceback(&e),
+                "plan form actions slot chain failed"
+            );
+            None
+        }
+        Err(reason) => {
+            plan_chain_abandoned(lua, PLAN_FORM_ACTIONS_SLOT, reason);
+            None
+        }
+    };
+    // A plugin that wants no form keeps `ui.plan_form` closed instead of
+    // answering with an empty menu.
+    let (rows, handlers) = answered
+        .filter(|answered| !answered.0.is_empty())
+        .unwrap_or_else(|| (proposed, Vec::new()));
+    match install_row_handlers(lua, session.to_owned(), handlers) {
+        Ok(generation) => PlanMenu { generation, rows },
+        Err(e) => {
+            // Nothing was stashed, so no row may go on claiming a handler: a
+            // pick would echo a generation that answers for nothing, and the
+            // built-in outcome the row named would go with it.
+            tracing::warn!(error = %e, "could not stash the plan form row handlers");
+            PlanMenu {
+                generation: 0,
+                rows: rows.into_iter().filter_map(without_handler).collect(),
+            }
+        }
+    }
+}
+
+/// A row the host could not stash a handler for. What is left is the built-in
+/// outcome it named, and a row that named none is one nobody can run.
+fn without_handler(mut row: PlanFormRow) -> Option<PlanFormRow> {
+    row.plugin = None;
+    row.action.is_some().then_some(row)
+}
+
+/// Both chains a landed plan fires, under one deadline: they run back to back
+/// for a single wait the user sees, so a budget each would let the host take
+/// twice what either constant says. `None` is a layer having taken the form
+/// over, so the host draws nothing for this draft.
+async fn open_plan_form(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    path: String,
+    session: &str,
+    rows: Vec<PlanFormRow>,
+) -> Option<PlanMenu> {
+    let deadline = Instant::now() + PLAN_FORM_SLOT_DEADLINE;
+    let args = match plan_form_event(lua, &path, session) {
+        Ok(args) => args,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the plan form slot event");
+            return Some(PlanMenu {
+                generation: 0,
+                rows,
+            });
+        }
+    };
+    if !plan_form_opens(lua, plugins, gate, deadline, args.clone()).await {
+        return None;
+    }
+    Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
+}
+
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
-/// `nil, reason` stops the call with a reason the model reads.
+/// `nil, reason` stops the call with a reason the model reads. A second value
+/// of `{ ask = reason }` instead escalates the call to the user, with or
+/// without a rewrite in front of it, where [`HookRun::may_ask`] allows it.
 ///
 /// Every failure below is a pass-through, because a layer is an opinion about a
 /// call and never a precondition for making it.
@@ -2958,20 +3364,24 @@ async fn run_hook(
     run: HookRun,
 ) -> Verdict {
     let HookRun {
-        slot,
+        slots,
         authority,
         cancel,
         deadline,
         value,
         call,
+        may_ask,
     } = run;
-    let slot = slot.as_str();
+    let names: Vec<&str> = slots.iter().map(String::as_str).collect();
+    let Some(&slot) = names.first() else {
+        return Verdict::Unchanged;
+    };
     let args = match (json_to_lua(lua, &value), json_to_lua(lua, &call)) {
         (Ok(value), Ok(call)) => MultiValue::from_vec(vec![value, call]),
         _ => return Verdict::Unchanged,
     };
     let allow_layer = layer_delegation(plugins, authority, slot);
-    let chain = run_host_chain(lua, slot, args, &allow_layer);
+    let chain = run_host_chain(lua, &names, args, &allow_layer);
     let returned = match run_awaited(lua, gate, cancel, deadline, chain).await {
         Ok(Ok(Some(values))) => values,
         Ok(Ok(None)) => return Verdict::Unchanged,
@@ -2986,31 +3396,58 @@ async fn run_hook(
     };
 
     let mut returned = returned.into_iter();
-    match returned.next() {
+    let first = returned.next();
+    let ask = match returned.next() {
+        Some(LuaValue::Table(second)) => match second.get::<Option<String>>(ASK_FIELD) {
+            Ok(reason) => reason,
+            Err(e) => {
+                tracing::warn!(slot, error = %e, "slot answered `ask` with something other than a string");
+                None
+            }
+        },
+        Some(LuaValue::String(reason)) if matches!(first, None | Some(LuaValue::Nil)) => {
+            return Verdict::Denied(reason.to_string_lossy());
+        }
+        _ => None,
+    };
+    let ask = match ask {
+        Some(reason) if !may_ask => {
+            tracing::warn!(
+                slot,
+                reason,
+                "only a tool input layer can ask, so the ask was dropped"
+            );
+            None
+        }
+        ask => ask,
+    };
+    let replaced = match first {
         Some(table @ LuaValue::Table(_)) => match lua_to_json_within(lua, &table, &value) {
             // The identity default hands back the value it was given, so a
             // layer that only deferred returns a table too. Comparing is the
             // only way to tell that apart from a rewrite, and it keeps the
             // original `Value` in play instead of a re-encode of it.
-            Ok(replacement) if replacement == value => Verdict::Unchanged,
-            Ok(replacement) => Verdict::Replaced(replacement),
+            Ok(replacement) if replacement == value => None,
+            Ok(replacement) => Some(replacement),
             Err(e) => {
                 tracing::warn!(slot, error = %strip_traceback(&e), "slot returned a table that is not json");
-                Verdict::Unchanged
+                None
             }
         },
-        None | Some(LuaValue::Nil) => match returned.next() {
-            Some(LuaValue::String(reason)) => Verdict::Denied(reason.to_string_lossy()),
-            _ => Verdict::Unchanged,
-        },
+        None | Some(LuaValue::Nil) => None,
         Some(other) => {
             tracing::warn!(
                 slot,
                 returned = other.type_name(),
                 "slot must return a table, nil, or nil plus a reason"
             );
-            Verdict::Unchanged
+            None
         }
+    };
+    match (ask, replaced) {
+        (Some(reason), input) => Verdict::Ask { reason, input },
+        (None, Some(replacement)) => Verdict::Replaced(replacement),
+        (None, None) => Verdict::Unchanged,
     }
 }
 
@@ -3324,13 +3761,20 @@ async fn run_tool_call(
 pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub prio_tx: flume::Sender<Request>,
+    /// Shared with the runtime on the Lua thread, so a handle can answer "is
+    /// anyone layering this" without a roundtrip.
+    pub layered: Arc<LayeredTools>,
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
+    pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
+    /// What [`load_user_source`] found on the Lua thread, for the host to
+    /// report.
+    pub key_lint: KeyLint,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -3344,15 +3788,23 @@ pub fn spawn(
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
     let tx_clone = tx.clone();
+    let layered: Arc<LayeredTools> = Arc::default();
+    let layered_thread = Arc::clone(&layered);
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
     let (ui_action_tx, ui_action_rx) = flume::unbounded::<UiAction>();
+    let (ui_waker, ui_wake_rx) = UiWaker::new();
     let ui_attachment = UiAttachment::default();
     let ui_attachment_thread = ui_attachment.clone();
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let key_lint = KeyLint::default();
+    let key_lint_thread = key_lint.clone();
+    // The file index outlives any one plugin host, so the walks a host
+    // rebuilt by `/reload` is waiting on are the ones the old host started.
+    publish_walks(EventHandle::from_tx(tx.clone()));
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -3369,8 +3821,11 @@ pub fn spawn(
                 hint_writer,
                 jit,
                 plugin_rules,
+                layered_thread,
             ) {
                 Ok(r) => {
+                    r.lua.set_app_data(key_lint_thread);
+                    r.lua.set_app_data(ui_waker);
                     let _ = init_tx.send(Ok(()));
                     r
                 }
@@ -3625,6 +4080,107 @@ pub fn spawn(
                             }
                             let _ = reply.send(());
                         }
+                        Request::RunPlanAction {
+                            session,
+                            generation,
+                            row,
+                            path,
+                            parallel,
+                            reply,
+                        } => {
+                            let found = rt
+                                .lua
+                                .app_data_ref::<PlanRowHandlers>()
+                                .ok_or(PLAN_HANDLERS_MISSING_ERR)
+                                .and_then(|handlers| {
+                                    let handler = handlers.handler(&session, generation, row)?;
+                                    let func = rt
+                                        .lua
+                                        .registry_value::<Function>(&handler.key)
+                                        .map_err(|_| PLAN_HANDLER_GONE_ERR)?;
+                                    Ok((Arc::clone(&handler.plugin), func))
+                                });
+                            match found {
+                                Ok((plugin, func)) => {
+                                    let lua = rt.lua.clone();
+                                    let gate = Rc::clone(&gate);
+                                    ex.spawn(async move {
+                                        let run = async {
+                                            let opts =
+                                                row_handler_opts(&lua, &session, &path, parallel)?;
+                                            let thread = lua.create_thread(func)?;
+                                            thread.into_async::<LuaValue>(opts)?.await
+                                        };
+                                        // Handler-then-action: the row's
+                                        // built-in outcome follows unless the
+                                        // handler answered `false` or failed.
+                                        let deadline =
+                                            Instant::now() + PLAN_ROW_HANDLER_DEADLINE;
+                                        let outcome = match run_awaited(
+                                            &lua,
+                                            &gate,
+                                            CancelToken::none(),
+                                            deadline,
+                                            run,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(LuaValue::Boolean(false))) => {
+                                                PlanActionOutcome::Vetoed
+                                            }
+                                            Ok(Ok(_)) => PlanActionOutcome::Proceed,
+                                            Ok(Err(e)) => {
+                                                tracing::warn!(plugin = %plugin, row, error = %strip_traceback(&e), "plan form row handler failed");
+                                                PlanActionOutcome::Failed
+                                            }
+                                            Err(reason) => {
+                                                tracing::warn!(plugin = %plugin, row, reason, "plan form row handler abandoned");
+                                                PlanActionOutcome::Failed
+                                            }
+                                        };
+                                        let _ = reply.send(outcome);
+                                    })
+                                    .detach();
+                                }
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        session,
+                                        generation,
+                                        row,
+                                        reason,
+                                        "plan form row pick reached no handler"
+                                    );
+                                    let _ = reply.send(PlanActionOutcome::Failed);
+                                }
+                            }
+                        }
+                        Request::OpenPlanForm {
+                            path,
+                            session,
+                            rows,
+                            reply,
+                        } => {
+                            // Spawned, not awaited: a layer may park, and
+                            // every other session is waiting on this request
+                            // loop.
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let gate = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let menu =
+                                    open_plan_form(&lua, &plugins, &gate, path, &session, rows)
+                                        .await;
+                                let generation = menu.as_ref().map_or(0, |m| m.generation);
+                                if reply.send(menu).is_err() {
+                                    // The form gave up on this answer, or the
+                                    // session it was asked about is gone. The
+                                    // handlers stashed for a menu nobody will
+                                    // ever draw go with it.
+                                    clear_menu_generation(&lua, &session, generation);
+                                }
+                            })
+                            .detach();
+                        }
                         Request::RunCommand {
                             plugin,
                             command,
@@ -3843,6 +4399,8 @@ pub fn spawn(
                             with_jobs(&rt.lua, |store| {
                                 store.kill_session(&rt.lua, end.session)
                             });
+                            // Nothing can pick from this session's plan form again.
+                            clear_session_rows(&rt.lua, &end.session.to_string());
                             if let Some((_, reply)) = end.wait {
                                 let _ = reply.send(());
                             }
@@ -3904,19 +4462,8 @@ pub fn spawn(
                             })
                             .detach();
                         }
-                        Request::RunKeybindCallback { id } => {
-                            let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
-                                let key = store.callback_for_id(id)?;
-                                rt.lua.registry_value::<Function>(key).ok()
-                            });
-                            if let Some(func) = func {
-                                let lua = rt.lua.clone();
-                                ex.spawn(async move {
-                                    if let Err(e) = run_detached(&lua, func.call_async::<()>(())).await {
-                                        tracing::warn!(keybind_id = id, error = %e, "keybind callback failed");
-                                    }
-                                }).detach();
-                            }
+                        Request::RunKeybindCallback { ticket } => {
+                            spawn_keybind_callback(&rt.lua, &ex, &gate, ticket);
                         }
                     }
                 }
@@ -3927,6 +4474,10 @@ pub fn spawn(
             // no caller blocks on a dead host.
             for _ in rx.drain() {}
             for _ in prio_rx.drain() {}
+            // Each pooled client owns a curl thread and its connection cache.
+            // Nothing else hands them back, so a host that fetched once would
+            // keep its sockets open for the rest of the process.
+            crate::api::net::clear_client_pool();
         })
         .map_err(|e| PluginError::Io {
             path: PathBuf::from("lua-thread"),
@@ -3941,13 +4492,16 @@ pub fn spawn(
     Ok(LuaThread {
         tx,
         prio_tx,
+        layered,
         join: Some(handle),
         shutdown,
         command_reader,
         keymap_reader,
         hint_reader,
         ui_action_rx,
+        ui_wake_rx,
         ui_attachment,
+        key_lint,
     })
 }
 

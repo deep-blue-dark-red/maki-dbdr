@@ -4,6 +4,7 @@
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local DEFAULT_MAX_LINE_BYTES = 500
+local NEWLINE_BYTE = string.byte("\n")
 
 local M = {}
 
@@ -24,6 +25,22 @@ end
 function M.resolve(opts, ctx)
   return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
     opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
+end
+
+--- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate
+--- lines here rather than terminate them, so a trailing one is an empty last
+--- line and counts as one.
+function M.tail(text, n)
+  local seen = 0
+  for i = #text, 1, -1 do
+    if text:byte(i) == NEWLINE_BYTE then
+      seen = seen + 1
+      if seen == n then
+        return text:sub(i + 1)
+      end
+    end
+  end
+  return text
 end
 
 return M

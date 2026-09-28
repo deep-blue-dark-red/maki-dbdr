@@ -17,16 +17,23 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
+use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
-use maki_agent::{AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig};
+use maki_agent::{
+    AgentConfig, AgentEvent, DoneReason, Envelope, ImageSource, PermissionsConfig, SteerKind,
+};
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
 use maki_providers::{TokenUsage, add_cost};
+use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
+use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
+
+const SESSION_LINE_PREFIX: &str = "session: ";
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -149,6 +156,13 @@ pub struct PrintParams {
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
     pub project_config: ProjectConfig,
+    /// Which session this run continues and writes under, and where. Resolved
+    /// by the caller from the same flags every other entry point reads.
+    pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken when it was
+    /// resolved and held for the whole run.
+    pub claim: SessionClaim,
+    pub storage: StateDir,
 }
 
 pub fn run(params: PrintParams) -> Result<()> {
@@ -166,6 +180,9 @@ pub fn run(params: PrintParams) -> Result<()> {
         model_policy,
         plugin_rules,
         project_config,
+        resumed,
+        claim,
+        storage,
     } = params;
 
     let prompt = match prompt {
@@ -201,6 +218,9 @@ pub fn run(params: PrintParams) -> Result<()> {
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd,
+        resumed,
+        claim,
+        storage,
         defaults,
         model_policy,
         plugin_rules,
@@ -213,7 +233,6 @@ pub fn run(params: PrintParams) -> Result<()> {
         cwd,
         task,
     } = handle;
-    crate::setup::report_session_start(maki_otel::emit::START_FRESH, Some(&session_id));
     let start = Instant::now();
 
     let mut verbose_out = match format {
@@ -222,15 +241,18 @@ pub fn run(params: PrintParams) -> Result<()> {
         _ => None,
     };
 
-    if let Some(out) = &mut verbose_out {
-        out.emit(&InitEvent {
+    match &mut verbose_out {
+        Some(out) => out.emit(&InitEvent {
             event_type: "system",
             subtype: "init",
             cwd: &cwd,
             session_id: &session_id,
             tools: &tool_names,
             model: &model.id,
-        })?;
+        })?,
+        // Text mode never says which session it wrote, and a later `-r`
+        // needs it. On stderr so a pipe reading the answer is unaffected.
+        None => eprintln!("{SESSION_LINE_PREFIX}{session_id}"),
     }
 
     let mut result_text = String::new();
@@ -299,6 +321,12 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed
             | AgentEvent::TurnToolsDone { .. } => {}
+            AgentEvent::Steered { .. } => {
+                if let Some(reason) = dropped_prompt(event, parent_tool_use_id) {
+                    is_error = true;
+                    result_text = reason.to_owned();
+                }
+            }
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -405,10 +433,41 @@ pub fn run(params: PrintParams) -> Result<()> {
     Ok(())
 }
 
+/// Nothing reached the model, so the reason is the only answer there is. A
+/// script checking the exit status should see that the prompt never ran.
+fn dropped_prompt<'a>(event: &'a AgentEvent, parent_tool_use_id: Option<&str>) -> Option<&'a str> {
+    match event {
+        AgentEvent::Steered {
+            kind: SteerKind::MessageDropped,
+            text,
+        } if parent_tool_use_id.is_none() => Some(text),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use maki_providers::TokenUsage;
+    use test_case::test_case;
+
+    const DROP_REASON: &str = "blocked by a plugin";
+    const PARENT_TOOL_USE_ID: &str = "toolu_parent";
+
+    #[test_case(SteerKind::MessageDropped, None, Some(DROP_REASON) ; "top_level_drop_is_the_result")]
+    #[test_case(SteerKind::MessageDropped, Some(PARENT_TOOL_USE_ID), None ; "subagent_drop_is_ignored")]
+    #[test_case(SteerKind::MessageRewritten, None, None ; "other_steers_are_ignored")]
+    fn dropped_prompt_only_counts_a_top_level_drop(
+        kind: SteerKind,
+        parent: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let event = AgentEvent::Steered {
+            kind,
+            text: DROP_REASON.into(),
+        };
+        assert_eq!(dropped_prompt(&event, parent), expected);
+    }
 
     const PRINT_RESULT_FIELDS: &[&str] = &[
         "type",

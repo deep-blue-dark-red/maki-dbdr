@@ -11,6 +11,9 @@ local partial = require("maki.partial")
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 local MAX_SCRIPT_LINES = 2000
+local OPEN_READ_CHECK_LINES = 1
+local READ_INPUT_SLOTS = { "tool.read.input", "tool.*.input" }
+local OPEN_READ_HOOKED_ERR = "open() cannot read while a plugin hooks the read tool, call read() instead"
 local NO_OUTPUT = "(no output)"
 local SEPARATOR = "──────"
 local CANCELLED_ERR = "cancelled"
@@ -49,6 +52,7 @@ async def gather(*calls):
     return results
 ]]):format(ERROR_PREFIX)
 local TOOLS_HEADER = "\n\nAvailable tools (called as Python functions with keyword arguments):\n"
+local WORKFLOW_OFF_NOTE = "\nNot callable: %s\n"
 -- MCP names and schemas already sit in the tool array (or the tool_search
 -- catalog), so point at those instead of repeating them here.
 local MCP_NOTE =
@@ -122,7 +126,7 @@ local description = "Run Python to chain dependent tool calls or filter their ou
   .. "tools are async functions here: `r = await read(path='x')`. Tools return strings — parse "
   .. "them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — "
   .. "pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. "
-  .. "No imports, no network. 30s default timeout."
+  .. "`open()` reads and writes text files. No imports, no network. 30s default timeout."
 
 local schema = {
   type = "object",
@@ -224,15 +228,24 @@ end
 -- to avoid recursion from describe callbacks.
 local function describe(dctx)
   local parts = { description, TOOLS_HEADER }
-  local has_workflow_only = false
-  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, dctx.workflow)) do
+  local has_workflow_only, gated = false, {}
+  -- Ask as if workflow were on, then hold back what it would unlock: those
+  -- names are listed as not callable, so the model stops trying them.
+  for _, t in ipairs(interpreter_tools(maki.api.get_tools(), dctx.audience, true)) do
     if matches_filter(t.name, dctx) then
-      has_workflow_only = has_workflow_only or t.workflow_only
-      parts[#parts + 1] = signature(t) .. "\n"
+      if t.workflow_only and not dctx.workflow then
+        gated[#gated + 1] = t.name
+      else
+        has_workflow_only = has_workflow_only or t.workflow_only
+        parts[#parts + 1] = signature(t) .. "\n"
+      end
     end
   end
   if has_workflow_only then
     parts[#parts + 1] = WORKFLOW_TOOLS_NOTE
+  end
+  if #gated > 0 then
+    parts[#parts + 1] = WORKFLOW_OFF_NOTE:format(table.concat(gated, ", "))
   end
   if dctx.mcp then
     parts[#parts + 1] = MCP_NOTE
@@ -247,6 +260,37 @@ local function start(input, ctx)
   local buf, _, highlight = build_body(ctx, input.code)
   ctx:live_buf(buf)
   highlight()
+end
+
+-- `open()` rides on the read and write tools, so hooks, plugins that replace
+-- them, permission prompts, the file lock and plan mode all still apply. The
+-- read tool numbers and caps lines, so we ask it for one line just to get its
+-- yes and record the read, then take the real content straight from disk.
+-- A read hook may have pointed that check at another file, so while one is
+-- installed we refuse rather than read the path it steered away from.
+local function file_access(tools)
+  local files = {}
+  if tools.read then
+    files.read = function(path)
+      local slots = maki.api.get_slots()
+      for _, name in ipairs(READ_INPUT_SLOTS) do
+        if slots[name] and #slots[name].fillers > 0 then
+          return nil, OPEN_READ_HOOKED_ERR
+        end
+      end
+      local _, err = tools.read({ path = path, offset = 1, limit = OPEN_READ_CHECK_LINES })
+      if err then
+        return nil, err
+      end
+      return maki.fs.read(maki.fs.abspath(path))
+    end
+  end
+  if tools.write then
+    files.write = function(path, content, append)
+      return tools.write({ path = path, content = content, append = append })
+    end
+  end
+  return files
 end
 
 local function handler(input, ctx)
@@ -318,6 +362,7 @@ local function handler(input, ctx)
     preamble = PREAMBLE,
     on_output = show,
     tools = tools,
+    files = file_access(tools),
   })
 
   if err then

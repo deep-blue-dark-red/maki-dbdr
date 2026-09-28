@@ -6,8 +6,21 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use fs4::{FileExt, TryLockError};
+
+/// How hard [`Lock::acquire_retrying`] retries before reporting a legitimately
+/// held lock. A close-then-reacquire can transiently report as held if a
+/// concurrent fork/posix_spawn duplicated the lock fd: flock lives on the open
+/// file description, so a child that inherited the fd keeps the lock until it
+/// hits exec. maki-pack spawns git, which fits. A real concurrent holder
+/// outlives the deadline (a clone can take tens of seconds), so a ~250ms retry
+/// absorbs the inheritance window without ever appearing to wait on a genuine
+/// lock.
+const LOCK_RETRY_DEADLINE: Duration = Duration::from_millis(250);
+const LOCK_RETRY_SLEEP: Duration = Duration::from_millis(5);
 
 /// Held for as long as the operation runs. Dropping it releases the lock.
 #[derive(Debug)]
@@ -30,12 +43,29 @@ pub enum LockError {
 impl Lock {
     /// Takes the lock without waiting, so a caller that cannot proceed can name
     /// who is in the way instead of hanging on a lock nobody is watching.
+    /// Callers that treat `Held` as ordinary control flow want this one.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
         Self::open_and_lock(path, FileExt::try_lock)
     }
 
     pub fn acquire_shared(path: &Path) -> Result<Self, LockError> {
         Self::open_and_lock(path, FileExt::try_lock_shared)
+    }
+
+    /// For the paths where a `Held` is a failure rather than a skip and that run
+    /// alongside spawning git: a bounded retry (see [`LOCK_RETRY_DEADLINE`])
+    /// absorbs the transient fd-inheritance hold without waiting on a genuine
+    /// lock.
+    pub fn acquire_retrying(path: &Path) -> Result<Self, LockError> {
+        let deadline = Instant::now() + LOCK_RETRY_DEADLINE;
+        loop {
+            match Self::acquire(path) {
+                Err(LockError::Held { .. }) if Instant::now() < deadline => {
+                    thread::sleep(LOCK_RETRY_SLEEP);
+                }
+                result => return result,
+            }
+        }
     }
 
     fn open_and_lock(
@@ -86,6 +116,17 @@ mod tests {
 
         let _held = Lock::acquire(&path).unwrap();
         let error = Lock::acquire(&path).expect_err("a held lock must not be taken twice");
+        assert!(matches!(error, LockError::Held { .. }), "got: {error}");
+    }
+
+    #[test]
+    fn retrying_still_reports_a_holder_that_outlives_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = lock_path(&dir);
+
+        let _held = Lock::acquire(&path).unwrap();
+        let error =
+            Lock::acquire_retrying(&path).expect_err("a genuine holder must outlast the retry");
         assert!(matches!(error, LockError::Held { .. }), "got: {error}");
     }
 

@@ -80,11 +80,12 @@ Fork commands that must be in `BUILTIN_COMMANDS`:
 `plugins/sessions/init.lua` registers `/rename <title>`, so the fork's AI-naming
 stays only as the automatic rename of a `New session` (see `start_rename`).
 
-Upstream now ships `plugins/completion/` (Lua `@` mention popup). The fork keeps
-the native `file_picker`: the `@` arm in `app/mod.rs` opens the window without
-printing anything, and the `@` is printed only if the picker closes without a
-pick (`mention_pending`), so a selected path reaches the message bare.
-On merge, disable the upstream plugin or the two popups double up.
+Upstream ships `plugins/completion/` (a Lua `@` mention popup driven by a
+`completion.sources` slot). The fork drops both on merge: the native
+`file_picker` is the only `@` popup, and it opens without printing anything,
+with the `@` printed only if the picker closes without a pick
+(`mention_pending`), so a selected path reaches the message bare. Keeping
+upstream's plugin would put two popups on the same `@`.
 
 ---
 
@@ -341,6 +342,49 @@ under parallel load, `trusted_folders::non_utf8_paths_are_refused`, and the
   path above, missing `update_bind` arms for `delete_current_session` /
   `toggle_global_sessions`, and a hardcoded `~/.gemini` skills path.
   `verify-fork.sh` now guards all three (145 checks).
+
+## Upstream v0.5.6 merge notes (2026-09-28)
+
+Resolved on `main` (upstream `49fda0e5`; 36 conflicted files, 85 commits past
+the `5da1b2a2` fork point). verify-fork 150/150, `cargo clippy --all --tests
+-- -D warnings` clean, `cargo fmt --check` clean. Decisions taken, so the next
+merge does not re-litigate them:
+
+- **Permissions.** `is_universal_scope` reads a `/**` prefix both ways
+  (canonical `canonical_key` *and* lexical `normalize_path`), while
+  `scope_matches` grants by the canonical reading only. The fork's
+  `universal_prefix_root`, which answered lexically in both places, is gone:
+  it made a lexically-rooted pattern match every scope, which upstream's
+  `lexical_root_through_symlink_is_refused_but_grants_only_its_subtree`
+  refuses. `maki-agent/src/permissions.rs` is now byte-identical to upstream.
+- **History marks its writes.** `push` and `rewrite` go through `edit`, which
+  sets `unsaved`, so `SessionTurn::drop` persists again. Without that, seven
+  `session::tests` found no file on disk.
+- **Compaction.** `compact_history` keeps the fork's `target_tokens` and
+  upstream's `hooks` + `(usage, summary)` return; `summarize` stays on
+  `cancel`/`session_id` and is handed them from `hooks` at the call.
+- **Turn completion.** `emit_turn_complete` keeps the fork's `cost`/`turn`
+  parameters and the caller's `ledger.add`; upstream's `subsidised_list_cost`
+  rides along in `TurnCompleteEvent`.
+- **Copilot** calls upstream's `responses::apply_responses_reasoning` again,
+  so the Responses body carries `summary: "auto"`. The fork's local copy is
+  gone.
+- **`@` completion dropped, not shipped disabled.** Upstream's
+  `plugins/completion/`, its `completion.sources` slot and the loader entry
+  are removed: the native `file_picker` is the only `@` popup (conflict zone
+  2). `OPTIONAL_BUILTINS` is now empty and its test went with it; the hooks
+  and context docs lost the matching section and `gen-docs` regenerated the
+  rest.
+- **Two upstream tests retargeted.** `a_key_an_unfocused_popup_claimed_...`
+  types `'a'` and `moving_the_cursor_alone_fires_...` types `"src"`, because
+  on this fork `@` opens the file picker without typing and never reaches the
+  input. Both still assert what they were written for.
+
+Inherited failures, verified on pristine `49fda0e5` in a scratch worktree and
+therefore not merge regressions: the 13 `file_index::tests` (parallel-load
+sensitive), `maki-pack`'s `deletion_preflight_..._one_revision_is_live` lock,
+`markdown::the_code_memo_follows_the_theme...`, and
+`child_env::child_sees_only_keys_set_after_strip`.
 
 ## Known gaps (not regressions, but broken)
 

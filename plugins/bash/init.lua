@@ -261,7 +261,8 @@ Commands run in ]] .. cwd .. [[ by default.
 - Chain dependent commands with `&&`. Use batch for independent ones.
 - Provide a short `description` (3-5 words).
 - Output truncated beyond 2000 lines or 50KB.
-- Interactive commands (sudo, ssh prompts) fail immediately.]]
+- Interactive commands (sudo, ssh prompts) fail immediately.
+- Use the `tail` param, not `| tail`: piping hides live output.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
@@ -286,6 +287,7 @@ maki.api.register_tool({
       command = { type = "string", description = "The bash command to execute", required = true },
       timeout = { type = "integer", description = "Timeout in seconds (default 120)" },
       workdir = { type = "string", description = "Working directory (default: cwd)" },
+      tail = { type = "integer", description = "Return only the last N lines" },
       description = { type = "string", description = "Short description (3-5 words) of what the command does" },
     },
   },
@@ -319,12 +321,19 @@ maki.api.register_tool({
     if workdir then
       s = s .. " in " .. relative_path(workdir)
     end
+    local hints = {}
     if input.timeout then
-      local buf = maki.ui.buf()
-      buf:line({ { s }, { " (" .. maki.ui.humantime(input.timeout) .. " timeout)", "dim" } })
-      return buf
+      hints[#hints + 1] = maki.ui.humantime(input.timeout) .. " timeout"
     end
-    return s
+    if input.tail then
+      hints[#hints + 1] = "tail " .. input.tail
+    end
+    if #hints == 0 then
+      return s
+    end
+    local buf = maki.ui.buf()
+    buf:line({ { s }, { " (" .. table.concat(hints, ", ") .. ")", "dim" } })
+    return buf
   end,
 
   restore = function(input, output, is_error, ctx)
@@ -358,6 +367,10 @@ maki.api.register_tool({
       return { llm_output = "error: command is required", is_error = true }
     end
 
+    if input.tail and input.tail < 1 then
+      return { llm_output = "error: tail must be >= 1", is_error = true }
+    end
+
     local command, workdir = parse_cd_hint(input)
     local timeout_secs = input.timeout or opts.timeout_secs
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
@@ -375,13 +388,23 @@ maki.api.register_tool({
     local has_output = false
     local finished = false
 
+    -- The cut happens on the accumulated text, after the view already streamed
+    -- every line, so the user still sees the whole run while the model gets
+    -- only the tail. Both the exit and the cancel path go through here.
+    local function final_output()
+      local output = table.concat(output_parts)
+      if input.tail then
+        output = output_limits.tail(output, input.tail)
+      end
+      return truncate(output, max_lines, max_bytes)
+    end
+
     local function finish(exit_code)
       if finished then
         return
       end
       finished = true
-      local output = table.concat(output_parts)
-      output = truncate(output, max_lines, max_bytes)
+      local output = final_output()
 
       local is_error = exit_code ~= 0
       local llm_output
@@ -441,8 +464,7 @@ maki.api.register_tool({
         return
       end
       finished = true
-      local out = truncate(table.concat(output_parts), max_lines, max_bytes)
-      ctx:finish(partial.cut(view, out, reason, timeout_secs))
+      ctx:finish(partial.cut(view, final_output(), reason, timeout_secs))
     end)
 
     return nil

@@ -34,25 +34,37 @@ passes through, so builtins, MCP tools, and ACP client tools behave alike:
 | `tool.<name>.input` | before the input is parsed or checked against your permission rules | the call the model wrote |
 | `tool.<name>.output` | on the result of a call that ran, including a failure or a permission refusal | `{ text, is_error }` |
 
+Name the tool `*` to wrap every tool. See
+[wrapping every tool](#wrapping-every-tool).
+
 A call an input layer stopped never reaches the output slot: the reason came
 from a layer, so there is nothing left to filter. A name that resolves to no
 tool fires neither slot.
 
-Layers take `function(prev, value, ctx)` and answer in one of three ways:
+Layers take `function(prev, value, ctx)` and answer in one of these ways:
 
 - return a table: it replaces the value for the rest of the call
 - return nothing: the value is left alone
 - return `nil, reason`: the call is stopped and the model reads `reason`
+- on `input` only, return `{ ask = reason }` as the second value: the user
+  must approve the call. See [asking the user](#asking-the-user).
+
+A layer that answers without calling `prev` ends the chain, and the layers
+below it never run. To pass a value on untouched, `return prev(value, ctx)`.
 
 Stopping means something different per stage. On `input` the tool never runs and
 `reason` becomes the tool result, marked as an error. On `output` the work is
 already done, so `reason` only replaces the text the model reads.
 
-`ctx` carries `tool`, `tool_id`, `session_id`, and `origin`. Origin is `"model"`
-for a call the model made and `"nested"` for one made on its behalf by `batch`,
-`code_execution`, or a plugin calling `maki.agent.call_tool`. Nested calls have
-no id of their own, so their `tool_id` is empty. A subagent runs its own model,
-so its calls arrive as `"model"` under the subagent's `session_id`.
+| `ctx` field | Meaning |
+| --- | --- |
+| `tool` | tool name |
+| `tool_id` | id of the call, empty for nested calls |
+| `tool_kind` | kind the tool declares, like `read`, `edit`, or `execute`. `nil` if it declares none. |
+| `origin` | `"model"`, or `"nested"` when `batch`, `code_execution`, or `maki.agent.call_tool` made the call |
+| `session_id` | session of the call. A subagent's calls arrive as `"model"` under its own session. |
+| `deadline_ms` | milliseconds left before the layer is dropped |
+| `input` | `output` only: the input the call ran with, after every input layer |
 
 ### Rewriting a command
 
@@ -61,11 +73,7 @@ model round trip every time it happens. A rewrite fixes the command in place:
 
 ```lua
 maki.api.set_slot("tool.bash.input", function(prev, input, ctx)
-  local rewritten = input.command:gsub("^grep %-r ", "rg ")
-  if rewritten == input.command then
-    return
-  end
-  input.command = rewritten
+  input.command = input.command:gsub("^grep %-r ", "rg ")
   return prev(input, ctx)
 end)
 ```
@@ -118,6 +126,29 @@ state saved with the session, like `batch` or `question`. That state is what get
 re-rendered on restore, so a value redacted in the text would come back after a
 restart.
 
+### Asking the user
+
+Some calls are risky in a way only a plugin can spot. Return
+`{ ask = reason }` as the second value to raise the permission prompt, with
+`reason` shown in it:
+
+```lua
+maki.api.set_slot("tool.bash.input", function(prev, input, ctx)
+  if input.command:find("terraform apply", 1, true) then
+    return nil, { ask = "This changes live infrastructure." }
+  end
+  return prev(input, ctx)
+end)
+```
+
+The prompt appears even when an allow rule or yolo mode would let the call
+through. A deny rule still wins. To ask about a rewritten call, return it
+first: `return input, { ask = reason }`. Other slots ignore `ask` with a warning
+and keep the rewrite.
+
+Each driver answers this prompt like any other. `maki -p` denies it, and an SDK
+client in `bypassPermissions` mode allows it without showing it.
+
 ## Rules
 
 **Permissions judge what runs.** An input layer runs before the schema check and
@@ -157,7 +188,8 @@ had passed the value along, and the error is logged with the plugin name.
 
 **Order is registration order.** The last layer registered is the outermost one
 and sees the value first. Package load order decides this, so avoid writing two
-layers that only work in one order.
+layers that only work in one order. The exception is `tool.*`: its layers
+always sit outside the tool's own layers.
 
 **`prev` is single use.** Calling it twice throws. Everything below a layer runs
 once per call.
@@ -177,42 +209,142 @@ that apart from leaving it alone. Set it to another value, or deny the call.
 
 ## Wrapping every tool
 
-Slot names are per tool, so a layer on `tool.bash.input` costs nothing when
-`read` is called. To cover all of them, loop over the registry:
+`tool.*.input` and `tool.*.output` fire for every tool, including MCP and ACP
+client tools that register later:
 
 ```lua
-local function redact(prev, out, ctx)
+maki.api.set_slot("tool.*.output", function(prev, out, ctx)
   out.text = out.text:gsub("sk%-%w+", "[redacted]")
   return prev(out, ctx)
-end
-
-for _, tool in ipairs(maki.api.get_tools()) do
-  maki.api.set_slot("tool." .. tool.name .. ".output", redact)
-end
+end)
 ```
 
-Most builtins declare no capability, so this loop only does anything for a plugin
-granted every permission. Run it from a plugin without them and each layer is
-skipped when its tool is called.
+`tool.*` layers wrap the tool's own layers, whatever the load order, so a
+`tool.bash.input` layer sees the value after them.
 
-This sees the tools registered so far, so run it from `init.lua`, which loads
-after the builtin plugins. It also misses MCP tools, which arrive when their
-server connects. Naming one slot directly has no such ordering rule: `set_slot`
-accepts a name before anything registers it.
+A bare `return` in a `tool.*` layer skips the tool's own layers too, which can
+switch off another plugin's block. Hand the tools you do not care about to
+`prev` instead.
+
+Each call charges the layer what that tool charges. A plugin granted only `run`
+has its `tool.*` layer run for `bash` and skipped for `read`, which declares no
+capability.
+
+## Agent slots
+
+The agent loop fires four slots of its own:
+
+| Slot | Fires | Gets |
+| --- | --- | --- |
+| `agent.user_message` | before the model sees a user message | `{ text, images, source }` |
+| `agent.stop` | when the model ends its turn without calling a tool | `{ reason, last_message, num_turns }` |
+| `agent.compact.before` | before a compaction starts | `{ reason, context_size, usable, request_instructions }` |
+| `agent.compact.prepare` | before the transcript goes to the summarizer | `{ results, budget, collapse }` |
+
+They follow the tool slot contract. `ctx` carries `session_id`, `task_id` (set
+inside a subagent), `model`, `context_size`, `context_window`, and
+`deadline_ms`.
+
+A layer on any of them needs every permission, because it steers what the agent
+does next. The chain gets 30 seconds, then the loop carries on without it.
+
+### agent.user_message
+
+`images` is the number of attached images. `source` is `"tui"`, `"acp"`,
+`"headless"` (`maki -p` and sdk mode), or `"plugin"`. Messages sent while the
+agent is working fire it too.
+
+Return `{ text = ... }` to rewrite the message. History keeps the new text, and
+the transcript marks it as rewritten. Return `nil, reason` to drop it: the model
+never sees it, the user sees `reason`, and `TurnEnd` reports `"dropped"`. A
+rewrite with no text and no images also drops it.
+
+```lua
+maki.api.set_slot("agent.user_message", function(prev, msg, ctx)
+  if msg.text:find("AKIA%u%u%u%u") then
+    return nil, "That message holds an AWS key. Remove it and send again."
+  end
+  return prev(msg, ctx)
+end)
+```
+
+### agent.stop
+
+`reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
+the final answer. Return `{ continue = text }` to send `text` as the next
+message and keep going:
+
+```lua
+maki.api.set_slot("agent.stop", function(prev, stop, ctx)
+  local todo = maki.fs.read("TODO.md")
+  if todo and todo:find("%- %[ %]") then
+    return { continue = "TODO.md still has open items. Keep going." }
+  end
+  return prev(stop, ctx)
+end)
+```
+
+A run continues at most 3 times in a row, so a layer that always answers
+`continue` cannot bill forever. The count resets on the next user message.
+
+### agent.compact.before
+
+`reason` is `"auto"` (the context crossed its threshold), `"overflow"` (the
+provider rejected the prompt as too long), or `"manual"` (`/compact`). `usable`
+is the token budget `context_size` is measured against. `request_instructions`
+is what the user typed after `/compact`.
+
+Return a table with any of:
+
+- `skip = true`: skip this compaction, same as `nil, reason`. An overflow
+  cannot be skipped, because the run cannot go on without compacting.
+- `instructions`: appended to the summary prompt, after the configured and
+  requested ones.
+- `continue`: appended to the message the agent resumes with.
+
+### agent.compact.prepare
+
+Before summarizing, maki replaces older tool results with a placeholder so the
+summarizer reads the recent ones in full. This slot picks which ones.
+
+`results` lists every tool result, oldest first, as
+`{ index, tool, input, bytes, text }`, with `text` cut to 4 KB. `index` is the
+position in `results`. `budget` is how many bytes of results maki keeps in full,
+and `collapse` holds the indexes it picked. Set `collapse` to replace that pick.
+This layer keeps every `todo_write` result:
+
+```lua
+maki.api.set_slot("agent.compact.prepare", function(prev, prep, ctx)
+  local collapse = {}
+  for _, i in ipairs(prep.collapse) do
+    if prep.results[i].tool ~= "todo_write" then
+      table.insert(collapse, i)
+    end
+  end
+  prep.collapse = collapse
+  return prev(prep, ctx)
+end)
+```
+
+Maki applies the pick itself, so a layer cannot split a tool call from its
+result.
 
 ## Plugin slots
 
 A plugin can define an extension point of its own with
 [`declare_slot`](/docs/lua-api/#maki-api-declare_slot). The declaring plugin
-owns the name and supplies the default, and anyone can wrap it with `set_slot`:
+owns the name and supplies the default, and wraps its own slot for free. A
+layer from any other plugin steers a chain the owner's callers trust, so it
+pays, and the owner sets the price, because the owner is the only one who knows
+what its default does with the arguments:
 
 ```lua
--- owner
+-- owner: layering this only rewrites text, so say so
 local render = maki.api.declare_slot("myplugin.render", function(text)
   return text:upper()
-end)
+end, { capability = {} })
 
--- anyone
+-- any other plugin, granted nothing
 maki.api.set_slot("myplugin.render", function(prev, text)
   return "[" .. prev(text) .. "]"
 end)
@@ -220,8 +352,24 @@ end)
 -- render("hi") now returns "[HI]"
 ```
 
-Names starting with `tool.` are reserved for maki, which fires them at points
-whose ordering it guarantees.
+`capability` is a list of permission names, and a layer needs all of them at
+once. An empty list is free for anyone. Leaving `capability` out charges every
+permission, which is what a tool declaring no capability charges: a slot that
+named no price has not promised its default exercises none, only that nobody
+asked. You can only name permissions your own plugin holds.
+
+The rule is the one the `tool.*` slots use, and it is read the same way: every
+call re-reads what each layer's plugin holds, so a layer registered by a plugin
+without the grant is skipped and the call carries on, and a reload that narrows
+a plugin's permissions costs it the layer on the next call.
+
+A slot name belongs to the plugin that declared it for as long as maki runs.
+Unloading the owner stops the chain firing, but does not free the name: nobody
+else can take it over, or re-declare it at a cheaper price and inherit the
+layers that trusted the old one.
+
+Names starting with `tool.`, `ui.`, and `agent.` are reserved for maki, which
+fires them at points whose ordering it guarantees.
 
 Use `maki.api.get_slots()` to see who owns and who wraps each slot.
 

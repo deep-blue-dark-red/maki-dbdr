@@ -36,6 +36,7 @@ pub enum Language {
     Hcl,
     Json,
     Make,
+    Clojure,
 }
 
 impl Language {
@@ -75,6 +76,7 @@ impl Language {
             "hcl" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "make" => Some(Self::Make),
+            "clojure" => Some(Self::Clojure),
             _ => None,
         }
     }
@@ -115,6 +117,7 @@ impl Language {
             "hcl" | "tf" | "tfvars" => Some(Self::Hcl),
             "json" => Some(Self::Json),
             "mk" => Some(Self::Make),
+            "clj" | "cljs" | "cljc" | "bb" => Some(Self::Clojure),
             _ => None,
         }
     }
@@ -155,6 +158,7 @@ impl Language {
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
+            Self::Clojure => tree_sitter_clojure_orchard::LANGUAGE.into(),
         }
     }
 }
@@ -199,5 +203,16 @@ mod tests {
     fn ts_extension_keeps_type_assertions() {
         let ts = Language::from_extension("ts").unwrap();
         assert!(parses_cleanly(ts, TYPE_ASSERTION_SOURCE));
+    }
+
+    #[test_case("clj")]
+    #[test_case("cljs")]
+    #[test_case("cljc")]
+    #[test_case("bb")]
+    fn clojure_extension_parses_cleanly(ext: &str) {
+        assert!(parses_cleanly(
+            Language::from_extension(ext).unwrap(),
+            "(ns a.b (:require [c.d :as e]))\n(defn f [x] (inc x))"
+        ));
     }
 }

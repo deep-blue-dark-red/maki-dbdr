@@ -13,31 +13,78 @@ use tracing::{debug, warn};
 use super::anthropic::shared;
 use super::openai::responses;
 use super::openai_compat;
-use crate::model::{
-    Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry,
-};
+use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::{ResolvedAuth, Timeouts};
+use crate::spec::{AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec};
 use crate::{
     AgentError, Effort, EffortDialect, Message, ProviderEvent, RequestOptions, StreamResponse,
     ThinkingConfig, dialect,
 };
+use maki_config::providers::Protocol;
 
 pub mod auth;
 
-const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 const SLUG: &str = "copilot";
+const DISPLAY_NAME: &str = "Copilot";
+const ENV_VAR: &str = "GH_COPILOT_TOKEN";
+const DEFAULT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+const DEFAULT_MODEL: &str = "copilot/gpt-5.6-terra";
+const LOGIN_URL: &str = "https://github.com/settings/copilot";
+/// Prose, not a value: the real endpoint is discovered over GraphQL.
+const DOC_API_URL: &str =
+    "https://api.githubcopilot.com (or GraphQL-discovered Copilot API endpoint)";
+const FEATURES: &str = "Native Copilot Chat HTTP API with model endpoint discovery";
+const AUTH_NOTE: &str = "(or run `maki auth login copilot` to import a token from gh CLI, the Copilot client, or the system keyring)";
 
-inventory::submit!(maki_config::providers::BuiltInProvider {
-    slug: "copilot",
-    display_name: "Copilot",
-    protocol: maki_config::providers::Protocol::Openai,
-    default_base_url: DEFAULT_API_ENDPOINT,
-    default_api_key_env: "GH_COPILOT_TOKEN",
-    default_model: "copilot/gpt-5.6-terra",
-    plans: None,
-    login_url: Some("https://github.com/settings/copilot"),
-    needs_url: false,
-});
+/// No Aperture route: Copilot's auth is GraphQL-discovered, not a clean proxy
+/// target.
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Generic,
+    supports_thinking: false,
+    accepts_arbitrary_models: true,
+    fallback_max_output: Some(100_000),
+    fallback_context_window: 200_000,
+    models_toml: include_str!("../../../models/copilot.toml"),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: None,
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: DEFAULT_API_ENDPOINT,
+        default_model: DEFAULT_MODEL,
+        plans: None,
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[DOC_API_URL],
+        features: Some(FEATURES),
+        auth: AuthDoc::EnvVarWith(AUTH_NOTE),
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Copilot::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Copilot::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
+
+inventory::submit!(SPEC.config_row());
 const GRAPHQL_QUERY: &str = "query { viewer { copilotEndpoints { api } } }";
 const API_VERSION_HEADER: &str = "2025-10-01";
 const EDITOR_VERSION_HEADER: &str = concat!("Maki/", env!("CARGO_PKG_VERSION"));
@@ -48,390 +95,6 @@ const MODELS_PATH: &str = "/models";
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
-
-/// Fallback pricing used until `/models` reports `billing.token_prices` (or
-/// for offline runs). The API wins via discovered metadata; these mirror
-/// GitHub's published rates (usage-based billing since June 2026,
-/// docs.github.com/copilot/reference/copilot-billing/models-and-pricing), at
-/// the default context tier.
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["gpt-5-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.25,
-                output: 2.00,
-                cache_write: 0.00,
-                cache_read: 0.025,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-mini"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4-nano"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.25,
-                cache_write: 0.00,
-                cache_read: 0.02,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-haiku-4.5"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 5.00,
-                cache_write: 1.25,
-                cache_read: 0.10,
-                fast: None,
-            },
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.50,
-                output: 9.00,
-                cache_write: 0.00,
-                cache_read: 0.15,
-                fast: None,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.6-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 3.75,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.7-flash"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 3.75,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["mai-code-1-flash-picker"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.75,
-                output: 4.50,
-                cache_write: 0.00,
-                cache_read: 0.075,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-4.5", "claude-sonnet-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 3.75,
-                cache_read: 0.30,
-                fast: None,
-            },
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-sonnet-5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 10.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 30.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["kimi-k2.7-code"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.95,
-                output: 4.00,
-                cache_write: 0.00,
-                cache_read: 0.19,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["kimi-k3"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 3.00,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gemini-3.1-pro-preview"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 12.00,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
-            },
-            max_output_tokens: Some(65_536),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-luna"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.20,
-                cache_write: 0.25,
-                cache_read: 0.02,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.4"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.50,
-                output: 15.00,
-                cache_write: 0.00,
-                cache_read: 0.25,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-sol"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 30.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.6-terra"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 12.00,
-                cache_write: 2.50,
-                cache_read: 0.20,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["gpt-5.3-codex"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.75,
-                output: 14.00,
-                cache_write: 0.00,
-                cache_read: 0.175,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &[
-                "claude-opus-5",
-                "claude-opus-4.8",
-                "claude-opus-4.7",
-                "claude-opus-4.6",
-                "claude-opus-4.5",
-            ],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: true,
-            pricing: ModelPricing {
-                input: 5.00,
-                output: 25.00,
-                cache_write: 6.25,
-                cache_read: 0.50,
-                fast: None,
-            },
-            max_output_tokens: Some(64_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 10.00,
-                output: 50.00,
-                cache_write: 12.50,
-                cache_read: 1.00,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["grok-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Generic,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 2.00,
-                output: 6.00,
-                cache_write: 0.00,
-                cache_read: 0.50,
-                fast: None,
-            },
-            max_output_tokens: Some(100_000),
-            context_window: 200_000,
-        },
-    ]
-}
 
 pub struct Copilot {
     client: HttpClient,
@@ -615,7 +278,12 @@ impl Copilot {
                 .map(Arc::new)
         });
         if let Some(info) = reasoning_info {
-            apply_responses_reasoning(&mut body, thinking, model, &effort_dialect(&info));
+            responses::apply_responses_reasoning(
+                &mut body,
+                thinking,
+                model,
+                &effort_dialect(&info),
+            );
         }
         let resolved =
             super::ResolvedAuth::new(SLUG, copilot_headers(&auth, Some("conversation-agent")))?
@@ -641,16 +309,7 @@ impl Copilot {
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let mut body = json!({
-            "model": model.id,
-            "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
-            "system": [{"type": "text", "text": system}],
-            "messages": anthropic_messages(messages),
-            "tools": tools,
-            "stream": true,
-        });
-        thinking.apply_to_body(&mut body, model);
-
+        let body = messages_body(model, messages, system, tools, thinking);
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
@@ -803,7 +462,7 @@ impl CopilotModel {
     /// `/models` reports prices in AI credits per billing batch (1 credit =
     /// $0.01), scaled to USD per 1M tokens for [`ModelPricing`]. The endpoint
     /// exposes only the default context tier and cached-input reads; cache
-    /// writes are inherited from the static manifest by id prefix so cost
+    /// writes are inherited from the static spec by id prefix so cost
     /// accounting matches the offline path.
     fn pricing(&self) -> Option<ModelPricing> {
         let token_prices = self.billing.token_prices.as_ref()?;
@@ -814,14 +473,13 @@ impl CopilotModel {
         }
         let usd_per_million = AIC_TO_USD_PER_MILLION / batch_size;
         let manifest_cache_write =
-            lookup_entry(models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
-        Some(ModelPricing {
-            input: default.input_price * usd_per_million,
-            output: default.output_price * usd_per_million,
-            cache_read: default.cache_price * usd_per_million,
-            cache_write: manifest_cache_write,
-            fast: None,
-        })
+            lookup_entry(SPEC.models(), &self.id).map_or(0.0, |entry| entry.pricing.cache_write);
+        Some(ModelPricing::per_million(
+            default.input_price * usd_per_million,
+            default.output_price * usd_per_million,
+            manifest_cache_write,
+            default.cache_price * usd_per_million,
+        ))
     }
 
     fn endpoint(&self) -> Endpoint {
@@ -1029,18 +687,23 @@ fn copilot_auth_from_resolved(auth: &super::ResolvedAuth) -> Result<CopilotAuth,
     })
 }
 
-fn anthropic_messages(messages: &[Message]) -> Value {
-    Value::Array(
-        messages
-            .iter()
-            .map(|message| {
-                json!({
-                    "role": message.role,
-                    "content": message.content,
-                })
-            })
-            .collect(),
-    )
+fn messages_body(
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: ThinkingConfig,
+) -> Value {
+    let mut body = json!({
+        "model": model.id,
+        "max_tokens": model.output_tokens().unwrap_or(shared::FALLBACK_MAX_TOKENS),
+        "system": [{"type": "text", "text": system}],
+        "messages": shared::wire_messages(messages),
+        "tools": tools,
+        "stream": true,
+    });
+    thinking.apply_to_body(&mut body, model);
+    body
 }
 
 fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
@@ -1052,17 +715,6 @@ fn effort_dialect(info: &CopilotModelInfo) -> EffortDialect<'_> {
         },
         adaptive: (!info.adaptive_thinking).then_some(Effort::High),
         off: info.reasoning_off.then_some(dialect::OFF),
-    }
-}
-
-fn apply_responses_reasoning(
-    body: &mut Value,
-    thinking: ThinkingConfig,
-    model: &Model,
-    dialect: &EffortDialect,
-) {
-    if let Some(effort) = thinking.effort_str(dialect, model) {
-        body["reasoning"] = json!({"effort": effort});
     }
 }
 
@@ -1134,12 +786,14 @@ impl Provider for Copilot {
 
 #[cfg(test)]
 mod tests {
-    const OPUS_CACHE_WRITE: f64 = 6.25;
-
     use super::*;
-    use crate::TokenUsage;
-    use crate::manifest::ManifestRegistry;
+    use crate::spec::ProviderRegistry;
+    use crate::{ContentBlock, Role, TokenUsage};
     use test_case::test_case;
+
+    const OPUS_CACHE_WRITE: f64 = 6.25;
+    const CLAUDE_SPEC: &str = "copilot/claude-opus-5";
+    const REPLY: &str = "reply";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -1243,14 +897,15 @@ mod tests {
     #[test_case(ModelTier::Medium, "gpt-5.6-terra"; "medium defaults to terra")]
     #[test_case(ModelTier::Strong, "claude-opus-5"; "strong defaults to opus")]
     fn manifest_has_exactly_one_default_per_tier(tier: ModelTier, expected_prefix: &str) {
-        let defaults: Vec<_> = models()
+        let defaults: Vec<_> = SPEC
+            .models()
             .iter()
             .filter(|entry| entry.default && entry.tier == tier)
             .collect();
         assert_eq!(defaults.len(), 1);
         assert_eq!(defaults[0].prefixes[0], expected_prefix);
         assert_eq!(
-            ManifestRegistry::find_default_for_tier("copilot", tier)
+            ProviderRegistry::find_default_for_tier("copilot", tier)
                 .unwrap()
                 .prefixes[0],
             expected_prefix
@@ -1339,18 +994,44 @@ mod tests {
         let dialect = effort_dialect(&info);
 
         let mut body = json!({});
-        apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
+        responses::apply_responses_reasoning(&mut body, ThinkingConfig::Off, &model, &dialect);
         assert_eq!(body, json!({"reasoning": {"effort": "none"}}));
 
         let mut body = json!({});
-        apply_responses_reasoning(
+        responses::apply_responses_reasoning(
             &mut body,
             ThinkingConfig::Effort(Effort::Medium),
             &model,
             &dialect,
         );
-        assert_eq!(body, json!({"reasoning": {"effort": "medium"}}));
+        assert_eq!(
+            body,
+            json!({"reasoning": {"effort": "medium", "summary": "auto"}})
+        );
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn messages_body_drops_unsigned_thinking_without_cache_control() {
+        let model = Model::from_spec(CLAUDE_SPEC).unwrap();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "gpt reasoning summary".into(),
+                    signature: None,
+                },
+                ContentBlock::Text { text: REPLY.into() },
+            ],
+            ..Default::default()
+        }];
+
+        let body = messages_body(&model, &messages, "system", &json!([]), ThinkingConfig::Off);
+
+        assert_eq!(
+            body["messages"],
+            json!([{"role": "assistant", "content": [{"type": "text", "text": REPLY}]}])
+        );
     }
 
     #[test]

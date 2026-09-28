@@ -75,7 +75,7 @@ pub struct TurnSnapshot {
 }
 
 /// On-disk representation of a [`TurnSnapshot`]: one JSON object per line in
-/// `logs_dir()/<session_id>/turn_stats.jsonl`. Carries the per-tool-call
+/// `sessions/turnstats/<session_id>.jsonl`. Carries the per-tool-call
 /// records (with their args) so the log is fully queryable offline.
 #[derive(Debug, Clone, Serialize)]
 pub struct PersistedTurn {

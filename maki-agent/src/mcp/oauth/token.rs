@@ -1,4 +1,4 @@
-use std::io::Read;
+use futures_lite::AsyncReadExt;
 
 use isahc::HttpClient;
 use isahc::http::Request;
@@ -71,19 +71,14 @@ async fn token_request(
         .body(body.into_bytes())
         .map_err(|e| OAuthError::Other(e.to_string()))?;
 
-    let mut response = smol::unblock({
-        let client = client.clone();
-        move || {
-            client
-                .send(req)
-                .map_err(|e| OAuthError::Network(e.to_string()))
-        }
-    })
-    .await?;
+    let mut response = client
+        .send_async(req)
+        .await
+        .map_err(|e| OAuthError::Network(e.to_string()))?;
 
     if !response.status().is_success() {
         let mut body_str = String::new();
-        let _ = response.body_mut().read_to_string(&mut body_str);
+        let _ = response.body_mut().read_to_string(&mut body_str).await;
         return Err(OAuthError::ServerRejected {
             status: response.status().as_u16(),
             body: body_str,
@@ -94,6 +89,7 @@ async fn token_request(
     response
         .body_mut()
         .read_to_string(&mut body_str)
+        .await
         .map_err(|e| OAuthError::Network(e.to_string()))?;
 
     parse_token_response(&body_str)

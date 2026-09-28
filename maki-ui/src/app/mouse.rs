@@ -1,13 +1,15 @@
 use std::time::{Duration, Instant};
 
-use crate::clipboard::CopyResult;
+use crate::clipboard::{self, CopyResult};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+use crate::image;
 use crate::repaint::Dirty;
 
 use super::App;
+use super::image_paste::{spawn_read, take_ready};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -15,6 +17,13 @@ pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
         match event.kind {
+            // Mouse capture turns the terminal's middle-click paste into a
+            // plain button event, so the selection is read back and routed
+            // like a bracketed paste.
+            MouseEventKind::Down(MouseButton::Middle) => {
+                self.primary_paste_rx
+                    .push(spawn_read(clipboard::read_primary_selection));
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(zone) = self.zone_at(event.row, event.column) {
                     if self.has_modal_overlay() && zone.zone != SelectionZone::Overlay {
@@ -22,9 +31,8 @@ impl App {
                     }
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
-                        let focused = !self.any_overlay_open();
                         self.input_box
-                            .handle_click(zone.area, event.row, event.column, focused);
+                            .handle_click(zone.area, event.row, event.column);
                     }
                     let scroll = self.scroll_offset(zone.zone);
                     self.selection_state = Some(SelectionState::Dragging {
@@ -65,6 +73,35 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// An image path anywhere in the paste wins and the text is dropped, the
+    /// same rule a bracketed paste follows.
+    pub(super) fn insert_pasted(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut any_image = false;
+        if self.is_main_chat() {
+            for line in text.lines() {
+                if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                    self.start_file_image_paste(path, media_type);
+                    any_image = true;
+                }
+            }
+        }
+        if !any_image {
+            self.route_text_paste(&text);
+        }
+    }
+
+    pub fn poll_primary_paste(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        while let Some(selection) = take_ready(&mut self.primary_paste_rx) {
+            dirty = Dirty::YES;
+            if let Some(text) = selection {
+                self.insert_pasted(text);
+            }
+        }
+        dirty
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {

@@ -1,7 +1,8 @@
 //! Drives the monty interpreter through its execution states.
 //! Sync tool calls resolve immediately; async (`await`) calls are batched via `ResolveFutures`
 //! and dispatched concurrently through [`AsyncResolver`], with results fed back one by one.
-//! `OsCall` is always rejected; the sandbox never touches the OS directly.
+//! The sandbox never touches the OS directly. Text files opened with `open()` or `pathlib`
+//! are served by the host's [`FileFn`], and every other `OsCall` is refused.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -9,11 +10,12 @@ use std::time::Duration;
 
 use monty::{MontyRun, RunProgress};
 use monty_types::{
-    CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult,
-    PrintWriter, PrintWriterCallback, ResourceLimits, ResourceTracker,
+    CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyFileHandle, MontyObject,
+    NameLookupResult, OpenCallArgs, OsFunctionCall, PathStringDataArgs, PrintWriter,
+    PrintWriterCallback, ResourceLimits, ResourceTracker,
 };
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::alloc::SandboxScope;
 use crate::convert::{json_to_monty, monty_to_json};
@@ -21,8 +23,24 @@ use crate::error::InterpreterError;
 
 const DEFAULT_MAX_RECURSION: usize = 100;
 const SCRIPT_NAME: &str = "agent.py";
+const OS_CALLS_DENIED: &str = "OS calls are not permitted";
+const BINARY_FILES_UNSUPPORTED: &str = "binary files are not supported, open in text mode";
 
 pub type ToolFn = Box<dyn Fn(&str, Vec<Value>, Vec<(String, Value)>) -> Result<Value, String>>;
+
+pub struct FileWrite {
+    pub path: String,
+    pub content: String,
+    pub append: bool,
+}
+
+pub enum FileOp {
+    Read(String),
+    Write(FileWrite),
+}
+
+/// `Ok` holds the content for a read and is ignored for a write.
+pub type FileFn = Box<dyn Fn(FileOp) -> Result<String, String>>;
 
 pub struct PendingCall {
     pub call_id: u32,
@@ -69,6 +87,7 @@ pub fn run(
     preamble: &str,
     tools: &HashMap<String, ToolFn>,
     resolver: Option<&AsyncResolver>,
+    files: Option<&FileFn>,
     limits: ResourceLimits,
     on_output: &mut dyn FnMut(&str),
 ) -> Result<InterpreterResult, InterpreterError> {
@@ -87,6 +106,7 @@ pub fn run(
         script,
         tools,
         resolver,
+        files,
         limits,
         &mut PrintWriter::Callback(&mut writer),
     )
@@ -110,10 +130,35 @@ fn execute(
     script: String,
     tools: &HashMap<String, ToolFn>,
     resolver: Option<&AsyncResolver>,
+    files: Option<&FileFn>,
     limits: ResourceLimits,
     print_writer: &mut PrintWriter<'_>,
 ) -> Result<Option<Value>, InterpreterError> {
     let _sandbox = limits.max_memory.is_some().then(SandboxScope::enter);
+    let mut host = FileHost {
+        files,
+        pending: Vec::new(),
+    };
+    let result = drive(script, tools, resolver, &mut host, limits, print_writer);
+    // CPython closes open files when a script dies, so their writes land even then.
+    match (result, host.flush_all()) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Err(flush_err)) => {
+            warn!(error = %flush_err, "buffered file write failed after the run failed");
+            Err(e)
+        }
+    }
+}
+
+fn drive(
+    script: String,
+    tools: &HashMap<String, ToolFn>,
+    resolver: Option<&AsyncResolver>,
+    host: &mut FileHost<'_>,
+    limits: ResourceLimits,
+    print_writer: &mut PrintWriter<'_>,
+) -> Result<Option<Value>, InterpreterError> {
     let runner = MontyRun::new(script, SCRIPT_NAME, vec![], CompileOptions::default())
         .map_err(|e| InterpreterError::Parse(e.to_string()))?;
 
@@ -165,6 +210,7 @@ fn execute(
                         .resume_pending(print_writer.reborrow())
                         .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
                 } else if let Some(tool_fn) = tools.get(name.as_str()) {
+                    host.flush_all()?;
                     let result = tool_fn(&name, args_json, kwargs_json).map_err(|e| {
                         InterpreterError::ToolCall {
                             tool: name.clone(),
@@ -197,10 +243,13 @@ fn execute(
                     .resume(result, print_writer.reborrow())
                     .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
-            RunProgress::OsCall(_) => {
-                return Err(InterpreterError::Sandboxed(
-                    "OS calls are not permitted".into(),
-                ));
+            RunProgress::OsCall(call) => {
+                if host.files.is_none() {
+                    return Err(InterpreterError::Sandboxed(OS_CALLS_DENIED.into()));
+                }
+                progress = call
+                    .resume_with(print_writer.reborrow(), |os_call| host.serve(os_call))
+                    .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
             RunProgress::ResolveFutures(state) => {
                 let resolver = resolver.ok_or_else(|| {
@@ -213,6 +262,7 @@ fn execute(
                     .filter_map(|id| pending_calls.remove(id))
                     .collect();
 
+                host.flush_all()?;
                 let resolved = resolver(batch)?;
 
                 let results: Vec<(u32, ExtFunctionResult)> = resolved
@@ -234,6 +284,106 @@ fn execute(
                     .map_err(|e| InterpreterError::Runtime(e.to_string()))?;
             }
         }
+    }
+}
+
+/// Keeps what the script writes with `open()` and `pathlib` in memory until
+/// someone could look at the file: a tool call, a read of that path, or the end
+/// of the run. A loop of `f.write` then turns into a single host write, and a
+/// cancelled run drops what is still waiting here. Paths are matched as the
+/// script typed them, so reading `./a` does not flush a write to `a`.
+struct FileHost<'a> {
+    files: Option<&'a FileFn>,
+    pending: Vec<FileWrite>,
+}
+
+impl FileHost<'_> {
+    fn serve(&mut self, call: OsFunctionCall) -> ExtFunctionResult {
+        let result = match call {
+            OsFunctionCall::Open(args) => self.open(args),
+            OsFunctionCall::ReadText(path) => self.read(path.into_string()),
+            OsFunctionCall::WriteText(args) => self.write(args, false),
+            OsFunctionCall::AppendText(args) => self.write(args, true),
+            other => return ExtFunctionResult::Error(other.on_no_handler()),
+        };
+        match result {
+            Ok(value) => ExtFunctionResult::Return(value),
+            Err(msg) => ExtFunctionResult::Error(MontyException::new(ExcType::OSError, Some(msg))),
+        }
+    }
+
+    fn call(&self, op: FileOp) -> Result<String, String> {
+        self.files
+            .map_or_else(|| Err(OS_CALLS_DENIED.into()), |files| files(op))
+    }
+
+    /// Monty leaves what `open()` does to the file up to us. A script can open
+    /// with `w` and never write, and the file must still end up empty, so the
+    /// open itself queues an empty replacement. A missing file for `r` only
+    /// shows up at the first read, which saves reading it twice.
+    fn open(&mut self, args: OpenCallArgs) -> Result<MontyObject, String> {
+        if args.mode.is_binary() {
+            return Err(BINARY_FILES_UNSUPPORTED.into());
+        }
+        let path = args.path.into_string();
+        if args.mode.truncate() {
+            self.buffer(FileWrite {
+                path: path.clone(),
+                content: String::new(),
+                append: false,
+            });
+        }
+        Ok(MontyObject::FileHandle(MontyFileHandle {
+            path,
+            mode: args.mode,
+            position: 0,
+        }))
+    }
+
+    fn read(&mut self, path: String) -> Result<MontyObject, String> {
+        if let Some(index) = self.pending.iter().position(|w| w.path == path) {
+            self.flush_at(index)?;
+        }
+        self.call(FileOp::Read(path)).map(MontyObject::String)
+    }
+
+    /// Monty moves the file position by the number we return, and text
+    /// positions count chars, not bytes.
+    fn write(&mut self, args: PathStringDataArgs, append: bool) -> Result<MontyObject, String> {
+        let written = args.data.chars().count() as i64;
+        self.buffer(FileWrite {
+            path: args.path.into_string(),
+            content: args.data,
+            append,
+        });
+        Ok(MontyObject::Int(written))
+    }
+
+    fn buffer(&mut self, write: FileWrite) {
+        match self.pending.iter_mut().find(|w| w.path == write.path) {
+            Some(pending) if write.append => pending.content.push_str(&write.content),
+            Some(pending) => *pending = write,
+            None => self.pending.push(write),
+        }
+    }
+
+    /// Stops at the first failure. The files after it stay queued, so the
+    /// final flush at the end of the run still writes them.
+    fn flush_all(&mut self) -> Result<(), InterpreterError> {
+        while !self.pending.is_empty() {
+            self.flush_at(0).map_err(InterpreterError::FileWrite)?;
+        }
+        Ok(())
+    }
+
+    /// The error names the path because it often shows up far from the
+    /// `write` that caused it.
+    fn flush_at(&mut self, index: usize) -> Result<(), String> {
+        let write = self.pending.remove(index);
+        let path = write.path.clone();
+        self.call(FileOp::Write(write))
+            .map(drop)
+            .map_err(|e| format!("{path}: {e}"))
     }
 }
 
@@ -281,6 +431,8 @@ pub fn limits(timeout: Duration, max_memory: usize) -> ResourceLimits {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use test_case::test_case;
@@ -294,6 +446,20 @@ mod tests {
     const NESTED_TIMEOUT: Duration = Duration::from_secs(5);
     const NESTED_DEADLOCK: &str = "nested run deadlocked";
     const USER_ERROR_LINE: usize = 2;
+    const FILE_PATH: &str = "notes.txt";
+    const FILE_CONTENT: &str = "old";
+    const MISSING_FILE_ERR: &str = "no such file";
+    const LOCKED_PATH: &str = "locked.txt";
+    const WRITE_DENIED_ERR: &str = "write denied";
+    const PEEK_TOOL: &str = "peek";
+    const WRITTEN: &str = "new";
+
+    struct MemoryFs {
+        files: HashMap<String, String>,
+        writes: usize,
+    }
+
+    type SharedFs = Rc<RefCell<MemoryFs>>;
 
     fn run_code(
         code: &str,
@@ -301,7 +467,76 @@ mod tests {
         resolver: Option<&AsyncResolver>,
         limits: ResourceLimits,
     ) -> Result<InterpreterResult, InterpreterError> {
-        run(code, NO_PREAMBLE, tools, resolver, limits, &mut |_| {})
+        run(
+            code,
+            NO_PREAMBLE,
+            tools,
+            resolver,
+            None,
+            limits,
+            &mut |_| {},
+        )
+    }
+
+    fn memory_fs() -> SharedFs {
+        Rc::new(RefCell::new(MemoryFs {
+            files: HashMap::from([(FILE_PATH.to_owned(), FILE_CONTENT.to_owned())]),
+            writes: 0,
+        }))
+    }
+
+    fn content(fs: &SharedFs) -> Value {
+        json!(fs.borrow().files.get(FILE_PATH))
+    }
+
+    /// Binds `path`, and `locked` where every write fails. The `peek` tool
+    /// returns what `path` holds at the moment it runs.
+    fn run_with_files(
+        code: &str,
+        fs: &SharedFs,
+        async_tools: bool,
+    ) -> Result<InterpreterResult, InterpreterError> {
+        let host_fs = Rc::clone(fs);
+        let files: FileFn = Box::new(move |op| {
+            let mut fs = host_fs.borrow_mut();
+            match op {
+                FileOp::Read(path) => fs
+                    .files
+                    .get(&path)
+                    .cloned()
+                    .ok_or_else(|| MISSING_FILE_ERR.to_owned()),
+                FileOp::Write(write) if write.path == LOCKED_PATH => {
+                    Err(WRITE_DENIED_ERR.to_owned())
+                }
+                FileOp::Write(write) => {
+                    fs.writes += 1;
+                    let file = fs.files.entry(write.path).or_default();
+                    if !write.append {
+                        file.clear();
+                    }
+                    file.push_str(&write.content);
+                    Ok(String::new())
+                }
+            }
+        });
+        let peek_fs = Rc::clone(fs);
+        let peek: ToolFn = Box::new(move |_, _, _| Ok(content(&peek_fs)));
+        let resolver_fs = Rc::clone(fs);
+        let resolver: AsyncResolver = Box::new(move |calls| {
+            Ok(calls
+                .into_iter()
+                .map(|c| (c.call_id, Ok(content(&resolver_fs))))
+                .collect())
+        });
+        run(
+            code,
+            &format!("path = '{FILE_PATH}'\nlocked = '{LOCKED_PATH}'"),
+            &HashMap::from([(PEEK_TOOL.to_owned(), peek)]),
+            async_tools.then_some(&resolver),
+            Some(&files),
+            default_limits(),
+            &mut |_| {},
+        )
     }
 
     fn run_with_preamble(
@@ -312,6 +547,7 @@ mod tests {
             code,
             preamble,
             &empty_tools(),
+            None,
             None,
             default_limits(),
             &mut |_| {},
@@ -492,6 +728,70 @@ mod tests {
         assert!(matches!(err, InterpreterError::ToolCall { .. }));
     }
 
+    #[test_case("open(path).read()" ; "open_read")]
+    #[test_case("from pathlib import Path\nPath(path).read_text()" ; "pathlib_read_text")]
+    fn file_reads_are_served_by_the_host(code: &str) {
+        let result = run_with_files(code, &memory_fs(), false).unwrap();
+        assert_eq!(result.output, Some(json!(FILE_CONTENT)));
+    }
+
+    #[test_case("with open(path, 'w') as f:\n    f.write('a')\n    f.write('b')", "ab" ; "write_mode_replaces")]
+    #[test_case("open(path, 'w')", "" ; "write_mode_without_writes_empties")]
+    #[test_case("with open(path, 'a') as f:\n    f.write('a')\n    f.write('b')", "oldab" ; "append_mode_appends")]
+    #[test_case("from pathlib import Path\nPath(path).write_text('ab')", "ab" ; "pathlib_write_text")]
+    fn buffered_writes_reach_the_host_once(code: &str, expected: &str) {
+        let fs = memory_fs();
+        run_with_files(code, &fs, false).unwrap();
+        assert_eq!(content(&fs), json!(expected));
+        assert_eq!(fs.borrow().writes, 1);
+    }
+
+    #[test]
+    fn buffered_writes_land_when_the_script_raises() {
+        let fs = memory_fs();
+        let code = format!("open(path, 'w').write('{WRITTEN}')\nraise ValueError()");
+        run_with_files(&code, &fs, false).unwrap_err();
+        assert_eq!(content(&fs), json!(WRITTEN));
+    }
+
+    #[test_case("open(path).read()", false ; "read")]
+    #[test_case("peek()", false ; "tool_call")]
+    #[test_case("await peek()", true ; "awaited_tool_call")]
+    fn buffered_writes_land_before_they_can_be_seen(expr: &str, async_tools: bool) {
+        let code = format!("open(path, 'w').write('{WRITTEN}')\n{expr}");
+        let result = run_with_files(&code, &memory_fs(), async_tools).unwrap();
+        assert_eq!(result.output, Some(json!(WRITTEN)));
+    }
+
+    #[test_case("", false ; "at_the_end")]
+    #[test_case("peek()", false ; "before_a_tool_call")]
+    #[test_case("await peek()", true ; "before_an_awaited_tool_call")]
+    fn failed_buffered_write_fails_the_run(expr: &str, async_tools: bool) {
+        let code = format!("open(locked, 'w').write('x')\n{expr}");
+        let err = run_with_files(&code, &memory_fs(), async_tools).unwrap_err();
+        assert!(
+            matches!(&err, InterpreterError::FileWrite(msg) if msg.contains(WRITE_DENIED_ERR)),
+            "got {err:?}"
+        );
+    }
+
+    #[test_case("open('missing.txt').read()", MISSING_FILE_ERR ; "host_error")]
+    #[test_case("open(path, 'rb')", BINARY_FILES_UNSUPPORTED ; "binary_mode")]
+    #[test_case("open(locked, 'w').write('x'); open(locked).read()", WRITE_DENIED_ERR ; "failed_write_before_a_read")]
+    fn file_errors_raise_a_catchable_os_error(expr: &str, message: &str) {
+        let code = format!("try:\n    {expr}\nexcept OSError as e:\n    err = str(e)\nerr");
+        let result = run_with_files(&code, &memory_fs(), false).unwrap();
+        let err = result.output.unwrap();
+        assert!(err.as_str().unwrap().contains(message), "got {err}");
+    }
+
+    #[test]
+    fn os_calls_are_fatal_without_a_file_host() {
+        let code = format!("open('{FILE_PATH}')");
+        let err = run_code(&code, &empty_tools(), None, default_limits()).unwrap_err();
+        assert!(matches!(err, InterpreterError::Sandboxed(_)), "got {err:?}");
+    }
+
     #[test]
     fn streaming_collects_stdout() {
         let mut called = false;
@@ -499,6 +799,7 @@ mod tests {
             "print('hello')\nprint('world')",
             NO_PREAMBLE,
             &empty_tools(),
+            None,
             None,
             default_limits(),
             &mut |_| {

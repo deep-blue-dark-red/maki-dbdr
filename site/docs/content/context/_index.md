@@ -67,6 +67,41 @@ All four end up in context, but at different times and prices:
 
 Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably wants to be a skill. `AGENTS.md` is a tax on every request; a skill is a tax only on the sessions that need it.
 
+## Pointing at a file with `@`
+
+Naming the file saves the agent a search, which costs a tool call and a few hundred tokens. Type `@` in the chat input to open a completion popup, ranked like the `Ctrl+S` file picker:
+
+```
+> explain @maki-ui/src/app/mo
+                ╭─────────────────────────────────╮
+                │ maki-ui/src/app/mod.rs          │
+                │ maki-ui/src/app/model.rs        │
+                ╰ ↑/↓ move Enter insert Esc close ╯
+```
+
+| Key | Action |
+|-----|--------|
+| `↓`, `Ctrl+N` | Next row |
+| `↑`, `Ctrl+P` | Previous row |
+| `Enter` | Insert the highlighted path |
+| `Esc` | Close the popup |
+
+The popup takes these keys only while it is open. Otherwise `↑` and `↓` still walk the input history and `Ctrl+P` still opens `/sessions`. The characters your query matched are highlighted the way the file picker highlights them. Keep typing to narrow the list. A space ends the mention, so an email address does not open the popup. Moving the caret out of the mention closes it. With no match, `Enter` closes the popup without sending. While the agent is working, the first `Esc` only closes the popup, and after that `Esc` stops the turn as usual.
+
+The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
+
+The plugin is off by default while its file index is tested on large repositories. Turn it on in `init.lua`:
+
+```lua
+maki.setup({
+  plugins = {
+    completion = { enabled = true },
+  },
+})
+```
+
+On a large repository the first index walk takes a moment. The popup shows `scanning…` and fills in when the walk finishes. If the walk has not reported back after a few seconds, it shows `no matches`.
+
 ## When the window fills
 
 Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary.
@@ -79,7 +114,7 @@ An archive is a complete session file, so `jq` or an editor reads it as it is. T
 cd ~/.local/state/maki/sessions
 mv <session-id>.jsonl <session-id>.jsonl.bak
 cp archive/<session-id>/<n>.jsonl <session-id>.jsonl
-maki -s <session-id>
+maki -r <session-id>
 ```
 
 `MAKI_DISABLE_AUTOCOMPACT=1` turns off the automatic compaction. A manual `/compact` still compacts.

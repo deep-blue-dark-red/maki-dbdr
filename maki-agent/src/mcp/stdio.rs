@@ -9,6 +9,7 @@ use async_lock::Mutex;
 
 use futures_lite::io::BufReader;
 use futures_lite::{AsyncBufReadExt, AsyncWriteExt};
+use maki_providers::strip_provider_keys;
 use serde_json::Value;
 use smol::channel;
 use tracing::{debug, info, warn};
@@ -44,7 +45,9 @@ impl StdioTransport {
         timeout: Duration,
     ) -> Result<Self, McpError> {
         let mut std_cmd = std::process::Command::new(program);
-        std_cmd.args(args).envs(environment);
+        strip_provider_keys(&mut std_cmd)
+            .args(args)
+            .envs(environment);
 
         #[cfg(unix)]
         unsafe {

@@ -27,6 +27,12 @@ pub mod providers;
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 pub const DEFAULT_MAX_OUTPUT_LINES: usize = 2000;
 pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
+
+pub const DEFAULT_CACHE_MISS_TIMEOUT_MINUTES: u64 = 5;
+
+pub const DEFAULT_CACHE_MISS_TOKEN_THRESHOLD: u32 = 100_000;
+
+pub const DEFAULT_CACHE_MISS_COST_THRESHOLD: f64 = 0.1;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
@@ -113,6 +119,14 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 ];
 
 pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
+
+/// Bundled plugins that ship switched off. They load only when a config says
+/// `plugins.<name> = { enabled = true }`, and the config layer accepts their
+/// tables either way so that line is not itself an error.
+///
+/// A plugin belongs here while what it does is worth shipping but what it
+/// costs at scale is not yet known.
+pub const OPTIONAL_BUILTINS: &[&str] = &[];
 
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
@@ -221,6 +235,7 @@ pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::M
 pub enum ConfigValue {
     Bool(bool),
     U64(u64),
+    F64(f64),
     Str(&'static str),
 }
 
@@ -229,6 +244,7 @@ impl ConfigValue {
         match self {
             Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             Self::U64(v) => v.to_string(),
+            Self::F64(v) => v.to_string(),
             Self::Str(s) => (*s).to_string(),
         }
     }
@@ -278,6 +294,14 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
 ];
+
+/// The variable names [`expand_env`] would look up in `value`.
+pub fn env_var_refs(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split("${")
+        .skip(1)
+        .filter_map(|part| part.split_once('}').map(|(var, _)| var))
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -490,11 +514,16 @@ impl RawConfig {
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
-            .filter(|name| !DEFAULT_BUILTINS.contains(&name.as_str()) && !packages.contains(name))
+            .filter(|name| {
+                !DEFAULT_BUILTINS.contains(&name.as_str())
+                    && !OPTIONAL_BUILTINS.contains(&name.as_str())
+                    && !packages.contains(name)
+            })
             .collect();
         unknown.sort();
         if let Some(&plugin) = unknown.first() {
             let mut valid: Vec<&str> = DEFAULT_BUILTINS.to_vec();
+            valid.extend(OPTIONAL_BUILTINS);
             valid.extend(packages.iter().map(String::as_str));
             valid.sort_unstable();
             return Err(ConfigError::UnknownPlugin {
@@ -532,6 +561,10 @@ pub struct UiFileConfig {
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub show_token_stats: Option<bool>,
     pub max_input_lines: Option<u32>,
+    pub warn_cache_miss: Option<bool>,
+    pub cache_miss_warning_timeout_minutes: Option<u64>,
+    pub cache_miss_warning_token_threshold: Option<u32>,
+    pub cache_miss_warn_dollar_cost_threshold: Option<f64>,
     pub cache_miss_warn_context: Option<u32>,
 }
 
@@ -552,6 +585,10 @@ impl UiFileConfig {
             theme,
             clock_format,
             max_input_lines,
+            warn_cache_miss,
+            cache_miss_warning_timeout_minutes,
+            cache_miss_warning_token_threshold,
+            cache_miss_warn_dollar_cost_threshold,
             cache_miss_warn_context
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
@@ -1188,9 +1225,33 @@ pub struct UiConfig {
     pub show_token_stats: bool,
 
     #[config(
+        default = true,
+        desc = "Ask for confirmation (y/n) before sending a turn that will likely miss the prompt cache: idle past cache_miss_warning_timeout_minutes, or after a model change, when the resend would cost more than cache_miss_warn_dollar_cost_threshold dollars or cache_miss_warning_token_threshold tokens as uncached input"
+    )]
+    pub warn_cache_miss: bool,
+
+    #[config(
+        default = DEFAULT_CACHE_MISS_TIMEOUT_MINUTES,
+        desc = "Idle minutes after which the next turn likely misses the prompt cache"
+    )]
+    pub cache_miss_warning_timeout_minutes: u64,
+
+    #[config(
+        default = DEFAULT_CACHE_MISS_TOKEN_THRESHOLD,
+        desc = "Uncached input tokens above which a likely cache miss asks for confirmation"
+    )]
+    pub cache_miss_warning_token_threshold: u32,
+
+    #[config(
+        default = DEFAULT_CACHE_MISS_COST_THRESHOLD,
+        desc = "Estimated uncached input dollars above which a likely cache miss asks for confirmation"
+    )]
+    pub cache_miss_warn_dollar_cost_threshold: f64,
+
+    #[config(
         skip,
         default = "None",
-        desc = "Context size (tokens) above which a >5min idle warns of a likely cache miss. Unset uses the model context window."
+        desc = "Overrides cache_miss_warning_token_threshold when set. Unset uses the model context window."
     )]
     pub cache_miss_warn_context: Option<u32>,
 }
@@ -1217,6 +1278,16 @@ impl UiConfig {
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
             show_token_stats: f.show_token_stats.unwrap_or(false),
+            warn_cache_miss: f.warn_cache_miss.unwrap_or(true),
+            cache_miss_warning_timeout_minutes: f
+                .cache_miss_warning_timeout_minutes
+                .unwrap_or(DEFAULT_CACHE_MISS_TIMEOUT_MINUTES),
+            cache_miss_warning_token_threshold: f
+                .cache_miss_warning_token_threshold
+                .unwrap_or(DEFAULT_CACHE_MISS_TOKEN_THRESHOLD),
+            cache_miss_warn_dollar_cost_threshold: f
+                .cache_miss_warn_dollar_cost_threshold
+                .unwrap_or(DEFAULT_CACHE_MISS_COST_THRESHOLD),
             cache_miss_warn_context: f.cache_miss_warn_context,
         }
     }
@@ -4052,6 +4123,20 @@ mod tests {
         }
     }
 
+    /// A name in both lists would be on by default and documented as opt-in,
+    /// and the two answers are given by different code paths.
+    #[test]
+    fn optional_builtins_are_not_also_defaults() {
+        for name in OPTIONAL_BUILTINS {
+            assert!(
+                !DEFAULT_BUILTINS.contains(name),
+                "{name} is both a default and an opt-in builtin"
+            );
+        }
+    }
+
+    /// The point of shipping one off by default: naming it in a config is
+    /// accepted, and it stays off until that config says `enabled = true`.
     #[test]
     fn removed_sub_tool_tables_error() {
         for &tool in EDIT_SUB_TOOLS {
@@ -4448,6 +4533,13 @@ mod tests {
             expand_env("x ${NOT_CLOSED").as_deref(),
             Ok("x ${NOT_CLOSED")
         );
+    }
+
+    #[test_case("plain value", &[] ; "no_refs")]
+    #[test_case("Bearer ${A}-${B}!", &["A", "B"] ; "every_ref")]
+    #[test_case("${A} ${NOT_CLOSED", &["A"] ; "unterminated_skipped")]
+    fn env_var_refs_names(value: &str, expected: &[&str]) {
+        assert_eq!(env_var_refs(value).collect::<Vec<_>>(), expected);
     }
 
     #[test]

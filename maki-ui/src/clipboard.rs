@@ -1,11 +1,30 @@
 use crate::terminal;
 use arboard::Clipboard;
 #[cfg(target_os = "linux")]
-use arboard::{LinuxClipboardKind, SetExtLinux};
+use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 
 pub(crate) enum CopyResult {
     Copied,
     Noop,
+}
+
+/// Reads the PRIMARY selection, the one middle-click pastes. Only Linux has
+/// one, and on Wayland only when the compositor offers it. Blocks until the
+/// app owning the selection answers, so never call it on the UI thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_primary_selection() -> Option<String> {
+    let mut clipboard = Clipboard::new().ok()?;
+    let text = clipboard
+        .get()
+        .clipboard(LinuxClipboardKind::Primary)
+        .text()
+        .ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_primary_selection() -> Option<String> {
+    None
 }
 
 pub(crate) struct ClipboardState {

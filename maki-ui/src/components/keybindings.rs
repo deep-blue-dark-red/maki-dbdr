@@ -1068,17 +1068,6 @@ mod tests {
     use crossterm::event::KeyEvent;
     use test_case::test_case;
 
-    #[test_case(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL), "ctrl+d")]
-    #[test_case(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), "alt+x")]
-    #[test_case(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT), "shift+tab")]
-    #[test_case(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), "shift+tab")]
-    #[test_case(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), "space")]
-    #[test_case(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), "f5")]
-    #[test_case(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), "a")]
-    fn key_event_to_string_cases(input: KeyEvent, expected: &str) {
-        assert_eq!(key_event_to_string(&input), expected);
-    }
-
     #[test]
     fn bind_requires_exact_modifiers() {
         let bind = key::TOGGLE_VERBOSE; // Ctrl+O

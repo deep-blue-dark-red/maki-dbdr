@@ -1,16 +1,19 @@
+mod child_env;
 pub(crate) mod error;
 pub(crate) mod image;
-pub mod manifest;
+pub(crate) mod manifest;
 pub mod model;
 pub mod model_registry;
 pub mod pricing;
 pub mod provider;
 pub(crate) mod providers;
 pub mod retry;
+pub mod spec;
 pub mod tokens;
 pub(crate) mod types;
 pub mod wire_log;
 
+pub use child_env::strip_provider_keys;
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
@@ -25,6 +28,7 @@ pub use providers::catalog::{
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
 pub use providers::copilot::auth as copilot_auth;
+pub use providers::custom;
 pub use providers::dynamic;
 pub use providers::openai::auth as openai_auth;
 pub use providers::update_api_log_symlink;
@@ -35,6 +39,6 @@ pub use types::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Effort, EffortDialect, IMAGE_EVICTED_NOTE,
     IMAGE_OMITTED_NOTE, IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
-    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, Upstream, UsageLimit,
-    adapt_images_for_model, dialect,
+    StopReason, StreamResponse, THINKING_USAGE, ThinkingConfig, ThinkingFallback, Upstream,
+    UsageLimit, adapt_images_for_model, dialect,
 };

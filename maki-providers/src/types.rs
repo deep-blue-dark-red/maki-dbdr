@@ -7,7 +7,6 @@
 //! belongs in model context, and must never be mistaken for the user talking.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -552,47 +551,53 @@ pub struct EffortDialect<'a> {
     pub off: Option<&'static str>,
 }
 
-/// How a local model spells thinking on the wire, in place of a token budget.
-/// Each mode carries the JSON fragment merged into the request body, so any
-/// shape a chat template needs works without a schema per provider.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ThinkingFields {
-    #[serde(default)]
-    off: Option<Map<String, Value>>,
-    #[serde(default)]
-    adaptive: Option<Map<String, Value>>,
-    /// Keyed by [`Effort`]; the declared keys are the levels the model accepts.
-    #[serde(flatten)]
-    levels: BTreeMap<Effort, Map<String, Value>>,
+/// The model's own spelling of each thinking mode, parsed and validated by
+/// maki-config. Turning one into wire bytes is this crate's job, see
+/// [`declared_fragment`].
+pub use maki_config::providers::ThinkingFields;
+
+/// What a request says when the model's fields do not spell the mode asked
+/// for. The fragment merge is identical everywhere, only this last step
+/// differs, so paths hand it in rather than each growing their own apply fn.
+#[derive(Debug, Clone, Copy)]
+pub enum ThinkingFallback {
+    /// Nothing. A generic openai-compat gateway takes whatever its upstream
+    /// takes, and guessing would 400 the ones that are strict.
+    None,
+    /// An effort string, for thinking-capable models only.
+    Dialect(&'static EffortDialect<'static>),
+    /// llama.cpp's token budget field.
+    BudgetField,
 }
 
-impl ThinkingFields {
-    /// Levels snap to the declared ones, so a level the model never advertised
-    /// is never sent. A token budget picks the level it corresponds to; models
-    /// that declare no levels fall back to `adaptive` and keep the count
-    /// (the returned flag tells the caller to still send the budget field).
-    fn fragment(
-        &self,
-        thinking: ThinkingConfig,
-        max: Option<u32>,
-    ) -> Option<(&Map<String, Value>, bool)> {
-        let level = match thinking {
-            ThinkingConfig::Off => return self.off.as_ref().map(|f| (f, false)),
-            ThinkingConfig::Adaptive => return self.adaptive.as_ref().map(|f| (f, false)),
-            ThinkingConfig::Effort(level) => level,
-            ThinkingConfig::Budget(n) => {
-                if self.levels.is_empty() {
-                    return self.adaptive.as_ref().map(|f| (f, true));
-                }
-                Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
+/// The fragment that spells `thinking` for this model, if it has one. Effort
+/// levels snap to the declared ones, so a level the model never advertised is
+/// never sent, while `off` and `adaptive` need explicit keys and never snap. A
+/// token budget picks the level it lands on. A model that declares no levels
+/// at all gets `adaptive` and keeps the count, which is what the returned flag
+/// asks the caller to send alongside.
+fn declared_fragment(
+    fields: &ThinkingFields,
+    thinking: ThinkingConfig,
+    max: Option<u32>,
+) -> Option<(&Map<String, Value>, bool)> {
+    let level = match thinking {
+        ThinkingConfig::Off => return fields.off.as_ref().map(|f| (f, false)),
+        ThinkingConfig::Adaptive => return fields.adaptive.as_ref().map(|f| (f, false)),
+        ThinkingConfig::Effort(level) => level,
+        ThinkingConfig::Budget(n) => {
+            if fields.levels.is_empty() {
+                return fields.adaptive.as_ref().map(|f| (f, true));
             }
-        };
-        let declared: Vec<Effort> = self.levels.keys().copied().collect();
-        self.levels
-            .get(&level.snap(&declared))
-            .or(self.adaptive.as_ref())
-            .map(|f| (f, false))
-    }
+            Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
+        }
+    };
+    let declared: Vec<Effort> = fields.levels.keys().copied().collect();
+    fields
+        .levels
+        .get(&level.snap(&declared))
+        .or(fields.adaptive.as_ref())
+        .map(|f| (f, false))
 }
 
 fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
@@ -699,6 +704,16 @@ pub mod dialect {
         supported: &[Low, Medium, High, XHigh],
         adaptive: Some(High),
         off: None,
+    };
+    /// Ollama's OpenAI-compat endpoint documents low, medium and high, and
+    /// rejects the rest, so anything higher snaps down. A model with its own
+    /// words for it says so through `thinking_fields` instead. Leaving effort
+    /// out lets a capable model start reasoning on its own, so Off has to say
+    /// "none" out loud. Only use behind `Model::supports_thinking`.
+    pub const OLLAMA: EffortDialect = EffortDialect {
+        supported: &[Low, Medium, High],
+        adaptive: Some(Medium),
+        off: Some(OFF),
     };
 }
 
@@ -840,6 +855,60 @@ impl ThinkingConfig {
         }
     }
 
+    /// What the model says about itself wins, and `fallback` covers the modes
+    /// it left unsaid.
+    pub fn apply_thinking(self, body: &mut Value, model: &Model, fallback: ThinkingFallback) {
+        if let Some(fields) = &model.thinking_fields
+            && self.apply_fields(body, model, fields, fallback)
+        {
+            return;
+        }
+        match fallback {
+            ThinkingFallback::None => {}
+            ThinkingFallback::Dialect(dialect) => {
+                if model.supports_thinking() {
+                    self.apply_reasoning_effort(body, dialect, model);
+                }
+            }
+            // The model has no way to spell this mode, so the budget field
+            // takes over: a request must never end up saying nothing.
+            ThinkingFallback::BudgetField => {
+                let budget = match self.request_budget(model, model.max_thinking_budget()) {
+                    Budgeted::Off => 0,
+                    Budgeted::Adaptive => -1,
+                    Budgeted::Tokens(n) => i64::from(n),
+                };
+                body[LOCAL_BUDGET_FIELD] = json!(budget);
+            }
+        }
+    }
+
+    /// Merges the fragment `fields` spell for this mode, and says whether they
+    /// spell it at all.
+    pub(crate) fn apply_fields(
+        self,
+        body: &mut Value,
+        model: &Model,
+        fields: &ThinkingFields,
+        fallback: ThinkingFallback,
+    ) -> bool {
+        let max = model.max_thinking_budget();
+        let Some((fragment, keep_budget)) = declared_fragment(fields, self, max) else {
+            return false;
+        };
+        let Some(object) = body.as_object_mut() else {
+            return false;
+        };
+        merge_body(object, fragment);
+        if keep_budget
+            && matches!(fallback, ThinkingFallback::BudgetField)
+            && let Budgeted::Tokens(budget) = self.request_budget(model, max)
+        {
+            body[LOCAL_BUDGET_FIELD] = json!(budget);
+        }
+        true
+    }
+
     /// `max` is Google's own documented ceiling on thinking, which is a
     /// capability and so part of resolving the level, not a trim.
     pub fn apply_google_thinking(self, body: &mut Value, model: &Model, max: u32) {
@@ -852,28 +921,6 @@ impl ThinkingConfig {
                 body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
             }
         }
-    }
-
-    pub fn apply_local_thinking(self, body: &mut Value, model: &Model) {
-        let max = model.max_thinking_budget();
-        if let Some(fields) = &model.thinking_fields
-            && let Some((fragment, keep_budget)) = fields.fragment(self, max)
-            && let Some(object) = body.as_object_mut()
-        {
-            merge_body(object, fragment);
-            if keep_budget && let Budgeted::Tokens(budget) = self.request_budget(model, max) {
-                body[LOCAL_BUDGET_FIELD] = json!(budget);
-            }
-            return;
-        }
-        // No fragment means the model has no way to spell this mode, so the
-        // budget field takes over: a request must never end up saying nothing.
-        let budget = match self.request_budget(model, max) {
-            Budgeted::Off => 0,
-            Budgeted::Adaptive => -1,
-            Budgeted::Tokens(n) => i64::from(n),
-        };
-        body[LOCAL_BUDGET_FIELD] = json!(budget);
     }
 
     pub fn parse(input: &str, current: Self) -> Result<Self, &'static str> {
@@ -1086,6 +1133,9 @@ mod tests {
     use crate::model::ThinkingSupport as Support;
     use test_case::test_case;
 
+    /// Ollama is the one path that pairs a dialect with per-model fields.
+    const DIALECT: ThinkingFallback = ThinkingFallback::Dialect(&dialect::OLLAMA);
+
     const INTERNED_DATA: &str = "aW50ZXJuZWQtcGF5bG9hZA==";
     /// Valid ASCII, but no image ever started with these bytes.
     const UNREADABLE_PAYLOAD: &str = "abc123";
@@ -1195,7 +1245,7 @@ mod tests {
 
     #[test]
     fn adapt_images_borrows_when_nothing_has_to_change() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let with_image = vec![Message {
             role: Role::User,
             content: vec![png_block(32)],
@@ -1222,7 +1272,7 @@ mod tests {
     fn adapt_images_rebuilds_only_the_messages_that_change() {
         const CAPTION: &str = "look";
         const OVERSIZED: u32 = 2600;
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let fine = ImageSource::new(
             ImageMediaType::Png,
             Arc::from(crate::image::png_base64(32, 32)),
@@ -1276,7 +1326,7 @@ mod tests {
 
     #[test]
     fn adapt_images_shrinks_what_a_provider_would_refuse() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let oversized = ContentBlock::Image {
             source: ImageSource::new(
                 ImageMediaType::Png,
@@ -1301,7 +1351,7 @@ mod tests {
     #[test]
     fn adapt_images_evicts_the_oldest_past_the_request_cap() {
         const EXTRA: usize = 3;
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let blocks = adapt(&model, (1..=MAX_IMAGES + EXTRA).map(png_block).collect());
         assert_eq!(image_count(&blocks), MAX_IMAGES);
         assert!(
@@ -1315,7 +1365,7 @@ mod tests {
     /// survivors: counting blocks instead would evict a good one in its place.
     #[test]
     fn adapt_images_drops_what_it_cannot_read_without_spending_the_cap() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let model = clamp_test_model(anthropic_spec());
         let mut content = vec![png_block(1), unreadable_block()];
         content.extend((2..=MAX_IMAGES).map(png_block));
         let blocks = adapt(&model, content);
@@ -1325,7 +1375,7 @@ mod tests {
 
     #[test]
     fn adapt_images_replaces_blocks_for_text_only_model() {
-        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let mut model = clamp_test_model(anthropic_spec());
         model.supports_vision_override = Some(false);
         let tool_result = ContentBlock::ToolResult {
             tool_use_id: "t1".into(),
@@ -1375,7 +1425,7 @@ mod tests {
     fn thinking_model(id: &str) -> crate::model::Model {
         crate::model::Model {
             id: id.into(),
-            ..clamp_test_model(crate::provider::ProviderKind::Anthropic)
+            ..clamp_test_model(anthropic_spec())
         }
     }
 
@@ -1413,6 +1463,7 @@ mod tests {
             &dialect::ANTHROPIC_ADAPTIVE,
             &dialect::TENSORX,
             &dialect::GROK,
+            &dialect::OLLAMA,
         ];
         for d in all {
             assert!(!d.supported.is_empty());
@@ -1496,6 +1547,10 @@ mod tests {
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Adaptive,      None         ; "anthropic_adaptive_is_native")]
     #[test_case(&dialect::ANTHROPIC_ADAPTIVE, ThinkingConfig::Effort(XHigh), Some("high") ; "anthropic_xhigh_snaps_down")]
     #[test_case(&dialect::TENSORX, ThinkingConfig::Off,             Some("none") ; "tensorx_off_explicit_none")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Off,             Some("none")   ; "ollama_off_explicit_none")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Adaptive,        Some("medium") ; "ollama_adaptive")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Minimal), Some("low")    ; "ollama_minimal_snaps_up")]
+    #[test_case(&dialect::OLLAMA, ThinkingConfig::Effort(Max),     Some("high")   ; "ollama_max_snaps_down")]
     fn thinking_apply_reasoning_effort(
         dialect: &EffortDialect,
         config: ThinkingConfig,
@@ -1507,6 +1562,37 @@ mod tests {
             Some(e) => assert_eq!(body["reasoning_effort"], e),
             None => assert!(body.get("reasoning_effort").is_none()),
         }
+    }
+
+    /// The model spells out `high` and nothing else. That one wins, and every
+    /// other mode has to come from the fallback, or ollama keeps reasoning
+    /// after the user turned thinking off. A generic gateway has no dialect to
+    /// guess at, so there it stays quiet.
+    #[test_case(ThinkingConfig::Effort(High), DIALECT, json!({"reasoning_effort": "xhigh"}) ; "declared_mode_uses_its_fragment")]
+    #[test_case(ThinkingConfig::Off, DIALECT, json!({"reasoning_effort": "none"}) ; "unspelled_mode_falls_back_to_the_dialect")]
+    #[test_case(ThinkingConfig::Off, ThinkingFallback::None, json!({}) ; "unspelled_mode_stays_quiet_without_one")]
+    fn thinking_fields_come_first(
+        thinking: ThinkingConfig,
+        fallback: ThinkingFallback,
+        expected: Value,
+    ) {
+        let model =
+            native_thinking_model("partial", json!({"high": {"reasoning_effort": "xhigh"}}));
+        let mut body = json!({});
+        thinking.apply_thinking(&mut body, &model, fallback);
+        assert_eq!(body, expected);
+    }
+
+    /// Ollama turns thinking on by itself, so "off" has to be said out loud,
+    /// but only to models that can think: the rest reject the field.
+    #[test_case(Support::Yes, json!({"reasoning_effort": "none"}) ; "capable_model_is_told_to_stop")]
+    #[test_case(Support::No, json!({}) ; "model_that_cannot_think_is_left_alone")]
+    fn dialect_fallback_follows_thinking_support(support: Support, expected: Value) {
+        let mut model = thinking_model("ollama-model");
+        model.thinking_override = Some(support);
+        let mut body = json!({});
+        ThinkingConfig::Off.apply_thinking(&mut body, &model, DIALECT);
+        assert_eq!(body, expected);
     }
 
     /// The badge reads as whatever the session is set to, and stays quiet when
@@ -1589,9 +1675,13 @@ mod tests {
     #[test_case(ThinkingConfig::Adaptive,       -1   ; "adaptive")]
     #[test_case(ThinkingConfig::Budget(4096),   4096 ; "budget")]
     #[test_case(ThinkingConfig::Budget(10000),  4096 ; "budget_clamped")]
-    fn thinking_apply_local_thinking(config: ThinkingConfig, expected: i64) {
+    fn thinking_apply_budget_field(config: ThinkingConfig, expected: i64) {
         let mut body = json!({});
-        config.apply_local_thinking(&mut body, &thinking_model("local-model"));
+        config.apply_thinking(
+            &mut body,
+            &thinking_model("local-model"),
+            ThinkingFallback::BudgetField,
+        );
         assert_eq!(body["thinking_budget_tokens"], expected);
     }
 
@@ -1603,7 +1693,11 @@ mod tests {
     #[test_case(ThinkingConfig::Budget(4096),  json!({"reasoning_effort": "xhigh"})  ; "numeric_budget_maps_to_declared_level")]
     fn local_native_effort_uses_declared_levels(config: ThinkingConfig, expected: Value) {
         let mut body = json!({});
-        config.apply_local_thinking(&mut body, &native_effort_model());
+        config.apply_thinking(
+            &mut body,
+            &native_effort_model(),
+            ThinkingFallback::BudgetField,
+        );
         assert_eq!(body, expected);
     }
 
@@ -1618,7 +1712,7 @@ mod tests {
         .clamped(&model)
         .thinking;
         let mut body = json!({});
-        thinking.apply_local_thinking(&mut body, &model);
+        thinking.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, json!({"reasoning_effort": "low"}));
     }
 
@@ -1635,7 +1729,7 @@ mod tests {
             }),
         );
         let mut body = json!({"chat_template_kwargs": {"keep": 1}});
-        config.apply_local_thinking(&mut body, &model);
+        config.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, expected);
     }
 
@@ -1652,7 +1746,7 @@ mod tests {
     ) {
         let model = native_thinking_model("local-partial", fields);
         let mut body = json!({});
-        config.apply_local_thinking(&mut body, &model);
+        config.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, json!({ "thinking_budget_tokens": expected }));
     }
 
@@ -1663,21 +1757,34 @@ mod tests {
         let mut model = thinking_model("llama-cpp-model");
         model.max_output_tokens = None;
         let mut body = json!({});
-        ThinkingConfig::Budget(16_384).apply_local_thinking(&mut body, &model);
+        ThinkingConfig::Budget(16_384).apply_thinking(
+            &mut body,
+            &model,
+            ThinkingFallback::BudgetField,
+        );
         assert_eq!(body["thinking_budget_tokens"], 16_384);
     }
 
-    fn clamp_test_model(provider: crate::provider::ProviderKind) -> crate::model::Model {
+    fn anthropic_spec() -> &'static crate::spec::ProviderSpec {
+        crate::spec::ProviderRegistry::get("anthropic").unwrap()
+    }
+
+    fn google_spec() -> &'static crate::spec::ProviderSpec {
+        crate::spec::ProviderRegistry::get("google").unwrap()
+    }
+
+    fn clamp_test_model(spec: &'static crate::spec::ProviderSpec) -> crate::model::Model {
         crate::model::Model {
             id: "test-model".into(),
-            provider: std::sync::Arc::<str>::from(provider.to_string()),
+            provider: std::sync::Arc::<str>::from(spec.slug),
             tier: crate::model::ModelTier::Medium,
-            family: provider.family(),
+            family: spec.family,
             supports_tool_examples_override: None,
             thinking_override: None,
-            supports_vision_override: Some(provider.family().supports_vision()),
+            supports_vision_override: Some(spec.family.supports_vision()),
             supports_fast_override: None,
             pricing: crate::model::ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
@@ -1696,7 +1803,7 @@ mod tests {
         thinking: ThinkingConfig,
         expected: ThinkingConfig,
     ) {
-        let mut model = clamp_test_model(crate::provider::ProviderKind::Anthropic);
+        let mut model = clamp_test_model(anthropic_spec());
         model.thinking_override = thinking_override;
         let opts = RequestOptions {
             thinking,
@@ -1716,7 +1823,7 @@ mod tests {
 
     #[test]
     fn request_options_clamped_fast_requires_model_support() {
-        let model = clamp_test_model(crate::provider::ProviderKind::Google);
+        let model = clamp_test_model(google_spec());
         let opts = RequestOptions {
             thinking: ThinkingConfig::Off,
             fast: true,

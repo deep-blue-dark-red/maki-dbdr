@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use futures_lite::io::AsyncReadExt;
@@ -9,6 +10,7 @@ use isahc::config::{Configurable, RedirectPolicy, ResolveMap, VersionNegotiation
 use isahc::{AsyncBody, HttpClient, Request, Response};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
+use regex::bytes::Regex;
 use smol::{Timer, unblock};
 use url::Url;
 
@@ -31,6 +33,11 @@ const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const DNS_ATTEMPTS: u32 = 3;
 const DNS_RETRY_DELAY: Duration = Duration::from_millis(150);
+const MAX_POOLED_CLIENTS: usize = 8;
+/// A pooled client holds a curl thread and open sockets, so an endpoint nobody
+/// reads any more has to give them back.
+const CLIENT_IDLE_TTL: Duration = Duration::from_secs(120);
+const INVALID_LINE_MATCH: &str = "invalid line_match";
 const ALLOWLIST_HINT: &str = "add it to `net.allowed_private_hosts` in your init.lua to allow it";
 /// Reserved IPv4 ranges the standard library has no predicate for. Carrier
 /// grade NAT is the one that bites: Alibaba Cloud parks its instance metadata
@@ -193,6 +200,8 @@ struct RequestParams {
     timeout: Duration,
     max_bytes: usize,
     retries: u32,
+    /// Keep only response lines this matches. `None` disables the filter.
+    line_match: Option<Regex>,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
 }
@@ -215,6 +224,9 @@ struct ResponseData {
 ///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
+///   `line_match` (string) Regex. Keep only the response lines it
+///   matches. Filtering happens after the body is read, so `max_bytes`
+///   still caps the transfer.
 ///
 /// The response table has three fields: `body` (string), `status`
 /// (integer), and `content_type` (string).
@@ -246,6 +258,9 @@ lua_table! {
     /// blocked to prevent SSRF, including after a redirect. Hosts listed in
     /// the `net.allowed_private_hosts` config option are exempt.
     /// Failed requests (5xx) are retried automatically.
+    ///
+    /// Requests reuse a pool of clients, so calls to the same host share one
+    /// keep-alive connection rather than pay a fresh handshake each time.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
@@ -295,6 +310,11 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         .and_then(|o| o.get::<u32>("retry").ok())
         .unwrap_or(MAX_RETRIES);
 
+    let line_match = opts
+        .and_then(|o| o.get::<String>("line_match").ok())
+        .map(|pattern| Regex::new(&pattern).map_err(|e| format!("{INVALID_LINE_MATCH}: {e}")))
+        .transpose()?;
+
     Ok(RequestParams {
         url,
         method,
@@ -303,6 +323,7 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         timeout,
         max_bytes,
         retries,
+        line_match,
         pin,
     })
 }
@@ -425,9 +446,107 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     builder.build().map_err(|e| format!("client error: {e}"))
 }
 
+/// What identifies the client a request can reuse: the pin is baked into
+/// the client's resolve map, and the timeout is a client option. Everything
+/// else varies per request, not per client.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ClientKey {
+    timeout: Duration,
+    pin: Option<(String, u16, IpAddr)>,
+}
+
+type PooledClient = (Arc<HttpClient>, Instant);
+type ClientPool = HashMap<ClientKey, PooledClient>;
+
+/// The curl thread and the keep-alive connection cache live inside the
+/// client, so rebuilding one per call pays a thread and a handshake every
+/// time. A loop fetching the same endpoint hits the same key on every call.
+/// A request holds an `Arc`, so freeing a slot only closes sockets once the
+/// requests using that client are done with it.
+static CLIENT_POOL: LazyLock<Mutex<ClientPool>> = LazyLock::new(Mutex::default);
+
+fn lock_pool() -> MutexGuard<'static, ClientPool> {
+    CLIENT_POOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn evict_idle(pool: &mut ClientPool, now: Instant) {
+    pool.retain(|_, (_, seen)| now.duration_since(*seen) < CLIENT_IDLE_TTL);
+}
+
+/// Frees a slot for a newcomer, always: clients nobody has used for
+/// `CLIENT_IDLE_TTL` first, then the least recently used one. Without the
+/// idle sweep a host that was fetched once keeps a thread and a socket for
+/// the rest of the session.
+fn make_room(pool: &mut ClientPool, now: Instant) {
+    evict_idle(pool, now);
+    while pool.len() >= MAX_POOLED_CLIENTS {
+        let Some(lru) = pool
+            .iter()
+            .min_by_key(|(_, (_, seen))| *seen)
+            .map(|(lru, _)| lru.clone())
+        else {
+            break;
+        };
+        pool.remove(&lru);
+    }
+}
+
+/// Hands out a client for `params`, reusing the pooled one when the key matches.
+fn pooled_client(params: &RequestParams) -> Result<Arc<HttpClient>, String> {
+    let key = ClientKey {
+        timeout: params.timeout,
+        pin: params
+            .pin
+            .as_ref()
+            .map(|p| (p.host.clone(), p.port, p.addr)),
+    };
+    let now = Instant::now();
+    {
+        let mut pool = lock_pool();
+        evict_idle(&mut pool, now);
+        if let Some((client, seen)) = pool.get_mut(&key) {
+            *seen = now;
+            return Ok(Arc::clone(client));
+        }
+    }
+    // Built outside the lock: `build_client` starts a curl thread, and this
+    // runs on the Lua thread's executor. Two callers racing the same cold key
+    // each pay for a client, and the loser is dropped when its request ends.
+    let client = Arc::new(build_client(params)?);
+    let now = Instant::now();
+    let mut pool = lock_pool();
+    make_room(&mut pool, now);
+    pool.insert(key, (Arc::clone(&client), now));
+    Ok(client)
+}
+
+/// Gives back every pooled client, called when the Lua thread stops so that no
+/// socket outlives the session that opened it.
+pub fn clear_client_pool() {
+    lock_pool().clear();
+}
+
+/// Keeps only the lines `pattern` matches, so a caller never carries the lines
+/// it discards into the Lua VM. The line terminator is not part of the match,
+/// so `$` anchors at the end of the line.
+fn keep_lines_matching(body: &[u8], pattern: &Regex) -> Vec<u8> {
+    let mut kept = Vec::new();
+    for line in body.split_inclusive(|byte| *byte == b'\n') {
+        let content = line.strip_suffix(b"\n").unwrap_or(line);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        if pattern.is_match(content) {
+            kept.extend_from_slice(line);
+        }
+    }
+    kept
+}
+
 async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let mut response = send_with_retries(&build_client(&params)?, &params).await?;
+    let client = pooled_client(&params)?;
+    let mut response = send_with_retries(&client, &params).await?;
 
     for _ in 0..MAX_REDIRECTS {
         let Some(location) = redirect_location(&response) else {
@@ -436,7 +555,8 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         params
             .follow_redirect(response.status().as_u16(), &location, &allowed)
             .await?;
-        response = send_with_retries(&build_client(&params)?, &params).await?;
+        let client = pooled_client(&params)?;
+        response = send_with_retries(&client, &params).await?;
     }
     if redirect_location(&response).is_some() {
         return Err(format!("gave up after {MAX_REDIRECTS} redirects"));
@@ -473,6 +593,10 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
+    let bytes = match &params.line_match {
+        Some(pattern) => keep_lines_matching(&bytes, pattern),
+        None => bytes,
+    };
     let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
         body,
@@ -709,6 +833,7 @@ mod tests {
     const AUTH_VALUE: &str = "Bearer tok";
     const ACCEPT_HEADER: &str = "Accept";
     const ACCEPT_VALUE: &str = "text/html";
+    const KEEP_PATTERN: &str = "^vllm:generation_tokens_total";
 
     fn allowlist(entries: &[&str]) -> HostAllowlist {
         HostAllowlist::parse(&entries.iter().map(|e| (*e).to_string()).collect::<Vec<_>>())
@@ -816,6 +941,7 @@ mod tests {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
+            line_match: None,
             pin: None,
         }
     }
@@ -1104,5 +1230,226 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == ACCEPT_HEADER && v == ACCEPT_VALUE)
         );
+    }
+
+    fn line_match_opts(lua: &Lua, pattern: &str) -> Table {
+        let opts = lua.create_table().unwrap();
+        opts.set("line_match", pattern).unwrap();
+        opts
+    }
+
+    #[test]
+    fn extract_params_line_match_default_none() {
+        assert!(
+            request_params(PUBLIC_URL, None)
+                .unwrap()
+                .line_match
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_params_line_match_compiled() {
+        let lua = Lua::new();
+        let opts = line_match_opts(&lua, KEEP_PATTERN);
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        assert_eq!(params.line_match.unwrap().as_str(), KEEP_PATTERN);
+    }
+
+    #[test_case("(" ; "unclosed_group")]
+    #[test_case("[a-" ; "unclosed_class")]
+    fn extract_params_line_match_invalid_errors(pattern: &str) {
+        let lua = Lua::new();
+        let opts = line_match_opts(&lua, pattern);
+        let Err(err) = request_params(PUBLIC_URL, Some(&opts)) else {
+            panic!("invalid line_match accepted");
+        };
+        assert!(err.starts_with(INVALID_LINE_MATCH), "{err}");
+    }
+
+    #[test_case(KEEP_PATTERN, "vllm:a 1\nvllm:generation_tokens_total{e=\"0\"} 2.0\nvllm:b 3\n", "vllm:generation_tokens_total{e=\"0\"} 2.0\n" ; "lf_terminated")]
+    #[test_case(KEEP_PATTERN, "vllm:a 1\r\nvllm:generation_tokens_total 2.0\r\n", "vllm:generation_tokens_total 2.0\r\n" ; "crlf_terminated")]
+    #[test_case(KEEP_PATTERN, "vllm:generation_tokens_total 2.0", "vllm:generation_tokens_total 2.0" ; "no_trailing_newline")]
+    #[test_case("generation", "vllm:a 1\nvllm:generation_tokens_total 2.0\n", "vllm:generation_tokens_total 2.0\n" ; "unanchored")]
+    #[test_case(r" 2\.0$", "vllm:a 2.0 1\r\nvllm:b 2.0\r\n", "vllm:b 2.0\r\n" ; "end_anchor_skips_line_terminator")]
+    fn keep_lines_matching_keeps_only_matching_lines(pattern: &str, body: &str, expected: &str) {
+        let kept = keep_lines_matching(body.as_bytes(), &Regex::new(pattern).unwrap());
+        assert_eq!(String::from_utf8(kept).unwrap(), expected);
+    }
+
+    /// The pool is process-wide, so the tests that touch it run one at a time.
+    static POOL_TESTS: Mutex<()> = Mutex::new(());
+
+    fn pool_tests_serialized() -> MutexGuard<'static, ()> {
+        POOL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    const FIRST_POOL_TIMEOUT_SECS: u64 = 400;
+    /// Long enough that the sweep sees it as idle, short enough for a test.
+    const OLDER_THAN_IDLE_TTL: Duration = Duration::new(CLIENT_IDLE_TTL.as_secs() + 1, 0);
+    /// A monotonic clock starts at boot, so `Instant::now()` cannot always
+    /// afford an age. Every test reads the clock this far ahead.
+    const CLOCK_HEADROOM_SECS: u64 = 3600;
+
+    fn clock() -> Instant {
+        Instant::now() + Duration::from_secs(CLOCK_HEADROOM_SECS)
+    }
+
+    fn client_key(timeout_secs: u64) -> ClientKey {
+        ClientKey {
+            timeout: Duration::from_secs(timeout_secs),
+            pin: None,
+        }
+    }
+
+    fn a_client_seen_at(seen: Instant) -> PooledClient {
+        (Arc::new(HttpClient::new().unwrap()), seen)
+    }
+
+    fn ago(now: Instant, since: Duration) -> Instant {
+        now - since
+    }
+
+    /// A pool at the cap. One client was last used `oldest_ago` before `now`,
+    /// the rest just now.
+    fn a_full_pool(now: Instant, oldest_ago: Duration) -> ClientPool {
+        let mut pool: ClientPool = (1..MAX_POOLED_CLIENTS as u64)
+            .map(|n| {
+                (
+                    client_key(FIRST_POOL_TIMEOUT_SECS + n),
+                    a_client_seen_at(now),
+                )
+            })
+            .collect();
+        pool.insert(
+            client_key(FIRST_POOL_TIMEOUT_SECS),
+            a_client_seen_at(ago(now, oldest_ago)),
+        );
+        pool
+    }
+
+    #[test]
+    fn make_room_always_frees_a_slot_for_the_newcomer() {
+        let now = clock();
+        // Every client the same age, so nothing but the count decides.
+        let mut pool = a_full_pool(now, Duration::ZERO);
+        make_room(&mut pool, now);
+        assert!(
+            pool.len() < MAX_POOLED_CLIENTS,
+            "an insert on a full pool would go over the cap"
+        );
+    }
+
+    #[test]
+    fn make_room_drops_the_least_recently_used_client() {
+        let now = clock();
+        let mut pool = a_full_pool(now, Duration::from_secs(60));
+        let oldest = client_key(FIRST_POOL_TIMEOUT_SECS);
+        make_room(&mut pool, now);
+        assert!(!pool.contains_key(&oldest), "the oldest client stayed");
+        assert_eq!(pool.len(), MAX_POOLED_CLIENTS - 1);
+    }
+
+    #[test]
+    fn make_room_hands_back_idle_clients_even_when_the_pool_is_not_full() {
+        let now = clock();
+        let idle = client_key(FIRST_POOL_TIMEOUT_SECS);
+        let fresh = client_key(FIRST_POOL_TIMEOUT_SECS + 1);
+        let mut pool = ClientPool::new();
+        pool.insert(
+            idle.clone(),
+            a_client_seen_at(ago(now, OLDER_THAN_IDLE_TTL)),
+        );
+        pool.insert(fresh.clone(), a_client_seen_at(now));
+        make_room(&mut pool, now);
+        assert!(
+            !pool.contains_key(&idle),
+            "an idle client holds a thread and a socket for nothing"
+        );
+        assert!(pool.contains_key(&fresh));
+    }
+
+    fn params_with_timeout(secs: u64) -> RequestParams {
+        RequestParams {
+            timeout: Duration::from_secs(secs),
+            ..redirect_params(PUBLIC_URL)
+        }
+    }
+
+    #[test]
+    fn the_pool_never_grows_past_the_cap() {
+        let _guard = pool_tests_serialized();
+        clear_client_pool();
+        for secs in 101..101 + 3 * MAX_POOLED_CLIENTS as u64 {
+            pooled_client(&params_with_timeout(secs)).unwrap();
+        }
+        assert!(
+            lock_pool().len() <= MAX_POOLED_CLIENTS,
+            "pool grew past the cap: {}",
+            lock_pool().len()
+        );
+    }
+
+    #[test]
+    fn clearing_the_pool_hands_every_client_back() {
+        let _guard = pool_tests_serialized();
+        clear_client_pool();
+        let params = params_with_timeout(DEFAULT_TIMEOUT_SECS);
+        let client = pooled_client(&params).unwrap();
+        assert_eq!(lock_pool().len(), 1);
+        clear_client_pool();
+        assert!(lock_pool().is_empty());
+        assert!(
+            !Arc::ptr_eq(&client, &pooled_client(&params).unwrap()),
+            "a cleared client came back out of the pool"
+        );
+    }
+
+    #[test]
+    fn pooled_client_is_reused_when_the_pool_is_full() {
+        let _guard = pool_tests_serialized();
+        clear_client_pool();
+        let params: Vec<_> = (0..MAX_POOLED_CLIENTS as u64)
+            .map(|n| params_with_timeout(FIRST_POOL_TIMEOUT_SECS + n))
+            .collect();
+        let clients: Vec<_> = params.iter().map(|p| pooled_client(p).unwrap()).collect();
+        for (params, client) in params.iter().zip(&clients) {
+            assert!(
+                Arc::ptr_eq(client, &pooled_client(params).unwrap()),
+                "a hit on a full pool was evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn pooled_client_is_reused_for_the_same_key() {
+        let _guard = pool_tests_serialized();
+        clear_client_pool();
+        let params = redirect_params(PUBLIC_URL);
+        let first = pooled_client(&params).unwrap();
+        let second = pooled_client(&params).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "repeat call built a new client"
+        );
+    }
+
+    #[test]
+    fn pooled_client_is_keyed_on_the_pin() {
+        let _guard = pool_tests_serialized();
+        clear_client_pool();
+        let unpinned = redirect_params(PUBLIC_URL);
+        let mut pinned = redirect_params(PUBLIC_URL);
+        pinned.pin = Some(DnsPin {
+            host: "example.com".to_string(),
+            port: HTTPS_PORT,
+            addr: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        });
+        assert!(!Arc::ptr_eq(
+            &pooled_client(&unpinned).unwrap(),
+            &pooled_client(&pinned).unwrap()
+        ));
     }
 }

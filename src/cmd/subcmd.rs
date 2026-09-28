@@ -1,21 +1,19 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
-use maki_config::project::{self, ProjectDecision, TrustMode};
+use maki_config::project::{self, TrustMode};
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_config::{Config, load_env_files, load_permissions};
-use maki_lua::{InitFiles, PluginHost};
 use maki_providers::provider::fetch_all_models;
+use maki_providers::spec::Owner;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, dynamic, openai_auth, xai_auth};
 use maki_storage::StateDir;
@@ -24,6 +22,9 @@ use maki_storage::auth::{
     delete_provider_credentials, load_provider_credentials, load_tokens, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
+
+const PROTOCOL_CHOICES: &str = "openai, openai-responses, anthropic or google";
+const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
 
 pub fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
     match provider {
@@ -61,6 +62,17 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
 
     let mut config = ProvidersConfig::load();
     let def = config.get(slug).cloned();
+
+    // Past the check above, an `Unknown` owner is a `providers.toml` entry with
+    // no `protocol`. Login would say "Configured" and it would never work,
+    // unless the slug is a models.dev provider, which brings its own protocol.
+    if matches!(Owner::of(slug), Owner::Unknown) && known_outside_catalog(slug, &catalog_slugs()) {
+        bail!(
+            "providers.toml entry [{slug}] has no `protocol` and is not a models.dev provider, so maki cannot talk to it\n\
+             add `protocol` ({PROTOCOL_CHOICES}) and `base_url`, or run `maki auth login` and pick \"Custom provider...\"\n\n\
+             See {PROVIDERS_TOML_DOCS}"
+        );
+    }
 
     let plan = select_plan(slug, builtin, def.as_ref())?;
 
@@ -134,6 +146,20 @@ fn login_provider(slug: &str, storage: &StateDir) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn catalog_slugs() -> Vec<String> {
+    catalog_providers()
+        .into_iter()
+        .map(|provider| provider.slug)
+        .collect()
+}
+
+/// An empty list means models.dev could not load, say offline with a cold
+/// cache. The slug may still be one of its providers then, so only a loaded
+/// catalog can rule it out.
+fn known_outside_catalog(slug: &str, catalog_slugs: &[String]) -> bool {
+    !catalog_slugs.is_empty() && !catalog_slugs.iter().any(|known| known == slug)
 }
 
 fn login_interactive(storage: &StateDir) -> Result<()> {
@@ -539,23 +565,7 @@ pub fn auth_status(storage: &StateDir) -> Result<()> {
 }
 
 pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
-    load_env_files(&trust.project_config);
-
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-    let (config, warnings) = super::load_plugins(
-        &mut host,
-        no_plugins,
-        super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
-        |host, names, warnings| load_effective_config(host, no_plugins, &trust, names, warnings),
-    )?;
-    super::report_warnings(warnings);
+    let (_host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let mut refresh_failure = None;
     if refresh {
@@ -584,51 +594,10 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     Ok(())
 }
 
-fn load_effective_config(
-    host: &PluginHost,
-    no_plugins: bool,
-    trust: &ProjectDecision,
-    names: &super::KnownNames<'_>,
-    warnings: &mut Vec<String>,
-) -> Result<Config> {
-    // `notices`, not `warning`: these commands never ask, so the skipped path
-    // and how to undo it are the only sign the project config did nothing.
-    warnings.extend(trust.notices());
-    let raw_config = host
-        .load_init_files(
-            InitFiles::resolve(&trust.project_config, no_plugins),
-            warnings,
-        )
-        .context("load init.lua files")?;
-    raw_config
-        .unwrap_or_default()
-        .into_config(false, &names(host)?)
-        .context("invalid config")
-}
-
 pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
-    load_env_files(&trust.project_config);
-
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-
-    let (_, warnings) = super::load_plugins(
-        &mut host,
-        no_plugins,
-        super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
-        |host, names, warnings| {
-            let mut config = load_effective_config(host, no_plugins, &trust, names, warnings)?;
-            config.permissions = load_permissions(&trust.project_config);
-            Ok(config)
-        },
-    )?;
-    super::report_warnings(warnings);
+    // Load-bearing binding: `index` is a Lua builtin, and dropping the host
+    // stops the Lua thread the tool runs on.
+    let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let abs_path = Path::new(path)
         .canonicalize()
@@ -661,11 +630,17 @@ pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Resu
             .mcp
             .get(server)
             .ok_or_else(|| color_eyre::eyre::eyre!("unknown MCP server: {server}"))?;
-        let (url, oauth) = match mcp_config::parse_server(server.to_owned(), raw.clone())?.transport
-        {
-            mcp_config::Transport::Http { url, oauth, .. } => (url, oauth),
-            _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
-        };
+        let origin = config.origins.get(server).cloned().unwrap_or_default();
+        let (url, oauth, ca_file) =
+            match mcp_config::parse_server(server.to_owned(), raw.clone(), &origin)?.transport {
+                mcp_config::Transport::Http {
+                    url,
+                    oauth,
+                    ca_file,
+                    ..
+                } => (url, oauth, ca_file),
+                _ => color_eyre::eyre::bail!("server '{server}' is not an HTTP transport"),
+            };
         mcp_oauth::authenticate(
             server,
             &url,
@@ -673,6 +648,7 @@ pub fn mcp_auth(server: &str, storage: &StateDir, trust_mode: TrustMode) -> Resu
             storage,
             mcp_oauth::Interaction::Cli,
             oauth,
+            ca_file.as_deref(),
         )
         .await?;
         eprintln!("Successfully authenticated with MCP server '{server}'");
@@ -710,24 +686,10 @@ pub fn prompt(
         bail!("--plan can only be used with the 'system' prompt variant");
     }
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    // The `trust.paths` policy deliberately stops at the session entry points
-    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
-    // user never saw, for a session it never runs.
-    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    let (host, config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
     let vars = template::env_vars();
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let (config, warnings) = super::load_plugins(
-        &mut host,
-        no_plugins,
-        super::BuiltinFailure::Fatal,
-        maki_lua::Interaction::None,
-        |host, names, warnings| load_effective_config(host, no_plugins, &trust, names, warnings),
-    )?;
-    super::report_warnings(warnings);
 
     if tools {
         let ctx = DescriptionContext {
@@ -752,8 +714,8 @@ pub fn prompt(
         return Ok(());
     }
 
-    let cwd_str = cwd.to_string_lossy();
-    let instructions = load_instruction_text(&cwd_str);
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let instructions = load_instruction_text(&cwd.to_string_lossy());
     let slots = host.event_handle().collect_prompt_slots();
 
     let output = match variant {
@@ -777,4 +739,25 @@ pub fn prompt(
 
     print!("{output}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    const CATALOG_SLUG: &str = "fireworks-ai";
+    const OTHER_CATALOG_SLUG: &str = "togetherai";
+
+    #[test_case(&[], false ; "unloaded_catalog_rules_nothing_out")]
+    #[test_case(&[CATALOG_SLUG], false ; "slug_in_loaded_catalog")]
+    #[test_case(&[OTHER_CATALOG_SLUG], true ; "slug_missing_from_loaded_catalog")]
+    fn known_outside_catalog_needs_a_loaded_catalog(catalog: &[&str], expected: bool) {
+        let catalog_slugs: Vec<String> = catalog.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            known_outside_catalog(CATALOG_SLUG, &catalog_slugs),
+            expected
+        );
+    }
 }

@@ -1,392 +1,177 @@
-use crate::model::{ModelEntry, ModelFamily, ModelTier};
-use crate::pricing::PricingSchedule;
-use crate::providers::{
-    anthropic, aperture, copilot, custom, deepseek, dynamic, google, llama_cpp, mistral, ollama,
-    openai, opencode, openrouter, regolo, requesty, synthetic, tensorx, xai, zai,
-};
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
-#[derive(Debug, Clone, Copy)]
-pub struct ProviderManifest {
-    pub slug: &'static str,
-    pub display_name: &'static str,
-    pub family: ModelFamily,
-    pub supports_thinking: bool,
-    pub accepts_arbitrary_models: bool,
-    pub fallback_max_output: Option<u32>,
-    pub fallback_context_window: u32,
-    pub models: &'static [ModelEntry],
-    /// Set by the providers whose rates move with the wall clock, so the hours
-    /// sit next to the prices they scale. Everyone else bills flat.
-    pub pricing_schedule: Option<&'static PricingSchedule>,
+use serde::{Deserialize, Deserializer};
+
+use crate::model::{ModelEntry, ModelTier};
+use crate::spec::{NO_CURATED_MODELS, ProviderRegistry};
+
+const SLUG_MISMATCH: &str = "slug header";
+const NO_PREFIXES: &str = "no prefixes";
+const DUPLICATE_PREFIX: &str = "duplicate prefix";
+const DUPLICATE_DEFAULT: &str = "second default for tier";
+const OUTPUT_EXCEEDS_WINDOW: &str = "exceeds context_window";
+
+/// The file format of `models/<slug>.toml`. `slug` is a checksum rather than
+/// data: nothing reads it except [`parse`], which is how an `include_str!`
+/// pointing at the wrong table gets caught.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelTable {
+    slug: String,
+    model: Vec<ModelEntry>,
 }
 
-const ANTHROPIC: ProviderManifest = ProviderManifest {
-    slug: "anthropic",
-    display_name: "Anthropic",
-    family: ModelFamily::Claude,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 200_000,
-    models: anthropic::models(),
-    pricing_schedule: None,
-};
+/// Curated prefixes outlive every caller anyway, so they are leaked instead of
+/// dragging a lifetime through the crate. Bounded: a few hundred short strings,
+/// parsed once per process.
+pub(crate) fn leak_prefixes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<&'static [&'static str], D::Error> {
+    let prefixes = Vec::<String>::deserialize(deserializer)?;
+    Ok(Box::leak(
+        prefixes
+            .into_iter()
+            .map(|prefix| &*String::leak(prefix))
+            .collect::<Box<[&'static str]>>(),
+    ))
+}
 
-const OPENAI: ProviderManifest = ProviderManifest {
-    slug: "openai",
-    display_name: "OpenAI",
-    family: ModelFamily::Gpt,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(100_000),
-    fallback_context_window: 200_000,
-    models: openai::models(),
-    pricing_schedule: None,
-};
+/// Every curated table, parsed once and keyed by the slug that owns it. Keyed
+/// by slug rather than by spec identity because a `ProviderSpec` is a `const`
+/// that call sites copy, so there is no single address to key on.
+static TABLES: LazyLock<HashMap<&'static str, Box<[ModelEntry]>>> = LazyLock::new(|| {
+    ProviderRegistry::builtins()
+        .iter()
+        .map(|spec| {
+            // Const fields only. Calling `ProviderSpec::models()` here would
+            // re-enter this `LazyLock` and hang.
+            let table = match spec.models_toml {
+                NO_CURATED_MODELS => Box::default(),
+                src => parse(spec.slug, src).unwrap_or_else(|e| panic!("{e}")),
+            };
+            (spec.slug, table)
+        })
+        .collect()
+});
 
-const GOOGLE: ProviderManifest = ProviderManifest {
-    slug: "google",
-    display_name: "Google",
-    family: ModelFamily::Gemini,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(65_536),
-    fallback_context_window: 1_000_000,
-    models: google::models(),
-    pricing_schedule: None,
-};
+/// Empty for any slug that is not a builtin, which is the right answer: those
+/// providers hand out their models from a live catalog.
+pub(crate) fn table(slug: &str) -> &'static [ModelEntry] {
+    TABLES.get(slug).map_or(&[], |table| table)
+}
 
-const COPILOT: ProviderManifest = ProviderManifest {
-    slug: "copilot",
-    display_name: "Copilot",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(100_000),
-    fallback_context_window: 200_000,
-    models: copilot::models(),
-    pricing_schedule: None,
-};
-
-const OLLAMA: ProviderManifest = ProviderManifest {
-    slug: "ollama",
-    display_name: "Ollama",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(16_384),
-    fallback_context_window: 128_000,
-    models: ollama::models(),
-    pricing_schedule: None,
-};
-
-const LLAMA_CPP: ProviderManifest = ProviderManifest {
-    slug: "llama-cpp",
-    display_name: "LlamaCpp",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: None,
-    fallback_context_window: 128_000,
-    models: llama_cpp::models(),
-    pricing_schedule: None,
-};
-
-const MISTRAL: ProviderManifest = ProviderManifest {
-    slug: "mistral",
-    display_name: "Mistral",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: None,
-    fallback_context_window: 128_000,
-    models: mistral::models(),
-    pricing_schedule: None,
-};
-
-const ZAI: ProviderManifest = ProviderManifest {
-    slug: "zai",
-    display_name: "Z.AI",
-    family: ModelFamily::Glm,
-    supports_thinking: false,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(16_000),
-    fallback_context_window: 128_000,
-    models: zai::models(),
-    pricing_schedule: None,
-};
-
-const DEEPSEEK: ProviderManifest = ProviderManifest {
-    slug: "deepseek",
-    display_name: "DeepSeek",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(384_000),
-    fallback_context_window: 1_000_000,
-    models: deepseek::models(),
-    pricing_schedule: Some(&deepseek::PEAK_HOURS),
-};
-
-const OPENROUTER: ProviderManifest = ProviderManifest {
-    slug: "openrouter",
-    display_name: "OpenRouter",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 200_000,
-    models: openrouter::models(),
-    pricing_schedule: None,
-};
-
-const REQUESTY: ProviderManifest = ProviderManifest {
-    slug: "requesty",
-    display_name: "Requesty",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 200_000,
-    models: requesty::models(),
-    pricing_schedule: None,
-};
-
-const REGOLO: ProviderManifest = ProviderManifest {
-    slug: "regolo",
-    display_name: "Regolo",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(120_000),
-    fallback_context_window: 120_000,
-    models: regolo::models(),
-    pricing_schedule: None,
-};
-
-const SYNTHETIC: ProviderManifest = ProviderManifest {
-    slug: "synthetic",
-    display_name: "Synthetic",
-    family: ModelFamily::Synthetic,
-    supports_thinking: true,
-    accepts_arbitrary_models: false,
-    fallback_max_output: Some(32_000),
-    fallback_context_window: 128_000,
-    models: synthetic::models(),
-    pricing_schedule: None,
-};
-
-const TENSORX: ProviderManifest = ProviderManifest {
-    slug: "tensorx",
-    display_name: "TensorX",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: None,
-    fallback_context_window: 200_000,
-    models: tensorx::models(),
-    pricing_schedule: None,
-};
-
-const OPENCODE: ProviderManifest = ProviderManifest {
-    slug: opencode::ZEN_SLUG,
-    display_name: "Opencode Zen",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(128_000),
-    fallback_context_window: 256_000,
-    models: &[],
-    pricing_schedule: None,
-};
-
-const XAI: ProviderManifest = ProviderManifest {
-    slug: "xai",
-    display_name: "xAI",
-    family: ModelFamily::Generic,
-    supports_thinking: true,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(131_072),
-    fallback_context_window: 500_000,
-    models: xai::models(),
-    pricing_schedule: None,
-};
-
-const OPENCODE_GO: ProviderManifest = ProviderManifest {
-    slug: opencode::GO_SLUG,
-    display_name: "Opencode Go",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(64_000),
-    fallback_context_window: 128_000,
-    models: &[],
-    pricing_schedule: None,
-};
-
-const APERTURE: ProviderManifest = ProviderManifest {
-    slug: "aperture",
-    display_name: "Aperture",
-    family: ModelFamily::Generic,
-    supports_thinking: false,
-    accepts_arbitrary_models: true,
-    fallback_max_output: Some(16_384),
-    fallback_context_window: 128_000,
-    models: aperture::models(),
-    pricing_schedule: None,
-};
-
-const BUILTINS: &[ProviderManifest] = &[
-    ANTHROPIC,
-    OPENAI,
-    GOOGLE,
-    COPILOT,
-    OLLAMA,
-    LLAMA_CPP,
-    MISTRAL,
-    ZAI,
-    DEEPSEEK,
-    OPENROUTER,
-    REQUESTY,
-    REGOLO,
-    SYNTHETIC,
-    TENSORX,
-    OPENCODE,
-    OPENCODE_GO,
-    XAI,
-    APERTURE,
-];
-
-pub struct ManifestRegistry;
-
-impl ManifestRegistry {
-    pub fn get(slug: &str) -> Option<&'static ProviderManifest> {
-        BUILTINS.iter().find(|m| m.slug == slug)
+/// The input is embedded at compile time, so the only caller turns an error
+/// into a panic. `spec::tests::every_builtin_model_table_parses` is what keeps
+/// a broken table off a user's machine.
+fn parse(slug: &str, src: &str) -> Result<Box<[ModelEntry]>, String> {
+    let file = format!("models/{slug}.toml");
+    let table: ModelTable = toml::from_str(src).map_err(|e| format!("{file}: {e}"))?;
+    if table.slug != slug {
+        return Err(format!(
+            "{file}: {SLUG_MISMATCH} {:?} does not match {slug:?}",
+            table.slug
+        ));
     }
 
-    /// Like `get`, but resolves dynamic and custom (providers.toml) slugs to
-    /// their base provider's manifest so capability lookups (thinking, display
-    /// name, tier defaults) still work for stubs that declare no models. `None`
-    /// for an unknown slug, so callers pick a fallback instead of silently
-    /// inheriting a zeroed manifest.
-    pub fn for_slug(slug: &str) -> Option<&'static ProviderManifest> {
-        Self::get(slug)
-            .or_else(|| dynamic::base_for_slug(slug).and_then(|base| Self::get(&base.to_string())))
-            .or_else(|| custom::base_kind(slug).and_then(|base| Self::get(&base.to_string())))
+    let mut prefixes_seen: HashSet<&str> = HashSet::new();
+    let mut defaults_seen: Vec<ModelTier> = Vec::new();
+
+    for (index, entry) in table.model.iter().enumerate() {
+        let Some(name) = entry.prefixes.first() else {
+            return Err(format!("{file}: row {}: {NO_PREFIXES}", index + 1));
+        };
+        let at = format!("{file} {name:?}");
+
+        for prefix in entry.prefixes {
+            if !prefixes_seen.insert(prefix) {
+                return Err(format!("{at}: {DUPLICATE_PREFIX} {prefix:?}"));
+            }
+        }
+        if let Some(max_output) = entry.max_output_tokens
+            && max_output > entry.context_window
+        {
+            return Err(format!(
+                "{at}: max_output_tokens {max_output} {OUTPUT_EXCEEDS_WINDOW} {}",
+                entry.context_window
+            ));
+        }
+        if entry.default {
+            if defaults_seen.contains(&entry.tier) {
+                return Err(format!("{at}: {DUPLICATE_DEFAULT} {:?}", entry.tier));
+            }
+            defaults_seen.push(entry.tier);
+        }
     }
 
-    pub fn builtins() -> &'static [ProviderManifest] {
-        BUILTINS
-    }
-
-    pub fn find_default_for_tier(slug: &str, tier: ModelTier) -> Option<&'static ModelEntry> {
-        Self::for_slug(slug)?
-            .models
-            .iter()
-            .find(|e| e.default && e.tier == tier)
-    }
+    Ok(table.model.into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::provider::ProviderKind;
-    use crate::providers::catalog::CATALOG_BACKED_BUILTINS;
-    use maki_config::providers::BuiltInProvider;
-    use std::str::FromStr;
-    use strum::IntoEnumIterator;
+    use super::{
+        DUPLICATE_DEFAULT, DUPLICATE_PREFIX, NO_PREFIXES, OUTPUT_EXCEEDS_WINDOW, SLUG_MISMATCH,
+        parse,
+    };
+    use test_case::test_case;
 
-    #[test]
-    fn every_builtin_manifest_with_provider_kind_matches_kind_fields() {
-        for manifest in BUILTINS {
-            let Some(kind) = ProviderKind::from_str(manifest.slug).ok() else {
-                continue;
-            };
-            assert_eq!(kind.to_string(), manifest.slug, "{}", manifest.slug);
-            assert_eq!(
-                manifest.display_name,
-                kind.display_name(),
-                "{}",
-                manifest.slug
-            );
-            assert_eq!(manifest.family, kind.family(), "{}", manifest.slug);
-            assert_eq!(
-                manifest.fallback_max_output,
-                kind.fallback_max_output(),
-                "{}",
-                manifest.slug,
-            );
-            assert_eq!(
-                manifest.fallback_context_window,
-                kind.fallback_context_window(),
-                "{}",
-                manifest.slug,
-            );
-        }
+    const SLUG: &str = "synthetic";
+    const ACCEPTED: &str = "table should have been rejected";
+    const UNKNOWN_KEY: &str = "unknown field";
+    const MISSING_KEY: &str = "missing field";
+
+    const ROW: &str = r#"
+        [[model]]
+        prefixes = ["a"]
+        tier = "strong"
+        family = "generic"
+        vision = false
+        default = true
+        context_window = 200000
+        pricing = { input = 1.0, output = 2.0, cache_write = 0.0, cache_read = 0.0 }
+    "#;
+
+    fn table(slug: &str, rows: &str) -> String {
+        format!("slug = \"{slug}\"\n{rows}")
     }
 
-    #[test]
-    fn for_slug_returns_none_for_unknown_slug() {
-        assert!(ManifestRegistry::for_slug("totally-unknown-slug").is_none());
-    }
-
-    #[test]
-    fn for_slug_returns_builtin_directly() {
-        let manifest = ManifestRegistry::for_slug("anthropic").unwrap();
-        assert_eq!(manifest.slug, "anthropic");
-        assert_eq!(manifest.display_name, "Anthropic");
-    }
-
-    #[test]
-    fn builtin_count_covers_provider_kind_variants() {
-        let kind_count = ProviderKind::iter().count();
+    #[test_case(&table("regolo", ROW), SLUG_MISMATCH ; "slug_header_names_another_provider")]
+    #[test_case(&table(SLUG, &ROW.replace(r#"["a"]"#, "[]")), NO_PREFIXES ; "row_without_prefixes")]
+    #[test_case(&format!("{}{}", table(SLUG, ROW), ROW.replace("default = true", "default = false")), DUPLICATE_PREFIX ; "prefix_repeated_in_table")]
+    #[test_case(&format!("{}{}", table(SLUG, ROW), ROW.replace(r#"["a"]"#, r#"["b"]"#)), DUPLICATE_DEFAULT ; "two_defaults_for_one_tier")]
+    #[test_case(&table(SLUG, &format!("{ROW}max_output_tokens = 200001\n")), OUTPUT_EXCEEDS_WINDOW ; "output_exceeds_window")]
+    #[test_case(&table(SLUG, &ROW.replace("vision", "visoin")), UNKNOWN_KEY ; "unknown_key")]
+    #[test_case(&table(SLUG, &ROW.replace("vision = false", "")), MISSING_KEY ; "missing_key")]
+    fn parse_rejects(src: &str, expected: &str) {
+        let message = parse(SLUG, src).expect_err(ACCEPTED);
         assert!(
-            BUILTINS.len() >= kind_count,
-            "BUILTINS has {} manifests but ProviderKind has {} variants",
-            BUILTINS.len(),
-            kind_count,
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
         );
-        for kind in ProviderKind::iter() {
-            assert!(
-                ManifestRegistry::get(&kind.to_string()).is_some(),
-                "ProviderKind variant {:?} has no manifest",
-                kind,
-            );
-        }
-    }
-
-    /// The picker lists the inventory, so a manifest without an entry is a
-    /// provider the user cannot reach. OpenRouter shipped that way for months.
-    #[test]
-    fn every_builtin_manifest_has_inventory_entry() {
-        for manifest in BUILTINS {
-            if CATALOG_BACKED_BUILTINS.contains(&manifest.slug) {
-                continue;
-            }
-            assert!(
-                inventory::iter::<BuiltInProvider>()
-                    .into_iter()
-                    .any(|b| b.slug == manifest.slug),
-                "manifest {:?} has no BuiltInProvider entry, so it never shows in the picker",
-                manifest.slug,
-            );
-        }
     }
 
     #[test]
-    fn every_builtin_provider_inventory_entry_has_matching_manifest() {
-        for builtin in inventory::iter::<BuiltInProvider>() {
-            let manifest = ManifestRegistry::get(builtin.slug).unwrap_or_else(|| {
-                panic!(
-                    "BuiltInProvider slug {:?} has no ProviderManifest",
-                    builtin.slug,
-                )
-            });
-            assert_eq!(
-                manifest.display_name, builtin.display_name,
-                "display_name mismatch between manifest and BuiltInProvider for slug {:?}",
-                builtin.slug,
-            );
-        }
+    fn optionals_are_none_until_a_row_declares_them() {
+        const MAX_OUTPUT: u32 = 64_000;
+        const FAST_INPUT: f64 = 10.0;
+        const FAST_OUTPUT: f64 = 50.0;
+        const PARSED: &str = "table should have parsed";
+
+        let bare = parse(SLUG, &table(SLUG, ROW)).expect(PARSED);
+        assert_eq!(bare[0].max_output_tokens, None);
+        assert!(bare[0].pricing.fast.is_none());
+
+        let declared = table(SLUG, ROW).replace(
+            "cache_read = 0.0 }",
+            &format!(
+                "cache_read = 0.0, fast = {{ input = {FAST_INPUT}, output = {FAST_OUTPUT} }} }}\nmax_output_tokens = {MAX_OUTPUT}"
+            ),
+        );
+        let entries = parse(SLUG, &declared).expect(PARSED);
+        let fast = entries[0].pricing.fast.as_ref().expect(PARSED);
+
+        assert_eq!(entries[0].max_output_tokens, Some(MAX_OUTPUT));
+        assert_eq!(fast.input, FAST_INPUT);
+        assert_eq!(fast.output, FAST_OUTPUT);
     }
 }

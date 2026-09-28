@@ -21,18 +21,19 @@ use maki_agent::headless::{self, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp;
 use maki_agent::permissions::{PermissionAnswer, PluginRuleStore, TaggedAnswer};
 use maki_agent::prompt::ResolvedSlots;
+use maki_agent::session::Resumed;
 use maki_agent::tools::QUESTION_TOOL_NAME;
 use maki_agent::{
-    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, PermissionsConfig,
-    SessionEndReason, SessionEvents, ToolOutput,
+    AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, InputSource,
+    PermissionsConfig, SessionEndReason, SessionEvents, SteerKind,
 };
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, Message, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
-use maki_storage::sessions::Session;
+use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
@@ -443,6 +444,13 @@ impl SdkWriter {
 
 pub struct SdkParams {
     pub cli: Cli,
+    /// Which session this run continues and writes under, and where. Resolved
+    /// by the caller from the same flags every other entry point reads.
+    pub resumed: Resumed,
+    /// The right to write [`Self::resumed`]'s session, taken when it was
+    /// resolved and held for the whole run.
+    pub claim: SessionClaim,
+    pub storage: StateDir,
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
@@ -533,6 +541,9 @@ struct Shared {
 pub fn run(params: SdkParams) -> Result<()> {
     let SdkParams {
         cli,
+        resumed,
+        claim,
+        storage,
         model,
         mut config,
         permissions_config,
@@ -552,15 +563,6 @@ pub fn run(params: SdkParams) -> Result<()> {
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let working_dir = cwd.to_string_lossy().into_owned();
-    let (session_id, initial_history, initial_context_size) = resolve_session(&cli, &working_dir)?;
-    crate::setup::report_session_start(
-        if initial_history.is_empty() {
-            maki_otel::emit::START_FRESH
-        } else {
-            maki_otel::emit::START_RESUME
-        },
-        session_id.as_ref(),
-    );
 
     let (mcp_handle, mcp_config_errors) =
         smol::block_on(mcp::start_connected(&cwd, project_config.clone()));
@@ -578,9 +580,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
         initial_wd: cwd.clone(),
-        session_id,
-        initial_history,
-        initial_context_size,
+        resumed,
+        claim,
+        storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
@@ -689,8 +691,13 @@ pub fn run(params: SdkParams) -> Result<()> {
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
-                let input =
-                    AgentInput::from_defaults(prompt, mode.agent_mode(&cwd), images, defaults);
+                let input = AgentInput::from_defaults(
+                    prompt,
+                    mode.agent_mode(&cwd),
+                    images,
+                    defaults,
+                    InputSource::Headless,
+                );
                 if handle.input_tx.send(input).is_err() {
                     break;
                 }
@@ -764,46 +771,6 @@ pub fn run(params: SdkParams) -> Result<()> {
     drop(writer);
     let _ = writer_thread.join();
     Ok(())
-}
-
-type StoredSession = Session<Message, TokenUsage, ToolOutput>;
-
-/// Also returns the provider's last prompt count for the restored history, so
-/// the resumed session's first request is budgeted from a measurement.
-fn resolve_session(cli: &Cli, cwd: &str) -> Result<(Option<SessionRef>, Vec<Message>, u32)> {
-    let (resumed_id, session) = if let Some(id) = &cli.session {
-        let storage = StateDir::resolve().context("resolve state dir")?;
-        let session_ref: SessionRef = id
-            .parse()
-            .map_err(|e| eyre!("invalid session id {id}: {e}"))?;
-        let session = StoredSession::load(session_ref.id(), &storage)
-            .map_err(|e| eyre!("load session {id}: {e}"))?;
-        ((!cli.fork_session).then_some(session_ref), Some(session))
-    } else if cli.continue_session {
-        let storage = StateDir::resolve().context("resolve state dir")?;
-        match StoredSession::latest(cwd, &storage) {
-            Ok(Some(session)) => (Some(SessionRef::from(session.id)), Some(session)),
-            _ => (None, None),
-        }
-    } else {
-        (None, None)
-    };
-    let context_size = session.as_ref().map_or(0, |s| s.meta.context_size);
-    let history = session
-        .map(StoredSession::take_messages)
-        .unwrap_or_default();
-
-    let cli_session_id = cli.session_id.as_deref().map(|s| {
-        s.parse::<SessionRef>()
-            .map_err(|e| eyre!("invalid session id {s:?}: {e}"))
-    });
-    let cli_session_id = match cli_session_id {
-        Some(Ok(id)) => Some(id),
-        Some(Err(e)) => return Err(e),
-        None => None,
-    };
-
-    Ok((cli_session_id.or(resumed_id), history, context_size))
 }
 
 fn parse_or_warn<T: serde::de::DeserializeOwned>(payload: Value, what: &str) -> Option<T> {
@@ -1100,6 +1067,13 @@ impl EventPump {
             | AgentEvent::PromptProgress { .. }
             | AgentEvent::StreamClosed
             | AgentEvent::TurnToolsDone { .. } => {}
+            // A later kept message overwrites this with its own answer, so the
+            // reason is the result only when every message was dropped.
+            AgentEvent::Steered {
+                kind: SteerKind::MessageDropped,
+                text,
+            } if parent_tool_use_id.is_none() => self.result_text.clone_from(text),
+            AgentEvent::Steered { .. } => {}
             AgentEvent::Retry {
                 attempt,
                 message,
@@ -1192,8 +1166,15 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer, so it is not a success.
-                let is_error = *reason == DoneReason::Cancelled;
+                // An interrupted run leaves a partial answer and a dropped one
+                // never ran, so neither is a success.
+                let is_error = match reason {
+                    DoneReason::Cancelled | DoneReason::Dropped => true,
+                    DoneReason::EndTurn
+                    | DoneReason::MaxTokens
+                    | DoneReason::MaxTurns
+                    | DoneReason::Compact => false,
+                };
                 let result = mem::take(&mut self.result_text);
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
@@ -1671,6 +1652,7 @@ mod tests {
                 id: TEST_TOOL_USE_ID.to_owned(),
                 tool: ToolKey::parse(TEST_TOOL).unwrap(),
                 scopes: Vec::new(),
+                reason: None,
             },
             subagent: None,
             run_id: 0,
@@ -1814,5 +1796,41 @@ mod tests {
 
         assert_eq!(answer_rx.try_recv(), Ok(tagged(PermissionAnswer::Deny)));
         assert!(out_rx.is_empty(), "{NO_CONTROL_REQUEST}");
+    }
+
+    fn top_level(event: AgentEvent) -> Envelope {
+        Envelope {
+            event,
+            subagent: None,
+            run_id: 0,
+        }
+    }
+
+    /// Nothing reached the model, so a client reading `is_error` must not take
+    /// the empty turn for an answer.
+    #[test]
+    fn a_dropped_prompt_is_an_error_with_its_reason() {
+        const DROP_REASON: &str = "blocked by a plugin";
+        let (mut pump, out_rx) = test_pump(PermissionMode::Default, flume::unbounded().0);
+
+        pump.handle(top_level(AgentEvent::Steered {
+            kind: SteerKind::MessageDropped,
+            text: DROP_REASON.into(),
+        }))
+        .unwrap();
+        pump.handle(top_level(AgentEvent::Done {
+            usage: TokenUsage::default(),
+            cost: None,
+            list_cost: None,
+            context_size: 0,
+            context_window: 0,
+            num_turns: 0,
+            reason: DoneReason::Dropped,
+        }))
+        .unwrap();
+
+        let wire: Value = serde_json::from_str(&out_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(wire["is_error"], true);
+        assert_eq!(wire["result"], DROP_REASON);
     }
 }

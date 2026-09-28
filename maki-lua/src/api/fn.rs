@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use maki_lua_macro::{lua_fn, lua_table};
+use maki_providers::strip_provider_keys;
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use shell_words::join as shell_join;
@@ -280,7 +281,7 @@ impl JobStore {
             on_exit,
         } = spec;
         let mut command = cmd.build();
-        command
+        strip_provider_keys(&mut command)
             .stdout(stdout.stdio()?)
             .stderr(stderr.stdio()?)
             .stdin(Stdio::null());

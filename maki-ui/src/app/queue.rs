@@ -16,6 +16,8 @@ pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
     Queued,
     Rejected(&'static str),
+    /// Parked behind the cache-miss y/n confirm.
+    Confirm,
 }
 
 #[derive(Default)]
@@ -130,6 +132,9 @@ impl App {
             } else {
                 SubmitOutcome::Rejected(NO_QUEUE_ERR)
             }
+        } else if let Some((_, cost)) = self.cache_miss_risk() {
+            self.cache_miss_prompt.open(msg, cost);
+            SubmitOutcome::Confirm
         } else {
             SubmitOutcome::Started(self.start_from_queue(&msg))
         }
@@ -145,6 +150,7 @@ impl App {
                 self.flash(e.into());
                 vec![]
             }
+            SubmitOutcome::Confirm => vec![],
         }
     }
 
@@ -241,8 +247,9 @@ impl App {
         self.status = Status::Streaming;
         self.start_turn_timer();
         self.last_done_info = None;
+        self.cache_miss_forced = false;
         self.cache_miss_warning = None;
-        self.fire_session_autocmd("TurnStart", serde_json::json!({}));
+        self.fire_session_autocmd("TurnStart", serde_json::json!({ "text": display }));
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());

@@ -19,6 +19,7 @@ color-eyre = { workspace = true }
 tracing = { workspace = true }
 syntect = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
 arboard = { workspace = true }
 jiff = { workspace = true }
@@ -35,7 +36,6 @@ image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 base64 = { workspace = true }
 nucleo = { workspace = true }
 nucleo-matcher = { workspace = true }
-ignore = { workspace = true }
 async-process = { workspace = true }
 libc = { workspace = true }
 strum = { workspace = true }

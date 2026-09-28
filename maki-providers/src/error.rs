@@ -8,6 +8,7 @@
 use std::{io, time::Duration};
 
 use isahc::{AsyncReadResponseExt, error::ErrorKind as HttpErrorKind};
+use serde_json::Value;
 
 use crate::{
     providers::opencode::{self, NonLoginError},
@@ -25,6 +26,10 @@ const OPENAI_LIMIT: &str = "maximum context length is ";
 const CONNECT_FAILED_MESSAGE: &str =
     "could not connect, check the server is running and the base URL is correct";
 const NETWORK_ERROR_MESSAGE: &str = "connection error, check your network";
+/// The request field a server names when it refuses reasoning summaries. Every
+/// Responses implementation spells the rejection with a different `code`, so
+/// the field is the only stable part of the answer.
+const REASONING_SUMMARY_PARAM: &str = "reasoning.summary";
 
 /// Why a provider refused a request for size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +254,20 @@ impl AgentError {
         self.non_login_error().is_some_and(|error| error.is_quota)
     }
 
+    pub fn is_unsupported_reasoning_summary(&self) -> bool {
+        let Self::Api { message, .. } = self else {
+            return false;
+        };
+        let Ok(body) = serde_json::from_str::<Value>(message) else {
+            return false;
+        };
+        let error = &body["error"];
+        error["param"].as_str() == Some(REASONING_SUMMARY_PARAM)
+            || error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(REASONING_SUMMARY_PARAM))
+    }
+
     /// Whether *this key* is the problem rather than the account, which is a
     /// different question from whether the request is worth retrying: the retry
     /// loop asks it for every error, since a 401 or a 403 is dead for this key
@@ -410,6 +429,29 @@ mod tests {
 
     fn api_msg(status: u16, message: &str) -> AgentError {
         AgentError::api(status, message)
+    }
+
+    const SUMMARY_BODY: &str = r#"{"error":{"message":"Your organization must be verified to generate reasoning summaries.","param":"reasoning.summary","code":"unsupported_value"}}"#;
+    const UNKNOWN_PARAMETER_BODY: &str = r#"{"error":{"message":"Unknown parameter: 'reasoning.summary'.","param":"reasoning.summary","code":"unknown_parameter"}}"#;
+    const NULL_CODE_BODY: &str =
+        r#"{"error":{"message":"bad request","param":"reasoning.summary","code":null}}"#;
+    const MESSAGE_ONLY_BODY: &str =
+        r#"{"error":{"message":"Unsupported value for reasoning.summary."}}"#;
+    const NO_PARAM_BODY: &str = r#"{"error":{"code":"unsupported_value","message":"Unsupported value: 'flash' is not one of the supported efforts."}}"#;
+
+    #[test_case(SUMMARY_BODY, true  ; "summary_unsupported")]
+    #[test_case(UNKNOWN_PARAMETER_BODY, true ; "unknown_parameter_code")]
+    #[test_case(NULL_CODE_BODY, true ; "null_code")]
+    #[test_case(MESSAGE_ONLY_BODY, true ; "message_names_param")]
+    #[test_case(NO_PARAM_BODY, false ; "unsupported_value_without_param")]
+    #[test_case(r#"{"error":{"code":"unsupported_value","param":"other.param"}}"#, false ; "other_param")]
+    #[test_case("not json", false ; "not_json")]
+    fn unsupported_reasoning_summary_matches_body(body: &str, expected: bool) {
+        assert_eq!(
+            api_msg(400, body).is_unsupported_reasoning_summary(),
+            expected
+        );
+        assert!(!api(400).is_unsupported_reasoning_summary());
     }
 
     fn opencode_body(error_type: &str, message: &str) -> String {

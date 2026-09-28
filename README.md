@@ -54,6 +54,12 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 ---
 # Maki 
 
+## Benchmarks
+
+<img src="./site/bench.svg" alt="Maki 0.5.5 at 70% pass rate and $2.06 per pass, against the FrontierHarness Eval baselines">
+
+[FrontierHarness Eval](https://frontierharness.org/) benchmark result, [click here to download report.zip](https://github.com/tontinton/maki/releases/download/v0.5.5/frontierharness-report-2026-09-21.zip)
+
 ## Features
 
 ### Context efficiency
@@ -109,6 +115,8 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
 **Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
+
+> Providers as Lua plugins WIP!
 
 ## Installation
 

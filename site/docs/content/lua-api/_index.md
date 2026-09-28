@@ -102,6 +102,7 @@ The rules:
 | [`maki`](#maki) | The global entry point. |
 | [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
+| [`maki.plan`](#maki-plan) | Plan-mode surface for plugins. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
@@ -123,7 +124,7 @@ The rules:
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
-| [`maki.text`](#maki-text) | Text transformation utilities. |
+| [`maki.text`](#maki-text) | Text utilities: format conversion and the fuzzy matcher the built-in |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
 | [`maki.treesitter.query`](#maki-treesitter-query) | Query compilation and lookup. |
@@ -771,17 +772,25 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-own events with `exec_autocmds`.
+`"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`, and
+`"FileIndexReady"`. Plugins can also fire their own events with
+`exec_autocmds`.
 
-Every host event carries `data.session_id`. For `"SessionReset"` and
+Every host event carries `data.session_id` except `"FileIndexReady"`,
+which is about a directory rather than a session. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
 name the session now running or focused. What each event adds:
 
 - `"ToolStart"`, `"ToolDone"`: `data.tool_id` and `data.tool`.
+- `"ToolDone"` adds `data.is_error` and `data.bytes`, the size of the
+  text the model reads. A call that ran also carries `data.duration_ms`
+  and `data.input`, the input after every `tool.*.input` layer. A call
+  that never ran, like a cancelled one, has neither.
+- `"TurnStart"`: `data.text`, the message that started the turn.
 - `"TurnEnd"`: `data.reason` (`"finished"`, `"max_tokens"`,
-  `"max_turns"`, or `"cancelled"`), `data.usage` (four token fields,
-  cache included), `data.cost`, `data.list_cost`, `data.context_size`,
+  `"max_turns"`, `"cancelled"`, or `"dropped"` when an
+  `agent.user_message` layer refused the message), `data.usage` (four
+  token fields, cache included), `data.cost`, `data.list_cost`, `data.context_size`,
   `data.context_window`, and `data.num_turns` (model round-trips the
   turn took). `list_cost` is the un-subsidised list price and `cost` is
   the real bill, so a budget plugin charges against whichever one it
@@ -789,9 +798,11 @@ name the session now running or focused. What each event adds:
 - `"AutoCompacting"`: `data.context_size` and `data.context_window` at
   trigger time.
 - `"CompactionDone"`: `data.context_size_before`,
-  `data.context_size_after`, and `data.context_window`.
+  `data.context_size_after`, `data.context_window`, and `data.summary`,
+  the text that replaced the history.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
-  agent just wrote. Fires once per draft.
+  agent just wrote. Fires once per draft. Plan state is per session, so
+  pass `data.session_id` to `maki.plan.read`.
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -807,6 +818,25 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+  chat input as `maki.ui.input` reports it. `data.source` is the plugin
+  name when that plugin's `maki.ui.input_edit` was the only writer this
+  frame, and nil otherwise (including when the user moved the caret), so
+  ignoring your own name never drops a change. `data.cursor_only` is true
+  when only the caret moved. Handlers that only care about the text
+  should return early on it. Fires at most once per frame, and only when
+  the text or caret changed. Focusing another session republishes that
+  session's input.
+- `"FileIndexReady"`: `data.root`, the absolute directory that was
+  walked, `data.files`, how many paths the walk left, and `data.crashed`
+  and `data.truncated`, the two ways that list is not the whole tree.
+  Fires once per walk that ends, whatever `maki.fs.fuzzy_files` or the
+  `Ctrl+S` picker started it, so a plugin ranking files asks again
+  instead of polling. A walk cancelled before it ended stays quiet.
+  `data.root` is absent for a directory with no UTF-8 spelling, and so is
+  the `root` of the call that asked for the walk, so a plugin matching
+  the two takes an event without a root as a reason to ask again. Asking
+  again only ever re-reads the root the plugin passed.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
@@ -914,16 +944,27 @@ maki.api.exec_autocmds("MyEvent", {
 ### `maki.api.declare_slot()` {#maki-api-declare_slot}
 
 ```lua
-maki.api.declare_slot({name}, {default})
+maki.api.declare_slot({name}, {default}, {opts?})
 ```
 
 Create a named extension point owned by your plugin. You provide a
 {default} function, and other plugins can wrap it with layers using
-`set_slot`. The returned callable runs the full chain: outermost
-layer first, then inward, ending at {default}.
+`set_slot`. The returned callable runs the full chain: outermost layer
+first, then inward, ending at {default}.
+
+{opts} prices what a layer from another plugin pays to steer your chain.
+You set it, because you are the only one who knows what your default does
+with the arguments it is handed. Pass `{ capability = { "net" } }` to
+charge the permissions you name, all of them at once; `{ capability = {} }`
+to let anyone layer for free, which is the honest price for a slot whose
+arguments are inert; or leave {opts} out to charge every permission, what a
+tool declaring no capability charges. You can only name permissions your
+own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."`, which the host fires itself.
+if {name} starts with `"tool."`, `"ui."`, or `"agent."`, which the host
+fires itself. The name stays yours across an unload: nobody else can take it over, or
+re-declare it cheaper, while maki runs.
 
 The chain is async: the default and every layer may park (`maki.fs.*`,
 `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -936,15 +977,17 @@ cancels the layers it is waiting on.
 
 - `{name}` (`string`) Unique slot name, e.g. `"myplugin.render"`.
 - `{default}` (`function`) Default implementation, called when no layers wrap it.
+- `{opts?}` (`table|nil`) `{ capability = { "net", ... } }`: what a layer from another plugin pays.
 
 **Returns:** (`function`) Callable that dispatches through all layers.
 
 **Example:**
 
 ```lua
+-- anyone may layer this one: it only uppercases the text it is given
 local render = maki.api.declare_slot("myplugin.render", function(text)
   return text:upper()
-end)
+end, { capability = {} })
 print(render("hello")) -- HELLO
 ```
 
@@ -971,13 +1014,34 @@ takes the seam down with it.
 Layers wrap in registration order, so the last one registered runs
 first and sees the value before the others do.
 
+Maki fires two slots around the plan form, both with
+`ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+menu, and `ui.plan_form` asks whether the form opens at all. Both are
+documented under [maki.plan](/docs/lua-api/#maki-plan).
+
 Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a
 table to replace the value, nothing to leave it alone, or
-`nil, reason` to stop the call. Wrapping one costs the capability the
-tool declares, and a tool declaring none costs every permission. See
+`nil, reason` to stop the call. An input layer can also answer
+`value, { ask = reason }` to make the user approve the call. Name the
+tool `*` (`tool.*.input`) to wrap every tool. Wrapping one costs the
+capability the tool declares, and a tool declaring none costs every
+permission.
+
+The agent loop fires `agent.user_message`, `agent.stop`,
+`agent.compact.before`, and `agent.compact.prepare`, with the same
+contract. Wrapping one costs every permission. See
 [Hooks](/docs/hooks/).
+
+Wrapping a slot another plugin declared steers a chain that plugin's
+callers trust, so it costs whatever the owner priced it at in
+`declare_slot`: the capabilities it named, every permission if it named
+none, or nothing at all if it declared its arguments inert. Layering a slot
+you declared yourself is free. Like the `tool.*` slots, this is decided
+when the chain fires: the call skips a layer that is not entitled and
+carries on, and a reload that changes what you hold takes effect on the
+next call.
 
 **Parameters:**
 
@@ -1003,13 +1067,101 @@ maki.api.get_slots()
 List all known slots and their current state. Useful for debugging
 which plugins own or wrap each slot.
 
-**Returns:** (`table`) Map of slot name to `{ owner, declared, fillers }`.
+`capability` is the list of permissions a layer from another plugin pays,
+and is absent on a slot whose owner named no price, which costs every
+permission.
+
+**Returns:** (`table`) Map of slot name to `{ owner, declared, fillers, capability }`.
 
 **Example:**
 
 ```lua
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
+end
+```
+
+
+## maki.plan {#maki-plan}
+
+Plan-mode surface for plugins.
+
+Read the plan, and shape the plan form by layering the two slots maki
+fires around it. Plan state is per session, so every call takes an
+optional `session` and defaults to the focused tab.
+
+`ui.plan_form.actions` is the menu. The default answers with the
+built-in rows, each `{ id, label, desc, action }`, and a layer
+appends, reorders or drops them before returning the list. Every row
+needs an `id` no other row uses, since that is how a later layer finds
+it. Anything past the 32nd row is dropped.
+
+A row carrying a `handler` has that function called on the Lua thread
+with `{ session, path, parallel }` when the user picks it. The row's
+`action` runs after the handler returns, unless the handler returned
+`false` or failed, so copying a built-in row and adding a handler
+keeps the built-in outcome. Drop the `action` to replace it.
+
+`ui.plan_form` is the form itself. A layer that answers `false` keeps
+it closed and renders the plan however it likes.
+
+Layering either slot costs every permission, the price of steering a
+call whose reach nobody declared: a row decides what pressing Enter
+does, up to a build-mode turn with every tool behind it.
+
+Unloading your plugin hands the form back and reaps its row handlers.
+
+```lua
+-- A row of your own, next to the built-in ones:
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+  local rows = prev(ev)
+  table.insert(rows, {
+    id = "commit_and_implement",
+    label = "Commit and implement",
+    desc = "Commit the plan file first, then implement it",
+    handler = function(opts)
+      maki.fn.system({ "git", "commit", "-am", "plan" })
+      maki.session.set_mode("build", { session = opts.session })
+      maki.session.prompt("Implement " .. opts.path, { session = opts.session })
+    end,
+  })
+  return rows
+end)
+
+-- Render the plan yourself for as long as this plugin is loaded:
+maki.api.set_slot("ui.plan_form", function(prev, ev)
+  local plan = maki.plan.read({ session = ev.session })
+  return false
+end)
+```
+
+---
+
+### `maki.plan.read()` {#maki-plan-read}
+
+```lua
+maki.plan.read({opts?})
+```
+
+Read the current plan state. Returns `{ mode, path, content, ready }`:
+- `mode` is `"plan"` or `"build"`.
+- `path` is the absolute plan path once the session has one, else `nil`.
+- `ready` is `true` once the agent has written the plan file.
+- `content` is the file contents, `nil` when the plan is not ready or the
+  read failed.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id, defaults to focused.
+
+**Returns:** (`table|nil`, `string|nil`) Plan snapshot table, or nil and an error.
+
+**Example:**
+
+```lua
+local plan, err = maki.plan.read({ session = id })
+if plan and plan.ready then
+  print(plan.path, plan.content)
 end
 ```
 
@@ -2657,7 +2809,12 @@ maki.fs.mkdir("a/b/c", { parents = true })
 maki.fs.glob({pattern}, {opts?})
 ```
 
-Find files matching one or more glob patterns.
+Find files matching one or more glob patterns, walked fresh on every call.
+
+Reads any path the plugin is allowed to read and keeps nothing afterwards.
+`maki.fs.fuzzy_files` ranks a walk the host caches instead, which is
+cheaper per keystroke but only covers the current working directory.
+
 Respects `.gitignore` by default. Pass `sort = "mtime"` to get the most
 recently modified files first.
 
@@ -2713,6 +2870,74 @@ for _, file in ipairs(hits) do
     end
   end
 end
+```
+
+---
+
+### `maki.fs.fuzzy_files()` {#maki-fs-fuzzy_files}
+
+```lua
+maki.fs.fuzzy_files({opts?})
+```
+
+Rank the files and directories under {opts.path} against {opts.query} and
+return the best ones, best first, with the state of the walk behind them.
+
+The host walks each root once and shares that walk with the built-in file
+picker (`Ctrl+S`), so a call ranks an existing list instead of walking the
+tree, and both rank alike. Use `maki.fs.glob` for patterns, a path outside
+the cwd, or a tree read fresh right now. Only `limit` items ever cross into
+Lua whatever the size of the repo, paths come back relative to the root
+with a trailing separator on the directories, and `.gitignore` and `.git`
+are respected. `highlights` cost a second matcher pass, so ask for them
+only to draw matches.
+
+`complete` is false while a walk is filling the list, so an empty `items`
+means "not found yet" and asking again is worth it. maki walks a bounded
+number of trees at once, so a first call can also answer before the walk it
+asked for has started. `crashed` and `truncated` are the two ways a
+complete list is still not the whole tree: a walker that died partway
+through it, and a tree bigger than the host's ceiling. Listen for
+`"FileIndexReady"` with `maki.api.create_autocmd` to be told when a walk
+lands rather than polling for it.
+
+The tools that write, move and delete files mark the tree they touched, so
+a call a moment after an edit re-walks and a file the agent just wrote is
+findable. A file a `bash` command creates or deletes is not: a shell
+command cannot say what it touched, and maki does not try to guess. That
+leaves the staleness window as the only guarantee, and it is this: a walk
+is redone the first time anything asks for the index more than twenty
+seconds after the last one landed, so a path may be missing from the list,
+or offered after it is gone, for up to twenty seconds.
+
+A second call from the same plugin cancels the one in flight, which answers
+with nil plus an error. While the user types that is expected, so treat the
+error as a stale answer. A plugin reading more than four roots keeps the
+four it asked for most recently: the walk behind an older one is let go and
+asking for it again walks it again.
+
+Requires the `fs_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `query` (`string`) what the user typed. Empty returns the first `limit` paths in walk order.
+  - `limit` (`integer`) how many items to return, at most 500. Default 20.
+  - `path` (`string`) the root to search, the cwd or below it. Default is the current working directory.
+  - `highlights` (`boolean`) also return where the query matched each path. Default false.
+
+**Returns:** (`table?`, `string?`) `{ root = string, complete = boolean, crashed = boolean, truncated = boolean, items = { { path = string, highlights = integer[][]? } } }`, or nil plus an error message. `root` is the resolved absolute directory the paths are relative to, spelled the way `"FileIndexReady"` spells it, so an event can be matched to the call that caused it. It is absent for a directory with no UTF-8 spelling, as it is on the event, so a plugin that gets no `root` treats every event as a reason to ask again rather than matching the wrong tree. `items` is a 1-based array, best first. `highlights` is only present when asked for, and holds `{ from, to }` byte ranges of `path`, ascending, 1-based and inclusive, so `path:sub(from, to)` is the matched text.
+
+**Example:**
+
+```lua
+local res, err = maki.fs.fuzzy_files({ query = "src/mai", limit = 20, highlights = true })
+if err then return end -- a newer call took over, this answer is stale
+for _, item in ipairs(res.items) do
+  local r = item.highlights[1]
+  print(item.path, r and item.path:sub(r[1], r[2]))
+end
+if not res.complete then print("still scanning, ask again") end
 ```
 
 
@@ -2916,6 +3141,13 @@ Requires the `run` [plugin permission](#plugin-permissions).
   - `tools` (`table?`) map of `name -> function` for tools the sandbox may call.
     Each function receives the tool input table and must return `(string)` or
     `(nil, err)`. Tool calls are batched and dispatched concurrently.
+  - `files` (`table?`) serves text file access from `open()` and `pathlib`.
+    `read(path)` returns `(content)`, `write(path, content, append)` returns
+    `(string)`, and both return `(nil, err)` on failure. Leave one out to
+    refuse that access. Writes wait and go out as one `write` per file right
+    before a tool call, a read of that path, or the end of the run, and a
+    cancelled run drops the ones still waiting. A failed write ends the run,
+    unless a read sent it, then it raises `OSError` just like a failed read.
 
 **Returns:** (`table`, `string?`) Result table, plus an error string on failure.
 
@@ -3055,14 +3287,62 @@ end
 
 ## maki.keymap {#maki-keymap}
 
-Key mappings, modeled after `vim.keymap`. If you have written a
-Neovim keymap plugin before, this will feel familiar.
+Key mappings, modeled after `vim.keymap`.
 
 ```lua
 maki.keymap.set("n", "<C-t>", function()
   print("hello")
 end, { desc = "Say hello" })
 ```
+
+## Key notation
+
+`set`, `del`, the `keys` option of `maki.ui.open_win` and `win:recv`
+key events all use one notation. `normalize` converts any accepted
+spelling to the canonical one.
+
+```lua
+if ev.type == "key" and ev.key == "<CR>" then submit() end
+```
+
+A single character stands for itself: `a`, `A`, `7`, `?`. Other keys
+go in angle brackets, after any modifiers.
+
+| Key | Notation | Also accepted |
+| --- | --- | --- |
+| Enter | `<CR>` | `<Enter>`, `<Return>` |
+| Escape | `<Esc>` | `<Escape>` |
+| Backspace | `<BS>` | `<Backspace>` |
+| Delete | `<Del>` | `<Delete>` |
+| Tab | `<Tab>` | |
+| Shift+Tab | `<S-Tab>` | |
+| Space | `<Space>` | |
+| Arrows | `<Up>`, `<Down>`, `<Left>`, `<Right>` | |
+| Navigation | `<Home>`, `<End>`, `<PageUp>`, `<PageDown>`, `<Insert>` | |
+| Function keys | `<F1>` through `<F24>` | |
+
+Modifiers are `C-` (control), `M-` (alt) and `S-` (shift), in that
+order: `<C-M-x>`. `Ctrl-`, `Alt-`, `A-` and `Shift-` are accepted as
+input.
+
+Terminals report some keys differently, so maki picks one form:
+
+- Control plus a letter is lowercase: `<C-N>` is `<C-n>`, as in Vim.
+- Shift plus a letter is the uppercase letter: `<S-a>` is `A`.
+- Without control or alt, shift is part of the char typed, so the key
+  is that char: Shift+1 on a US layout is `!`, and `<S-!>` is `!`.
+  `<S-Space>` is `<Space>`. With alt the prefix stays: `<M-S-1>`.
+- Shift+Tab is always `<S-Tab>`, with or without the kitty keyboard
+  protocol.
+
+Key strings in a plugin and every module it `require`s are checked at
+load. Each invalid one is logged with its file and line, and the status
+bar shows a summary, so a typo shows up at startup.
+
+Upgrading from older versions: `win:recv` used to deliver `"enter"`,
+`"esc"`, `"ctrl+n"` and `"shift+tab"`. These now arrive as `<CR>`,
+`<Esc>`, `<C-n>` and `<S-Tab>`, and the load check flags the old
+spellings.
 
 ---
 
@@ -3072,17 +3352,34 @@ end, { desc = "Say hello" })
 maki.keymap.set({mode}, {lhs}, {rhs}, {opts?})
 ```
 
-Bind a key to a Lua function, just like `vim.keymap.set`. Only
-normal mode (`"n"`) is supported right now. If {lhs} is already
-mapped, the old binding is replaced and a warning is logged.
+Bind a key to a Lua function, like `vim.keymap.set`. Only normal mode
+(`"n"`) is supported.
+
+Bindings are global and belong to the plugin that set them. They stack:
+the last `set` wins, and when that plugin calls `del` or unloads, the
+previous holder gets the key back. Shadowing another plugin's binding logs
+a warning naming both. Setting a key you already hold replaces your
+binding.
+
+For a key a popup should own only while it is on screen, use the `keys`
+option of `maki.ui.open_win` instead.
+
+A handler that runs consumes the key, even if it raises (the error is
+logged). If the plugin has too many callbacks in flight, the key goes to
+maki's built-in binding rather than to the binding underneath.
+
+`<C-c>` and `<C-z>` are reserved so quit and suspend always work. Binding
+either is an error.
 
 **Parameters:**
 
 - `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
 - `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-- `{rhs}` (`function`) Called when the key is pressed.
+- `{rhs}` (`function`) Called when the key is pressed. The return value is ignored.
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
+  - `unique` (`boolean`) fail the call, naming the owner, when anything
+    already maps the key. Default false.
 
 **Example:**
 
@@ -3100,8 +3397,13 @@ end, { desc = "Toggle panel" })
 maki.keymap.del({mode}, {lhs})
 ```
 
-Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-exists for that key.
+Remove your plugin's mapping for {lhs} in {mode}, like `vim.keymap.del`.
+The key goes back to whoever held it before you, or to maki's default
+binding.
+
+A plugin can only remove its own mappings. If another plugin maps {lhs},
+nothing changes and a warning names that plugin. Does nothing if nothing
+maps {lhs}.
 
 **Parameters:**
 
@@ -3112,6 +3414,29 @@ exists for that key.
 
 ```lua
 maki.keymap.del("n", "<C-t>")
+```
+
+---
+
+### `maki.keymap.normalize()` {#maki-keymap-normalize}
+
+```lua
+maki.keymap.normalize({lhs})
+```
+
+Canonical spelling of {lhs}. Accepts every spelling `set` accepts and
+returns the string a `key` event carries.
+
+**Parameters:**
+
+- `{lhs}` (`string`) Key in any accepted notation.
+
+**Returns:** (`string|nil`, `string|nil`) Canonical notation, or nil and an error.
+
+**Example:**
+
+```lua
+local canon = maki.keymap.normalize("<Enter>")  -- "<CR>"
 ```
 
 
@@ -3300,6 +3625,48 @@ maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
 ```
 
+---
+
+### `maki.model.info()` {#maki-model-info}
+
+```lua
+maki.model.info({spec})
+```
+
+Resolve a model spec to everything maki knows about it: identity, tier,
+context window, and the price table the session would be billed by --
+including rates resolved from provider config or the bundled catalog
+(e.g. subsidised custom providers), which the provider's own /v1/models
+endpoint may never report. Purely local -- no UI round-trip, no network
+-- so it also works from slash commands and headless embeddings.
+
+**Parameters:**
+
+- `{spec}` (`string`) `"provider/id"`, as listed by `available()`.
+
+**Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, provider_display,
+  tier, subsidised_by?, context_window, max_output_tokens?, free?,
+  pricing?}`, or nil and an error.
+
+  `free` has three states: `true` when the model is known to cost nothing,
+  `false` when it is metered, and nil when no source ever quoted a rate.
+  Check `~= nil` before trusting it.
+
+  `subsidised_by` names the subscription prepaying this provider (billed
+  cost is $0, the rates are the list-price reference). It sits at the top
+  level because it holds whether or not rates resolved.
+
+  `pricing` is present only when rates are known:
+  `{input, output, cache_write, cache_read}` in USD per million tokens,
+  plus optional `fast = {input, output}`.
+
+**Example:**
+
+```lua
+local m, err = maki.model.info("anthropic/claude-opus-4-6")
+if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
+```
+
 
 ## maki.net {#maki-net}
 
@@ -3308,6 +3675,9 @@ HTTP client for fetching web content. All traffic goes over HTTPS
 blocked to prevent SSRF, including after a redirect. Hosts listed in
 the `net.allowed_private_hosts` config option are exempt.
 Failed requests (5xx) are retried automatically.
+
+Requests reuse a pool of clients, so calls to the same host share one
+keep-alive connection rather than pay a fresh handshake each time.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -3334,6 +3704,9 @@ listed in `net.allowed_private_hosts`.
   `timeout` (integer) Timeout in seconds, max 120 (default 30).
   `max_bytes` (integer) Max response size in bytes (default 5 MB).
   `retry` (integer) Retries on 5xx errors (default 3).
+  `line_match` (string) Regex. Keep only the response lines it
+  matches. Filtering happens after the body is read, so `max_bytes`
+  still caps the transfer.
 
 The response table has three fields: `body` (string), `status`
 (integer), and `content_type` (string).
@@ -3459,9 +3832,8 @@ The returned table:
 
 `usage` and `cost` include subagent spend. `context_size` is the main
 session's own, since a subagent runs its own window. There is no
-`list_cost` here because `cost` is re-settled from stored usage when a
-session resumes and list price is not stored, so per-turn list price
-lives on the `TurnEnd` autocmd instead.
+`list_cost` here: the un-subsidised total for a run arrives on the
+`TurnEnd` autocmd, and `maki.model.info` carries the rates behind it.
 
 **Parameters:**
 
@@ -3475,6 +3847,53 @@ lives on the `TurnEnd` autocmd instead.
 local s = maki.session.read()
 if s.context_size > s.context_window * 0.8 then
   maki.ui.notify("context is nearly full")
+end
+```
+
+---
+
+### `maki.session.messages()` {#maki-session-messages}
+
+```lua
+maki.session.messages({opts?})
+```
+
+Reads a live session's transcript, oldest first: everything the model has
+been sent so far, tool calls and results included. Read only.
+
+Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
+`"assistant"`. `kind` is `"turn"` for something the user or the model said
+and `"observation"` for a report sent to the model as a user message, like
+`maki.session.notify`. `hidden` marks a message only the model sees, such
+as a nudge or a compaction note. `content` lists blocks:
+
+```text
+{ type = "text", text }
+{ type = "thinking", text }
+{ type = "tool_use", id, name, input }
+{ type = "tool_result", tool_use_id, content, is_error }
+{ type = "image", media_type }
+```
+
+Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
+session, so pass `session` there. Hook and event payloads carry the
+`session_id` to pass.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) id of a live session, defaults to the focused one.
+  - `last` (`integer?`) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
+
+**Example:**
+
+```lua
+local msgs = maki.session.messages({ last = 1 })
+local last = msgs and msgs[1]
+if last and last.role == "assistant" then
+  print(last.content[1].text)
 end
 ```
 
@@ -3605,6 +4024,35 @@ maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
 
 ---
 
+### `maki.session.set_mode()` {#maki-session-set_mode}
+
+```lua
+maki.session.set_mode({mode}, {opts?})
+```
+
+Switches a live session between plan and build mode. Entering plan mode
+allocates the session's plan file if it has none.
+
+A session that is mid-plan answers the next prompt with another draft of
+the plan. Set `"build"` first and that prompt implements it.
+
+**Parameters:**
+
+- `{mode}` (`string`) "build" or "plan".
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.set_mode("build", { session = opts.session })
+maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
+```
+
+---
+
 ### `maki.session.set_title()` {#maki-session-set_title}
 
 ```lua
@@ -3708,12 +4156,12 @@ local _, err = maki.task.focus("main")
 
 ## maki.text {#maki-text}
 
-Text transformation utilities.
-
-Helper functions for converting between text formats.
+Text utilities: format conversion and the fuzzy matcher the built-in
+pickers use.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
 
 ---
@@ -3739,6 +4187,83 @@ Useful for cleaning up web content fetched with `maki.webfetch`.
 local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+```
+
+---
+
+### `maki.text.fuzzy()` {#maki-text-fuzzy}
+
+```lua
+maki.text.fuzzy({needle}, {haystack}, {opts?})
+```
+
+Scores {needle} against {haystack} with the fuzzy matcher the built-in
+pickers use. {needle} is one pattern, spaces included.
+
+Higher is better. Scores are only comparable across haystacks scored
+against the same needle. An empty needle matches everything with score 0.
+
+The second return value lists where the match landed, in the same shape
+as `maki.fs.fuzzy_files`: 1-based inclusive `{ from, to }` byte ranges,
+ascending, with adjacent characters merged. `haystack:sub(from, to)` is
+the matched text.
+
+Needs no plugin permission.
+
+**Parameters:**
+
+- `{needle}` (`string`) What the user typed.
+- `{haystack}` (`string`) The candidate to score it against.
+- `{opts?}` (`table?`) Options:
+  - `paths` (`boolean`) rank {haystack} as a path, favouring the last segment, like the file picker. Off by default, like the model, command and list pickers.
+
+**Returns:** (`integer|nil`, `table|nil`) Score and matched byte ranges, or nil when the needle does not match.
+
+**Example:**
+
+```lua
+local score, at = maki.text.fuzzy("mrs", "maki-ui/src/main.rs", { paths = true })
+if score then print(("maki-ui/src/main.rs"):sub(at[1][1], at[1][2])) end
+```
+
+---
+
+### `maki.text.fuzzy_list()` {#maki-text-fuzzy_list}
+
+```lua
+maki.text.fuzzy_list({needle}, {haystacks}, {opts?})
+```
+
+Scores {needle} against every entry of {haystacks} and returns the
+matches, best first.
+
+Ties keep their input order, so candidates you pre-sorted (by mtime, say)
+stay in that order for an empty needle. `index` is the 1-based position in
+{haystacks}, and `highlights` uses the byte ranges of `fuzzy`. Entries
+that are not valid UTF-8 are skipped.
+
+To rank files, use `maki.fs.fuzzy_files` instead. It queries the index
+the host already keeps, so no candidate list crosses into Lua.
+
+Needs no plugin permission.
+
+**Parameters:**
+
+- `{needle}` (`string`) What the user typed.
+- `{haystacks}` (`table`) Array of candidate strings.
+- `{opts?}` (`table?`) Options:
+  - `limit` (`integer`) keep at most this many results.
+  - `paths` (`boolean`) rank candidates as paths, like the file picker. Off by default.
+  - `highlights` (`boolean`) also return where the query matched, off by default since it costs a second pass.
+
+**Returns:** (`table`) Array of `{ text, index, score, highlights? }`, best first.
+
+**Example:**
+
+```lua
+for _, m in ipairs(maki.text.fuzzy_list(query, names, { limit = 10 })) do
+  print(m.text, m.score)
+end
 ```
 
 
@@ -4942,12 +5467,13 @@ toast:line("copied!")
 maki.ui.theme_color({name})
 ```
 
-Looks up a semantic color from the current theme. Use this to keep
-your plugin's colors consistent with the rest of the UI.
+Looks up a color the syntax theme names, such as "background",
+"foreground" or "accent". For the styles the UI paints with, use
+`maki.ui.theme_style`.
 
 **Parameters:**
 
-- `{name}` (`string`) Semantic color name, e.g. "accent" or "background".
+- `{name}` (`string`) Syntax theme color name, e.g. "accent" or "background".
 
 **Returns:** (`string|nil`) "#rrggbb" for a truecolor theme, a palette index as a
   string like "4" when the theme names an ANSI color, or "default" for the
@@ -4961,6 +5487,37 @@ local accent = maki.ui.theme_color("accent")
 if accent then
   buf:line({ { "note", { fg = accent, bold = true } } })
 end
+```
+
+---
+
+### `maki.ui.theme_style()` {#maki-ui-theme_style}
+
+```lua
+maki.ui.theme_style({name})
+```
+
+Looks up a named style from the current theme. The names are the ones a span
+already takes as a string ("dim", "item_selected", "keybind_section",
+"diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
+same. Reach for the table when you need the parts, say to keep a style's
+foreground over a background of your own.
+
+**Parameters:**
+
+- `{name}` (`string`) Style name, the same spelling a span accepts.
+
+**Returns:** (`table|nil`) `{fg?, bg?, bold?, italic?, underline?, dim?,
+  strikethrough?, reversed?}`, ready to use as a span style. Colors are
+  spelled as in `maki.ui.theme_color`. Nil when the name is unknown, and an
+  empty table when the theme leaves that style unset.
+
+**Example:**
+
+```lua
+local sel = maki.ui.theme_style("item_selected")
+local dim = maki.ui.theme_style("dim")
+buf:line({ { "note", { fg = dim.fg, bg = sel.bg } } })
 ```
 
 ---
@@ -5159,6 +5716,9 @@ Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 
+There is no action for sending the user's message. To take keys like
+`<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
+
 For slash commands rather than keybound actions, see
 `maki.api.run_command`.
 
@@ -5224,11 +5784,11 @@ and close the window when you are done.
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
   - `row` (`integer?`) row offset from the anchor corner. Negative values move up.
   - `col` (`integer?`) column offset from the anchor corner.
-  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input caret: the host takes the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the caret. With no caret on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
   - `border` (`string`) border style. One of "rounded" (default), "single", "double", "none".
   - `title` (`string`) text shown in the top border. Default "".
   - `title_pos` (`string`) title alignment. One of "left" (default), "center", "right".
-  - `footer` (`table`) key-hint pairs shown in the bottom border. Each entry is {key, label}.
+  - `footer` (`table`) key-hint pairs shown in the bottom border. Each entry is {key, label}. A bordered float is widened to fit its title and footer, up to the screen width.
   - `zindex` (`integer`) stacking order. Default 50.
   - `cursor_line` (`boolean`) highlight the focused row. Default false.
   - `reserved_top` (`integer`) rows reserved at the top of the content area. Default 0.
@@ -5236,7 +5796,8 @@ and close the window when you are done.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
-  - `visible` (`boolean`) whether the window is initially visible. Default true.
+  - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+  - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
   - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 
@@ -5306,6 +5867,104 @@ maki.ui.set_window_title("maki: " .. session_name)
 maki.ui.set_window_title("")
 ```
 
+---
+
+### `maki.ui.input()` {#maki-ui-input}
+
+```lua
+maki.ui.input()
+```
+
+Reads the chat input text and the cursor position.
+
+Offsets are byte offsets into `text`, the unit the Lua string library
+indexes by, so `text:sub(1, cursor)` is everything before the cursor. A
+newline counts as one byte.
+
+The returned table has:
+
+- `session_id` (string) the tab the value was read from. Pass it to
+  `input_edit`, which refuses once another tab is focused.
+- `text` (string) the whole value, newlines included.
+- `cursor` (integer) byte offset of the cursor into `text`.
+- `version` (integer) counter of changes to the value. Pass it to
+  `input_edit`, which refuses once the value has moved on.
+
+The cursor line and column are a slice of those two, so the table leaves
+them out: with `local before = st.text:sub(1, st.cursor)`,
+`select(2, before:gsub("\n", ""))` is the 0-based line and
+`#before:match("[^\n]*$")` the byte column inside it.
+
+To put a window on the caret, open it with `anchor = "input_caret"`. The
+host re-places it every frame, so it follows wraps and resizes.
+
+**Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+local before = st.text:sub(1, st.cursor)
+```
+
+---
+
+### `maki.ui.input_edit()` {#maki-ui-input_edit}
+
+```lua
+maki.ui.input_edit({opts})
+```
+
+Replaces a byte range of the chat input, as if the user had selected it
+and typed {text}. The cursor lands after the inserted text unless you
+say otherwise.
+
+A handler runs after the key that woke it, so the user may have typed on
+or switched tab in between. Five checks refuse the edit:
+
+- `stop` past the end of the value.
+- An offset inside a multi-byte character.
+- `version` no longer current.
+- `session_id` naming a tab that is not focused. Both guards are
+  required and neither substitutes for the other: every tab counts
+  versions from zero.
+- A chat input the user cannot see, since text written there would be
+  sent later without ever being read. A permission prompt, the plan form,
+  a pack review, a `below` split, a focused subagent chat and a terminal
+  too short to give the box a text row all take it off screen, and a
+  picker, a modal or a focused plugin window covers it.
+
+Read again and retry on any of them.
+
+Tabs and carriage returns in {text} become spaces and newlines, and the
+other control characters are dropped, the way a paste is rewritten.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `start` (`integer`) byte offset the replaced range starts at.
+  - `stop` (`integer`) byte offset it ends at. `start == stop` inserts.
+  - `text` (`string`) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
+  - `version` (`integer`) the version `maki.ui.input` returned, which the offsets were planned against.
+  - `session_id` (`string`) the session `maki.ui.input` read the offsets from.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, default is the end of the inserted text.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+-- Replace the "@src/ma" before the cursor with a full path:
+maki.ui.input_edit({
+  start = 8,
+  stop = st.cursor,
+  text = "src/main.rs",
+  version = st.version,
+  session_id = st.session_id,
+})
+```
+
 
 ## maki.ui.Win {#maki-ui-Win}
 
@@ -5336,7 +5995,7 @@ Win:recv({timeout_ms?})
 Waits for the next event from this window. Call this in a loop to build an interactive UI. Returns nil once the window is closed or the channel disconnects. Pass {timeout_ms} to also get `{type="timeout"}` events so your plugin can animate while idle.
 
 Event tables by type:
-- `{type="key", key}` -- keypress. Key is a string like "q", "j", or "esc".
+- `{type="key", key}` -- keypress. {key} is in canonical `maki.keymap` notation: `"q"`, `"<CR>"`, `"<Esc>"`, `"<C-n>"`, `"<S-Tab>"`.
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
 - `{type="close"}` -- window was closed externally.
@@ -5354,7 +6013,7 @@ Event tables by type:
 while true do
   local ev = win:recv()
   if not ev or ev.key == "q" then break end
-  if ev.type == "key" and ev.key == "j" then
+  if ev.type == "key" and ev.key == "<Down>" then
     -- move cursor down
   end
 end
@@ -5379,7 +6038,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `title_pos` (`string`) title alignment, "left", "center", or "right".
   - `footer` (`table`) key-hint pairs `{{key, label}, ...}` shown in the bottom border.
   - `border` (`string`) "rounded", "single", "double", or "none".
-  - `anchor` (`string`) corner origin, "NW", "NE", "SW", or "SE".
+  - `anchor` (`string`) corner origin, "NW", "NE", "SW", "SE", or "input_caret".
   - `width` (`integer|string`) new width; integer or "N%".
   - `height` (`integer|string`) new height; integer or "N%".
   - `zindex` (`integer`) stacking order.
@@ -5482,6 +6141,9 @@ Win:hide()
 Hides the window without closing it. The window keeps its state
 and buffer contents. Call `show()` to bring it back.
 
+A hidden window of any kind takes no space, draws nothing and claims no
+keys. It still accepts commands and reports events.
+
 **Example:**
 
 ```lua
@@ -5530,7 +6192,8 @@ for rich content. Style can be a named string like "bold" or
 Colors accept "#rrggbb", a terminal color name like "blue" or "light-gray",
 or a palette index as a string like "4". Names must be spelled exactly,
 hyphens included. Named and indexed colors are left for the terminal to
-resolve, so they follow the user's palette.
+resolve, so they follow the user's palette. To mix a named style with colors
+of your own, `maki.ui.theme_style` hands back its parts.
 
 **Parameters:**
 
@@ -5921,7 +6584,8 @@ function M.lerp(from, to, t)
 end
 
 function M.dim(color, factor)
-  local bg = maki.ui.theme_color("background")
+  local background = maki.ui.theme_style("background")
+  local bg = background and background.bg
   return bg and M.lerp(color, bg, factor)
 end
 
@@ -5962,17 +6626,40 @@ function M.replace(content, old_string, new_string, replace_all)
 function ListPicker.render_header(win, lines, input, prefix, inner)
 
 -- Open a fuzzy-filter picker in a floating window and block until the user
--- decides. {items} is a list of strings or { label, detail? } tables. {opts}:
--- title, footer, cursor (initial index), submit_keys (extra submit keys
--- besides enter), action_keys (keys that close the picker and report
--- themselves, like { "R" } for a refresh binding. Use uppercase keys, since
--- lowercase ones keep feeding the filter). Returns
--- { type = "choice"|"delete", index }, { type = "key", key, index? } or
--- { type = "close" }.
+-- decides.
+--
+-- {items} is a list of strings or of
+-- { label, detail?, section?, section_detail? } tables. A detail is a string, or
+-- a list of { text, style } parts when the right of a row needs more than one
+-- color. Mark one part `elastic = true` and that is the part a narrow row cuts,
+-- leaving the parts after it whole.
+--
+-- {opts}:
+--   title, footer, cursor (initial index)
+--   submit_keys: extra submit keys besides <CR>
+--   action_keys: keys that close the picker and report themselves, like { "R" }
+--     for a refresh binding. Use uppercase keys, lowercase ones keep feeding
+--     the filter
+--   live_keys: { [key] = function(item|nil) -> items|nil }, keys that swap the
+--     list in place, keeping the typed query. Called with the selected item, or
+--     nil when nothing matches, and returning nil leaves the list alone.
+--     Handlers run inside the render loop, so keep them cheap and hand anything
+--     slow to an action_key
+--   key: function(item) -> string|nil, a row's identity. Rows sharing the
+--     selected row's key are tinted, and the cursor follows its key across a
+--     live swap
+--
+-- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
+-- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
+--
+-- Returns { type = "choice"|"delete", index, item },
+-- { type = "key", key, index?, item? } or { type = "close" }. Prefer {item},
+-- since {index} points into an {items} a live swap may have replaced.
 function ListPicker.open(items, opts)
 ListPicker.split_words = split_words
 ListPicker.matches = matches
 ListPicker.highlight_spans = highlight_spans
+ListPicker.range_spans = range_spans
 ```
 
 ### `require("maki.output_limits")`
@@ -5980,33 +6667,16 @@ ListPicker.highlight_spans = highlight_spans
 ```lua
 -- Shared per-tool output limit options, so the tools that support them
 -- cannot drift apart.
-
-local DEFAULT_MAX_OUTPUT_LINES = 2000
-local DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
-local DEFAULT_MAX_LINE_BYTES = 500
-
-local M = {}
-
 M.DEFAULT_MAX_LINE_BYTES = DEFAULT_MAX_LINE_BYTES
-M.specs = {
-  max_output_lines = { type = "integer", desc = "Override `agent.max_output_lines` for this tool." },
-  max_output_bytes = { type = "integer", desc = "Override `agent.max_output_bytes` for this tool." },
-}
-
 function M.extend(spec)
-  for name, s in pairs(M.specs) do
-    spec[name] = s
-  end
-  return spec
-end
 
 --- Returns max_lines, max_bytes: tool override when set, agent-wide otherwise.
 function M.resolve(opts, ctx)
-  return opts.max_output_lines or ctx:config("max_output_lines", DEFAULT_MAX_OUTPUT_LINES),
-    opts.max_output_bytes or ctx:config("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES)
-end
 
-return M
+--- Last {n} lines of {text}, or all of it when it has fewer. Newlines separate
+--- lines here rather than terminate them, so a trailing one is an empty last
+--- line and counts as one.
+function M.tail(text, n)
 ```
 
 ### `require("maki.partial")`
@@ -6098,10 +6768,14 @@ function M.report()
 --   * No line ever contains a literal newline; newlines split into rows.
 --
 -- Parents OWN their keys. `handle_key` returns one of R.IGNORED / R.MOVED /
--- R.CHANGED. Parent dispatchers must filter their own keys (esc, ctrl+c,
+-- R.CHANGED. Parent dispatchers must filter their own keys (`<Esc>`, `<C-c>`,
 -- submit keys, etc.) BEFORE forwarding, because `handle_key` claims any key
--- it can interpret. `ctrl+a` is bound to move-home; if a parent wants it for
--- "select all" it must intercept first.
+-- it can interpret. `<C-a>` is bound to move-home, so a parent that wants it
+-- for "select all" must intercept first.
+--
+-- Keys are in canonical notation, as `win:recv` delivers them. Splitting a
+-- line is the `input:split_line()` method rather than a pseudo-key, so every
+-- key in KEYMAP is one a terminal can send.
 --
 -- IGNORED is returned when the buffer literally cannot act (backspace at
 -- (1, 0), right at end of buffer, etc.). Parents can use that signal to fall
@@ -6234,6 +6908,14 @@ local function truncate(text, max_lines, max_bytes)
     end
     local new_bytes = bytes + #line + 1
     if new_bytes > max_bytes then
+      if #out == 0 then
+        -- Back off UTF-8 continuation bytes so no character is split in half.
+        local cut = max_bytes
+        while cut > 0 and line:find("^[\128-\191]", cut + 1) do
+          cut = cut - 1
+        end
+        out[1] = line:sub(1, cut)
+      end
       break
     end
     out[#out + 1] = line

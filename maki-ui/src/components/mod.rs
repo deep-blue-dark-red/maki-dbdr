@@ -1,4 +1,5 @@
 pub(crate) mod btw_modal;
+pub(crate) mod cache_miss_prompt;
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod export_picker;
@@ -193,11 +194,6 @@ impl ModalScroll {
     }
 }
 
-pub struct LoadedSession {
-    pub messages: Vec<Message>,
-    pub model_spec: String,
-}
-
 use std::path::PathBuf;
 
 pub enum Action {
@@ -214,8 +210,9 @@ pub enum Action {
     CancelSubagent {
         tool_use_id: String,
     },
-    NewSession,
-    LoadSession(Box<LoadedSession>),
+    /// The history under this runtime changed (reset, load, rewind), so the
+    /// agent has to be respawned on it.
+    RestartAgent(Vec<Message>),
     ChangeModel(String),
     RefreshProvider {
         slug: String,
@@ -423,13 +420,7 @@ pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
 
 #[cfg(test)]
 pub(crate) fn test_pricing() -> ModelPricing {
-    ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 3.75,
-        cache_read: 0.30,
-        fast: None,
-    }
+    ModelPricing::per_million(3.0, 15.0, 3.75, 0.30)
 }
 
 #[cfg(test)]
@@ -444,6 +435,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         supports_vision_override: Some(true),
         supports_fast_override: None,
         pricing: test_pricing(),
+        subsidised_by: None,
         discovered_free: false,
         max_output_tokens: Some(8192),
         turn_output_tokens: None,

@@ -654,7 +654,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::sessions::{Session, TitleSource};
+    use crate::sessions::{Session, SessionClaim, TitleSource};
 
     const SESSION_MODEL: &str = "test-model";
     const INIT_LUA: &str = "init.lua";
@@ -702,7 +702,8 @@ mod tests {
         let state = StateDir::from_path(dir.path().to_path_buf());
         let mut session: Session<StoredMessage, u32, ()> =
             Session::new(SESSION_MODEL, cwd.to_str().unwrap());
-        session.save(&state).unwrap();
+        let claim = SessionClaim::acquire(session.id, &state).unwrap();
+        session.save(&claim, &state).unwrap();
     }
 
     #[test]
@@ -1231,6 +1232,7 @@ mod tests {
         ));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[cfg(unix)]
     #[test]
     fn non_utf8_paths_are_refused() {
@@ -1239,6 +1241,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let non_utf8 = dir.path().join(OsString::from_vec(vec![b'x', 0xff]));
+        // macOS 14+ (APFS) rejects non-UTF-8 names at the filesystem layer, so
+        // the test only runs where the filesystem admits the name.
         fs::create_dir(&non_utf8).unwrap();
         assert!(matches!(
             CanonicalFolder::resolve(&non_utf8),

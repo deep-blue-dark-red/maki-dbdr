@@ -184,8 +184,8 @@ pub fn model_cost(id: &str, usage: &StoredTokenUsage, current: &Model, fast: boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ManifestRegistry;
     use crate::model::{FastPricing, ModelFamily, ModelPricing, ModelTier};
+    use crate::spec::ProviderRegistry;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -238,6 +238,7 @@ mod tests {
                 input: input_rate,
                 ..ModelPricing::ZERO
             },
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: None,
             turn_output_tokens: None,
@@ -399,9 +400,9 @@ mod tests {
     #[test]
     fn bare_ids_resolve_against_the_current_provider() {
         let current = Model::from_spec(SCHEDULED_SPEC).unwrap();
-        let sibling_id = ManifestRegistry::for_slug(&current.provider)
+        let sibling_id = ProviderRegistry::for_slug(&current.provider)
             .expect("a builtin provider")
-            .models
+            .models()
             .iter()
             .find_map(|e| (e.pricing.input != current.pricing.input).then_some(e.prefixes[0]))
             .expect("a sibling model the table prices differently");

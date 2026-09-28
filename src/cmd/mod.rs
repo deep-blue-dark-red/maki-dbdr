@@ -4,16 +4,21 @@ mod session;
 mod subcmd;
 mod tui;
 
+use std::env;
+use std::sync::Arc;
+
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
-use maki_config::Config;
-use maki_config::project::TrustMode;
-use maki_lua::{DiscoveredPackage, Interaction, PluginHost};
+use maki_agent::tools::ToolRegistry;
+use maki_config::project::{self, TrustMode};
+use maki_config::{Config, load_env_files, load_permissions};
+use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
 use crate::project_trust;
+use crate::setup;
 use crate::update;
 
 fn sanitize_warnings(warnings: &[String]) -> Vec<String> {
@@ -109,11 +114,72 @@ fn load_plugins(
         .collect();
     warnings.extend(host.load_declared_packages(&available, &declared, &config.plugins));
 
+    // Last, so it covers every load above. Taking empties it, so a later
+    // `/reload` only reports what that load found.
+    warnings.extend(host.take_key_warning());
+
     Ok((config, sanitize_warnings(&warnings)))
 }
 
 fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {
     host.declared_packages().context("read declared packages")
+}
+
+/// Everything a non-session subcommand needs before it can do work: the model
+/// registry, project trust, `.env`, the plugin host, the effective config, and
+/// the TUI's logging and telemetry, so a plugin's `maki.log.*` has somewhere to
+/// go. One function, so the next
+/// subcommand cannot forget a step the way all three of these did.
+///
+/// Plugins still load before the subscriber exists, because the config that
+/// configures it is Lua-produced. That is unchanged from `cmd::tui::run`.
+fn cli_stack(
+    no_plugins: bool,
+    no_jit: bool,
+    trust_mode: TrustMode,
+) -> Result<(PluginHost, Config)> {
+    // First, as in `cmd::tui::run`, so anything that resolves a model sees the
+    // models the TUI would.
+    let storage = StateDir::resolve().context("resolve data directory")?;
+    maki_providers::model_registry::load_from_storage(&storage);
+    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    // The `trust.paths` policy deliberately stops at the session entry points
+    // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
+    // user never saw, for a session it never runs.
+    let trust = project::resolve_noninteractive(&cwd, trust_mode);
+    load_env_files(&trust.project_config);
+
+    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+        .context("initialize lua plugin host")?;
+    let (config, warnings) = load_plugins(
+        &mut host,
+        no_plugins,
+        BuiltinFailure::Fatal,
+        Interaction::None,
+        |host, names, warnings| {
+            // `notices`, not `warning`: these commands never ask, so the
+            // skipped path and how to undo it are the only sign the project
+            // config did nothing.
+            warnings.extend(trust.notices());
+            let raw = host
+                .load_init_files(
+                    InitFiles::resolve(&trust.project_config, no_plugins),
+                    warnings,
+                )
+                .context("load init.lua files")?;
+            let mut config = raw
+                .unwrap_or_default()
+                .into_config(false, &names(host)?)
+                .context("invalid config")?;
+            config.permissions = load_permissions(&trust.project_config);
+            Ok(config)
+        },
+    )?;
+    setup::init_logging(&config.storage);
+    setup::init_telemetry(&config.telemetry);
+    setup::install_panic_log_hook();
+    report_warnings(warnings);
+    Ok((host, config))
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {

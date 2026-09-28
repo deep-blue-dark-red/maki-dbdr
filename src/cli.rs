@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
@@ -25,6 +25,10 @@ pub enum InputFormat {
 
 #[derive(Parser)]
 #[command(name = "maki", version, about = "AI coding agent for the terminal")]
+// Only one way to name the session to load, or the resolver would quietly pick
+// one. `--fork-session` requires it, since forking nothing used to start a
+// blank session.
+#[command(group = ArgGroup::new("loaded").args(["continue_session", "resume"]))]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -50,8 +54,13 @@ pub struct Cli {
     pub continue_session: bool,
 
     /// Resume a specific session by its ID
-    #[arg(short = 's', long, alias = "resume")]
-    pub session: Option<String>,
+    #[arg(
+        short = 'r',
+        long,
+        visible_short_alias = 's',
+        visible_alias = "session"
+    )]
+    pub resume: Option<String>,
 
     /// Output format for --print mode
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -103,12 +112,12 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',', visible_alias = "disallowedTools")]
     pub disallowed_tools: Vec<String>,
 
-    /// Session ID for SDK mode
+    /// Write this run under a chosen session ID, unless one already exists there
     #[arg(long)]
     pub session_id: Option<String>,
 
     /// Fork the loaded session under a new ID
-    #[arg(long)]
+    #[arg(long, requires = "loaded")]
     pub fork_session: bool,
 
     /// Maximum number of agent turns
@@ -376,6 +385,8 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
+    const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
+
     #[test_case("Read", "read")]
     #[test_case("Bash", "bash")]
     #[test_case("CodeExecution", "code_execution")]
@@ -394,5 +405,20 @@ mod tests {
     #[test]
     fn normalize_tool_name_multi_edit_rejects_snake_variant() {
         assert!(normalize_tool_name("MultiEdit").is_err());
+    }
+
+    /// `--session-id` with `-c` stays legal: continue the latest, but write
+    /// under this id.
+    #[test_case(&["-c", "-r", SESSION_ID], false ; "two sessions to load")]
+    #[test_case(&["-c", "-s", SESSION_ID], false ; "two sessions to load through the short alias")]
+    #[test_case(&["-c", "--session", SESSION_ID], false ; "two sessions to load through the long alias")]
+    #[test_case(&["--fork-session"], false ; "a fork with nothing to fork")]
+    #[test_case(&["--fork-session", "-c"], true ; "a fork of the latest")]
+    #[test_case(&["--fork-session", "-r", SESSION_ID], true ; "a fork of a named session")]
+    #[test_case(&["-c", "--session-id", SESSION_ID], true ; "a redirected continue")]
+    fn session_flag_combinations(args: &[&str], accepted: bool) {
+        let argv = std::iter::once("maki").chain(args.iter().copied());
+
+        assert_eq!(Cli::try_parse_from(argv).is_ok(), accepted);
     }
 }

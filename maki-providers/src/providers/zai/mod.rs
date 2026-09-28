@@ -1,30 +1,116 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_config::providers::{BuiltInProvider, Protocol, ProviderPlan};
+use maki_config::providers::{Protocol, ProviderPlan};
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ModelTier, ThinkingSupport};
+use crate::model::{Model, ModelFamily, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::aperture::NO_PATH_PREFIX;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::spec::{
+    ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+};
 use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
     dialect,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+
+const SLUG: &str = "zai";
+const DISPLAY_NAME: &str = "Z.AI";
+const ENV_VAR: &str = "ZHIPU_API_KEY";
+const BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+const CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
+const DEFAULT_MODEL: &str = "zai/glm-5.1";
+const CODING_MODEL: &str = "zai/glm-5-code";
+const LOGIN_URL: &str = "https://z.ai/manage-apikey/apikey-list";
+const MAX_TOKENS_FIELD: &str = "max_tokens";
+const AUTH_NOTE: &str = "(shared across both endpoints)";
 
 static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
-    slug: "zai",
-    api_key_env: "ZHIPU_API_KEY",
-    base_url: "https://api.z.ai/api/paas/v4",
-    max_tokens_field: "max_tokens",
+    slug: SLUG,
+    api_key_env: ENV_VAR,
+    base_url: BASE_URL,
+    max_tokens_field: MAX_TOKENS_FIELD,
     include_stream_usage: false,
-    provider_name: "Z.AI",
+    provider_name: DISPLAY_NAME,
 };
+
+const PLANS: &[(&str, ProviderPlan)] = &[
+    (
+        "standard",
+        ProviderPlan {
+            display_name: "Pay-as-you-go",
+            base_url: BASE_URL,
+            default_model: Some(DEFAULT_MODEL),
+            login_url: None,
+        },
+    ),
+    (
+        "coding",
+        ProviderPlan {
+            display_name: "Coding plan",
+            base_url: CODING_BASE_URL,
+            default_model: Some(CODING_MODEL),
+            login_url: None,
+        },
+    ),
+];
+
+/// The gateway gets no path prefix: Z.AI's API has no `/v1` segment at all
+/// (`/api/paas/v4/chat/completions`), so the upstream base url must carry the
+/// whole path and any prefix would double it up.
+pub(crate) const SPEC: ProviderSpec = ProviderSpec {
+    slug: SLUG,
+    display_name: DISPLAY_NAME,
+    api_key_env: ENV_VAR,
+    family: ModelFamily::Glm,
+    supports_thinking: false,
+    accepts_arbitrary_models: false,
+    fallback_max_output: Some(16_000),
+    fallback_context_window: 128_000,
+    models_toml: include_str!("../../../models/zai.toml"),
+    pricing_schedule: None,
+    native: Some(Native {
+        new: create,
+        with_auth: create_with_auth,
+        aperture: Some(ApertureRoute {
+            path_prefix: NO_PATH_PREFIX,
+        }),
+    }),
+    login: Some(LoginConfig {
+        protocol: Protocol::Openai,
+        default_base_url: BASE_URL,
+        default_model: DEFAULT_MODEL,
+        plans: Some(PLANS),
+        login_url: Some(LOGIN_URL),
+        needs_url: false,
+    }),
+    docs: GeneratedDocs {
+        api_urls: &[BASE_URL, CODING_BASE_URL],
+        features: None,
+        auth: AuthDoc::EnvVarWith(AUTH_NOTE),
+        catalog: CatalogDoc::Table,
+        trailing_notes: &[],
+    },
+};
+
+fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Zai::new(timeouts)?))
+}
+
+fn create_with_auth(
+    auth: Arc<Mutex<ResolvedAuth>>,
+    timeouts: Timeouts,
+    system_prefix: Option<String>,
+) -> Box<dyn Provider> {
+    Box::new(Zai::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+}
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 
@@ -84,225 +170,7 @@ impl From<QuotaResponse> for ProviderUsage {
     }
 }
 
-inventory::submit!(BuiltInProvider {
-    slug: "zai",
-    display_name: "Z.AI",
-    protocol: Protocol::Openai,
-    default_base_url: "https://api.z.ai/api/paas/v4",
-    default_api_key_env: "ZHIPU_API_KEY",
-    default_model: "zai/glm-5.1",
-    plans: Some(&[
-        (
-            "standard",
-            ProviderPlan {
-                display_name: "Pay-as-you-go",
-                base_url: "https://api.z.ai/api/paas/v4",
-                default_model: Some("zai/glm-5.1"),
-                login_url: None,
-            }
-        ),
-        (
-            "coding",
-            ProviderPlan {
-                display_name: "Coding plan",
-                base_url: "https://api.z.ai/api/coding/paas/v4",
-                default_model: Some("zai/glm-5-code"),
-                login_url: None,
-            }
-        ),
-    ]),
-    login_url: Some("https://z.ai/manage-apikey/apikey-list"),
-    needs_url: false,
-});
-
-/// Rates come from the pay as you go table on docs.z.ai, not models.dev, which
-/// carries a launch promo past its expiry and so halves the GLM-5 line. A later
-/// `glm-5.x` nobody has curated yet still reads models.dev: a promo rate is the
-/// wrong number, but it beats the zero an unpriced model gets, which renders as
-/// free.
-///
-/// The coding plan (`zai-coding-plan`) is blocked from the catalog instead. The
-/// plan already paid for those models, so every row in it really is zero.
-pub(crate) const fn models() -> &'static [ModelEntry] {
-    &[
-        ModelEntry {
-            prefixes: &["glm-5-code"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 1.20,
-                output: 5.00,
-                cache_write: 0.00,
-                cache_read: 0.30,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.3"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.3-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: true,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.15,
-                output: 0.50,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.2"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 1_000_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5.1"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.40,
-                output: 4.40,
-                cache_write: 0.00,
-                cache_read: 0.26,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-5"],
-            tier: ModelTier::Strong,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 1.00,
-                output: 3.20,
-                cache_write: 0.00,
-                cache_read: 0.20,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.7", "glm-4.6"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: true,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
-            },
-            max_output_tokens: Some(131072),
-            context_window: 200_000,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-flash"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.00,
-                output: 0.00,
-                cache_write: 0.00,
-                cache_read: 0.00,
-                fast: None,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5-air"],
-            tier: ModelTier::Weak,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.20,
-                output: 1.10,
-                cache_write: 0.00,
-                cache_read: 0.03,
-                fast: None,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-        ModelEntry {
-            prefixes: &["glm-4.5"],
-            tier: ModelTier::Medium,
-            family: ModelFamily::Glm,
-            vision: false,
-            default: false,
-            pricing: ModelPricing {
-                input: 0.60,
-                output: 2.20,
-                cache_write: 0.00,
-                cache_read: 0.11,
-                fast: None,
-            },
-            max_output_tokens: Some(98304),
-            context_window: 131_072,
-        },
-    ]
-}
+inventory::submit!(SPEC.config_row());
 
 pub struct Zai {
     compat: OpenAiCompatProvider,
@@ -432,6 +300,7 @@ fn adjust_model(model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelTier;
     use test_case::test_case;
 
     const SAMPLE_BODY: &str = r#"{"code":200,"data":{"limits":[

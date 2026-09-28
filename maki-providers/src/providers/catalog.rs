@@ -59,7 +59,7 @@ const ALLOWED_NPM: &[&str] = &["@ai-sdk/openai-compatible", "@ai-sdk/anthropic"]
 
 const IMAGE_MODALITY: &str = "image";
 
-/// Used only where the catalog is the whole story. A builtin has its manifest
+/// Used only where the catalog is the whole story. A builtin has its spec
 /// fallbacks to reach for instead, which are per provider and so beat a guess.
 const DEFAULT_CONTEXT: u32 = 128_000;
 const DEFAULT_OUTPUT: u32 = 64_000;
@@ -279,7 +279,7 @@ impl ProviderData {
 
 /// What models.dev publishes about one model. Every field is `Option` because
 /// "the catalog says no" and "the catalog does not say" have to stay apart: a
-/// builtin has a manifest and a curated table to fall through to, and collapsing
+/// builtin has a spec and a curated table to fall through to, and collapsing
 /// the two here would let a thin upstream row shrink a 1M window to 128k, or
 /// turn thinking off for a model we know reasons.
 #[derive(Clone, Debug, Default)]
@@ -349,6 +349,8 @@ impl CatalogData {
 
         for (provider_id, provider) in index {
             let slug = builtin_slug(&provider_id);
+            // The second clause is dead while no Opencode slug has a login
+            // row. It says what to do if one ever gains it: keep the entry.
             if builtin_provider(slug).is_some() && !CATALOG_BACKED_BUILTINS.contains(&slug) {
                 let models = parse_models(&provider.models);
                 debug!(
@@ -494,6 +496,20 @@ pub fn catalog_provider_if_available(provider_id: &str) -> Option<ProviderData> 
 fn with_provider_if_available<T>(slug: &str, f: impl FnOnce(&ProviderData) -> T) -> Option<T> {
     let guard = SHARED_CATALOG.get()?.lock().ok()?;
     guard.providers.get(slug).map(f)
+}
+
+/// The env var each catalog provider reads its key from, if one is set. A cold
+/// catalog gives nothing, because a fetch here would stall every spawn.
+pub(crate) fn key_vars_if_available() -> Vec<String> {
+    let Some(Ok(guard)) = SHARED_CATALOG.get().map(|catalog| catalog.lock()) else {
+        return Vec::new();
+    };
+    guard
+        .providers
+        .values()
+        .filter_map(ProviderData::env_key_set)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Non-blocking availability check for catalog-backed providers: true only when
@@ -658,12 +674,13 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     CatalogMeta {
         context: published_limit(limit.and_then(|l| l.context)),
         output: published_limit(limit.and_then(|l| l.output)),
-        pricing: model.cost.as_ref().map(|cost| ModelPricing {
-            input: cost.input.unwrap_or(0.0),
-            output: cost.output.unwrap_or(0.0),
-            cache_write: cost.cache_write.unwrap_or(0.0),
-            cache_read: cost.cache_read.unwrap_or(0.0),
-            fast: None,
+        pricing: model.cost.as_ref().map(|cost| {
+            ModelPricing::per_million(
+                cost.input.unwrap_or(0.0),
+                cost.output.unwrap_or(0.0),
+                cost.cache_write.unwrap_or(0.0),
+                cost.cache_read.unwrap_or(0.0),
+            )
         }),
         supports_thinking: model.reasoning,
         supports_vision,
@@ -1044,10 +1061,10 @@ mod tests {
         Authentication, CatalogData, CatalogMeta, EndpointType, ProviderData, ProviderQuirks,
         SessionRef, StateDir, available_if_warm, determine_catalog_format, parse_model, quirks_for,
     };
-    use crate::manifest::ManifestRegistry;
     use crate::model::{Model, ModelInfo, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::{ResolvedAuth, Timeouts, deepseek, opencode};
+    use crate::spec::ProviderRegistry;
     use crate::{AgentError, ModelFamily, ModelTier, RequestOptions};
     use test_case::test_case;
 
@@ -1076,6 +1093,9 @@ mod tests {
     const PAID_INPUT_PRICE: f64 = 1.0;
     const PAID_CONTEXT: u32 = 128_000;
     const PAID_OUTPUT: u32 = 64_000;
+    /// Stands in for `OPENCODE_API_KEY`, which a dev running the tests may
+    /// well have set, and then the free fallback would never kick in.
+    const UNSET_KEY_ENV: &str = "MAKI_TEST_UNSET_KEY";
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1167,6 +1187,7 @@ mod tests {
             supports_vision_override: None,
             supports_fast_override: None,
             pricing: ModelPricing::default(),
+            subsidised_by: None,
             discovered_free: false,
             max_output_tokens: None,
             turn_output_tokens: None,
@@ -1409,10 +1430,7 @@ mod tests {
         let (_tmp, state_dir) = temp_state_dir();
         let provider = CatalogProvider {
             name: "Test".into(),
-            env: vec!["OPENCODE_API_KEY"]
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect(),
+            env: vec![UNSET_KEY_ENV.into()],
             npm: "@ai-sdk/openai-compatible".into(),
             api: None,
             models: HashMap::new(),
@@ -1584,7 +1602,7 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec![UNSET_KEY_ENV.into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
@@ -1700,10 +1718,10 @@ mod tests {
         assert!(unlisted.supports_vision());
         assert!(
             !unlisted.supports_thinking(),
-            "the manifest default is true, so only the catalog can say no"
+            "the spec default is true, so only the catalog can say no"
         );
 
-        let curated = &deepseek::models()[0];
+        let curated = &deepseek::SPEC.models()[0];
         let listed = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", curated_flash())).unwrap();
         assert_eq!(listed.pricing.input, curated.pricing.input);
         assert_eq!(listed.context_window, curated.context_window);
@@ -1718,7 +1736,7 @@ mod tests {
     fn a_relative_matched_by_prefix_loses_to_the_catalog_naming_the_model() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::models()[0];
+        let curated = &deepseek::SPEC.models()[0];
 
         let sibling = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", sibling_model())).unwrap();
         assert_eq!(sibling.pricing.input, UNLISTED_INPUT_PRICE);
@@ -1743,14 +1761,14 @@ mod tests {
 
     /// The catalog only outranks a relative where it has something to say.
     /// Every field it leaves out keeps falling through, first to the relative
-    /// and then to the manifest, or reading models.dev would cost a model the
+    /// and then to the spec, or reading models.dev would cost a model the
     /// metadata it already had.
     #[test]
     fn fields_the_catalog_omits_fall_through() {
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
-        let curated = &deepseek::models()[0];
-        let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
+        let curated = &deepseek::SPEC.models()[0];
+        let spec = ProviderRegistry::for_slug(BUILTIN_SLUG).unwrap();
 
         let quiet = Model::from_spec(&format!("{BUILTIN_SLUG}/{}", quiet_sibling_model())).unwrap();
         assert_eq!(
@@ -1760,10 +1778,10 @@ mod tests {
         assert_eq!(quiet.context_window, curated.context_window);
         assert_eq!(quiet.max_output_tokens, curated.max_output_tokens);
         assert_eq!(quiet.supports_vision(), curated.vision);
-        assert_eq!(quiet.supports_thinking(), manifest.supports_thinking);
+        assert_eq!(quiet.supports_thinking(), spec.supports_thinking);
     }
 
-    /// models.dev leaves `limit` off plenty of entries, and a builtin manifest
+    /// models.dev leaves `limit` off plenty of entries, and a builtin spec
     /// carries a real number for its provider (DeepSeek serves 1M context)
     /// against the 128k/64k the catalog guesses for everyone else. An
     /// unpublished limit must not read as a published one, or every gap in the
@@ -1778,15 +1796,15 @@ mod tests {
         );
         super::seed_catalog_for_tests(index, state_dir);
 
-        let manifest = ManifestRegistry::for_slug(BUILTIN_SLUG).unwrap();
+        let spec = ProviderRegistry::for_slug(BUILTIN_SLUG).unwrap();
         let model = Model::from_spec(&format!("{BUILTIN_SLUG}/{UNLISTED_MODEL}")).unwrap();
 
         assert_eq!(
             model.pricing.input, UNLISTED_INPUT_PRICE,
             "the catalog entry has to be the one answering, or the limits below prove nothing"
         );
-        assert_eq!(model.context_window, manifest.fallback_context_window);
-        assert_eq!(model.max_output_tokens, manifest.fallback_max_output);
+        assert_eq!(model.context_window, spec.fallback_context_window);
+        assert_eq!(model.max_output_tokens, spec.fallback_max_output);
     }
 
     /// Every builtin the catalog covers reaches its metadata, whichever SDK it
@@ -1935,7 +1953,7 @@ mod tests {
     }
 
     fn curated_flash() -> &'static str {
-        deepseek::models()[0].prefixes[0]
+        deepseek::SPEC.models()[0].prefixes[0]
     }
 
     fn sibling_model() -> String {
@@ -1979,7 +1997,7 @@ mod tests {
 
     /// The catalog is the last word before the family guess, so anything more
     /// specific still wins. Only discovery can be exercised here: the builtins
-    /// the catalog keeps (`opencode`, `opencode-go`) list no manifest models.
+    /// the catalog keeps (`opencode`, `opencode-go`) list no spec models.
     #[test]
     fn discovery_beats_catalog_vision() {
         let (_tmp, state_dir) = temp_state_dir();
@@ -2531,8 +2549,6 @@ mod tests {
     #[test]
     fn catalog_all_models_public_fallback_shows_only_free() {
         let (_tmp, state_dir) = temp_state_dir();
-        // Provider with OPENCODE_API_KEY in env but no key set gets "public" fallback.
-        // Only free (zero-cost) models should appear in all_models.
         let mut models = HashMap::new();
         models.insert(
             "free-model".into(),
@@ -2568,14 +2584,13 @@ mod tests {
             "opencode".into(),
             CatalogProvider {
                 name: "Opencode".into(),
-                env: vec!["OPENCODE_API_KEY".into()],
+                env: vec![UNSET_KEY_ENV.into()],
                 npm: "@ai-sdk/openai-compatible".into(),
                 api: Some("https://opencode.ai/zen/v1".into()),
                 models,
             },
         );
 
-        // No OPENCODE_API_KEY set in env — falls back to "public"
         let data = CatalogData::from_index(providers, &state_dir);
 
         let opencode = data.providers.get("opencode").unwrap();
@@ -2718,7 +2733,7 @@ pub(crate) mod schema {
         pub cost: Option<CatalogCost>,
         #[serde(default)]
         pub provider: Option<CatalogShape>,
-        /// `None` where the row omits the flag, so a builtin keeps its manifest
+        /// `None` where the row omits the flag, so a builtin keeps its spec
         /// default instead of reading an absent field as a published "no".
         pub attachment: Option<bool>,
         pub reasoning: Option<bool>,

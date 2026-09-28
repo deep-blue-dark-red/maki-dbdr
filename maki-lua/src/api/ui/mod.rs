@@ -4,24 +4,37 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use humantime::format_duration;
+use maki_agent::UiWaker;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
+use crate::api::keymap::accept_key;
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
-    TitlePos, UiAction, WinCommand, WinEvent, ui_send,
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
+    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
+use crate::key::Key;
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
 
 use crate::runtime::with_task_bufs;
-use win::WinHandle;
+use win::{WinHandle, WinSender};
+
+/// `fg`, `bg` and six modifiers.
+const UI_STYLE_FIELDS: usize = 8;
+
+/// A focused window is handed every key the host does not answer itself, so a
+/// list of keys to take on top of that claims nothing it does not already
+/// have. Refused rather than ignored: a plugin writing one has the wrong model
+/// of who is reading the keyboard, and that is worth an error it can read.
+const FOCUSED_CLAIM_ERR: &str =
+    "a focused window already receives every key, so `keys` belongs to `focus = false` windows";
 
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
@@ -51,6 +64,39 @@ impl HintStore {
             .iter()
             .map(|(k, v)| (Arc::clone(k), v.clone()))
             .collect()
+    }
+}
+
+/// The windows each plugin has open, so unloading it can take them down.
+///
+/// A window is the one thing a plugin puts on screen that the host cannot
+/// otherwise revoke. The handle lives in the plugin's module table, and a
+/// module nobody references any more goes only when the Lua collector next
+/// runs. Until then the float is on screen with its key loop cancelled along
+/// with the load, and every key it claimed is swallowed on the way to a
+/// channel nobody reads: `/reload` would leave the user's `<CR>` doing
+/// nothing until a collection they cannot ask for.
+#[derive(Default)]
+pub(crate) struct WinStore {
+    open: BTreeMap<Arc<str>, Vec<WinSender>>,
+}
+
+impl WinStore {
+    /// Drops the windows that have already gone on the way in, so a plugin
+    /// opening and closing one per keystroke does not grow this for the run.
+    fn track(&mut self, plugin: Arc<str>, cmd_tx: WinSender) {
+        let windows = self.open.entry(plugin).or_default();
+        windows.retain(|tx| !tx.is_disconnected());
+        windows.push(cmd_tx);
+    }
+
+    /// The same command the plugin's own `win:close()` sends, so the window
+    /// leaves by the one path every other window leaves by and the plugin's
+    /// loop still hears the close it is waiting on.
+    pub fn close_plugin(&mut self, plugin: &str) {
+        for tx in self.open.remove(plugin).unwrap_or_default() {
+            tx.send(WinCommand::Close);
+        }
     }
 }
 
@@ -106,10 +152,11 @@ fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
     }))
 }
 
-/// Looks up a semantic color from the current theme. Use this to keep
-/// your plugin's colors consistent with the rest of the UI.
+/// Looks up a color the syntax theme names, such as "background",
+/// "foreground" or "accent". For the styles the UI paints with, use
+/// `maki.ui.theme_style`.
 ///
-/// @param name string Semantic color name, e.g. "accent" or "background".
+/// @param name string Syntax theme color name, e.g. "accent" or "background".
 /// @return (string|nil) "#rrggbb" for a truecolor theme, a palette index as a
 ///   string like "4" when the theme names an ANSI color, or "default" for the
 ///   terminal's own color. Nil only when the name is unknown. Every form can be
@@ -127,6 +174,47 @@ fn theme_color(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
     Ok(mlua::Value::String(
         lua.create_string(segment_color_to_lua(color))?,
     ))
+}
+
+/// Looks up a named style from the current theme. The names are the ones a span
+/// already takes as a string ("dim", "item_selected", "keybind_section",
+/// "diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
+/// same. Reach for the table when you need the parts, say to keep a style's
+/// foreground over a background of your own.
+///
+/// @param name string Style name, the same spelling a span accepts.
+/// @return (table|nil) `{fg?, bg?, bold?, italic?, underline?, dim?,
+///   strikethrough?, reversed?}`, ready to use as a span style. Colors are
+///   spelled as in `maki.ui.theme_color`. Nil when the name is unknown, and an
+///   empty table when the theme leaves that style unset.
+/// @example
+/// local sel = maki.ui.theme_style("item_selected")
+/// local dim = maki.ui.theme_style("dim")
+/// buf:line({ { "note", { fg = dim.fg, bg = sel.bg } } })
+#[lua_fn]
+fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
+    let Some(style) = maki_highlight::ui_style(&name) else {
+        return Ok(mlua::Value::Nil);
+    };
+    let tbl = lua.create_table_with_capacity(0, UI_STYLE_FIELDS)?;
+    for (key, color) in [("fg", style.fg), ("bg", style.bg)] {
+        if let Some(c) = color {
+            tbl.raw_set(key, segment_color_to_lua(c))?;
+        }
+    }
+    for (key, on) in [
+        ("bold", style.bold),
+        ("italic", style.italic),
+        ("underline", style.underline),
+        ("dim", style.dim),
+        ("strikethrough", style.strikethrough),
+        ("reversed", style.reversed),
+    ] {
+        if on {
+            tbl.raw_set(key, true)?;
+        }
+    }
+    Ok(mlua::Value::Table(tbl))
 }
 
 /// Syntax-highlights a chunk of source code. Returns a table of styled
@@ -312,6 +400,9 @@ fn set_window_title(
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 ///
+/// There is no action for sending the user's message. To take keys like
+/// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
+///
 /// For slash commands rather than keybound actions, see
 /// `maki.api.run_command`.
 ///
@@ -330,6 +421,112 @@ fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaRe
     )));
     try_pair!(ui_send(Some(&tx), UiAction::Builtin(builtin)));
     Ok((Some(true), None))
+}
+
+async fn input_roundtrip(
+    lua: Lua,
+    tx: &flume::Sender<UiAction>,
+    req: InputRequest,
+) -> LuaResult<Pair<mlua::Value>> {
+    ui_json_roundtrip(&lua, Some(tx), |reply_tx| UiAction::Input { req, reply_tx }).await
+}
+
+fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
+    opts.get::<Option<T>>(key)?
+        .ok_or_else(|| mlua::Error::runtime(format!("input_edit: '{key}' is required")))
+}
+
+/// Reads the chat input text and the cursor position.
+///
+/// Offsets are byte offsets into `text`, the unit the Lua string library
+/// indexes by, so `text:sub(1, cursor)` is everything before the cursor. A
+/// newline counts as one byte.
+///
+/// The returned table has:
+///
+/// - `session_id` (string) the tab the value was read from. Pass it to
+///   `input_edit`, which refuses once another tab is focused.
+/// - `text` (string) the whole value, newlines included.
+/// - `cursor` (integer) byte offset of the cursor into `text`.
+/// - `version` (integer) counter of changes to the value. Pass it to
+///   `input_edit`, which refuses once the value has moved on.
+///
+/// The cursor line and column are a slice of those two, so the table leaves
+/// them out: with `local before = st.text:sub(1, st.cursor)`,
+/// `select(2, before:gsub("\n", ""))` is the 0-based line and
+/// `#before:match("[^\n]*$")` the byte column inside it.
+///
+/// To put a window on the caret, open it with `anchor = "input_caret"`. The
+/// host re-places it every frame, so it follows wraps and resizes.
+///
+/// @return (table|nil, string|nil) The input state, or nil and an error.
+/// @example
+/// local st = maki.ui.input()
+/// local before = st.text:sub(1, st.cursor)
+#[lua_fn]
+async fn input(lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<Pair<mlua::Value>> {
+    input_roundtrip(lua, &tx, InputRequest::Read).await
+}
+
+/// Replaces a byte range of the chat input, as if the user had selected it
+/// and typed {text}. The cursor lands after the inserted text unless you
+/// say otherwise.
+///
+/// A handler runs after the key that woke it, so the user may have typed on
+/// or switched tab in between. Five checks refuse the edit:
+///
+/// - `stop` past the end of the value.
+/// - An offset inside a multi-byte character.
+/// - `version` no longer current.
+/// - `session_id` naming a tab that is not focused. Both guards are
+///   required and neither substitutes for the other: every tab counts
+///   versions from zero.
+/// - A chat input the user cannot see, since text written there would be
+///   sent later without ever being read. A permission prompt, the plan form,
+///   a pack review, a `below` split, a focused subagent chat and a terminal
+///   too short to give the box a text row all take it off screen, and a
+///   picker, a modal or a focused plugin window covers it.
+///
+/// Read again and retry on any of them.
+///
+/// Tabs and carriage returns in {text} become spaces and newlines, and the
+/// other control characters are dropped, the way a paste is rewritten.
+///
+/// @param opts table Options:
+///   `start` (integer) byte offset the replaced range starts at.
+///   `stop` (integer) byte offset it ends at. `start == stop` inserts.
+///   `text` (string) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
+///   `version` (integer) the version `maki.ui.input` returned, which the offsets were planned against.
+///   `session_id` (string) the session `maki.ui.input` read the offsets from.
+///   `cursor` (integer|nil) byte offset to leave the cursor at, default is the end of the inserted text.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error.
+/// @example
+/// local st = maki.ui.input()
+/// -- Replace the "@src/ma" before the cursor with a full path:
+/// maki.ui.input_edit({
+///   start = 8,
+///   stop = st.cursor,
+///   text = "src/main.rs",
+///   version = st.version,
+///   session_id = st.session_id,
+/// })
+#[lua_fn]
+async fn input_edit(
+    lua: Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
+    opts: Table,
+) -> LuaResult<Pair<mlua::Value>> {
+    let req = InputRequest::Edit(InputEdit {
+        start: opts.get("start")?,
+        stop: opts.get("stop")?,
+        text: required(&opts, "text")?,
+        cursor: opts.get("cursor")?,
+        version: required(&opts, "version")?,
+        session_id: required(&opts, "session_id")?,
+        plugin,
+    });
+    input_roundtrip(lua, &tx, req).await
 }
 
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
@@ -362,6 +559,23 @@ async fn open_editor(
     Ok(reply_rx.recv_async().await.unwrap_or(-1))
 }
 
+/// The keys an unfocused window takes while it is on screen, read through the
+/// same gate `maki.keymap.set` reads, so the two can never drift.
+///
+/// Every key is parsed before the window is opened, so a typo leaves the
+/// plugin with no window rather than a window holding half a list.
+fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
+    let Some(keys) = opts.get::<Option<Table>>("keys")? else {
+        return Ok(Vec::new());
+    };
+    if focus {
+        return Err(mlua::Error::runtime(FOCUSED_CLAIM_ERR));
+    }
+    keys.sequence_values::<String>()
+        .map(|lhs| accept_key(&lhs?))
+        .collect()
+}
+
 /// Opens a floating or split window that displays the contents of {buf}.
 /// Returns a Win handle you can use to receive events, update layout,
 /// and close the window when you are done.
@@ -372,11 +586,11 @@ async fn open_editor(
 ///   - height (integer|string): window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
 ///   - row (integer?): row offset from the anchor corner. Negative values move up.
 ///   - col (integer?): column offset from the anchor corner.
-///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input caret: the host takes the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the caret. With no caret on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
 ///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
 ///   - title (string): text shown in the top border. Default "".
 ///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
-///   - footer (table): key-hint pairs shown in the bottom border. Each entry is {key, label}.
+///   - footer (table): key-hint pairs shown in the bottom border. Each entry is {key, label}. A bordered float is widened to fit its title and footer, up to the screen width.
 ///   - zindex (integer): stacking order. Default 50.
 ///   - cursor_line (boolean): highlight the focused row. Default false.
 ///   - reserved_top (integer): rows reserved at the top of the content area. Default 0.
@@ -384,7 +598,8 @@ async fn open_editor(
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
-///   - visible (boolean): whether the window is initially visible. Default true.
+///   - keys (table): keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or `maki.keymap.set` bindings. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
+///   - visible (boolean): whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
 /// @return (Win) Window handle.
@@ -400,8 +615,9 @@ async fn open_editor(
 /// })
 #[lua_fn]
 fn open_win(
-    _lua: &Lua,
+    lua: &Lua,
     #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
     buf: mlua::AnyUserData,
     opts: Table,
 ) -> LuaResult<WinHandle> {
@@ -412,6 +628,7 @@ fn open_win(
     let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
     let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
     let focus = opt_bool(&opts, "focus").unwrap_or(true);
+    let keys = parse_claimed_keys(&opts, focus)?;
     let zindex: u16 = opts.get("zindex").unwrap_or(50);
 
     let width = parse_dimension(&opts, "width", Dimension::Percent(60));
@@ -446,6 +663,7 @@ fn open_win(
         visible,
         needs_input,
         stack,
+        keys,
     };
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -468,6 +686,11 @@ fn open_win(
     // in practice.
     let (event_tx, event_rx) = flume::unbounded::<WinEvent>();
     let (cmd_tx, cmd_rx) = flume::unbounded::<WinCommand>();
+    let waker = lua.app_data_ref::<UiWaker>().map(|waker| waker.clone());
+    if let Some(waker) = &waker {
+        buf_handle.buf.wake_on_change(waker);
+    }
+    let cmd_tx = WinSender::new(cmd_tx, waker);
 
     let _ = tx.try_send(UiAction::OpenWin {
         buf: buf_handle.buf.clone(),
@@ -476,6 +699,13 @@ fn open_win(
         event_tx,
         cmd_rx,
     });
+
+    // Stamped with the plugin that opened it so unloading that plugin closes
+    // it, the way its keymaps and hints are cleared. Without the stamp the
+    // host has no name on the window and nothing to revoke.
+    if let Some(mut store) = lua.app_data_mut::<WinStore>() {
+        store.track(plugin, cmd_tx.clone());
+    }
 
     Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h, visible))
 }
@@ -506,10 +736,10 @@ lua_table! {
     /// local win = maki.ui.open_win(buf, { title = "Greeting", width = "50%", height = 5 })
     /// ```
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
-        buf, theme_color, highlight, markdown, humantime, terminal_size,
+        buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title,
+        manual set_window_title, manual input, manual input_edit,
     ]
 }
 
@@ -526,7 +756,9 @@ pub(crate) fn create_ui_table(
         set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
-        open_win__register(&t, lua, tx)?;
+        input__register(&t, lua, tx.clone())?;
+        input_edit__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
+        open_win__register(&t, lua, tx, Arc::clone(&plugin))?;
     }
 
     let p = Arc::clone(&plugin);
@@ -726,6 +958,8 @@ fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::render::Line]) -> Lu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::util::command::UiReply;
+    use crate::api::util::convert::lua_to_json;
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -803,6 +1037,64 @@ mod tests {
         assert!(parse_footer(&tbl).is_err());
     }
 
+    /// A window with {claims} in its `keys`, as `open_win` reads it.
+    fn claim_opts(lua: &Lua, claims: &[&str]) -> Table {
+        let opts = lua.create_table().unwrap();
+        let keys = lua.create_table().unwrap();
+        for (i, key) in claims.iter().enumerate() {
+            keys.raw_set(i + 1, *key).unwrap();
+        }
+        opts.raw_set("keys", keys).unwrap();
+        opts
+    }
+
+    #[test]
+    fn claimed_keys_are_parsed_in_the_notation_keymaps_use() {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &["<Tab>", "<C-n>"]);
+
+        assert_eq!(
+            parse_claimed_keys(&opts, false).unwrap(),
+            vec![Key::parse("<Tab>").unwrap(), Key::parse("<C-n>").unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_keys_claims_none() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+
+        assert!(parse_claimed_keys(&opts, true).unwrap().is_empty());
+    }
+
+    /// The same two keys `maki.keymap.set` refuses, from the same list. A
+    /// window claiming one would publish a key the host answers first, which
+    /// is a popup that never sees it and a user who cannot quit.
+    #[test_case("<C-c>" ; "quit")]
+    #[test_case("<C-z>" ; "suspend")]
+    fn a_window_cannot_claim_a_key_the_host_reserves(lhs: &str) {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &[lhs]);
+
+        let err = parse_claimed_keys(&opts, false).unwrap_err().to_string();
+        assert!(
+            err.contains(lhs),
+            "the error has to name the key, got: {err}"
+        );
+    }
+
+    /// A focused window is handed every key already, so a list of keys to take
+    /// on top of that is an author with the wrong model of who is reading the
+    /// keyboard, not a redundant option to quietly drop.
+    #[test]
+    fn claiming_keys_on_a_focused_window_is_an_error() {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &["<Tab>"]);
+
+        let err = parse_claimed_keys(&opts, true).unwrap_err().to_string();
+        assert!(err.contains(FOCUSED_CLAIM_ERR), "got: {err}");
+    }
+
     #[test]
     fn try_parse_dimension_numeric_is_abs() {
         let lua = Lua::new();
@@ -866,6 +1158,7 @@ mod tests {
     #[test_case("NE", Anchor::NE ; "ne")]
     #[test_case("SW", Anchor::SW ; "sw")]
     #[test_case("SE", Anchor::SE ; "se")]
+    #[test_case("input_caret", Anchor::InputCaret ; "input_caret")]
     #[test_case("garbage", Anchor::NW ; "invalid_falls_back_to_default")]
     fn parse_anchor_cases(input: &str, expected: Anchor) {
         let lua = Lua::new();
@@ -1375,5 +1668,188 @@ mod tests {
         store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
         store.set(Arc::from("plug"), vec![]);
         assert!(store.snapshot_entries().is_empty());
+    }
+
+    const WIN_PLUGIN: &str = "plug";
+    const OTHER_WIN_PLUGIN: &str = "other";
+    const WINDOW_LEFT_OPEN: &str =
+        "unloading a plugin has to close the window it left on screen holding keys";
+    const WINDOW_TAKEN_DOWN: &str = "another plugin's window must survive the unload";
+
+    /// What `/reload` costs without this: the float stays up with its key loop
+    /// cancelled, so every key it claimed is taken from the user and dropped
+    /// until the Lua collector happens to run.
+    #[test]
+    fn unloading_a_plugin_closes_the_windows_it_opened() {
+        let mut store = WinStore::default();
+        let (mine, mine_rx) = flume::unbounded::<WinCommand>();
+        let (theirs, theirs_rx) = flume::unbounded::<WinCommand>();
+        store.track(Arc::from(WIN_PLUGIN), WinSender::new(mine, None));
+        store.track(Arc::from(OTHER_WIN_PLUGIN), WinSender::new(theirs, None));
+
+        store.close_plugin(WIN_PLUGIN);
+
+        assert!(
+            matches!(mine_rx.try_recv(), Ok(WinCommand::Close)),
+            "{WINDOW_LEFT_OPEN}"
+        );
+        assert!(theirs_rx.try_recv().is_err(), "{WINDOW_TAKEN_DOWN}");
+    }
+
+    /// A popup opened and closed on every keystroke must not grow the list it
+    /// is tracked in for the rest of the run.
+    #[test]
+    fn a_window_already_gone_is_forgotten_on_the_next_open() {
+        let mut store = WinStore::default();
+        let (gone, gone_rx) = flume::unbounded::<WinCommand>();
+        store.track(Arc::from(WIN_PLUGIN), WinSender::new(gone, None));
+        drop(gone_rx);
+
+        let (live, _live_rx) = flume::unbounded::<WinCommand>();
+        store.track(Arc::from(WIN_PLUGIN), WinSender::new(live, None));
+
+        assert_eq!(store.open[WIN_PLUGIN].len(), 1);
+    }
+
+    const STALE_RANGE_ERR: &str = "stop 99 is past the end of the input (5)";
+    const READ_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const INPUT_PLUGIN: &str = "test";
+
+    /// Stands in for the focused session's input box: reads answer with a
+    /// snapshot, edits answer with whatever {edit} decides.
+    fn ui_with_input(edit: fn(InputEdit) -> UiReply) -> Lua {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        std::thread::spawn(move || {
+            while let Ok(UiAction::Input { req, reply_tx }) = rx.recv() {
+                let reply = match req {
+                    InputRequest::Read => Ok(serde_json::json!({
+                        "session_id": READ_SESSION_ID,
+                        "text": "hello",
+                        "cursor": 5,
+                        "version": 7,
+                    })),
+                    InputRequest::Edit(edit_req) => edit(edit_req),
+                };
+                let _ = reply_tx.send(reply);
+            }
+        });
+        let lua = Lua::new();
+        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        lua.globals().set("ui", t).unwrap();
+        lua
+    }
+
+    /// Echoes the request back, so a test can assert on what the UI would have
+    /// been asked to do.
+    fn echo_edit(edit: InputEdit) -> UiReply {
+        Ok(serde_json::json!({
+            "start": edit.start,
+            "stop": edit.stop,
+            "text": edit.text,
+            "cursor": edit.cursor,
+            "version": edit.version,
+            "session_id": edit.session_id,
+            "plugin": edit.plugin,
+        }))
+    }
+
+    /// Both guards are required, so a test only ever varies the range.
+    fn edit_script(range: &str) -> String {
+        format!(
+            r#"local st = ui.input()
+               return ui.input_edit({{
+                 {range},
+                 version = st.version, session_id = st.session_id,
+               }})"#
+        )
+    }
+
+    fn eval(lua: &Lua, script: &str) -> (serde_json::Value, Option<String>) {
+        let (val, err): (mlua::Value, Option<String>) =
+            smol::block_on(lua.load(script).eval_async()).unwrap();
+        (lua_to_json(lua, &val).unwrap(), err)
+    }
+
+    #[test]
+    fn input_reports_text_cursor_and_version() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, "return ui.input()");
+        assert_eq!(err, None);
+        assert_eq!(val["text"], "hello");
+        assert_eq!(val["cursor"], 5);
+        assert_eq!(val["version"], 7);
+        assert_eq!(val["session_id"], READ_SESSION_ID);
+    }
+
+    #[test]
+    fn input_edit_forwards_the_range_and_defaults_the_cursor() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, &edit_script("start = 1, stop = 3, text = \"xy\""));
+        assert_eq!(err, None);
+        assert_eq!(val["start"], 1);
+        assert_eq!(val["stop"], 3);
+        assert_eq!(val["text"], "xy");
+        assert_eq!(val["cursor"], serde_json::Value::Null);
+    }
+
+    /// Leaving a required key out has to fail loudly instead of writing
+    /// unguarded, and that includes {text}: the input box has no undo, so a
+    /// misspelled key defaulting to the empty string deletes the range the
+    /// call meant to replace.
+    #[test_case("version" ; "version")]
+    #[test_case("session_id" ; "session_id")]
+    #[test_case("text" ; "text")]
+    fn input_edit_refuses_to_write_without_a_required_key(missing: &str) {
+        let lua = ui_with_input(echo_edit);
+        let kept = [
+            "version = st.version",
+            "session_id = st.session_id",
+            r#"text = "x""#,
+        ]
+        .iter()
+        .filter(|key| !key.starts_with(missing))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+        let err = smol::block_on(
+            lua.load(format!(
+                r#"local st = ui.input()
+                   return ui.input_edit({{ start = 0, stop = 5, {kept} }})"#
+            ))
+            .eval_async::<mlua::Value>(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(missing), "the error has to name it: {err}");
+    }
+
+    /// The host stamps the name on, so a caller cannot claim another plugin's.
+    #[test]
+    fn input_edit_names_the_calling_plugin() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 0, text = \"x\""));
+        assert_eq!(err, None);
+        assert_eq!(val["plugin"], INPUT_PLUGIN);
+    }
+
+    /// Both guards have to reach the UI, or an edit planned against text that
+    /// has moved on lands anyway.
+    #[test]
+    fn input_edit_forwards_the_version_and_the_session() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 5, text = \"x\""));
+        assert_eq!(err, None);
+        assert_eq!(val["version"], 7);
+        assert_eq!(val["session_id"], READ_SESSION_ID);
+    }
+
+    /// A handler writes after the key that woke it, so a range the user has
+    /// typed past comes back as an error instead of landing somewhere else.
+    #[test]
+    fn input_edit_answers_a_stale_range_in_the_error_slot() {
+        let lua = ui_with_input(|_| Err(STALE_RANGE_ERR.into()));
+        let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\""));
+        assert_eq!(val, serde_json::Value::Null);
+        assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
     }
 }

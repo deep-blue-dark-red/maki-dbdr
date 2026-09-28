@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 
+use maki_providers::Model;
 use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::model_registry;
-use maki_providers::provider::ProviderKind;
+use maki_providers::spec::ProviderRegistry;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -20,6 +21,8 @@ const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
 const FREE_PREFIX: &str = "Free · ";
+const PRICE_SEPARATOR: &str = " · ";
+const PRICE_WIDTH: usize = 7;
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
@@ -38,14 +41,13 @@ fn footer_line() -> Line<'static> {
 }
 
 fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
-    let digit = match (key.code, key.modifiers.contains(KeyModifiers::SHIFT)) {
-        // Kitty protocol: Shift+digit reported with base key + SHIFT modifier
-        (KeyCode::Char(c @ '1'..='4'), true) => c,
-        // Legacy terminals: Shift+digit reported as the resulting character
-        (KeyCode::Char('!' | '¡'), false) => '1', // US, ES
-        (KeyCode::Char('@' | '"' | '™'), false) => '2', // US, UK/DE
-        (KeyCode::Char('#' | '§' | '£'), false) => '3', // US, DE, UK
-        (KeyCode::Char('$' | '€' | '¤'), false) => '4', // US, EU, Nordic
+    // Shift+digit arrives as the character it types, with the SHIFT bit
+    // already folded into it by key normalization.
+    let digit = match key.code {
+        KeyCode::Char('!' | '¡') => '1',       // US, ES
+        KeyCode::Char('@' | '"' | '™') => '2', // US, UK/DE
+        KeyCode::Char('#' | '§' | '£') => '3', // US, DE, UK
+        KeyCode::Char('$' | '€' | '¤') => '4', // US, EU, Nordic
         _ => return None,
     };
     match digit {
@@ -70,7 +72,7 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     suffix: Option<String>,
-    tier: String,
+    detail: String,
     override_tiers: Vec<ModelTier>,
     free: bool,
 }
@@ -85,7 +87,7 @@ impl PickerItem for ModelEntry {
     }
 
     fn detail(&self) -> Option<&str> {
-        Some(&self.tier)
+        Some(&self.detail)
     }
 
     fn section(&self) -> Option<&str> {
@@ -270,27 +272,41 @@ impl Overlay for ModelPicker {
     }
 }
 
+fn format_pricing(model: &Model) -> Option<String> {
+    let pricing = &model.pricing;
+    (model.subsidised_by.is_none() && !pricing.is_zero()).then(|| {
+        format!(
+            "{:>PRICE_WIDTH$}/{:<PRICE_WIDTH$}",
+            format!("${:.2}", pricing.input),
+            format!("${:.2}", pricing.output),
+        )
+    })
+}
+
 fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
-    let provider_display = if let Ok(kind) = provider_str.parse::<ProviderKind>() {
-        kind.display_name().to_string()
-    } else if let Some(name) = dynamic::display_name(provider_str) {
-        name.to_string()
-    } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
-        info.display_name.clone()
-    } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
-        builtin.display_name.to_string()
-    } else {
-        let config = maki_config::providers::ProvidersConfig::load();
-        config.get(provider_str)?;
-        maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
-    };
+    // `opencode-go` has a spec row but was never a `ProviderKind`, so the
+    // catalog named it and still should. That is what `is_native` filters for.
+    let provider_display =
+        if let Some(spec) = ProviderRegistry::get(provider_str).filter(|s| s.is_native()) {
+            spec.display_name.to_string()
+        } else if let Some(name) = dynamic::display_name(provider_str) {
+            name.to_string()
+        } else if let Some(info) = maki_providers::catalog_provider_if_available(provider_str) {
+            info.display_name.clone()
+        } else if let Some(builtin) = maki_config::providers::builtin_provider(provider_str) {
+            builtin.display_name.to_string()
+        } else {
+            let config = maki_config::providers::ProvidersConfig::load();
+            config.get(provider_str)?;
+            maki_config::providers::resolve_display_name(provider_str, config.get(provider_str))
+        };
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free) = match maki_providers::Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free()),
-        Err(_) => (String::new(), false),
+    let (tier, free, price) = match Model::from_spec(spec) {
+        Ok(m) => (m.tier.to_string(), m.is_free(), format_pricing(&m)),
+        Err(_) => (String::new(), false, None),
     };
     let tier = if override_tiers.is_empty() {
         tier
@@ -306,13 +322,18 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         (true, false) => format!("{FREE_PREFIX}{tier}"),
         (false, _) => tier,
     };
+    let detail = match price {
+        Some(price) if !tier.is_empty() => format!("{tier}{PRICE_SEPARATOR}{price}"),
+        Some(price) => price,
+        None => tier,
+    };
     let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
         provider_display,
         suffix: None,
-        tier,
+        detail,
         override_tiers,
         free,
     })
@@ -323,7 +344,7 @@ mod tests {
     use super::*;
     use crate::components::key;
     use crate::components::keybindings::key as kb;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent};
     use maki_providers::ModelInfo;
     use maki_providers::ModelPricing;
     use test_case::test_case;
@@ -413,14 +434,14 @@ mod tests {
         let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
-        assert!(!entry.tier.is_empty());
+        assert!(!entry.detail.is_empty());
     }
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
         let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
         assert!(
-            !entry.tier.starts_with(FREE_PREFIX),
+            !entry.detail.starts_with(FREE_PREFIX),
             "paid anthropic model must not be marked free"
         );
     }
@@ -433,8 +454,6 @@ mod tests {
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
     #[test_case(key(KeyCode::Char('$')),           ModelTier::Compaction ; "legacy_dollar_compaction")]
     #[test_case(key(KeyCode::Char('€')),           ModelTier::Compaction ; "legacy_euro_compaction")]
-    #[test_case(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::SHIFT), ModelTier::Strong     ; "kitty_shift_1_strong")]
-    #[test_case(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::SHIFT), ModelTier::Compaction ; "kitty_shift_4_compaction")]
     fn tier_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
         let mut p = ModelPicker::new(test_models());
         p.open("anthropic/claude-sonnet-4-20250514");
@@ -643,13 +662,8 @@ mod tests {
 
     const OX_SPEC: &str = "openrouter/stealth/ox-alpha";
     const PAID_ID: &str = "vendor/paid-model";
-    const PAID_PRICING: ModelPricing = ModelPricing {
-        input: 3.0,
-        output: 15.0,
-        cache_write: 0.0,
-        cache_read: 0.0,
-        fast: None,
-    };
+    const PAID_PRICING: ModelPricing = ModelPricing::per_million(3.0, 15.0, 0.0, 0.0);
+    const PAID_PRICE_LABEL: &str = "  $3.00/$15.00 ";
 
     fn register_openrouter_models() {
         model_registry::set_known_models(
@@ -666,7 +680,7 @@ mod tests {
         register_openrouter_models();
         let entry = parse_model_entry(OX_SPEC).unwrap();
         assert!(
-            entry.tier.starts_with(FREE_PREFIX),
+            entry.detail.starts_with(FREE_PREFIX),
             "zero-priced discovery must mark the entry free"
         );
     }
@@ -676,8 +690,14 @@ mod tests {
         register_openrouter_models();
         let entry = parse_model_entry(&format!("openrouter/{PAID_ID}")).unwrap();
         assert!(
-            !entry.tier.starts_with(FREE_PREFIX),
+            !entry.detail.starts_with(FREE_PREFIX),
             "paid discovery must not mark the entry free"
+        );
+        assert!(
+            entry
+                .detail
+                .ends_with(&format!("{PRICE_SEPARATOR}{PAID_PRICE_LABEL}")),
+            "paid discovery must show its price"
         );
     }
 
