@@ -122,11 +122,13 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = "Run Python to chain dependent tool calls or filter their output. The same "
-  .. "tools are async functions here: `r = await read(path='x')`. Tools return strings — parse "
-  .. "them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — "
-  .. "pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. "
-  .. "`open()` reads and writes text files. No imports, no network. 30s default timeout."
+local description = "Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. "
+  .. "Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. "
+  .. "Tools return strings; parse as needed and print only useful results. "
+  .. "For concurrency, use `await gather(index(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. "
+  .. "Available modules: re, asyncio, sys, os, json. No imports or direct network access. "
+  .. "open() supports text files; follow the same read/edit/write rules as direct calls. "
+  .. "Default execution budget: 30s, excluding time waiting for tools."
 
 local schema = {
   type = "object",
@@ -135,11 +137,11 @@ local schema = {
   properties = {
     code = {
       type = "string",
-      description = "Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency.",
+      description = "Python script. Await tools, use their required arguments, and print the results you need to see.",
     },
     timeout = {
       type = "integer",
-      description = "Script execution timeout in seconds (default 30)",
+      description = "Execution budget in seconds, excluding tool waits (default 30)",
     },
   },
 }

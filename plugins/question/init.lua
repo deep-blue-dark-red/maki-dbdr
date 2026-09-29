@@ -2,16 +2,8 @@ local QuestionForm = require("question_form")
 local QuestionHelpers = require("question_helpers")
 local ToolView = require("maki.tool_view")
 
-local DESCRIPTION = [[Use this tool when you need to ask the user questions during execution. This allows you to:
-- Gather user preferences or requirements
-- Clarify ambiguous instructions
-- Get decisions on implementation choices as you work
-- Offer choices to the user about what direction to take
-
-Rules:
-- `custom` enabled by default adds "Type your own answer" - don't include catch-all options.
-- Answers returned as arrays of labels. Set `multiSelect: true` for multi-select.
-- Put recommended option first with "(Recommended)" suffix.]]
+local DESCRIPTION =
+  [[Ask the user for missing requirements or a decision needed to proceed. Group related questions in one call. Put the recommended option first, with "(Recommended)" in its label. Free-text answers are available by default; omit catch-all options. Set multiSelect=true only for multiple choices. Returns selected labels per question.]]
 
 local function normalize(questions)
   questions = questions or {}

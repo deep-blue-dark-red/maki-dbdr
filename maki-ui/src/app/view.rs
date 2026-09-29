@@ -331,6 +331,10 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
+        let r = self.tool_prompt_modal.view(frame, full);
+        if r.width > 0 {
+            overlay_rect = r;
+        }
         let r = self.plugins_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;

@@ -229,13 +229,7 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "ast_grep",
   kind = "search",
-  description = [[Structural (AST) search over the codebase via the ast-grep CLI: matches whole syntax nodes, not text.
-
-- Patterns are code snippets with metavariables: `fn $F() { $BODY }`, `console.log($X)`, `if $COND { $C }`.
-- Each match shows the lines it covers and what its metavariables bound.
-- Language is inferred from file extensions unless `lang` is given; .gitignore is respected.
-- Prefer the **grep** tool for plain text/regex search.
-- Needs the `ast-grep` binary on PATH (https://ast-grep.github.io).]],
+  description = [[Search code by syntax structure. Supply pattern (code with metavariables, e.g. console.log($X)) or kind (node type, e.g. function_item). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.]],
 
   schema = {
     type = "object",
@@ -246,7 +240,7 @@ maki.api.register_tool({
       },
       kind = {
         type = "string",
-        description = "ESQuery-style node kind to match instead of a pattern, e.g. `function_item`.",
+        description = "Syntax node kind, e.g. function_item. Supply this or pattern.",
       },
       lang = {
         type = "string",
@@ -330,12 +324,8 @@ maki.api.register_tool({
   mutable_path = "path",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
-  description = [[Rewrite every match of an ast-grep pattern in place.
-
-- `rewrite` is the replacement snippet and may reuse the pattern's metavariables (`$F`, `$BODY`).
-- `path` is required: the file or directory to rewrite, absolute.
-- Every match under `path` is rewritten, not just the ones `limit` shows; the matches and their replacements are printed, then the applied count.
-- Needs the `ast-grep` binary on PATH (https://ast-grep.github.io).]],
+  description = [[Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind. Supply rewrite; it may reuse pattern metavariables such as $X.
+Every match is changed: limit caps displayed matches, not edits. Returns replacements and the applied count. Requires ast-grep on PATH.]],
 
   schema = {
     type = "object",
@@ -346,7 +336,7 @@ maki.api.register_tool({
       },
       kind = {
         type = "string",
-        description = "ESQuery-style node kind to match instead of a pattern, e.g. `function_item`.",
+        description = "Syntax node kind, e.g. function_item. Supply this or pattern.",
       },
       rewrite = {
         type = "string",

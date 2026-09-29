@@ -154,12 +154,7 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "index",
   kind = "read",
-  description = [[
-Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
-
-- Use this FIRST to understand file structure before using read with offset/limit.
-- Supports source files in different programming languages and markdown.
-- Falls back with an error on unsupported languages. Use read instead.]],
+  description = [[Return a file outline: imports, types, and function signatures with [line numbers]. Call once before reading an unread code file, then use read for the needed range. Supports source code and Markdown; if the language is unsupported, use read.]],
 
   schema = {
     type = "object",

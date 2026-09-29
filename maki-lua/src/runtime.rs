@@ -2247,13 +2247,6 @@ impl LuaRuntime {
         true
     }
 
-    fn codegen_backlog_len(&self) -> usize {
-        self.codegen_queue
-            .as_ref()
-            .map(|q| q.lock().expect("codegen queue").len())
-            .unwrap_or(0)
-    }
-
     fn drop_plugin_keys(&mut self, name: &str) -> Option<Arc<maki_pack::lock::Lock>> {
         self.warm_tools.borrow_mut().clear();
         with_jobs(&self.lua, |store| {

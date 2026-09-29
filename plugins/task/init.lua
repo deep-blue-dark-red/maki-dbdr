@@ -34,18 +34,9 @@ local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
 
-local description = [[Launch an autonomous subagent to perform tasks independently. Best combined with batch.
-
-Subagent types (set via `subagent_type`):
-- `research` (default): Read-only tools. For codebase exploration or gathering context.
-- `general`: Full tool access. For delegating implementation work.
-
-Notes:
-1. Launch multiple tasks concurrently when possible.
-2. The agent's result is not visible to the user. Summarize it in your response.
-3. Each invocation starts fresh - inline any needed context into the prompt.
-4. Tell it to return concise summaries with file:line refs, not full file contents.
-]]
+local description =
+  [[Delegate a self-contained subgoal to a new agent. Use research (default) for read-only exploration or general for implementation. Include the objective, relevant context, file scope, and expected result in prompt; each call starts fresh.
+Use batch for independent subgoals; give implementation agents separate file ownership. Request a concise result with file:line references. The user does not see the result directly; summarize relevant findings. Use async for background tool calls.]]
 
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
@@ -74,7 +65,7 @@ local schema = {
     },
     model_tier = {
       type = "string",
-      description = 'Model tier (optional, omit to use current model, capped at current tier):\n- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.\n- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.\n- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits.',
+      description = "Model tier: strong for complex reasoning, medium for implementation, weak for simple search or edits. Omit to inherit; capped at the current tier.",
     },
     thinking = {
       description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",

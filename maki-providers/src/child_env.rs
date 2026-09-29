@@ -142,12 +142,17 @@ mod tests {
     fn child_sees_only_keys_set_after_strip() {
         let inherited = anthropic::SPEC.api_key_env;
         let explicit = bedrock::BEARER_TOKEN_ENV;
-        let mut cmd = Command::new("printenv");
-        cmd.args([inherited, explicit]).env(inherited, SECRET);
-        let output = strip_provider_keys(&mut cmd)
-            .env(explicit, SECRET)
-            .output()
-            .unwrap();
-        assert_eq!(output.stdout, format!("{SECRET}\n").as_bytes());
+        // One printenv per var: BSD printenv only prints its first argument,
+        // so a single invocation would silently skip the rest.
+        for (var, expected) in [(inherited, false), (explicit, true)] {
+            let mut cmd = Command::new("printenv");
+            cmd.arg(var).env(inherited, SECRET);
+            let seen = strip_provider_keys(&mut cmd)
+                .env(explicit, SECRET)
+                .output()
+                .unwrap();
+            let want = if expected { format!("{SECRET}\n") } else { String::new() };
+            assert_eq!(String::from_utf8_lossy(&seen.stdout), want, "{var}");
+        }
     }
 }

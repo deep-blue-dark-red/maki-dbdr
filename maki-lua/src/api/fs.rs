@@ -2241,14 +2241,20 @@ mod tests {
         index
     }
 
-    fn files_opts(lua: &Lua, root: &Path, query: &str, limit: usize, highlights: bool) -> Table {
-        walked(root);
+    fn files_opts(
+        lua: &Lua,
+        root: &Path,
+        query: &str,
+        limit: usize,
+        highlights: bool,
+    ) -> (Table, maki_agent::FileIndex) {
+        let index = walked(root);
         let opts = lua.create_table().unwrap();
         opts.set("path", root.to_str().unwrap()).unwrap();
         opts.set("query", query).unwrap();
         opts.set("limit", limit).unwrap();
         opts.set("highlights", highlights).unwrap();
-        opts
+        (opts, index)
     }
 
     fn files_answer(tbl: &Table, opts: Table) -> Table {
@@ -2260,7 +2266,8 @@ mod tests {
     }
 
     fn files_call(lua: &Lua, tbl: &Table, root: &Path, query: &str, limit: usize) -> Table {
-        files_answer(tbl, files_opts(lua, root, query, limit, false))
+        let (opts, _held) = files_opts(lua, root, query, limit, false);
+        files_answer(tbl, opts)
     }
 
     fn items(found: &Table) -> Vec<Table> {
@@ -2476,7 +2483,7 @@ mod tests {
             "nothing asked for them"
         );
 
-        let opts = files_opts(&lua, tmp.path(), HIGHLIGHT_QUERY, SMALL_LIMIT, true);
+        let (opts, _held) = files_opts(&lua, tmp.path(), HIGHLIGHT_QUERY, SMALL_LIMIT, true);
         let asked = files_answer(&tbl, opts);
         let ranges: Vec<Vec<u32>> = items(&asked)[0]
             .get::<Table>("highlights")
@@ -2509,7 +2516,7 @@ mod tests {
         let _walked = walked(tmp.path());
         let lua = Lua::new();
         let tbl = fs_table(&lua);
-        let opts = files_opts(&lua, tmp.path(), HIGHLIGHT_QUERY, SMALL_LIMIT, true);
+        let (opts, _held) = files_opts(&lua, tmp.path(), HIGHLIGHT_QUERY, SMALL_LIMIT, true);
 
         let painted = picker_call(&lua, &tbl, opts);
         assert_eq!(

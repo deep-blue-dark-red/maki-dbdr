@@ -184,11 +184,9 @@ end
 
 maki.api.register_tool({
   name = "memory",
-  description = "Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.\n\n"
-    .. "- Notes are retrieved by tag; reuse the tags from your system prompt when they fit.\n"
-    .. "- Save important context before compaction or to build up project knowledge.\n"
-    .. "- Keep entries concise and current. Delete outdated information.\n"
-    .. "- Notes are plain files; `list` and `read` report the dir, so use the edit tool on `<dir>/<name>` for targeted changes.",
+  description = "Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. "
+    .. "Keep notes current; update or delete stale facts. list/read return the notes directory; "
+    .. "use edit on <dir>/<path> for targeted updates.",
 
   schema = {
     type = "object",
@@ -196,10 +194,9 @@ maki.api.register_tool({
       command = {
         type = "string",
         enum = { "list", "read", "write", "delete" },
-        description = "- `list [tags]`: tag-grouped index, no bodies.\n"
-          .. "- `read path|tags`: one body (path) or collated bodies (tags).\n"
-          .. "- `write path tags content`: create or overwrite a note.\n"
-          .. "- `delete path`",
+        description = "Action name only: list, read, write, or delete. Pass arguments in separate fields. "
+          .. "list: optional tags, returns index. read: path or tags, returns bodies. "
+          .. "write: path and content, optional tags, creates or overwrites. delete: path.",
         required = true,
       },
       path = {

@@ -34,7 +34,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Execution & Control",
-        &["batch", "code_execution", "question"],
+        &["async", "batch", "code_execution", "question"],
     ),
     (
         "Agent & Knowledge",

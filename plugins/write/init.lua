@@ -1,12 +1,8 @@
 local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
-local DESCRIPTION = [[Write content to a file, replacing existing content.
-
-- Creates parent directories if needed.
-- Always read the file first before writing.
-- NEVER create files unless absolutely necessary - prefer editing existing files.
-- NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.]]
+local DESCRIPTION =
+  [[Create a necessary new file with content; creates parent directories. Use edit or multiedit for existing files, including after an edit failure. This tool overwrites existing content by default; append=true adds to the end. Create documentation only when the user requests it.]]
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -44,7 +40,7 @@ maki.api.register_tool({
       },
       content = {
         type = "string",
-        description = "The complete file content to write",
+        description = "Complete content for a new file; when append=true, only the text to add",
         required = true,
       },
       append = {

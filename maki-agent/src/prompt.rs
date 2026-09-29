@@ -366,7 +366,7 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    const NATIVE_EFFICIENT_LINE: &str = "Most efficient tools: batch, index, code_execution, task";
+    const NATIVE_EFFICIENT_LINE: &str = "Most efficient tools: batch, index, list, code_execution, task";
 
     fn slots(prompt: PromptId, entries: &[(Slot, &str)]) -> ResolvedSlots {
         let mut slots = ResolvedSlots::default();

@@ -329,8 +329,8 @@ fn write_diff(
 /// Log a response. Stores the exact received bytes.
 /// Log a response. Errors are swallowed — logging must never break a request.
 pub fn log_response(path: &Path, ts_ms: u64, status: u16, content_type: &str, raw_body: &[u8]) {
-    let mut payload = Vec::with_capacity(10 + raw_body.len());
-    put_u32(&mut payload, u32::from(status));
+    let mut payload = Vec::with_capacity(8 + raw_body.len());
+    payload.extend_from_slice(&status.to_le_bytes());
     put_bytes(&mut payload, content_type.as_bytes());
     payload.extend_from_slice(raw_body);
     let _ = with_session_file(path, |file, _| {

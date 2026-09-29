@@ -47,8 +47,9 @@ local INDICATOR = {
 }
 
 local description = string.format(
-  "Run independent tool calls in parallel (1-%d). Not for dependent or "
-    .. "output-filtering chains — use code_execution. Don't nest batch in batch.",
+  "Run 1-%d independent tool calls in parallel and wait for all results. "
+    .. "Each item: {tool: name, parameters: arguments}. Calls must not depend on each other's results or modify the same file. "
+    .. "Use code_execution for dependencies or output filtering, async to keep working while tools run. Do not nest batch.",
   MAX_BATCH_SIZE
 )
 

@@ -20,13 +20,8 @@ local STATUS_MARKERS = {
   cancelled = { "[x]", "todo_cancelled" },
 }
 
-local DESCRIPTION = [[Create or update a structured todo list to track tasks.
-
-**Use after EACH completed step!**
-
-- Send the complete list each time (replace-all semantics).
-- Use ONLY for multi-step work (3+ steps).
-- Skip for trivial tasks.]]
+local DESCRIPTION =
+  [[Track work with 3+ steps. Create the list before starting and update after each completed step. Every call replaces the entire list: include all items and their current statuses. Before finishing, mark each completed or cancelled. Skip for trivial tasks.]]
 
 local function items_of(sid, task)
   return todos[sid] and todos[sid][task] or {}

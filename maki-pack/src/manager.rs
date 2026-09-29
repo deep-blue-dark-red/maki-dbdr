@@ -412,7 +412,11 @@ impl Manager {
     /// directory.
     pub fn remove(&self, name: &str, lock: &mut Lockfile) -> Result<(), ManagerError> {
         self.check_name(name, "")?;
-        let _package_guard = Lock::acquire(&paths::package_lock(&self.site, name))?;
+        // Retrying, not plain acquire: a forked-but-not-yet-exec'd git child
+        // elsewhere in this process duplicates every open fd and keeps a
+        // released flock alive for a few microseconds, and a Held here is a
+        // failure rather than the preflight answer the revision locks give.
+        let _package_guard = Lock::acquire_retrying(&paths::package_lock(&self.site, name))?;
         let (dirs, failures) = self.package_dirs(name);
         if let Some(failure) = failures.into_iter().next() {
             return Err(failure);
@@ -420,7 +424,9 @@ impl Manager {
         let revision_guards = dirs
             .revisions
             .iter()
-            .map(|revision| Lock::acquire(&paths::revision_lock(&self.site, name, revision)))
+            .map(|revision| {
+                Lock::acquire_retrying(&paths::revision_lock(&self.site, name, revision))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let root = paths::package_root(&self.site, name);
         let trash = paths::package_trash(&self.site, name);

@@ -135,12 +135,7 @@ end
 maki.api.register_tool({
   name = "webfetch",
   kind = "fetch",
-  description = [[Fetch a URL and return its contents.
-
-- Supports markdown (default), text, html, or json output formats.
-- HTTP URLs are auto-upgraded to HTTPS.
-- Max response size is 5MB, max timeout is 120s.
-- Best used inside code_execution with some truncation / filter to avoid context bloat.]],
+  description = [[Fetch a known URL as markdown (default), text, html, or json. HTTP is upgraded to HTTPS. Maximum response: 5MB; timeout up to 120s (default 30s). For large pages, call from code_execution and print only relevant sections. Use websearch to find URLs.]],
 
   schema = {
     type = "object",

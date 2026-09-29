@@ -1,10 +1,8 @@
 local helpers = require("create_plugin_helpers")
 local shorten_path = require("maki.shorten_path")
 
-local DESCRIPTION = [[Scaffold a new bundled plugin in the maki source tree, for developing maki itself.
-
-- Creates <path>/<name>/init.lua and plugin.toml, then lists the wiring steps that make the plugin load.
-- Never use it for a personal plugin: those live in ~/.config/maki/lua/<name>.lua and load on /reload, while a file under plugins/ does nothing until maki is rebuilt.]]
+local DESCRIPTION =
+  [[Scaffold a bundled plugin for development of maki itself. Creates <path>/<name>/init.lua and plugin.toml, then reports required wiring steps; rebuilding maki is required to load it. For personal plugins, create ~/.config/maki/lua/<name>.lua and use /reload instead.]]
 
 maki.api.register_tool({
   name = "create_plugin",

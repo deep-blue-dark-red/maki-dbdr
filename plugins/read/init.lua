@@ -6,19 +6,9 @@ local helpers = require("read_helpers")
 local truncate_bytes = helpers.truncate_bytes
 local split_lines = helpers.split_lines
 
-local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
-
-- Supports absolute, relative, and ~/ paths.
-- **offset** and **limit** are required. Use offset=1 to read from the first line.
-- Use limit=0 to read until the end of file (capped at 2000 lines).
-- Use the **index** tool or **grep** tool first to find the offset and limit.
-- Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
-- Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
-- Do not reread the same range (same file and same offset).
-- Prefer grep to locate content instead of scanning full files.
-- Call in parallel when reading multiple files.
-- Avoid tiny repeated slices - read a larger window if you need more context.]]
+local DESCRIPTION =
+  [[Read a file range with 1-based line numbers. Supply path, offset (first line), and limit (line count). limit=0 reads to EOF, capped at 2000 lines by default. Absolute, relative, and ~/ paths are accepted.
+Use index first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
@@ -159,7 +149,7 @@ maki.api.register_tool({
     properties = {
       path = {
         type = "string",
-        description = "Absolute path to the file",
+        description = "File path: absolute, relative, or ~/",
         required = true,
         alias = "file_path",
       },

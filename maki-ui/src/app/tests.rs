@@ -4696,6 +4696,62 @@ fn system_prompt_a_picker_enter_opens_plugin_source_file() {
     assert!(path.ends_with(PLUGIN_ENTRY_FILE), "{}", path.display());
 }
 
+/// Selecting `/tool_prompt` from the command palette must run the same arm as
+/// typing it: the palette hands over a `ParsedCommand`, not the literal text.
+#[test]
+fn tool_prompt_selected_from_palette_opens_the_modal() {
+    let mut app = test_app();
+    app.btw_tools = Some(Arc::new(ArcSwap::from_pointee(
+        SYSTEM_PROMPT_TEXT.to_string(),
+    )));
+    type_slash(&mut app);
+    for ch in "tool_prompt".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(actions.is_empty(), "{} actions", actions.len());
+    assert!(app.tool_prompt_modal.is_open(), "modal must open");
+}
+
+/// `/tool_prompt` used to open its modal without ever drawing it: the state
+/// flipped and keys were captured while the screen stayed untouched.
+#[test]
+fn tool_prompt_command_renders_the_modal() {
+    let mut app = test_app();
+    app.btw_tools = Some(Arc::new(ArcSwap::from_pointee(
+        SYSTEM_PROMPT_TEXT.to_string(),
+    )));
+    let actions = app.execute_command(
+        ParsedCommand {
+            name: "/tool_prompt".into(),
+            args: String::new(),
+            bang: false,
+        },
+        0,
+    );
+    assert!(actions.is_empty());
+    assert!(app.tool_prompt_modal.is_open());
+
+    let backend = TestBackend::new(TEST_AREA.width, TEST_AREA.height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| {
+        app.view(frame);
+    })
+    .unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("Tool prompt"), "{screen}");
+    assert!(screen.contains(SYSTEM_PROMPT_TEXT), "{screen}");
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.tool_prompt_modal.is_open());
+}
+
 #[test]
 fn btw_empty_flashes_error() {
     let mut app = test_app();

@@ -151,7 +151,7 @@ end
 maki.api.register_tool({
   name = "skill",
   kind = "read",
-  description = "Load a task-specific playbook by name.",
+  description = "Load instructions for a task-specific skill. Pass name to load it; omit name to list available skills.",
 
   schema = {
     type = "object",
@@ -376,7 +376,7 @@ if has_project_skills() then
   maki.api.register_tool({
     name = "skill_test",
     kind = "fetch",
-    description = "Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings. Failures include elapsed time, exit code, and captured stderr/stdout tails; per-test `timeout_ms` overrides the 60s default.",
+    description = "Test a skill using its SKILL.md tests frontmatter. Runs one headless maki subprocess per case and checks the response against expect_contains / expect_not_contains. Returns pass/fail details and failure output. Each case defaults to 60s; timeout_ms overrides it.",
 
     schema = {
       type = "object",

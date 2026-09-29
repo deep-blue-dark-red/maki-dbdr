@@ -33,18 +33,14 @@ local OUT_OF_ORDER_NOTE =
   "Results arrive out of order as workers free up - always reference jobs by id or name, never by position."
 
 local description = table.concat({
-  "Run tool calls in the background while you keep working. Typical loop: spawn slow jobs, do other work, wait for results, cancel what you no longer need.",
+  "Queue independent tool calls in the background; spawn returns job ids immediately. Use batch when you want to wait for all calls, task for an autonomous subagent.",
   "",
-  "Actions (set via `action`):",
-  "- spawn (default): queue `jobs` (each { tool, parameters, name?, timeout_seconds? }); optional `workers` limits how many of this batch run at once. The reply contains only job ids.",
-  "- status: snapshot of every job, including result tails. Cheap to poll while working.",
-  "- wait: block until `job_ids` (default: all unfinished jobs) finish or `timeout_seconds` (default 300; 0 returns immediately with current state) elapses. Returns finished jobs' results. Hitting the timeout is normal, not an error - just wait again.",
-  "- cancel: stop `job_ids` (default: all unfinished jobs). Queued jobs never start; running jobs are flagged and their results discarded.",
+  "- spawn (default): supply jobs as {tool, parameters, name?, timeout_seconds?}. Optional workers limits concurrency for this spawn.",
+  "- status: inspect jobs and result tails.",
+  "- wait: retrieve results for job_ids (ids or names; default all unfinished). Waits up to timeout_seconds (default 300; 0 returns immediately). A wait timeout does not stop jobs; wait again if needed.",
+  "- cancel: cancel job_ids (default all unfinished). Queued jobs never start; running jobs may continue, but their results are discarded. Cancellation does not undo side effects.",
   "",
-  "Rules:",
-  "- Workers pull jobs from a queue, so jobs finish in any order - always match results by job id or name, never by position.",
-  "- Jobs die when the session ends.",
-  "- Never call async from inside a job.",
+  "Match results by id or name, never position. Use returned job ids to collect needed results before finishing; jobs end with the session. Do not call async inside a job.",
 }, "\n")
 
 local opts = maki.api.register_options({
