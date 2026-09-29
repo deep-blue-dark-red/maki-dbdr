@@ -61,6 +61,7 @@ use crate::components::status_bar::StatusBar;
 use crate::components::system_prompt_modal::{
     SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
 };
+use crate::components::tool_prompt_modal::ToolPromptModal;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -374,6 +375,7 @@ pub struct App {
     pub(super) prompt_file_picker: ListPicker<PathBuf>,
     pub(super) help_modal: HelpModal,
     pub(super) system_prompt_modal: SystemPromptModal,
+    pub(super) tool_prompt_modal: ToolPromptModal,
     pub(super) export_picker: ExportPicker,
     pub(super) plugins_modal: PluginsModal,
     pub(super) skills_modal: SkillsModal,
@@ -452,6 +454,7 @@ pub struct App {
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) btw_system: Option<Arc<ArcSwap<String>>>,
+    pub(crate) btw_tools: Option<Arc<ArcSwap<String>>>,
     pub(crate) prompt_meta: Option<Arc<ArcSwap<crate::agent::PromptMeta>>>,
     pub(crate) prompt_dirty: Option<Arc<AtomicBool>>,
     pub(crate) image_paste_rx: Vec<flume::Receiver<Result<ImageSource, String>>>,
@@ -553,6 +556,7 @@ impl App {
             prompt_file_picker: ListPicker::new().with_width_pct(WIDTH_PERCENT),
             help_modal: HelpModal::new(),
             system_prompt_modal: SystemPromptModal::new(),
+            tool_prompt_modal: ToolPromptModal::new(),
             export_picker: ExportPicker::new(),
             plugins_modal: PluginsModal::new(),
             skills_modal: SkillsModal::new(),
@@ -599,6 +603,7 @@ impl App {
             usage_slot: Arc::new(ArcSwapOption::empty()),
             shared_history: None,
             btw_system: None,
+            btw_tools: None,
             prompt_meta: None,
             prompt_dirty: None,
             image_paste_rx: vec![],
@@ -1075,6 +1080,10 @@ impl App {
             self.system_prompt_modal.scroll(delta);
             return None;
         }
+        if self.tool_prompt_modal.is_open() {
+            self.tool_prompt_modal.scroll(delta);
+            return None;
+        }
         if self.usage_modal.is_open() {
             self.usage_modal.scroll(delta);
             return None;
@@ -1217,6 +1226,11 @@ impl App {
                 }
                 SystemPromptAction::None => vec![],
             });
+        }
+
+        if self.tool_prompt_modal.is_open() {
+            self.tool_prompt_modal.handle_key(key);
+            return Some(vec![]);
         }
 
         if self.plugins_modal.is_open() {
@@ -2682,6 +2696,16 @@ impl App {
                 }
                 vec![]
             }
+            "/tool_prompt" => {
+                let built = self.btw_tools.as_ref().is_some_and(|s| !s.load().is_empty());
+                if built {
+                    let source = Arc::clone(self.btw_tools.as_ref().unwrap());
+                    self.tool_prompt_modal.open(source);
+                } else {
+                    self.flash("Tool prompt not built yet".into());
+                }
+                vec![]
+            }
             "/logs" => {
                 vec![Action::RunLogsCommand]
             }
@@ -2862,10 +2886,11 @@ impl App {
         vec![]
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 22] {
+    fn overlays(&self) -> [&dyn Overlay; 23] {
         [
             &self.help_modal,
             &self.system_prompt_modal,
+            &self.tool_prompt_modal,
             &self.prompt_file_picker,
             &self.export_picker,
             &self.plugins_modal,
@@ -2889,10 +2914,11 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 22] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 23] {
         [
             &mut self.help_modal,
             &mut self.system_prompt_modal,
+            &mut self.tool_prompt_modal,
             &mut self.prompt_file_picker,
             &mut self.export_picker,
             &mut self.plugins_modal,

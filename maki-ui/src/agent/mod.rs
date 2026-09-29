@@ -52,6 +52,7 @@ pub(crate) struct AgentHandles {
     pub(crate) answer_tx: flume::Sender<String>,
     pub(crate) history: SharedMessages,
     pub(crate) btw_system: Arc<ArcSwap<String>>,
+    pub(crate) btw_tools: Arc<ArcSwap<String>>,
     pub(crate) prompt_meta: Arc<ArcSwap<PromptMeta>>,
     pub(crate) prompt_dirty: Arc<AtomicBool>,
     pub(crate) mcp_handle: Option<McpHandle>,
@@ -107,6 +108,7 @@ impl AgentHandles {
         app.answer_tx = Some(self.answer_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
         app.btw_system = Some(Arc::clone(&self.btw_system));
+        app.btw_tools = Some(Arc::clone(&self.btw_tools));
         app.prompt_meta = Some(Arc::clone(&self.prompt_meta));
         app.prompt_dirty = Some(Arc::clone(&self.prompt_dirty));
         app.queue.set_shared(self.queue.clone());
@@ -252,6 +254,7 @@ fn spawn_agent_internal(
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
     let btw_system: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
+    let btw_tools: Arc<ArcSwap<String>> = Arc::new(ArcSwap::from_pointee(String::new()));
     let prompt_meta: Arc<ArcSwap<PromptMeta>> =
         Arc::new(ArcSwap::from_pointee(PromptMeta::default()));
     let prompt_dirty = Arc::new(AtomicBool::new(false));
@@ -266,6 +269,7 @@ fn spawn_agent_internal(
         resumed,
         Arc::clone(&shared_history),
         Arc::clone(&btw_system),
+        Arc::clone(&btw_tools),
         Arc::clone(&prompt_meta),
         Arc::clone(&prompt_dirty),
         mcp_handle.clone(),
@@ -289,6 +293,7 @@ fn spawn_agent_internal(
         answer_tx,
         history: shared_history,
         btw_system,
+        btw_tools,
         prompt_meta,
         prompt_dirty,
         mcp_handle,

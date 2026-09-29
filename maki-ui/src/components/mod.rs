@@ -34,6 +34,7 @@ pub(crate) mod streaming_content;
 pub(crate) mod system_prompt_modal;
 pub(crate) mod theme_picker;
 pub(crate) mod tool_display;
+pub(crate) mod tool_prompt_modal;
 pub(crate) mod usage_modal;
 pub(crate) mod wrap;
 

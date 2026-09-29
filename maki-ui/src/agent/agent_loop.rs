@@ -19,6 +19,7 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
 use maki_storage::id::SessionRef;
+use serde_json::Value;
 use tracing::error;
 
 use super::ModelSlot;
@@ -43,6 +44,31 @@ fn base_tools(
     )
 }
 
+/// `/tool_prompt` body: one `## name` section per tool the model is offered,
+/// with its instruction text, in request order. MCP tools are already merged
+/// into `tools` by [`agent::request_tools`].
+fn render_tool_prompt(tools: &Value) -> String {
+    let defs = tools.as_array();
+    let count = defs.map_or(0, |defs| defs.len());
+    let mut out = format!("{count} tools enabled\n");
+    for def in defs.into_iter().flatten() {
+        let Some(name) = def["name"].as_str() else {
+            continue;
+        };
+        out.push_str("\n## ");
+        out.push_str(name);
+        out.push_str("\n\n");
+        match def["description"].as_str() {
+            Some(desc) if !desc.trim().is_empty() => {
+                out.push_str(desc);
+                out.push('\n');
+            }
+            _ => out.push_str("(no description)\n"),
+        }
+    }
+    out
+}
+
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
@@ -55,6 +81,7 @@ pub(super) struct AgentLoop {
     /// every run over it, so the provider's own counts pile up between turns.
     gauge: ContextGauge,
     btw_system: Arc<ArcSwap<String>>,
+    btw_tools: Arc<ArcSwap<String>>,
     prompt_meta: Arc<ArcSwap<super::PromptMeta>>,
     prompt_dirty: Arc<AtomicBool>,
     cancels: Arc<RunCancels>,
@@ -80,6 +107,7 @@ impl AgentLoop {
         resumed: Resumed,
         shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
+        btw_tools: Arc<ArcSwap<String>>,
         prompt_meta: Arc<ArcSwap<super::PromptMeta>>,
         prompt_dirty: Arc<AtomicBool>,
         mcp_handle: Option<McpHandle>,
@@ -106,6 +134,7 @@ impl AgentLoop {
             history: History::restored(resumed.history).with_mirror(shared_history),
             gauge: ContextGauge::restored(resumed.context_size),
             btw_system,
+            btw_tools,
             prompt_meta,
             prompt_dirty,
             cancels,
@@ -132,7 +161,7 @@ impl AgentLoop {
             // a republish even with nothing queued to run.
             if self.prompt_dirty.swap(false, Ordering::Relaxed) {
                 let slots = self.lua_handle.collect_prompt_slots_async().await;
-                self.publish_btw_system(&slots);
+                self.publish_btw_prompts(&slots);
             }
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
@@ -215,7 +244,7 @@ impl AgentLoop {
         // First point the prompt is fully resolved: instructions are on disk
         // and the plugin host is up, so the slots are real rather than empty.
         let slots = self.lua_handle.collect_prompt_slots_async().await;
-        self.publish_btw_system(&slots);
+        self.publish_btw_prompts(&slots);
 
         if let Some(ref mcp) = self.mcp {
             // The queue is drained right after this, and a prompt typed during
@@ -224,6 +253,8 @@ impl AgentLoop {
                 return false;
             }
             spawn_oauth_for_needs_auth(mcp);
+            // The earlier publish could not know the MCP tools yet.
+            self.publish_btw_tools();
         }
         !teardown.is_cancelled()
     }
@@ -355,7 +386,7 @@ impl AgentLoop {
         // name the model that is current now.
         let slot = self.model_slot.load();
         let RunContext { system, tools } = run_builder(&slot.model, &input.mode, input.workflow);
-        self.publish_btw_system(&prompt_slots);
+        self.publish_btw_prompts(&prompt_slots);
 
         while self.answer_rx.lock().await.try_recv().is_ok() {}
 
@@ -403,9 +434,10 @@ impl AgentLoop {
         self.instructions = smol::unblock(move || agent::load_instructions(&cwd)).await;
     }
 
-    fn publish_btw_system(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
+    fn publish_btw_prompts(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) {
         self.btw_system
             .store(Arc::new(self.system_prompt(prompt_slots)));
+        self.publish_btw_tools();
         self.prompt_meta.store(Arc::new(super::PromptMeta {
             instruction_files: self.instructions.loaded.paths(),
             after_sources: prompt_slots
@@ -419,9 +451,13 @@ impl AgentLoop {
         }));
     }
 
-    /// Always pins `Build` mode: btw runs no tools, so Plan-mode constraints would only confuse
-    /// the model, and a gauge sizing this only cares about the length. Everything else matches
-    /// the live prompt.
+    fn publish_btw_tools(&self) {
+        self.btw_tools.store(Arc::new(self.tool_prompt()));
+    }
+
+    /// Always pins `Build` mode and no workflow: btw runs neither, so Plan-mode
+    /// constraints would only confuse the model and a gauge sizing this only
+    /// cares about the length. Everything else matches the live prompt.
     fn system_prompt(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) -> String {
         agent::build_system_prompt(
             &self.vars,
@@ -430,6 +466,16 @@ impl AgentLoop {
             prompt_slots,
             &self.model_slot.load().model,
         )
+    }
+
+    /// What `/tool_prompt` shows: every tool definition a run would send, with
+    /// MCP tools merged in, rendered as `## name` + instruction text. Pins
+    /// `workflow = false` for the same reason [`Self::system_prompt`] pins
+    /// `Build` mode.
+    fn tool_prompt(&self) -> String {
+        let model = self.model_slot.load().model.clone();
+        let base = base_tools(&self.vars, &model, &self.config, self.mcp.is_some(), false);
+        render_tool_prompt(&agent::request_tools(&base, self.mcp.as_ref()))
     }
 
     fn emit_error(&self, run_id: u64, error: AgentError) {
@@ -484,5 +530,48 @@ fn spawn_oauth_for_needs_auth(handle: &McpHandle) {
             tracing::info!(server = %server_name, "MCP server authenticated via OAuth");
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use test_case::test_case;
+
+    const ALPHA: &str = "alpha";
+    const BETA: &str = "beta";
+    const ALPHA_INSTR: &str = "Alpha does things.";
+    const BETA_INSTR: &str = "Beta does other things.";
+
+    #[test]
+    fn renders_one_section_per_tool_in_order() {
+        let tools = json!([
+            {"name": ALPHA, "description": ALPHA_INSTR},
+            {"name": BETA, "description": BETA_INSTR},
+        ]);
+        let out = render_tool_prompt(&tools);
+        let alpha_at = out.find(&format!("## {ALPHA}")).expect("alpha section");
+        let beta_at = out.find(&format!("## {BETA}")).expect("beta section");
+        assert!(alpha_at < beta_at, "request order must be kept:\n{out}");
+        assert!(out.starts_with("2 tools enabled"), "{out}");
+        assert!(out.contains(ALPHA_INSTR) && out.contains(BETA_INSTR), "{out}");
+    }
+
+    #[test_case(Some(""), "no description" ; "blank_description")]
+    #[test_case(None, "no description" ; "missing_description")]
+    fn nameless_description_falls_back_to_placeholder(description: Option<&str>, needle: &str) {
+        let mut def = json!({"name": ALPHA});
+        if let Some(desc) = description {
+            def["description"] = json!(desc);
+        }
+        let out = render_tool_prompt(&json!([def]));
+        assert!(out.contains(needle), "{out}");
+    }
+
+    #[test]
+    fn empty_tool_list_renders_zero_header() {
+        let out = render_tool_prompt(&json!([]));
+        assert_eq!(out, "0 tools enabled\n");
     }
 }

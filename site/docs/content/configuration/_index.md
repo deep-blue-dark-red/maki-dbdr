@@ -265,7 +265,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `workers` | integer | `4` | 1 | Max concurrently running jobs. Spawn calls may lower this per call, never raise it. |
+| `workers` | integer | `8` | 1 | Max concurrently running jobs. Spawn calls may lower this per call, never raise it. |
 
 ### `plugins.bash`
 

@@ -33,20 +33,23 @@ local OUT_OF_ORDER_NOTE =
   "Results arrive out of order as workers free up - always reference jobs by id or name, never by position."
 
 local description = table.concat({
-  "Queue tool calls to run in the background and keep working. Returns job ids immediately.",
+  "Run tool calls in the background while you keep working. Typical loop: spawn slow jobs, do other work, wait for results, cancel what you no longer need.",
   "",
   "Actions (set via `action`):",
-  "- spawn (default): `jobs` = array of { tool, parameters, name?, timeout_seconds? }, optional `workers` (1..=configured max). Returns ids at once; results are NOT in this reply.",
-  "- status: snapshot of the whole queue, including result tails.",
-  "- wait: block until the jobs named in `job_ids` (default: all non-terminal) settle, or `timeout_seconds` elapses (default 300, 0 = single check). Returns statuses plus results of settled jobs; a timeout is not an error, re-wait or poll.",
-  "- cancel: kill the jobs named in `job_ids` (default: all non-terminal). Queued jobs never start; running jobs are flagged, and their late result is discarded when the child call returns.",
+  "- spawn (default): queue `jobs` (each { tool, parameters, name?, timeout_seconds? }); optional `workers` limits how many of this batch run at once. The reply contains only job ids.",
+  "- status: snapshot of every job, including result tails. Cheap to poll while working.",
+  "- wait: block until `job_ids` (default: all unfinished jobs) finish or `timeout_seconds` (default 300; 0 returns immediately with current state) elapses. Returns finished jobs' results. Hitting the timeout is normal, not an error - just wait again.",
+  "- cancel: stop `job_ids` (default: all unfinished jobs). Queued jobs never start; running jobs are flagged and their results discarded.",
   "",
-  "Not FIFO: N workers pull from the queue, so jobs complete out of order - always match results by job id or name, never by position. Jobs are session-scoped and die when the session ends. Do not call async from inside a job. Poll `status` instead of queueing unbounded work, and cancel jobs whose results you no longer need.",
+  "Rules:",
+  "- Workers pull jobs from a queue, so jobs finish in any order - always match results by job id or name, never by position.",
+  "- Jobs die when the session ends.",
+  "- Never call async from inside a job.",
 }, "\n")
 
 local opts = maki.api.register_options({
   workers = {
-    default = 4,
+    default = 8,
     min = 1,
     desc = "Max concurrently running jobs. Spawn calls may lower this per call, never raise it.",
   },
@@ -73,11 +76,11 @@ local schema = {
     job_ids = {
       type = "array",
       items = { type = "string" },
-      description = "wait/cancel: job ids or names (default: all non-terminal jobs)",
+      description = "wait/cancel: job ids or names (default: all unfinished jobs)",
     },
     timeout_seconds = {
       type = "integer",
-      description = "wait: seconds to block before returning current statuses (default 300, 0 = single check)",
+      description = "wait: seconds to block before returning current statuses (default 300; 0 returns immediately)",
     },
   },
 }
@@ -309,6 +312,12 @@ local function do_wait(input)
   if not jobs then
     return { llm_output = err, is_error = true }
   end
+  -- A wait that lands after everything settled would otherwise answer with
+  -- an empty queue; the model wants the results, so widen to the whole
+  -- queue (terminal jobs included, tails on).
+  if #jobs == 0 then
+    jobs = q.jobs
+  end
   local timeout = input.timeout_seconds == nil and DEFAULT_WAIT_TIMEOUT or input.timeout_seconds
   if type(timeout) ~= "number" or timeout < 0 then
     return { llm_output = "timeout_seconds must be a number >= 0", is_error = true }
@@ -334,6 +343,9 @@ local function do_cancel(input)
     return { llm_output = err, is_error = true }
   end
   local lines = {}
+  if #jobs == 0 then
+    lines[1] = "nothing to cancel"
+  end
   for _, job in ipairs(jobs) do
     if lib.TERMINAL[job.status] then
       lines[#lines + 1] = string.format("%s already %s", job.id, job.status)

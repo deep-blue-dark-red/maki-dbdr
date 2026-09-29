@@ -279,12 +279,12 @@ Search the web for real-time information using Exa AI.
 
 ### `async` {#async}
 
-Queue tool calls to run in the background and keep working. Returns job ids immediately.
+Run tool calls in the background while you keep working. Typical loop: spawn slow jobs, do other work, wait for results, cancel what you no longer need.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `action` | string | no |  | One of "spawn" (default), "status", "wait", "cancel" |
-| `job_ids` | array | no | all non-terminal jobs | wait/cancel: job ids or names |
+| `job_ids` | array | no | all unfinished jobs | wait/cancel: job ids or names |
 | `jobs` | array | no |  | spawn: jobs to queue, each { tool, parameters, name?, timeout_seconds? } or flat { tool, ...params } |
-| `timeout_seconds` | integer | no | 300, 0 = single check | wait: seconds to block before returning current statuses |
+| `timeout_seconds` | integer | no | 300; 0 returns immediately | wait: seconds to block before returning current statuses |
 | `workers` | integer | no |  | spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option |

@@ -42,6 +42,7 @@ Type `/` in the input box to open the command palette.
 | `/reload_config` | Reload configuration from disk without restarting |
 | `/verbose` | Toggle verbose output mode |
 | `/system_prompt` | Show the resolved system prompt (Ctrl+E edits system.md) |
+| `/tool_prompt` | Show the tool instructions of every enabled tool |
 | `/logs` | Open logs directory |
 | `/export` | Export session transcript as Markdown or JSON |
 | `/skills` | Manage global and project AI agent skills |

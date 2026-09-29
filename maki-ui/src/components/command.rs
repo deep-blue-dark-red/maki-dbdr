@@ -202,6 +202,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         bang: false,
     },
     BuiltinCommand {
+        name: "/tool_prompt",
+        description: "Show the tool instructions of every enabled tool",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/logs",
         description: "Open logs directory",
         max_args: 0,

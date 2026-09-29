@@ -21,7 +21,8 @@ use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
 use maki_agent::tools::{
-    HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
+    DescriptionContext, HeaderResult, PermissionScopes, RegistryError, Tool, ToolAudience,
+    ToolFilter, ToolLive, ToolRegistry, ToolSource,
 };
 use maki_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle, UiWaker};
 use maki_storage::id::{MakiId, SessionRef};
@@ -61,7 +62,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
-use crate::api::util::loaded::LoadedPluginsWriter;
+use crate::api::util::loaded::{LoadedPlugin, LoadedPluginsWriter, PluginToolInfo};
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
@@ -2708,8 +2709,35 @@ impl LuaRuntime {
     /// Pushes the current plugin set to the snapshot readers. Call after any
     /// change to `self.plugins`, never from a path that could deadlock on one.
     fn publish_loaded(&self) {
-        let names = self.plugins.borrow().keys().cloned().collect();
-        self.loaded_plugins.publish(names);
+        let names: Vec<Arc<str>> = self.plugins.borrow().keys().cloned().collect();
+        let mut by_plugin: HashMap<Arc<str>, Vec<PluginToolInfo>> = HashMap::new();
+        let dctx = DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MODEL,
+            workflow: false,
+            mcp: false,
+        };
+        for entry in self.registry.iter().iter() {
+            let ToolSource::Lua { plugin } = &entry.source else {
+                continue;
+            };
+            by_plugin
+                .entry(Arc::clone(plugin))
+                .or_default()
+                .push(PluginToolInfo {
+                    name: entry.name().into(),
+                    description: entry.tool.description(&dctx).into_owned(),
+                    schema: entry.tool.schema(),
+                });
+        }
+        let plugins = names
+            .into_iter()
+            .map(|name| LoadedPlugin {
+                tools: by_plugin.remove(&name).unwrap_or_default(),
+                name,
+            })
+            .collect();
+        self.loaded_plugins.publish(plugins);
     }
 
     fn clear_plugin(&mut self, plugin: &str) {

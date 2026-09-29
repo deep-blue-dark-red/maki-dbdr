@@ -1506,9 +1506,9 @@ mod tests {
         fn snapshot_names(reader: &LoadedPluginsReader) -> Vec<String> {
             reader
                 .load_full()
-                .names()
+                .plugins()
                 .iter()
-                .map(|name| name.to_string())
+                .map(|plugin| plugin.name.to_string())
                 .collect()
         }
 
@@ -1523,6 +1523,14 @@ mod tests {
         assert!(
             !snap.contains("cronjob"),
             "opt-in builtin stays off until configured"
+        );
+        let read = snap.plugin("read").expect("tool plugin carries its tools");
+        assert_eq!(read.tools.len(), 1);
+        assert_eq!(read.tools[0].name.as_ref(), "read");
+        assert!(!read.tools[0].description.is_empty());
+        assert!(
+            read.tools[0].schema.get("properties").is_some(),
+            "the input schema the model sees rides along"
         );
 
         host.unload("status").unwrap();

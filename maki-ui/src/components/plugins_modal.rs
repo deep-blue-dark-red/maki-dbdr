@@ -2,12 +2,13 @@ use crate::components::Overlay;
 use crate::components::modal::Modal;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_lua::{EventHandle, LoadedPlugins};
+use maki_lua::{EventHandle, LoadedPlugins, PluginToolInfo};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,12 +17,15 @@ pub struct PluginInfo {
     pub name: String,
     pub source_path: PathBuf,
     pub is_loaded: bool,
+    pub tools: Vec<PluginToolInfo>,
 }
 
 pub enum PluginsAction {
     None,
     EditPlugin(PathBuf),
 }
+
+const KEY_HINTS: &str = " ↑/↓ navigate · Space toggle · e edit · Esc close ";
 
 pub struct PluginsModal {
     open: bool,
@@ -164,6 +168,18 @@ impl PluginsModal {
         self.render_list(frame, chunks[0]);
         self.render_detail(frame, chunks[1]);
 
+        let t = theme::current();
+        let footer = Rect {
+            x: popup.x + 1,
+            y: popup.y + popup.height - 1,
+            width: popup.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(KEY_HINTS, t.tool_dim)).right_aligned()),
+            footer,
+        );
+
         popup
     }
 
@@ -232,6 +248,22 @@ impl PluginsModal {
                 Span::styled(status, status_style),
             ]));
             lines.push(Line::from(""));
+            for tool in &plugin.tools {
+                lines.push(Line::from(vec![
+                    Span::styled("Tool: ", t.tool_dim),
+                    Span::styled(tool.name.to_string(), t.item.add_modifier(Modifier::BOLD)),
+                ]));
+                lines.push(Line::from(Span::styled(tool.description.clone(), t.item_desc)));
+                push_input_schema(&mut lines, &tool.schema, &t);
+                lines.push(Line::from(""));
+            }
+            if plugin.is_loaded && plugin.tools.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "This plugin registers no tools",
+                    t.tool_dim,
+                )));
+                lines.push(Line::from(""));
+            }
             lines.push(Line::from(Span::styled("Source:", t.tool_dim)));
             let path_str = plugin.source_path.to_string_lossy().into_owned();
             // wrap long paths
@@ -242,31 +274,47 @@ impl PluginsModal {
             {
                 lines.push(Line::from(Span::styled(chunk.to_string(), t.item_desc)));
             }
-            lines.push(Line::from(""));
         } else {
             lines.push(Line::from(Span::styled("No plugin selected", t.tool_dim)));
         }
 
-        // Key hints
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "── Keys ──────────────",
-            t.tool_dim,
-        )));
-        for (key, desc) in &[
-            ("Space/Enter", "toggle enable/disable"),
-            ("e", "open source in editor"),
-            ("↑/↓", "navigate"),
-            ("Esc", "close"),
-        ] {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:<12}", key), t.item.add_modifier(Modifier::BOLD)),
-                Span::styled(desc.to_string(), t.tool_dim),
-            ]));
-        }
-
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
+    }
+}
+
+fn push_input_schema(lines: &mut Vec<Line>, schema: &Value, t: &theme::Theme) {
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    if props.is_empty() {
+        return;
+    }
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    lines.push(Line::from(Span::styled("Input:", t.tool_dim)));
+    for (name, prop) in props {
+        let kind = prop.get("type").and_then(Value::as_str).unwrap_or("any");
+        let mut spans = vec![
+            Span::styled(format!("  {name}"), t.item),
+            Span::styled(format!(" {kind}"), t.tool_dim),
+        ];
+        if required.contains(&name.as_str()) {
+            spans.push(Span::styled(" (required)", t.tool_dim));
+        }
+        lines.push(Line::from(spans));
+        if let Some(desc) = prop.get("description").and_then(Value::as_str)
+            && !desc.is_empty()
+        {
+            lines.push(Line::from(Span::styled(
+                format!("    {desc}"),
+                t.item_desc,
+            )));
+        }
     }
 }
 
@@ -291,10 +339,14 @@ pub(crate) fn plugin_source_path(name: &str) -> Option<PathBuf> {
 fn build_plugin_list(loaded: &LoadedPlugins) -> Vec<PluginInfo> {
     maki_lua::bundled_plugins()
         .filter(|(name, _)| *name != "lib") // lib is internal, not user-facing
-        .map(|(name, source_path)| PluginInfo {
-            name: name.to_string(),
-            source_path: PathBuf::from(source_path),
-            is_loaded: loaded.contains(name),
+        .map(|(name, source_path)| {
+            let entry = loaded.plugin(name);
+            PluginInfo {
+                name: name.to_string(),
+                source_path: PathBuf::from(source_path),
+                is_loaded: entry.is_some(),
+                tools: entry.map(|p| p.tools.clone()).unwrap_or_default(),
+            }
         })
         .collect()
 }
@@ -302,6 +354,7 @@ fn build_plugin_list(loaded: &LoadedPlugins) -> Vec<PluginInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_lua::LoadedPlugin;
     use maki_lua::test_support::loaded_plugins_pair;
 
     fn is_loaded(modal: &PluginsModal, name: &str) -> bool {
@@ -346,5 +399,74 @@ mod tests {
         writer.publish(&["sessions", "cronjob"]);
         modal.sync_generation();
         assert!(is_loaded(&modal, "cronjob"), "picked up without a keypress");
+    }
+
+    const TOOL_DESCRIPTION: &str = "Read a file from disk.";
+    const PATH_DESCRIPTION: &str = "Absolute path to the file";
+
+    fn modal_with_tool() -> PluginsModal {
+        let (writer, reader) = loaded_plugins_pair();
+        writer.publish_plugins(vec![LoadedPlugin {
+            name: Arc::from("read"),
+            tools: vec![PluginToolInfo {
+                name: Arc::from("read"),
+                description: TOOL_DESCRIPTION.into(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": PATH_DESCRIPTION },
+                        "limit": { "type": "integer" },
+                    },
+                    "required": ["path"],
+                }),
+            }],
+        }]);
+        let mut modal = PluginsModal::new();
+        modal.open(&EventHandle::disconnected_for_test().with_loaded_reader(reader));
+        modal
+    }
+
+    fn screen(modal: &mut PluginsModal) -> String {
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| {
+            modal.view(f, f.area());
+        }).unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn detail_shows_tool_description_and_input_schema() {
+        let mut modal = modal_with_tool();
+        modal.selected = modal
+            .plugins
+            .iter()
+            .position(|plugin| plugin.name == "read")
+            .unwrap();
+
+        let text = screen(&mut modal);
+        assert!(text.contains(TOOL_DESCRIPTION), "description missing:\n{text}");
+        assert!(text.contains("path string (required)"), "typed prop missing:\n{text}");
+        assert!(text.contains(PATH_DESCRIPTION), "prop doc missing:\n{text}");
+        assert!(text.contains("limit integer"), "optional prop missing:\n{text}");
+        assert!(!text.contains("limit integer (required)"));
+    }
+
+    #[test]
+    fn a_plugin_without_tools_says_so() {
+        let (writer, reader) = loaded_plugins_pair();
+        writer.publish(&["sessions"]);
+        let mut modal = PluginsModal::new();
+        modal.open(&EventHandle::disconnected_for_test().with_loaded_reader(reader));
+        modal.selected = modal
+            .plugins
+            .iter()
+            .position(|plugin| plugin.name == "sessions")
+            .unwrap();
+
+        assert!(
+            screen(&mut modal).contains("This plugin registers no tools"),
+            "command-only plugin needs a note"
+        );
     }
 }
