@@ -6,14 +6,16 @@ M.ALIAS_SCHEDULE_PATTERN = "^@%w+$"
 M.SCHEDULE_FIELD_PATTERN = "^[%d%a%*%-%,/]+$"
 M.LOG_SUBDIR = "cron/logs"
 M.MAX_NAME_LEN = 64
+M.MULTILINE_PATTERN = "[\r\n]"
 
-local EDITABLE_FIELDS = {
+M.EDITABLE_FIELDS = {
   "schedule",
   "cwd",
   "model",
   "skill",
   "prompt",
   "yolo",
+  "continue",
   "allowed_tools",
   "log",
   "env_file",
@@ -36,6 +38,15 @@ function M.validate_name(name)
   end
   if not name:match(M.NAME_PATTERN) then
     return "name must start with a letter and use only letters, digits, '-' or '_'"
+  end
+  return nil
+end
+
+-- A job lives on one crontab line: a newline in any field splits it, and the
+-- fragments lose the marker, so list can no longer see nor strip_job remove it.
+function M.validate_single_line(field, value)
+  if type(value) == "string" and value:match(M.MULTILINE_PATTERN) then
+    return field .. " must not contain newlines; a job is a single crontab line"
   end
   return nil
 end
@@ -79,6 +90,10 @@ function M.build_command(job, exe)
   end
   steps[#steps + 1] = "cd " .. M.quote(job.cwd)
   flags[#flags + 1] = M.quote(exe) .. " -p"
+  if job.continue then
+    -- Resumes the most recent session in cwd: the context channel across fires.
+    flags[#flags + 1] = "-c"
+  end
   if job.yolo then
     flags[#flags + 1] = "--yolo"
   end
@@ -98,7 +113,7 @@ end
 
 function M.encode_job(job)
   local payload = { name = job.name }
-  for _, field in ipairs(EDITABLE_FIELDS) do
+  for _, field in ipairs(M.EDITABLE_FIELDS) do
     payload[field] = job[field]
   end
   return payload
@@ -144,11 +159,11 @@ function M.parse_crontab(content)
   return jobs, broken
 end
 
--- Drop only the managed line of {name}; every other line (managed or not)
--- survives untouched.
+-- Drop only the managed line of {name}; every other line (managed or not,
+-- blank or not) survives untouched, byte for byte.
 function M.strip_job(content, name)
   local kept = {}
-  for line in content:gmatch("[^\n]+") do
+  for line in (content .. "\n"):gmatch("(.-)\n") do
     local line_name = marker_parts(line)
     if line_name ~= name then
       kept[#kept + 1] = line
@@ -161,7 +176,7 @@ end
 function M.merge_edit(existing, edits)
   local merged = M.encode_job(existing)
   merged.name = existing.name
-  for _, field in ipairs(EDITABLE_FIELDS) do
+  for _, field in ipairs(M.EDITABLE_FIELDS) do
     if edits[field] ~= nil then
       merged[field] = edits[field]
     end
@@ -171,7 +186,7 @@ end
 
 function M.format_jobs(jobs, broken)
   if #jobs == 0 and #broken == 0 then
-    return "No maki cronjobs in the crontab. Use cronjob add to create one."
+    return "No maki cronjobs yet. Use cronjob add to create one."
   end
   local out = {}
   for _, entry in ipairs(jobs) do
@@ -180,6 +195,7 @@ function M.format_jobs(jobs, broken)
       entry.name .. ":",
       "  schedule: " .. (job.schedule or "?"),
       "  cwd:      " .. (job.cwd or "?"),
+      "  continue: " .. (job.continue and "last session in cwd" or "(off)"),
       "  model:    " .. (blank(job.model) and "(default)" or job.model),
       "  skill:    " .. (blank(job.skill) and "(none)" or job.skill),
       "  prompt:   " .. (blank(job.prompt) and "(none)" or job.prompt),
@@ -197,9 +213,14 @@ function M.default_log(state_dir, name)
 end
 
 -- Crontab lines have no trailing newline; write_crontab adds the final one.
+-- Content that already ends in a newline carries its own separator, so the
+-- append never invents a blank line.
 function M.append_line(content, line)
   if content == "" then
     return line
+  end
+  if content:sub(-1) == "\n" then
+    return content .. line
   end
   return content .. "\n" .. line
 end

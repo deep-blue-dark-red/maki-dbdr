@@ -53,11 +53,22 @@ fn os_getenv(_lua: &Lua, name: String) -> LuaResult<Option<String>> {
     Ok(std::env::var(&name).ok())
 }
 
+/// Return the process id of the running maki. Like `vim.uv.os_getpid`. Useful
+/// for naming per-process files that other programs watch.
+///
+/// @return (integer) Process id.
+/// @example
+/// local pid = maki.uv.os_getpid()
+#[lua_fn]
+fn os_getpid(_lua: &Lua) -> LuaResult<u32> {
+    Ok(std::process::id())
+}
+
 lua_table! {
     /// System and environment utilities, modelled after `vim.uv`.
     ///
-    /// Provides access to the working directory, home directory, and environment
-    /// variables. None of these functions throw.
+    /// Provides access to the working directory, home directory, process id,
+    /// and environment variables. None of these functions throw.
     ///
     /// Filesystem location queries (`cwd`, `os_homedir`, `exepath`) need
     /// `fs_read`, while `os_getenv` reads the process environment, where
@@ -67,6 +78,6 @@ lua_table! {
     /// local home = maki.uv.os_homedir()
     /// ```
     "maki.uv" => pub(crate) fn create_uv_table(perms: &PluginPermissions), DOCS [
-        cwd(perms), os_homedir(perms), exepath(perms), os_getenv(perms),
+        cwd(perms), os_homedir(perms), exepath(perms), os_getenv(perms), os_getpid,
     ]
 }

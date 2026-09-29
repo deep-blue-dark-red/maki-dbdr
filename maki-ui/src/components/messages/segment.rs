@@ -417,6 +417,10 @@ impl SegmentCache {
         self.segments.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
     pub fn push_spacer_if_needed(&mut self) {
         if !self.segments.is_empty() {
             self.segments.push(Segment::spacer());

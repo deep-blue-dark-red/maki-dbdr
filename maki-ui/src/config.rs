@@ -155,6 +155,7 @@ pub fn load_config() -> UserSettings {
                 "skills_dir" => settings.skills_dirs.push(val.to_string()),
                 "export_path" => settings.export_path = Some(val.to_string()),
                 "disabled_plugin" => settings.disabled_plugins.push(val.to_string()),
+                "enabled_plugin" => settings.enabled_plugins.push(val.to_string()),
                 "global_sessions" => settings.global_sessions = val.parse().unwrap_or(false),
                 "spinner_enabled" => settings.spinner_enabled = val.parse().unwrap_or(true),
                 "spinner_style" => settings.spinner_style = val.to_string(),
@@ -184,6 +185,21 @@ pub fn load_config() -> UserSettings {
     }
 
     settings
+}
+
+/// What the `/plugins` modal recorded in `user.config`: the flat file has no
+/// `[plugins]` table, so startup layers these on top of the resolved list.
+pub struct PluginOverrides {
+    pub enabled: Vec<String>,
+    pub disabled: Vec<String>,
+}
+
+pub fn plugin_overrides() -> PluginOverrides {
+    let settings = crate::components::settings_picker::UserSettings::load();
+    PluginOverrides {
+        enabled: settings.enabled_plugins.clone(),
+        disabled: settings.disabled_plugins.clone(),
+    }
 }
 
 /// Moves the first legacy config file onto `path`: fork-era `user.config` and
@@ -251,6 +267,9 @@ pub fn save_config(settings: &UserSettings) {
     }
     for plugin in &settings.disabled_plugins {
         lines.push(format!("disabled_plugin = {}", plugin));
+    }
+    for plugin in &settings.enabled_plugins {
+        lines.push(format!("enabled_plugin = {}", plugin));
     }
 
     lines.push("".to_string());
@@ -366,6 +385,22 @@ mod tests {
 
         // Reset so other tests sharing this thread's config file (test mode
         // pins one file per OS thread) don't see this value.
+        UserSettings::default().save();
+    }
+
+    #[test]
+    fn save_then_load_round_trips_plugin_toggles() {
+        let settings = UserSettings {
+            disabled_plugins: vec!["status".to_owned()],
+            enabled_plugins: vec!["cronjob".to_owned()],
+            ..Default::default()
+        };
+        settings.save();
+
+        let loaded = load_config();
+        assert_eq!(loaded.disabled_plugins, ["status".to_owned()]);
+        assert_eq!(loaded.enabled_plugins, ["cronjob".to_owned()]);
+
         UserSettings::default().save();
     }
 }

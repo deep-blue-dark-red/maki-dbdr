@@ -4090,6 +4090,9 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     )
     .unwrap();
     let rx = host.ui_action_rx();
+    // The test stands in for the UI loop, so claim the UI the way every loop
+    // generation does before it starts draining `UiAction`.
+    host.ui_attachment().attach();
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
 
@@ -6173,6 +6176,81 @@ fn view_image_tool_rejects_non_image() {
     )
     .unwrap_err();
     assert!(err.contains("not an image"), "got: {err}");
+}
+
+/// The ast-grep tools are a thin shell over the `ast-grep` CLI, so they only
+/// prove themselves by running one: a search reports matches with the bindings
+/// their metavariables took, and a rewrite changes the file it names.
+#[test]
+fn ast_grep_tools_search_then_rewrite() {
+    let installed = std::process::Command::new("ast-grep")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !installed {
+        eprintln!("skipping: ast-grep is not on PATH");
+        return;
+    }
+
+    let (reg, _host) = builtins_host();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("src.rs");
+    std::fs::write(&file, "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+    let path = dir.path().to_str().unwrap();
+
+    let found = exec_tool(
+        &reg,
+        "ast_grep",
+        json!({ "pattern": "println!($X)", "path": path }),
+    )
+    .unwrap();
+    assert!(found.contains("println!(\"hi\")"), "match text: {found}");
+    assert!(found.contains("$X=\"hi\""), "metavariable binding: {found}");
+
+    let replaced = exec_tool(
+        &reg,
+        "ast_grep_replace",
+        json!({
+            "pattern": "println!($X)",
+            "rewrite": "eprintln!($X)",
+            "path": path,
+        }),
+    )
+    .unwrap();
+    assert!(
+        replaced.contains("Applied 1 changes"),
+        "reports what it applied: {replaced}"
+    );
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        after.contains("eprintln!(\"hi\")"),
+        "file rewritten: {after}"
+    );
+
+    // The CLI exits 1 the way grep does when nothing matched; that is a plain
+    // "No matches" reply, not an error.
+    let empty = exec_tool(
+        &reg,
+        "ast_grep",
+        json!({ "pattern": "no_such_fn($X)", "path": path }),
+    )
+    .unwrap();
+    assert!(empty.contains("No matches"), "got: {empty}");
+
+    // A pattern ast-grep cannot parse matches nothing and only warns on
+    // stderr; answering as an error gets the pattern fixed instead of read
+    // as an honest empty search.
+    let unparseable = exec_tool(
+        &reg,
+        "ast_grep",
+        json!({ "pattern": ".unwrap_or($X)", "lang": "rust", "path": file }),
+    )
+    .unwrap_err();
+    assert!(
+        unparseable.contains("Pattern contains an ERROR node"),
+        "got: {unparseable}"
+    );
 }
 
 fn probe_output(data: &str) -> (image::ImageFormat, u32, u32) {

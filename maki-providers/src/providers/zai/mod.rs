@@ -114,6 +114,18 @@ fn create_with_auth(
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 
+/// Z.AI serves permanent account problems behind a 429: `1113` is an empty
+/// balance, `1309` an expired coding plan, `1311` a model the plan does not
+/// include. Waiting cures none of them, so `stream_message` rewrites them
+/// to 402, which the retry loop treats as final.
+const PERMANENT_CODES: [&str; 3] = ["1113", "1309", "1311"];
+
+fn permanent_account_error(status: u16, message: &str) -> bool {
+    (status == 429 || status >= 500)
+        && (PERMANENT_CODES.iter().any(|code| message.contains(code))
+            || message.contains("nsufficien"))
+}
+
 /// First GLM that takes thinking parameters at all. A floor instead of a prefix
 /// allowlist, so the next GLM gets thinking without us shipping a release.
 const THINKING_SINCE: (u32, u32) = (5, 2);
@@ -239,10 +251,8 @@ impl Provider for Zai {
             {
                 Err(AgentError::Api {
                     status, message, ..
-                }) if (status == 429 || status >= 500)
-                    && (message.contains("1113") || message.contains("nsufficien")) =>
-                {
-                    warn!(status, "insufficient funds, bailing out");
+                }) if permanent_account_error(status, &message) => {
+                    warn!(status, "permanent account error, bailing out");
                     Err(AgentError::api(402, message))
                 }
                 result => result,
@@ -353,6 +363,21 @@ mod tests {
         assert!(pricing.input > glm_5.input);
         assert!(pricing.output > glm_5.output);
         assert!(pricing.cache_read > glm_5.cache_read);
+    }
+
+    const PLAN_LACKS_MODEL_BODY: &str =
+        r#"{"error":{"code":"1311","message":"当前订阅套餐暂未开放GLM-5.3-Highspeed权限"}}"#;
+    const INSUFFICIENT_BODY: &str = r#"{"error":{"code":"1113","message":"账户已欠费"}}"#;
+    const RATE_LIMITED_BODY: &str = r#"{"error":{"code":"1302","message":"触发速率限制"}}"#;
+
+    /// A real throttle on the same status must keep its backoff.
+    #[test_case(429, PLAN_LACKS_MODEL_BODY, true ; "plan_lacks_model")]
+    #[test_case(429, INSUFFICIENT_BODY, true ; "insufficient_balance")]
+    #[test_case(500, INSUFFICIENT_BODY, true ; "insufficient_balance_on_5xx")]
+    #[test_case(429, RATE_LIMITED_BODY, false ; "rate_limit_stays_retryable")]
+    #[test_case(400, PLAN_LACKS_MODEL_BODY, false ; "other_status_stays")]
+    fn permanent_account_errors_are_detected(status: u16, body: &str, expected: bool) {
+        assert_eq!(permanent_account_error(status, body), expected);
     }
 
     #[test]

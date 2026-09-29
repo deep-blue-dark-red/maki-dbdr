@@ -47,6 +47,7 @@ Type `/` in the input box to open the command palette.
 | `/skills` | Manage global and project AI agent skills |
 | `/plugins` | Enable or disable built-in Lua plugins |
 | `/rewind` | Show rewind menu to delete turns |
+| `/aa_scores` | Refresh the cached Artificial Analysis intelligence scores |
 | `/memory` | View, edit, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |

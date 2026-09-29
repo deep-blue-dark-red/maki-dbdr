@@ -4652,8 +4652,9 @@ fn system_prompt_p_picker_enter_opens_selected_file() {
         instruction_files: vec![file.clone()],
         after_sources: vec![],
     })));
-    app.system_prompt_modal
-        .open(Arc::new(ArcSwap::from_pointee(SYSTEM_PROMPT_TEXT.to_string())));
+    app.system_prompt_modal.open(Arc::new(ArcSwap::from_pointee(
+        SYSTEM_PROMPT_TEXT.to_string(),
+    )));
     app.update(Msg::Key(key(KeyCode::Char('p'))));
     assert!(app.prompt_file_picker.is_open());
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -4663,11 +4664,15 @@ fn system_prompt_p_picker_enter_opens_selected_file() {
 #[test]
 fn system_prompt_p_without_instruction_files_flashes() {
     let mut app = test_app();
-    app.system_prompt_modal
-        .open(Arc::new(ArcSwap::from_pointee(SYSTEM_PROMPT_TEXT.to_string())));
+    app.system_prompt_modal.open(Arc::new(ArcSwap::from_pointee(
+        SYSTEM_PROMPT_TEXT.to_string(),
+    )));
     app.update(Msg::Key(key(KeyCode::Char('p'))));
     assert!(!app.prompt_file_picker.is_open());
-    assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_NO_INSTRUCTION_FILES);
+    assert_eq!(
+        app.status_bar.flash_text().unwrap(),
+        FLASH_NO_INSTRUCTION_FILES
+    );
 }
 
 /// The editor must never be handed a plugin directory: `hx <dir>` opens
@@ -4679,8 +4684,9 @@ fn system_prompt_a_picker_enter_opens_plugin_source_file() {
         instruction_files: vec![],
         after_sources: vec![AFTER_SOURCE_PLUGIN.to_string()],
     })));
-    app.system_prompt_modal
-        .open(Arc::new(ArcSwap::from_pointee(SYSTEM_PROMPT_TEXT.to_string())));
+    app.system_prompt_modal.open(Arc::new(ArcSwap::from_pointee(
+        SYSTEM_PROMPT_TEXT.to_string(),
+    )));
     app.update(Msg::Key(key(KeyCode::Char('a'))));
     assert!(app.prompt_file_picker.is_open());
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
@@ -7708,7 +7714,9 @@ fn waiting_duration_advances_across_event_less_renders() {
     assert!(text1.contains("5s"), "expected ~5s elapsed, got: {text1}");
     assert!(text1.contains("retrying in 29s (#2)"), "got: {text1}");
 
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // Advance the clock instead of sleeping: an event-less re-render must
+    // still read `turn_start.elapsed()` fresh rather than a cached snapshot.
+    app.turn_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(7));
     let text2 = status_bar_text(&mut app);
 
     assert_ne!(
@@ -7716,8 +7724,8 @@ fn waiting_duration_advances_across_event_less_renders() {
         "event-less render should still show advanced time"
     );
     assert!(
-        text2.contains("6s"),
-        "expected duration to advance to 6s, got: {text2}"
+        text2.contains("7s"),
+        "expected duration to advance to 7s, got: {text2}"
     );
 }
 
@@ -8044,10 +8052,41 @@ fn idle_large_context_confirms_before_sending() {
     assert_eq!(app.input_box.buffer.value(), "hi");
 
     // Yes: the held message starts the run.
-    app.cache_miss_prompt.open(queued_msg("go"), 0.5);
+    app.cache_miss_prompt.open(
+        queued_msg("go"),
+        CacheMissRisk {
+            tokens: 150_000,
+            cost: 0.5,
+            idle_minutes: maki_config::DEFAULT_CACHE_MISS_TIMEOUT_MINUTES,
+            token_threshold: 100_000,
+            cost_threshold: maki_config::DEFAULT_CACHE_MISS_COST_THRESHOLD,
+        },
+    );
     let actions = app.update(Msg::Key(key(KeyCode::Char('y'))));
     assert!(matches!(&actions[0], Action::SendMessage(_)));
     assert!(!app.cache_miss_prompt.is_open());
+}
+
+/// The red warning must not outlive the commit: the resend it describes is
+/// the turn now streaming, but `last_turn_at` only freshens at completion,
+/// so a naive re-derive on render would put it right back.
+#[test]
+fn starting_a_turn_keeps_the_warning_cleared() {
+    let mut app = idle_app();
+    app.update_cache_miss_warning();
+    assert!(app.cache_miss_warning.is_some());
+
+    assert!(matches!(
+        app.submit_prompt(queued_msg("hi")),
+        SubmitOutcome::Confirm
+    ));
+    let actions = app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert!(matches!(&actions[0], Action::SendMessage(_)));
+
+    // What render_status_bar does every frame.
+    app.update_cache_miss_warning();
+    assert!(app.cache_miss_warning.is_none());
+    assert!(app.cache_miss_risk().is_none());
 }
 
 #[test]

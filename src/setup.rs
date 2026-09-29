@@ -21,6 +21,7 @@ use tracing_subscriber::fmt::MakeWriter;
 const LOG_ENV: &str = "MAKI_LOG";
 const LOG_ENV_SHARED: &str = "RUST_LOG";
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::INFO;
+const WIRE_LOG_ENV: &str = "MAKI_LOG_API";
 
 const PROVIDER_PRIORITY: &[&str] = &[
     "anthropic",
@@ -285,9 +286,10 @@ fn sets_a_level(value: &str) -> bool {
 /// Logging is the first thing to set up and the last thing allowed to stop the
 /// program, but a failure here used to be swallowed whole, so an unwritable log
 /// dir looked exactly like an idle one: no logs, no reason, no clue.
-pub fn init_logging(storage_config: &maki_config::StorageConfig) {
+pub fn init_logging(config: &maki_config::Config) {
+    init_wire_logging(config);
     let writer =
-        match RotatingFileWriter::new(storage_config.max_log_bytes, storage_config.max_log_files) {
+        match RotatingFileWriter::new(config.storage.max_log_bytes, config.storage.max_log_files) {
             Ok(writer) => writer,
             Err(error) => {
                 eprintln!("maki: logging disabled, cannot open the log file: {error}");
@@ -299,6 +301,16 @@ pub fn init_logging(storage_config: &maki_config::StorageConfig) {
         .with_env_filter(log_filter())
         .with_writer(SharedWriter(Mutex::new(writer)))
         .init();
+}
+
+/// Wire logging is off unless `log_api` (or `MAKI_LOG_API`) turns it on. One
+/// relaxed atomic, so the per-request cost when off is a single load.
+fn init_wire_logging(config: &maki_config::Config) {
+    let env_on = std::env::var(WIRE_LOG_ENV).is_ok_and(|v| matches!(v.as_str(), "1" | "true"));
+    maki_config::LOG_API.store(
+        config.log_api || env_on,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[cfg(test)]

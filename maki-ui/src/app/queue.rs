@@ -139,8 +139,8 @@ impl App {
             } else {
                 SubmitOutcome::Rejected(NO_QUEUE_ERR)
             }
-        } else if let Some((_, cost)) = self.cache_miss_risk() {
-            self.cache_miss_prompt.open(msg, cost);
+        } else if let Some(risk) = self.cache_miss_risk() {
+            self.cache_miss_prompt.open(msg, risk);
             SubmitOutcome::Confirm
         } else {
             SubmitOutcome::Started(self.start_from_queue(&msg))

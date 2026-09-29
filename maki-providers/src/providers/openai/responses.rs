@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -227,12 +227,14 @@ async fn post_responses(
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
+    let url = format!("{base}{RESPONSES_PATH}");
 
+    super::super::log_api_request(&url, &json_body, body, "input");
     let request = auth
         .configure_request(
             Request::builder()
                 .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+                .uri(&url)
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
@@ -248,12 +250,7 @@ async fn post_responses(
     let status = response.status().as_u16();
 
     if status == 200 {
-        parse_sse(
-            BufReader::new(response.into_body()),
-            event_tx,
-            stream_timeout,
-        )
-        .await
+        super::super::sse_captured!(response, event_tx, stream_timeout, parse_sse)
     } else {
         Err(AgentError::from_response(response).await)
     }

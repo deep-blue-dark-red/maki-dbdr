@@ -2,14 +2,14 @@ use crate::components::Overlay;
 use crate::components::modal::Modal;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
-use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_lua::EventHandle;
+use maki_lua::{EventHandle, LoadedPlugins};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct PluginInfo {
@@ -28,6 +28,9 @@ pub struct PluginsModal {
     plugins: Vec<PluginInfo>,
     selected: usize,
     event_handle: Option<EventHandle>,
+    /// Generation of the snapshot `plugins` was built from, so a load that
+    /// finishes while the modal is up redraws without a keypress.
+    generation: u64,
 }
 
 impl PluginsModal {
@@ -37,6 +40,7 @@ impl PluginsModal {
             plugins: Vec::new(),
             selected: 0,
             event_handle: None,
+            generation: 0,
         }
     }
 
@@ -47,9 +51,27 @@ impl PluginsModal {
         self.refresh();
     }
 
+    fn loaded(&self) -> Arc<LoadedPlugins> {
+        self.event_handle
+            .as_ref()
+            .map(|handle| handle.loaded_plugins().load_full())
+            .unwrap_or_else(|| Arc::new(LoadedPlugins::default()))
+    }
+
     fn refresh(&mut self) {
-        self.plugins = build_plugin_list();
+        let loaded = self.loaded();
+        self.generation = loaded.generation();
+        self.plugins = build_plugin_list(&loaded);
         self.selected = self.selected.min(self.plugins.len().saturating_sub(1));
+    }
+
+    /// Rebuilds when the runtime published a new set while the modal is up:
+    /// a toggle answers asynchronously, so the row it changed has to catch up
+    /// without a keypress.
+    fn sync_generation(&mut self) {
+        if self.loaded().generation() != self.generation {
+            self.refresh();
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PluginsAction {
@@ -80,7 +102,6 @@ impl PluginsModal {
             KeyCode::Char(' ') | KeyCode::Enter => {
                 if let Some(plugin) = self.plugins.get(self.selected).cloned() {
                     self.toggle(&plugin.name, plugin.is_loaded);
-                    self.refresh();
                 }
                 PluginsAction::None
             }
@@ -105,9 +126,17 @@ impl PluginsModal {
                 if !settings.disabled_plugins.contains(&name.to_string()) {
                     settings.disabled_plugins.push(name.to_string());
                 }
+                settings.enabled_plugins.retain(|plugin| plugin != name);
             } else {
                 handle.load_builtin(name);
-                settings.disabled_plugins.retain(|p| p != name);
+                settings.disabled_plugins.retain(|plugin| plugin != name);
+                // A default builtin loads again on the next start without a
+                // note; an opt-in one needs the record to come back at all.
+                if !maki_config::DEFAULT_BUILTINS.contains(&name)
+                    && !settings.enabled_plugins.contains(&name.to_string())
+                {
+                    settings.enabled_plugins.push(name.to_string());
+                }
             }
         }
         settings.save();
@@ -117,6 +146,7 @@ impl PluginsModal {
         if !self.open {
             return Rect::default();
         }
+        self.sync_generation();
 
         let content_height = (self.plugins.len() as u16 + 4).clamp(12, 30);
         let modal = Modal {
@@ -160,8 +190,6 @@ impl PluginsModal {
             let label = format!("{} {}", check, plugin.name);
             let style = if i == self.selected {
                 t.item_selected.add_modifier(Modifier::BOLD)
-            } else if plugin.is_loaded {
-                t.item
             } else {
                 t.tool_dim
             };
@@ -260,26 +288,63 @@ pub(crate) fn plugin_source_path(name: &str) -> Option<PathBuf> {
     maki_lua::bundled_plugin_entry_file(name)
 }
 
-fn build_plugin_list() -> Vec<PluginInfo> {
-    let registry = ToolRegistry::global();
-    let snapshot = registry.iter();
-    let loaded_plugins: std::collections::HashSet<String> = snapshot
-        .iter()
-        .filter_map(|t| {
-            if let ToolSource::Lua { plugin } = &t.source {
-                Some(plugin.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
+fn build_plugin_list(loaded: &LoadedPlugins) -> Vec<PluginInfo> {
     maki_lua::bundled_plugins()
         .filter(|(name, _)| *name != "lib") // lib is internal, not user-facing
         .map(|(name, source_path)| PluginInfo {
             name: name.to_string(),
             source_path: PathBuf::from(source_path),
-            is_loaded: loaded_plugins.contains(name),
+            is_loaded: loaded.contains(name),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maki_lua::test_support::loaded_plugins_pair;
+
+    fn is_loaded(modal: &PluginsModal, name: &str) -> bool {
+        modal
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .unwrap_or_else(|| panic!("{name} should be listed"))
+            .is_loaded
+    }
+
+    /// The registry never sees a plugin without tools, so the list has to read
+    /// the runtime's own set to tell `/plugins` the truth.
+    #[test]
+    fn rows_follow_the_runtime_state_not_the_tool_registry() {
+        let (writer, reader) = loaded_plugins_pair();
+        writer.publish(&["sessions", "thinking", "status"]);
+        let mut modal = PluginsModal::new();
+        modal.open(&EventHandle::disconnected_for_test().with_loaded_reader(reader));
+
+        assert!(is_loaded(&modal, "sessions"), "command-only plugin is on");
+        assert!(is_loaded(&modal, "thinking"), "picker plugin is on");
+        assert!(is_loaded(&modal, "status"), "autocmd-only plugin is on");
+        assert!(!is_loaded(&modal, "cronjob"), "opt-in builtin is off");
+        assert!(
+            modal.plugins.iter().all(|plugin| plugin.name != "lib"),
+            "lib stays internal"
+        );
+    }
+
+    #[test]
+    fn a_publish_while_open_rebuilds_the_list() {
+        let (writer, reader) = loaded_plugins_pair();
+        writer.publish(&["sessions"]);
+        let mut modal = PluginsModal::new();
+        modal.open(&EventHandle::disconnected_for_test().with_loaded_reader(reader));
+        assert!(
+            !is_loaded(&modal, "cronjob"),
+            "off until the runtime says so"
+        );
+
+        writer.publish(&["sessions", "cronjob"]);
+        modal.sync_generation();
+        assert!(is_loaded(&modal, "cronjob"), "picked up without a keypress");
+    }
 }

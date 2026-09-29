@@ -5,6 +5,7 @@ use maki_lua::PluginHost;
 use test_case::test_case;
 
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
+#[test_case("ast_grep", include_str!("../../plugins/ast_grep/tests/spec.lua") ; "ast_grep_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
 #[test_case("lib", include_str!("../../plugins/lib/tests/spec.lua") ; "lib_spec")]
 #[test_case("list", include_str!("../../plugins/list/tests/spec.lua") ; "list_plugin_spec")]
@@ -12,11 +13,13 @@ use test_case::test_case;
 #[test_case("question", include_str!("../../plugins/question/tests/spec.lua") ; "question_plugin_spec")]
 #[test_case("read", include_str!("../../plugins/read/tests/spec.lua") ; "read_plugin_spec")]
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
+#[test_case("status", include_str!("../../plugins/status/tests/spec.lua") ; "status_plugin_spec")]
 #[test_case("task", include_str!("../../plugins/task/tests/spec.lua") ; "task_plugin_spec")]
 #[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
 #[test_case("cronjob", include_str!("../../plugins/cronjob/tests/spec.lua") ; "cronjob_plugin_spec")]
 #[test_case("create_plugin", include_str!("../../plugins/create_plugin/tests/spec.lua") ; "create_plugin_plugin_spec")]
+#[test_case("aa_scores", include_str!("../../plugins/aa_scores/tests/spec.lua") ; "aa_scores_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]
 #[test_case("write", include_str!("../../plugins/write/tests/spec.lua") ; "write_plugin_spec")]

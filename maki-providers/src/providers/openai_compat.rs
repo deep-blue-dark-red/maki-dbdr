@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::MakiId;
 use serde::{Deserialize, Deserializer};
@@ -171,14 +171,13 @@ impl OpenAiCompatProvider {
     fn build_request(
         &self,
         method: &str,
-        path: &str,
+        url: &str,
         auth: &ResolvedAuth,
     ) -> isahc::http::request::Builder {
-        let base = self.base_url(auth);
         auth.configure_request(
             Request::builder()
                 .method(method)
-                .uri(format!("{base}{path}"))
+                .uri(url)
                 .header("user-agent", super::user_agent()),
         )
     }
@@ -192,13 +191,15 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
+        let url = format!("{}{}", self.base_url(auth), "/chat/completions");
         let mut request = self
-            .build_request("POST", "/chat/completions", auth)
+            .build_request("POST", &url, auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
             request = request.header(key, value);
         }
 
+        super::log_api_request(&url, &json_body, body, "messages");
         let request = request.body(json_body)?;
 
         debug!(
@@ -211,12 +212,7 @@ impl OpenAiCompatProvider {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(
-                BufReader::new(response.into_body()),
-                event_tx,
-                self.stream_timeout,
-            )
-            .await
+            super::sse_captured!(response, event_tx, self.stream_timeout, parse_sse)
         } else {
             Err(AgentError::from_response(response).await)
         }

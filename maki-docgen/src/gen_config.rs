@@ -4,8 +4,8 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, OPTIONAL_BUILTINS,
+    ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
@@ -342,10 +342,23 @@ All fields are optional. Typos in field names cause an error right away.
     write_telemetry_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
+    let opt_in = if OPTIONAL_BUILTINS.is_empty() {
+        String::new()
+    } else {
+        let names = OPTIONAL_BUILTINS
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            " The opt-in plugins ({names}) load only when a config says \
+             `enabled = true`."
+        )
+    };
     writeln!(
         out,
         "The `plugins` table turns plugins on or off and passes options to \
-         them. All bundled plugins are on by default. Set \
+         them. All bundled plugins are on by default.{} Set \
          `enabled = false` to turn one off.\n\n\
          A plugin that is off never loads, so its tool name is free for one \
          of your own plugins to take. Permission rules are keyed by the tool \
@@ -361,7 +374,8 @@ All fields are optional. Typos in field names cause an error right away.
          The old `tools` table is gone. If your config still uses it, \
          Maki stops at startup and shows you the new form.\n\n\
          This table is for bundled plugins only. Your own plugins go in \
-         `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).\n"
+         `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).\n",
+        opt_in
     )
     .unwrap();
     writeln!(

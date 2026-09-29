@@ -364,7 +364,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
-    setup::init_logging(&stack.config.storage);
+    setup::init_logging(&stack.config);
     // A distinct, one-time-per-process marker: `maki.log` is one shared,
     // append-only file across every run, with no session id on most lines
     // (only headless mode's persistence errors carry one). Without this,

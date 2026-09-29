@@ -3,7 +3,7 @@ local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
 local Toast = require("maki.toast")
 
-local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines", "create_plugin" }
+local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines", "ast_grep_replace", "create_plugin" }
 local VIEW_PREF_FILE = "picker_view"
 
 -- A toast and not a flash, because this feedback has to stay readable while

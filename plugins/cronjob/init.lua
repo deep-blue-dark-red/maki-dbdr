@@ -2,9 +2,8 @@ local lib = require("cron_lib")
 
 local CRONTAB_WAIT_MS = 10000
 local ACTIONS = { "add", "edit", "delete", "list" }
-local EDITABLE_FIELDS = { "schedule", "cwd", "model", "skill", "prompt", "yolo", "allowed_tools", "log", "env_file" }
 
-local DESCRIPTION = [[Schedule recurring maki runs in the user's crontab. Each job fires
+local DESCRIPTION = [[Schedule recurring maki runs with the cronjob tool. Each job fires
 `maki -p` (headless build mode) in a fixed directory with a pinned model and
 optional skill, and appends output to a log file.
 
@@ -18,6 +17,10 @@ Notes:
 - schedule is a standard 5-field cron expression ("30 7 * * 1-5") or an alias (@daily, @hourly, ...).
 - model is a spec like "anthropic/claude-sonnet-4-6"; omit to use the default.
 - Jobs run unattended: yolo defaults to true (deny rules still apply), and gate with allowed_tools for a narrower allow list.
+- continue = true resumes the most recent session in cwd each fire instead of
+  starting fresh. Context (and token cost) then grows with every run, and the
+  session resumed is simply the last one in that directory, which may be one of
+  yours. Default off: every fire is a cold start.
 - cron provides almost no environment: pass env_file (sourced before the run) when the job needs API keys or PATH entries.
 - The job log defaults to <state dir>/cron/logs/<name>.log.
 
@@ -39,6 +42,12 @@ local function validate_input(input)
   if input.action == "list" then
     return nil
   end
+  for _, field in ipairs(lib.EDITABLE_FIELDS) do
+    local multiline_err = lib.validate_single_line(field, input[field])
+    if multiline_err then
+      return multiline_err
+    end
+  end
   local err = lib.validate_name(input.name)
   if err then
     return err
@@ -51,7 +60,7 @@ local function validate_input(input)
   end
   if input.action == "edit" then
     local touched = false
-    for _, field in ipairs(EDITABLE_FIELDS) do
+    for _, field in ipairs(lib.EDITABLE_FIELDS) do
       touched = touched or input[field] ~= nil
     end
     if not touched then
@@ -68,7 +77,7 @@ end
 local function jobwait_ok(id)
   local result = maki.fn.jobwait(id, CRONTAB_WAIT_MS)
   if type(result) ~= "table" then
-    return nil, "crontab timed out after " .. (CRONTAB_WAIT_MS / 1000) .. "s"
+    return nil, "cronjob install timed out after " .. (CRONTAB_WAIT_MS / 1000) .. "s"
   end
   if result.exit_code == 0 then
     return result
@@ -103,14 +112,15 @@ local function write_crontab(content)
     return nil, "mkdir " .. dir .. ": " .. mkdir_err
   end
   local tmp = dir .. "/crontab.tmp"
-  local _, write_err = maki.fs.write(tmp, content:gsub("\n*$", "\n"))
+  local normalized = content:gsub("\n*$", "\n")
+  local _, write_err = maki.fs.write(tmp, normalized)
   if write_err then
     return nil, "write " .. tmp .. ": " .. write_err
   end
   local result, err = jobwait_ok(maki.fn.jobstart("crontab " .. lib.quote(tmp)))
   maki.fs.rm(tmp)
   if not result then
-    return nil, "crontab install failed: " .. err
+    return nil, "cronjob install failed: " .. err
   end
   return true
 end
@@ -140,6 +150,7 @@ local function build_new_job(input)
     skill = input.skill,
     prompt = input.prompt,
     yolo = input.yolo ~= false,
+    continue = input.continue == true,
     allowed_tools = input.allowed_tools,
     log = input.log or lib.default_log(state, input.name),
     env_file = input.env_file,
@@ -177,7 +188,7 @@ local function handle_add(input)
   if not content then
     return fail(read_err)
   end
-  local jobs, broken = lib.parse_crontab(content)
+  local jobs = lib.parse_crontab(content)
   if find_job(jobs, input.name) then
     return fail(
       "cronjob '"
@@ -191,10 +202,14 @@ local function handle_add(input)
     return fail(build_err)
   end
   prepare_log_dir(job.log)
-  local installed, install_err = write_crontab(lib.append_line(lib.strip_job(content, input.name), line))
+  local stripped = lib.strip_job(content, input.name)
+  local installed, install_err = write_crontab(lib.append_line(stripped, line))
   if not installed then
-    return fail("failed to install crontab: " .. (install_err or "unknown error"))
+    return fail("failed to install cronjobs: " .. (install_err or "unknown error"))
   end
+  -- Counted after the strip: a corrupted line sharing this job's name went
+  -- with it, so it is no longer "left untouched".
+  local _, broken = lib.parse_crontab(stripped)
   return "scheduled cronjob '"
     .. input.name
     .. "':\n"
@@ -227,7 +242,7 @@ local function handle_edit(input)
   prepare_log_dir(merged.log)
   local installed, install_err = write_crontab(lib.append_line(lib.strip_job(content, input.name), line))
   if not installed then
-    return fail("failed to install crontab: " .. (install_err or "unknown error"))
+    return fail("failed to install cronjobs: " .. (install_err or "unknown error"))
   end
   return "updated cronjob '" .. input.name .. "':\n" .. line
 end
@@ -243,7 +258,7 @@ local function handle_delete(input)
   end
   local installed, install_err = write_crontab(lib.strip_job(content, input.name))
   if not installed then
-    return fail("failed to install crontab: " .. (install_err or "unknown error"))
+    return fail("failed to install cronjobs: " .. (install_err or "unknown error"))
   end
   return "deleted cronjob '" .. input.name .. "'"
 end
@@ -273,6 +288,10 @@ maki.api.register_tool({
       skill = { type = "string", description = "Skill name the run should load (add/edit)" },
       prompt = { type = "string", description = "Prompt text for the run (add requires prompt or skill)" },
       yolo = { type = "boolean", description = "Run with --yolo (default true)" },
+      continue = {
+        type = "boolean",
+        description = "Resume the most recent session in cwd each fire (default false; fresh start)",
+      },
       allowed_tools = { type = "string", description = "Comma-separated tool allow list (add/edit)" },
       log = { type = "string", description = "Log file path (add/edit; default <state dir>/cron/logs/<name>.log)" },
       env_file = {
@@ -286,7 +305,7 @@ maki.api.register_tool({
     if not input.action then
       return nil
     end
-    local scope = "crontab " .. input.action
+    local scope = "cronjob " .. input.action
     if input.name then
       scope = scope .. " " .. input.name
     end

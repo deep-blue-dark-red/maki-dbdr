@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 23 built-in tools in this reference (22 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -115,6 +115,37 @@ Search file contents using regex.
 | `limit` | integer | no |  | Max match groups to return |
 | `path` | string | no | cwd | Directory to search in |
 | `pattern` | string | yes |  | Regex pattern |
+
+### `ast_grep` {#ast_grep}
+
+Structural (AST) search over the codebase via the ast-grep CLI: matches whole syntax nodes, not text.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include` | string | no |  | File glob filter (e.g. *.rs) |
+| `kind` | string | no |  | ESQuery-style node kind to match instead of a pattern, e.g. `function_item`. |
+| `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
+| `limit` | integer | no |  | Max matches to return |
+| `path` | string | no | cwd | Directory or file to search in |
+| `pattern` | string | no |  | AST pattern: code with metavariables, e.g. `fn $F() { $BODY }`. One of `pattern`/`kind`. |
+| `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
+| `timeout` | integer | no | 60 | Timeout in seconds |
+
+### `ast_grep_replace` {#ast_grep_replace}
+
+Rewrite every match of an ast-grep pattern in place.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `include` | string | no |  | File glob filter (e.g. *.rs) |
+| `kind` | string | no |  | ESQuery-style node kind to match instead of a pattern, e.g. `function_item`. |
+| `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
+| `limit` | integer | no |  | Max matches to show |
+| `path` | string | yes |  | Absolute path to the file or directory to rewrite |
+| `pattern` | string | no |  | AST pattern: code with metavariables, e.g. `fn $F() { $BODY }`. One of `pattern`/`kind`. |
+| `rewrite` | string | yes |  | Replacement snippet, may use the pattern's metavariables |
+| `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
+| `timeout` | integer | no | 60 | Timeout in seconds |
 
 ### `index` {#index}
 
@@ -243,3 +274,17 @@ Search the web for real-time information using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## Additional tools
+
+### `async` {#async}
+
+Queue tool calls to run in the background and keep working. Returns job ids immediately.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `action` | string | no |  | One of "spawn" (default), "status", "wait", "cancel" |
+| `job_ids` | array | no | all non-terminal jobs | wait/cancel: job ids or names |
+| `jobs` | array | no |  | spawn: jobs to queue, each { tool, parameters, name?, timeout_seconds? } or flat { tool, ...params } |
+| `timeout_seconds` | integer | no | 300, 0 = single check | wait: seconds to block before returning current statuses |
+| `workers` | integer | no |  | spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option |

@@ -7,6 +7,7 @@ const PERMISSION_DENIED_SUBSTR: &str = "permission denied";
 const CWD: &str = "maki.uv.cwd()";
 const HOMEDIR: &str = "maki.uv.os_homedir()";
 const GETENV: &str = r#"maki.uv.os_getenv("HOME")"#;
+const GETPID: &str = "maki.uv.os_getpid()";
 
 fn setup() -> PluginHost {
     let reg = Arc::new(ToolRegistry::new());
@@ -54,4 +55,15 @@ fn a_neighbouring_permission_does_not_carry_over(held: Permission, call: &str, n
         .to_string();
     assert!(err.contains(PERMISSION_DENIED_SUBSTR), "got: {err}");
     assert!(err.contains(&format!("'{needed}'")), "got: {err}");
+}
+
+#[test]
+fn os_getpid_needs_no_permission() {
+    let chunk = format!(
+        r#"local value = {GETPID}
+        assert(type(value) == "number", "expected a number, got: " .. tostring(value))"#
+    );
+    setup()
+        .load_source_with_permissions("uv_perm", &chunk, PluginPermissions::denied())
+        .unwrap();
 }

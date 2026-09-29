@@ -374,10 +374,15 @@ impl Anthropic {
         self
     }
 
-    fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
+    fn url_for(&self, path: &str) -> String {
         let auth = self.auth.lock().unwrap();
         let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
-        let url = format!("{}{path}", origin(base));
+        format!("{}{path}", origin(base))
+    }
+
+    fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
+        let url = self.url_for(path);
+        let auth = self.auth.lock().unwrap();
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -408,6 +413,7 @@ impl Anthropic {
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
+        super::log_api_request(&self.url_for(MESSAGES_PATH), &json_body, body, "messages");
         let request = builder.body(json_body)?;
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
@@ -602,7 +608,24 @@ pub(crate) async fn parse_sse(
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(response.into_body());
+    let status = response.status().as_u16();
+    let content_type = super::content_type_header(&response);
+    let mut tee = super::TeeBody::new(response.into_body());
+    let result = read_sse(&mut tee, event_tx, stream_timeout).await;
+    super::log_api_response(
+        status,
+        content_type.as_deref(),
+        tee.into_capture().as_deref(),
+    );
+    result
+}
+
+async fn read_sse(
+    body: &mut super::TeeBody<isahc::AsyncBody>,
+    event_tx: &Sender<ProviderEvent>,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
+    let reader = BufReader::new(body);
     let mut lines = reader.lines();
     let mut parser = shared::EventParser::new();
     let mut current_event = String::new();

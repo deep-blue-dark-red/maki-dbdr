@@ -15,6 +15,7 @@ use maki_config::project::{self, TrustMode};
 use maki_config::{Config, load_env_files, load_permissions};
 use maki_lua::{DiscoveredPackage, InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
+use maki_ui::config::plugin_overrides;
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, MigrateAction, SessionAction, TrustAction};
 use crate::project_trust;
@@ -78,7 +79,7 @@ fn load_plugins(
         .map(|problem| format!("skipping package: {problem}"))
         .collect();
 
-    let config = build_config(
+    let mut config = build_config(
         host,
         &|host: &PluginHost| {
             let mut names = discovered_names.clone();
@@ -89,6 +90,15 @@ fn load_plugins(
         },
         &mut warnings,
     )?;
+
+    // `/plugins` records these in `user.config`, which has no `[plugins]`
+    // table of its own, so they land on top of what the config resolved.
+    let overrides = plugin_overrides();
+    warnings.extend(config.plugins.apply_overrides(
+        &overrides.enabled,
+        &overrides.disabled,
+        &discovered_names,
+    ));
 
     // Before any plugin can call `maki.net`, so the first request already sees
     // the hosts the user exempted from the private-address block.
@@ -175,7 +185,7 @@ fn cli_stack(
             Ok(config)
         },
     )?;
-    setup::init_logging(&config.storage);
+    setup::init_logging(&config);
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     report_warnings(warnings);

@@ -61,12 +61,13 @@ All fields are optional. Typos in field names cause an error right away.
 
 ### Top-level
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
-| `always_fast` | bool | `false` | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
-| `always_workflow` | bool | `false` | Start every session with workflow mode (task callable inside code_execution) |
-| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `always_yolo` | bool | `false` | - | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
+| `always_fast` | bool | `false` | - | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
+| `always_workflow` | bool | `false` | - | Start every session with workflow mode (task callable inside code_execution) |
+| `always_thinking` | bool \| string | `false` | - | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `log_api` | bool | `false` | `MAKI_LOG_API` | Append every LLM request and response to a compressed `.mlog` wire log under the sessions directory (view with `mlog`) |
 
 ### `ui`
 
@@ -231,7 +232,7 @@ Every field also has an environment variable, shown in the Env column, and the v
 
 ## Plugins
 
-The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. Set `enabled = false` to turn one off.
+The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. The opt-in plugins (`cronjob`) load only when a config says `enabled = true`. Set `enabled = false` to turn one off.
 
 A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
 
@@ -249,6 +250,22 @@ maki.setup({
     },
 })
 ```
+
+### `plugins.ast_grep`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_line_bytes` | integer | `500` | 80 | Truncate displayed match lines longer than this many bytes. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `search_result_limit` | integer | `100` | 10 | Max matches per search. A call's `limit` param overrides it. |
+| `timeout_secs` | integer | `60` | 5 | Kill the ast-grep run after this many seconds. A call's `timeout` param overrides it. |
+
+### `plugins.async`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `workers` | integer | `4` | 1 | Max concurrently running jobs. Spawn calls may lower this per call, never raise it. |
 
 ### `plugins.bash`
 

@@ -136,6 +136,9 @@ struct SessionLog {
     /// Interned fragment bytes -> id.
     blobs: HashMap<Vec<u8>, u32>,
     next_id: u32,
+    /// Handle kept open across records; `with_session_file` reopens it when
+    /// `None` (first use, or after an error dropped it).
+    file: Option<File>,
 }
 
 /// Keyed by the session's current log file. Renaming the file (on session
@@ -199,6 +202,32 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(b);
 }
 
+/// Run `f` with the session's open log file. The handle stays open across
+/// records so a record costs no open/stat syscalls. Any error resets the whole
+/// session state: the interning table must never disagree with what reached
+/// the disk, and a fresh table just re-DEFs shared blobs once.
+fn with_session_file<T>(
+    path: &Path,
+    f: impl FnOnce(&mut File, &mut SessionLog) -> std::io::Result<T>,
+) -> Option<T> {
+    let Ok(mut map) = SESSIONS.lock() else {
+        return None;
+    };
+    let sess = map.entry(path.to_path_buf()).or_default();
+    let mut held = sess.file.take().or_else(|| open_append(path).ok());
+    let file = held.as_mut()?;
+    match f(file, sess) {
+        Ok(v) => {
+            sess.file = held;
+            Some(v)
+        }
+        Err(_) => {
+            *sess = SessionLog::default();
+            None
+        }
+    }
+}
+
 /// Log a request. `fragments` (verified byte-exact by the caller) enables
 /// message interning; otherwise the request is diffed against the previous one.
 /// Errors are swallowed — logging must never break a request.
@@ -212,20 +241,16 @@ pub fn log_request(
     // Never trust fragments that don't reproduce the exact bytes: fall back to
     // a byte-exact diff/full record instead.
     let fragments = fragments.filter(|f| f.reconstruct() == raw_body);
-
-    let Ok(mut map) = SESSIONS.lock() else { return };
-    let sess = map.entry(path.to_path_buf()).or_default();
-    let Ok(mut file) = open_append(path) else {
-        return;
-    };
-
-    let ok = match fragments {
-        Some(frags) => write_refs(&mut file, ts_ms, uri, &frags, sess),
-        None => write_diff(&mut file, ts_ms, uri, raw_body, sess),
-    };
-    if ok.is_ok() {
-        sess.last_body = raw_body.to_vec();
-    }
+    let _ = with_session_file(path, |file, sess| {
+        let written = match fragments {
+            Some(frags) => write_refs(file, ts_ms, uri, &frags, sess),
+            None => write_diff(file, ts_ms, uri, raw_body, sess),
+        };
+        if written.is_ok() {
+            sess.last_body = raw_body.to_vec();
+        }
+        written
+    });
 }
 
 fn write_refs(
@@ -302,16 +327,15 @@ fn write_diff(
 }
 
 /// Log a response. Stores the exact received bytes.
+/// Log a response. Errors are swallowed — logging must never break a request.
 pub fn log_response(path: &Path, ts_ms: u64, status: u16, content_type: &str, raw_body: &[u8]) {
-    let Ok(_guard) = SESSIONS.lock() else { return };
-    let Ok(mut file) = open_append(path) else {
-        return;
-    };
-    let mut payload = Vec::with_capacity(6 + content_type.len() + raw_body.len());
-    payload.extend_from_slice(&status.to_le_bytes());
+    let mut payload = Vec::with_capacity(10 + raw_body.len());
+    put_u32(&mut payload, u32::from(status));
     put_bytes(&mut payload, content_type.as_bytes());
     payload.extend_from_slice(raw_body);
-    let _ = write_record(&mut file, ts_ms, RESPONSE, &payload);
+    let _ = with_session_file(path, |file, _| {
+        write_record(file, ts_ms, RESPONSE, &payload)
+    });
 }
 
 // ---------------------------------------------------------------------------

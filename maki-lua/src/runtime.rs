@@ -61,6 +61,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
+use crate::api::util::loaded::LoadedPluginsWriter;
 use crate::api::util::setup::ConfigStore;
 use crate::docs_render;
 use crate::error::PluginError;
@@ -2095,6 +2096,9 @@ struct LuaRuntime {
     pending: PendingTools,
     plugin_rules: Arc<PluginRuleStore>,
     plugins: PluginMap,
+    /// Published after every load and unload: the UI asks this instead of the
+    /// tool registry, which never sees a command-only plugin.
+    loaded_plugins: LoadedPluginsWriter,
     live_tasks: LiveTasks,
     warm_tools: WarmTools,
     registry: Arc<ToolRegistry>,
@@ -2116,6 +2120,7 @@ impl LuaRuntime {
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
+        loaded_plugins: LoadedPluginsWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
         layered: Arc<LayeredTools>,
@@ -2206,6 +2211,7 @@ impl LuaRuntime {
             pending,
             plugin_rules,
             plugins,
+            loaded_plugins,
             live_tasks: Rc::new(RefCell::new(HashMap::new())),
             warm_tools: Rc::new(RefCell::new(VecDeque::new())),
             registry,
@@ -2685,6 +2691,7 @@ impl LuaRuntime {
         if package {
             with_packs(&self.lua, |packs| packs.active.insert(name.to_string()));
         }
+        self.publish_loaded();
 
         Ok(())
     }
@@ -2696,6 +2703,13 @@ impl LuaRuntime {
         self.discard_pending(pending);
         with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
         self.clear_plugin(plugin);
+    }
+
+    /// Pushes the current plugin set to the snapshot readers. Call after any
+    /// change to `self.plugins`, never from a path that could deadlock on one.
+    fn publish_loaded(&self) {
+        let names = self.plugins.borrow().keys().cloned().collect();
+        self.loaded_plugins.publish(names);
     }
 
     fn clear_plugin(&mut self, plugin: &str) {
@@ -2731,6 +2745,7 @@ impl LuaRuntime {
         if let Some(mut store) = self.lua.app_data_mut::<WinStore>() {
             store.close_plugin(plugin);
         }
+        self.publish_loaded();
     }
 
     fn evict_warm(&self, tool_use_id: &str) {
@@ -3775,6 +3790,7 @@ pub(crate) struct LuaThread {
     pub command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
+    pub loaded_plugins: crate::api::util::loaded::LoadedPluginsReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_wake_rx: flume::Receiver<()>,
     pub ui_attachment: UiAttachment,
@@ -3806,6 +3822,7 @@ pub fn spawn(
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let (loaded_writer, loaded_reader) = LoadedPluginsWriter::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
     // The file index outlives any one plugin host, so the walks a host
@@ -3825,6 +3842,7 @@ pub fn spawn(
                 command_writer,
                 keymap_writer,
                 hint_writer,
+                loaded_writer,
                 jit,
                 plugin_rules,
                 layered_thread,
@@ -3994,17 +4012,6 @@ pub fn spawn(
                             live,
                             nested,
                         } => {
-                            if tracing::enabled!(tracing::Level::DEBUG) {
-                                let backlog = rt.codegen_backlog_len();
-                                if backlog > 0 {
-                                    tracing::debug!(
-                                        plugin = %plugin,
-                                        tool = %tool,
-                                        backlog,
-                                        "lua tool call started before native codegen drained"
-                                    );
-                                }
-                            }
                             let lua = rt.lua.clone();
                             let plugins = Rc::clone(&rt.plugins);
                             let live_tasks = Rc::clone(&rt.live_tasks);
@@ -4504,6 +4511,7 @@ pub fn spawn(
         command_reader,
         keymap_reader,
         hint_reader,
+        loaded_plugins: loaded_reader,
         ui_action_rx,
         ui_wake_rx,
         ui_attachment,

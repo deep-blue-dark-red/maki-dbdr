@@ -35,6 +35,8 @@ pub struct UserSettings {
     #[serde(default)]
     pub disabled_plugins: Vec<String>,
     #[serde(default)]
+    pub enabled_plugins: Vec<String>,
+    #[serde(default)]
     pub global_sessions: bool,
     #[serde(default)]
     pub override_expand_string: Option<String>,
@@ -74,6 +76,7 @@ impl Default for UserSettings {
             skills_dirs: Vec::new(),
             export_path: None,
             disabled_plugins: Vec::new(),
+            enabled_plugins: Vec::new(),
             global_sessions: false,
             override_expand_string: None,
             spinner_enabled: true,

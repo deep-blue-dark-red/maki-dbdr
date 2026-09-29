@@ -1350,7 +1350,17 @@ mod tests {
             if ready(&corpus) {
                 return corpus;
             }
-            assert!(Instant::now() < deadline, "{NEVER_SETTLED}");
+            if Instant::now() >= deadline {
+                let walk = lock(&index.shared.walk);
+                eprintln!(
+                    "DBG wait_for timeout: walks={} running={} ended={} complete={}",
+                    WALKS.load(Ordering::Relaxed),
+                    walk.running,
+                    walk.ended.is_some(),
+                    corpus.complete,
+                );
+                panic!("{NEVER_SETTLED}");
+            }
             thread::yield_now();
         }
     }

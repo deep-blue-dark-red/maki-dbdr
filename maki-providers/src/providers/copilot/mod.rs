@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use flume::Sender;
-use futures_lite::io::BufReader;
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
@@ -234,6 +233,13 @@ impl Copilot {
             body["tools"] = wire_tools;
         }
 
+        let json_body = serde_json::to_vec(&body)?;
+        super::log_api_request(
+            &format!("{}{CHAT_COMPLETIONS_PATH}", auth.endpoint),
+            &json_body,
+            &body,
+            "messages",
+        );
         let request = self
             .build_post(
                 &auth,
@@ -241,15 +247,15 @@ impl Copilot {
                 Some("conversation-agent"),
                 &body,
             )?
-            .body(serde_json::to_vec(&body)?)?;
+            .body(json_body)?;
         let response = self.client.send_async(request).await?;
         if response.status().is_success() {
-            openai_compat::parse_sse(
-                BufReader::new(response.into_body()),
+            super::sse_captured!(
+                response,
                 event_tx,
                 self.stream_timeout,
+                openai_compat::parse_sse
             )
-            .await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -310,10 +316,17 @@ impl Copilot {
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let body = messages_body(model, messages, system, tools, thinking);
+        let json_body = serde_json::to_vec(&body)?;
+        super::log_api_request(
+            &format!("{}{MESSAGES_PATH}", auth.endpoint),
+            &json_body,
+            &body,
+            "messages",
+        );
         let request = self
             .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
             .header("anthropic-version", "2023-06-01")
-            .body(serde_json::to_vec(&body)?)?;
+            .body(json_body)?;
         let response = self.client.send_async(request).await?;
         if response.status().is_success() {
             super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await

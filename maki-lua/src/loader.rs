@@ -16,6 +16,7 @@ use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
+use crate::api::util::loaded::LoadedPluginsReader;
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
@@ -102,12 +103,20 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/batch"),
     },
     BundledPlugin {
+        name: "async",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/async"),
+    },
+    BundledPlugin {
         name: "grep",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/grep"),
     },
     BundledPlugin {
         name: "glob",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/glob"),
+    },
+    BundledPlugin {
+        name: "ast_grep",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/ast_grep"),
     },
     BundledPlugin {
         name: "skill",
@@ -136,6 +145,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "create_plugin",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/create_plugin"),
+    },
+    BundledPlugin {
+        name: "aa_scores",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/aa_scores"),
     },
     BundledPlugin {
         name: "memory",
@@ -984,6 +997,7 @@ impl PluginHost {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
             layered: Arc::clone(&self.inner.layered),
+            loaded: self.inner.loaded_plugins.clone(),
         }
     }
 
@@ -997,6 +1011,11 @@ impl PluginHost {
 
     pub fn hint_reader(&self) -> HintReader {
         self.inner.hint_reader.clone()
+    }
+
+    /// Which plugins the Lua thread currently holds, read without a roundtrip.
+    pub fn loaded_plugins(&self) -> LoadedPluginsReader {
+        self.inner.loaded_plugins.clone()
     }
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
@@ -1025,6 +1044,9 @@ pub struct EventHandle {
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
+    /// Published by the Lua thread and read without touching it: which
+    /// plugins are loaded right now.
+    loaded: LoadedPluginsReader,
 }
 
 impl EventHandle {
@@ -1033,12 +1055,26 @@ impl EventHandle {
             tx,
             prio_tx: flume::unbounded().0,
             layered: Arc::default(),
+            loaded: LoadedPluginsReader::empty(),
         }
     }
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
         Self::from_tx(flume::unbounded().0)
+    }
+
+    /// The same handle, reading {loaded} instead, for a test that drives the
+    /// UI without a Lua host.
+    #[doc(hidden)]
+    pub fn with_loaded_reader(mut self, loaded: LoadedPluginsReader) -> Self {
+        self.loaded = loaded;
+        self
+    }
+
+    /// Which plugins the Lua thread holds, read without a roundtrip.
+    pub fn loaded_plugins(&self) -> &LoadedPluginsReader {
+        &self.loaded
     }
 
     /// Whether a plugin is layering either of the plan form slots. False on a
@@ -1115,6 +1151,7 @@ impl EventHandle {
             tx: shared.clone(),
             prio_tx: shared,
             layered: Arc::default(),
+            loaded: LoadedPluginsReader::empty(),
         }
     }
 
@@ -1461,6 +1498,48 @@ mod tests {
         );
     }
 
+    /// `/plugins` reads this snapshot: the tool registry never lists a plugin
+    /// that only registers commands or autocmds, so "is it loaded" has to come
+    /// from the runtime itself.
+    #[test]
+    fn loaded_plugins_snapshot_tracks_loads_and_unloads() {
+        fn snapshot_names(reader: &LoadedPluginsReader) -> Vec<String> {
+            reader
+                .load_full()
+                .names()
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        }
+
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+        let reader = host.loaded_plugins();
+
+        let snap = reader.load_full();
+        assert!(snap.contains("sessions"), "command-only plugin is loaded");
+        assert!(snap.contains("status"), "autocmd-only plugin is loaded");
+        assert!(
+            !snap.contains("cronjob"),
+            "opt-in builtin stays off until configured"
+        );
+
+        host.unload("status").unwrap();
+        let snap = reader.load_full();
+        assert!(!snap.contains("status"), "unload reaches the snapshot");
+        assert!(snap.contains("sessions"), "sibling plugin still loaded");
+        assert!(snap.generation() > 1, "generation advanced");
+
+        let before = snapshot_names(&reader);
+        assert!(host.load_source("boom", "error('nope')").is_err());
+        assert_eq!(
+            snapshot_names(&reader),
+            before,
+            "a failed load adds nothing to the set"
+        );
+    }
+
     #[test]
     fn run_command_sends_correct_request() {
         let (prio_tx, prio_rx) = flume::bounded(8);
@@ -1469,6 +1548,7 @@ mod tests {
             tx,
             prio_tx,
             layered: Arc::default(),
+            loaded: LoadedPluginsReader::empty(),
         };
         handle.run_command(
             Arc::from("myplugin"),

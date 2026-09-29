@@ -520,9 +520,7 @@ impl<T: PickerItem> ListPicker<T> {
                 s,
                 Modal {
                     title: &self.title,
-                    width_percent: self
-                        .width_pct
-                        .unwrap_or_else(|| width_percent(area.width)),
+                    width_percent: self.width_pct.unwrap_or_else(|| width_percent(area.width)),
                     max_height_percent: MAX_HEIGHT_PERCENT,
                 },
                 self.max_visible,

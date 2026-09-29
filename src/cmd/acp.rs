@@ -56,7 +56,7 @@ pub fn run(
     let (model, warning) = setup::resolve_model(model_arg.as_deref(), &config.provider, &storage)?;
     super::report_warnings(Vec::from_iter(warning));
 
-    setup::init_logging(&config.storage);
+    setup::init_logging(&config);
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();

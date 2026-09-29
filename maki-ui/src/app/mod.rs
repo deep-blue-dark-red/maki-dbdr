@@ -32,7 +32,9 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::btw_modal::BtwModal;
 
-use crate::components::cache_miss_prompt::{Answer as CacheMissAnswer, CacheMissPrompt};
+use crate::components::cache_miss_prompt::{
+    Answer as CacheMissAnswer, CacheMissPrompt, Risk as CacheMissRisk,
+};
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
@@ -56,7 +58,9 @@ use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, U
 use crate::components::skills_modal::{SkillsAction, SkillsModal};
 use crate::components::stats_modal::{StatsModal, TurnSnapshot};
 use crate::components::status_bar::StatusBar;
-use crate::components::system_prompt_modal::{SystemPromptAction, SystemPromptModal, WIDTH_PERCENT};
+use crate::components::system_prompt_modal::{
+    SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
+};
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -941,12 +945,18 @@ impl App {
         Dirty::YES
     }
 
-    /// (tokens, cost) of resending the whole context uncached, when a cache
-    /// miss is likely: after the idle timeout or a model/thinking change, and
-    /// either cost or size over the configured thresholds.
-    pub(super) fn cache_miss_risk(&self) -> Option<(u32, f64)> {
+    /// The numbers a confirmed resend would cost and the limits that raised
+    /// the question, when a cache miss is likely: after the idle timeout or a
+    /// model/thinking change, and either cost or size over the thresholds.
+    pub(super) fn cache_miss_risk(&self) -> Option<CacheMissRisk> {
         let cfg = &self.ui_config;
         if !cfg.warn_cache_miss || self.state.context_size == 0 {
+            return None;
+        }
+        // A turn in flight is the resend this warning is about; without this
+        // guard it re-renders over the whole streaming turn, since
+        // `last_turn_at` only refreshes at turn completion.
+        if self.status == Status::Streaming {
             return None;
         }
         let timeout = Duration::from_secs(cfg.cache_miss_warning_timeout_minutes * 60);
@@ -958,6 +968,7 @@ impl App {
         let threshold = cfg
             .cache_miss_warn_context
             .unwrap_or(cfg.cache_miss_warning_token_threshold);
+        let cost_threshold = cfg.cache_miss_warn_dollar_cost_threshold;
         let cost = self
             .state
             .model
@@ -969,16 +980,24 @@ impl App {
                 self.state.fast,
             )
             .unwrap_or(0.0);
-        (cost > cfg.cache_miss_warn_dollar_cost_threshold || self.state.context_size > threshold)
-            .then_some((self.state.context_size, cost))
+        (cost > cost_threshold || self.state.context_size > threshold).then_some(CacheMissRisk {
+            tokens: self.state.context_size,
+            cost,
+            idle_minutes: cfg.cache_miss_warning_timeout_minutes,
+            token_threshold: threshold,
+            cost_threshold,
+        })
     }
 
     /// Sets `cache_miss_warning` when a cache miss is likely, so the status
     /// bar shows the extra cost before the user commits to a turn.
     pub(super) fn update_cache_miss_warning(&mut self) {
-        self.cache_miss_warning = self
-            .cache_miss_risk()
-            .map(|(_, cost)| format!("{CACHE_MISS_WARNING} ${cost:.2} · Enter to resend, or /new"));
+        self.cache_miss_warning = self.cache_miss_risk().map(|r| {
+            format!(
+                "{CACHE_MISS_WARNING} ${:.2} · Enter to resend, or /new",
+                r.cost
+            )
+        });
     }
 
     fn active_chat(&mut self) -> &mut Chat {

@@ -317,10 +317,16 @@ impl AgentError {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
+        let content_type = crate::providers::content_type_header(&response);
         let message = response
             .text()
             .await
             .unwrap_or_else(|_| "unable to read error body".into());
+        crate::providers::log_api_response(
+            status,
+            content_type.as_deref(),
+            Some(message.as_bytes()),
+        );
         Self::Api {
             status,
             message,

@@ -620,6 +620,7 @@ impl Provider for Bedrock {
                     builder = builder.header(k.as_str(), v.as_str());
                 }
             }
+            super::super::log_api_request(&url, &json_body, &body, "messages");
             let request = builder.body(json_body)?;
 
             debug!(model = %model_id, region = %auth.region, "sending Bedrock request");
@@ -633,47 +634,60 @@ impl Provider for Bedrock {
             let mut parser = shared::EventParser::new();
             let mut frame_buf = Vec::new();
             let mut read_buf = [0u8; 8192];
+            let mut capture = super::super::wire_log_enabled().then(Vec::new);
 
-            loop {
-                let body = response.body_mut();
-                let n = {
-                    use futures_lite::io::AsyncReadExt;
-                    body.read(&mut read_buf).await?
-                };
-                if n == 0 {
-                    break;
-                }
-                frame_buf.extend_from_slice(&read_buf[..n]);
-
-                while frame_buf.len() >= MIN_EVENTSTREAM_FRAME {
-                    let peek_total = u32::from_be_bytes([
-                        frame_buf[0],
-                        frame_buf[1],
-                        frame_buf[2],
-                        frame_buf[3],
-                    ]) as usize;
-                    if frame_buf.len() < peek_total {
+            let result = async {
+                loop {
+                    let body = response.body_mut();
+                    let n = {
+                        use futures_lite::io::AsyncReadExt;
+                        body.read(&mut read_buf).await?
+                    };
+                    if n == 0 {
                         break;
                     }
+                    frame_buf.extend_from_slice(&read_buf[..n]);
 
-                    let (consumed, payload) = decode_eventstream_frame(&frame_buf)?;
-                    frame_buf.drain(..consumed);
+                    while frame_buf.len() >= MIN_EVENTSTREAM_FRAME {
+                        let peek_total = u32::from_be_bytes([
+                            frame_buf[0],
+                            frame_buf[1],
+                            frame_buf[2],
+                            frame_buf[3],
+                        ]) as usize;
+                        if frame_buf.len() < peek_total {
+                            break;
+                        }
 
-                    let Some(payload) = payload else {
-                        continue;
-                    };
+                        let (consumed, payload) = decode_eventstream_frame(&frame_buf)?;
+                        frame_buf.drain(..consumed);
 
-                    let (event_type, json) = decode_event_payload(&payload)?;
+                        let Some(payload) = payload else {
+                            continue;
+                        };
 
-                    if let ControlFlow::Break(()) =
-                        parser.process(&event_type, &json, event_tx).await?
-                    {
-                        return Ok(parser.finish());
+                        let (event_type, json) = decode_event_payload(&payload)?;
+
+                        if let Some(capture) = &mut capture {
+                            capture.extend_from_slice(json.as_bytes());
+                            capture.extend_from_slice(b"\n\n");
+                        }
+
+                        if let ControlFlow::Break(()) =
+                            parser.process(&event_type, &json, event_tx).await?
+                        {
+                            return Ok(parser.finish());
+                        }
                     }
                 }
-            }
 
-            Ok(parser.finish())
+                Ok(parser.finish())
+            }
+            .await;
+
+            let content_type = super::super::content_type_header(&response);
+            super::super::log_api_response(status, content_type.as_deref(), capture.as_deref());
+            result
         })
     }
 

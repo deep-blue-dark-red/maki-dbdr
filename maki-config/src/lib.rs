@@ -96,6 +96,9 @@ pub const MIN_RETRY_BASE_MS: u64 = 1;
 pub const MIN_RETRY_MAX_MS: u64 = 1;
 
 pub const DEFAULT_BUILTINS: &[&str] = &[
+    "aa_scores",
+    "ast_grep",
+    "async",
     "bash",
     "batch",
     "code_execution",
@@ -110,6 +113,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "read",
     "sessions",
     "skill",
+    "status",
     "task",
     "thinking",
     "todo_write",
@@ -121,13 +125,22 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
 
 pub const OPT_IN_TOOLS: &[&str] = &["edit_lines"];
 
+/// A tool a default builtin ships under a name other than its plugin's.
+/// `DEFAULT_BUILTINS` names plugins, and those are also the `plugins.<name>`
+/// config tables, so a second tool joins the builtin tool names here instead:
+/// `--allowed-tools`, `agent.allowed_tools` and the MCP server name check all
+/// read this list too.
+pub const EXTRA_BUILTIN_TOOLS: &[&str] = &["ast_grep_replace"];
+
 /// Bundled plugins that ship switched off. They load only when a config says
 /// `plugins.<name> = { enabled = true }`, and the config layer accepts their
 /// tables either way so that line is not itself an error.
 ///
 /// A plugin belongs here while what it does is worth shipping but what it
-/// costs at scale is not yet known.
-pub const OPTIONAL_BUILTINS: &[&str] = &[];
+/// costs at scale is not yet known. `cronjob` is here because it rewrites the
+/// user's crontab and starts unattended runs, which installing maki should not
+/// do on its own.
+pub const OPTIONAL_BUILTINS: &[&str] = &["cronjob"];
 
 /// These used to be their own `tools.<name>` tables and are now edit plugin
 /// options; the config layer uses this list to reject the old form with a
@@ -140,6 +153,7 @@ pub const FILE_WRITE_TOOLS: &[&str] = &[
     "multiedit",
     "edit_lines",
     "insert_lines",
+    "ast_grep_replace",
     "create_plugin",
 ];
 
@@ -301,6 +315,14 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         env: None,
         description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
+    ConfigField {
+        name: "log_api",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        env: Some("MAKI_LOG_API"),
+        description: "Append every LLM request and response to a compressed `.mlog` wire log under the sessions directory (view with `mlog`)",
+    },
 ];
 
 /// The variable names [`expand_env`] would look up in `value`.
@@ -435,6 +457,7 @@ pub struct RawConfig {
     pub always_fast: Option<bool>,
     pub always_workflow: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
+    pub log_api: Option<bool>,
     #[serde(default)]
     pub ui: UiFileConfig,
     pub agent: AgentFileConfig,
@@ -457,7 +480,8 @@ impl RawConfig {
             always_yolo,
             always_fast,
             always_workflow,
-            always_thinking
+            always_thinking,
+            log_api
         );
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
@@ -488,6 +512,7 @@ impl RawConfig {
         // leaves the list to the CLI.
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
+            log_api: self.log_api.unwrap_or(false),
             session_defaults: SessionDefaults {
                 fast: self.always_fast.unwrap_or(false),
                 workflow: self.always_workflow.unwrap_or(false),
@@ -1153,6 +1178,7 @@ pub struct PermissionsConfig {
 #[derive(Clone)]
 pub struct Config {
     pub always_yolo: bool,
+    pub log_api: bool,
     pub session_defaults: SessionDefaults,
     pub ui: UiConfig,
     pub agent: AgentConfig,
@@ -1394,7 +1420,7 @@ impl ToolOutputLines {
             "code_execution" => self.code_execution,
             "task" => self.task,
             "index" => self.index,
-            "grep" | "glob" => self.grep,
+            "grep" | "glob" | "ast_grep" => self.grep,
             "read" => self.read,
             "memory" => self.write,
             name if FILE_WRITE_TOOLS.contains(&name) => self.write,
@@ -2043,6 +2069,42 @@ impl PluginsConfig {
             packages: enabled_packages,
             opts,
         }
+    }
+
+    /// Layers the `/plugins` choices `user.config` recorded over what the
+    /// config resolved: disabled names leave the load list, enabled ones join
+    /// it. A name nothing knows about is a stale record rather than a typo in
+    /// a `plugins.<name>` table, so it warns instead of failing startup.
+    pub fn apply_overrides(
+        &mut self,
+        enabled: &[String],
+        disabled: &[String],
+        known_packages: &[String],
+    ) -> Vec<String> {
+        for name in disabled {
+            self.names.retain(|plugin| plugin != name);
+            self.packages.retain(|plugin| plugin != name);
+        }
+
+        let mut warnings = Vec::new();
+        for name in enabled {
+            if DEFAULT_BUILTINS.contains(&name.as_str())
+                || OPTIONAL_BUILTINS.contains(&name.as_str())
+            {
+                if !self.names.iter().any(|plugin| plugin == name) {
+                    self.names.push(name.clone());
+                }
+            } else if known_packages.contains(name) {
+                // `load_builtins` refuses anything outside the bundled list,
+                // so a package belongs to `packages` alone.
+                if !self.packages.iter().any(|plugin| plugin == name) {
+                    self.packages.push(name.clone());
+                }
+            } else {
+                warnings.push(format!("user.config: no plugin named {name}, ignoring it"));
+            }
+        }
+        warnings
     }
 }
 
@@ -3269,6 +3331,7 @@ mod tests {
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
             always_yolo: false,
+            log_api: false,
             session_defaults: SessionDefaults::default(),
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
@@ -4186,6 +4249,48 @@ mod tests {
             serde_json::json!(180),
             "opts survive for when the plugin is re-enabled"
         );
+    }
+
+    /// What `/plugins` wrote to `user.config` lands on top of the config:
+    /// a default builtin can be dropped, an opt-in one added.
+    #[test]
+    fn user_config_overrides_rewire_the_load_list() {
+        let mut config = PluginsConfig::from_plugins(HashMap::new());
+        let warnings = config.apply_overrides(&["cronjob".to_owned()], &["status".to_owned()], &[]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+        assert!(
+            !config.names.iter().any(|name| name == "status"),
+            "disabled builtin left the load list"
+        );
+        assert!(
+            config.names.iter().any(|name| name == "cronjob"),
+            "opt-in builtin joined the load list"
+        );
+    }
+
+    /// A package never lands in `names`: `load_builtins` refuses anything it
+    /// does not ship, and a package has its own load path.
+    #[test]
+    fn user_config_overrides_keep_packages_out_of_the_builtin_list() {
+        let mut config = PluginsConfig::from_plugins(HashMap::new());
+        let warnings = config.apply_overrides(&["pack".to_owned()], &[], &["pack".to_owned()]);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+        assert!(config.packages.iter().any(|name| name == "pack"));
+        assert!(
+            !config.names.iter().any(|name| name == "pack"),
+            "packages stay out of the bundled list"
+        );
+    }
+
+    /// A stale record is not a `plugins.<name>` typo, so it warns and is
+    /// skipped rather than stopping startup.
+    #[test]
+    fn user_config_overrides_warn_on_unknown_names() {
+        let mut config = PluginsConfig::from_plugins(HashMap::new());
+        let warnings = config.apply_overrides(&["ghost".to_owned()], &[], &[]);
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("ghost"), "got: {}", warnings[0]);
+        assert!(!config.names.iter().any(|name| name == "ghost"));
     }
 
     #[test]

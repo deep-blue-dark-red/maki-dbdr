@@ -227,6 +227,7 @@ impl Google {
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
+        super::log_api_request(&url, &json_body, &body, "contents");
         let request = self
             .build_request("POST", &url)
             .header("content-type", "application/json")
@@ -587,7 +588,24 @@ async fn parse_sse(
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(response.into_body());
+    let status = response.status().as_u16();
+    let content_type = super::content_type_header(&response);
+    let mut tee = super::TeeBody::new(response.into_body());
+    let result = read_sse(&mut tee, event_tx, stream_timeout).await;
+    super::log_api_response(
+        status,
+        content_type.as_deref(),
+        tee.into_capture().as_deref(),
+    );
+    result
+}
+
+async fn read_sse(
+    body: &mut super::TeeBody<isahc::AsyncBody>,
+    event_tx: &Sender<ProviderEvent>,
+    stream_timeout: Duration,
+) -> Result<StreamResponse, AgentError> {
+    let reader = BufReader::new(body);
     let mut lines = reader.lines();
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();

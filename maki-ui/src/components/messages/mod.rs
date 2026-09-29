@@ -577,6 +577,10 @@ impl MessagesPanel {
         self.streaming_text.visible_len()
     }
 
+    pub fn streaming_thinking_len(&self) -> usize {
+        self.streaming_thinking.visible_len()
+    }
+
     pub fn prompt_progress(&self) -> Option<PromptProgress> {
         self.prompt_progress
     }
@@ -1380,7 +1384,7 @@ impl MessagesPanel {
             return false;
         }
         let cached_height = self.cache.total_height(width);
-        let spacer = if self.cache.len() > 0 { 1 } else { 0 };
+        let spacer = if self.cache.is_empty() { 0 } else { 1 };
         let thinking_start = cached_height + spacer;
         let height = self.build_streaming_collapsed_lines().len() as u32;
         if doc_row >= thinking_start && doc_row < thinking_start + height {

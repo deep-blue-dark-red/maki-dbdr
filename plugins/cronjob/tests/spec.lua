@@ -45,6 +45,26 @@ case("validate_name", function()
   assert(lib.validate_name(string.rep("a", lib.MAX_NAME_LEN + 1)), "overlong rejected")
 end)
 
+case("validate_single_line", function()
+  eq(lib.validate_single_line("prompt", "triage open issues"), nil, "single line ok")
+  assert(lib.validate_single_line("prompt", "two\nlines"), "newline rejected")
+  assert(lib.validate_single_line("cwd", "carriage\rreturn"), "carriage return rejected")
+  eq(lib.validate_single_line("prompt", nil), nil, "nil ignored")
+  eq(lib.validate_single_line("yolo", true), nil, "non-string ignored")
+
+  -- The corruption this guards against: a newline splits the job's single
+  -- crontab line. The JSON half still parses, so the job stays visible and
+  -- removable, but the command half becomes an orphan line cron chokes on.
+  local split = lib.build_line(
+    { name = "split", schedule = "@daily", cwd = "/tmp", prompt = "a\nb", yolo = true },
+    "/maki"
+  )
+  local jobs, broken = lib.parse_crontab(split)
+  eq(#jobs, 1, "json half still parses")
+  eq(#broken, 0, "no fragment carries the marker twice")
+  assert(split:find("\n", 1, true), "physical line is split")
+end)
+
 case("validate_schedule", function()
   eq(lib.validate_schedule("30 7 * * 1-5"), nil, "five fields")
   eq(lib.validate_schedule("*/15 0,12 1-15 JAN-MON *"), nil, "rich fields")
@@ -84,8 +104,15 @@ case("build_command", function()
   local minimal = lib.build_command({ name = "j", schedule = "@daily", cwd = "/tmp", yolo = false }, "/maki")
   contains(minimal, "'/maki' -p ", "no yolo when false")
   assert(not minimal:find("--yolo", 1, true), "no yolo flag")
+  assert(not minimal:find("-c ", 1, true), "no continue flag")
   assert(not minimal:find("-m ", 1, true), "no model flag")
   assert(not minimal:find(">>", 1, true), "no log redirect")
+
+  local resuming = lib.build_command(
+    { name = "j", schedule = "@daily", cwd = "/tmp", prompt = "go", continue = true },
+    "/maki"
+  )
+  contains(resuming, "'/maki' -p -c ", "continue flag emitted")
 
   local with_env = lib.build_command({
     name = "j",
@@ -112,6 +139,15 @@ case("build_line roundtrip", function()
     eq(jobs[1].job[field], value, "roundtrip field " .. field)
   end
   eq(jobs[1].name, "nightly-triage", "name")
+end)
+
+case("continue roundtrip", function()
+  local line = lib.build_line(
+    { name = "resumed", schedule = "@hourly", cwd = "/tmp", continue = true },
+    "/maki"
+  )
+  local jobs = lib.parse_crontab(line)
+  eq(jobs[1].job.continue, true, "continue survives the json payload")
 end)
 
 case("parse_crontab", function()
@@ -147,6 +183,16 @@ case("strip_job", function()
   eq(lib.strip_job("", "nightly-triage"), "", "empty content")
 end)
 
+case("strip_job preserves blank lines", function()
+  local target = lib.build_line(JOB, "/maki")
+  local content = table.concat({ "MAILTO=me@example.com", "", "# keep me", "", target }, "\n")
+
+  eq(lib.strip_job(content, "absent"), content, "no match is byte-identical")
+  local stripped = lib.strip_job(content, "nightly-triage")
+  contains(stripped, "MAILTO=me@example.com\n\n# keep me", "blank lines and comments survive")
+  assert(not stripped:find("maki-cron:nightly-triage ", 1, true), "target line dropped")
+end)
+
 case("merge_edit", function()
   local edits = { schedule = "@daily", model = "" }
   local merged = lib.merge_edit(JOB, edits)
@@ -156,6 +202,8 @@ case("merge_edit", function()
   eq(merged.cwd, "/home/user/repo", "untouched field kept")
   eq(merged.prompt, "triage open issues", "untouched prompt kept")
   eq(merged.yolo, true, "untouched yolo kept")
+  eq(lib.merge_edit(JOB, {}).continue, nil, "absent continue stays absent")
+  eq(lib.merge_edit(JOB, { continue = true }).continue, true, "continue editable")
 end)
 
 case("format_jobs", function()
@@ -172,6 +220,12 @@ case("format_jobs", function()
   }, {})
   contains(with_defaults, "(default)", "missing model annotated")
   contains(with_defaults, "(none)", "missing skill annotated")
+  contains(with_defaults, "continue: (off)", "continue shown when off")
+
+  local resumed_out = lib.format_jobs({
+    { name = "resumed", job = { schedule = "@daily", cwd = "/tmp", continue = true } },
+  }, {})
+  contains(resumed_out, "continue: last session in cwd", "continue shown when on")
 
   local with_broken = lib.format_jobs({}, { "0 0 * * 1 leftover # maki-cron:corrupted {" })
   contains(with_broken, "unparseable", "broken lines surfaced")
@@ -184,6 +238,7 @@ end)
 case("append_line", function()
   eq(lib.append_line("", "new line"), "new line", "empty content")
   eq(lib.append_line("existing", "new line"), "existing\nnew line", "separator added")
+  eq(lib.append_line("existing\n", "new line"), "existing\nnew line", "no blank line invented")
 end)
 
 if #failures > 0 then

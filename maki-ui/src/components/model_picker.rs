@@ -11,6 +11,7 @@ use maki_providers::ModelTier;
 use maki_providers::dynamic;
 use maki_providers::model_registry;
 use maki_providers::spec::ProviderRegistry;
+use maki_storage::aa_scores::AaScores;
 
 use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -20,7 +21,7 @@ use crate::theme;
 const TITLE: &str = " Models ";
 const RECENT_SECTION: &str = "Recent";
 const FREE_LABEL: &str = "Free";
-const FREE_PREFIX: &str = "Free · ";
+const SCORE_LABEL: &str = "AA";
 const PRICE_SEPARATOR: &str = " · ";
 const PRICE_WIDTH: usize = 7;
 
@@ -164,16 +165,21 @@ impl ModelPicker {
 
     fn load_entries(&self) -> Vec<ModelEntry> {
         let specs = self.available.get();
+        let scores = AaScores::load();
         let mut entries = Vec::new();
         for spec in &self.recents {
-            if let Some(mut e) = parse_model_entry(spec) {
+            if let Some(mut e) = parse_model_entry(spec, &scores) {
                 e.suffix = Some(std::mem::take(&mut e.provider_display));
                 e.provider_display = RECENT_SECTION.to_string();
                 entries.push(e);
             }
         }
         let mut full: Vec<ModelEntry> = specs
-            .map(|s| s.iter().filter_map(|s| parse_model_entry(s)).collect())
+            .map(|s| {
+                s.iter()
+                    .filter_map(|s| parse_model_entry(s, &scores))
+                    .collect()
+            })
             .unwrap_or_default();
         full.sort_by(|a, b| {
             a.provider_display
@@ -283,7 +289,7 @@ fn format_pricing(model: &Model) -> Option<String> {
     })
 }
 
-fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
+fn parse_model_entry(spec: &str, scores: &AaScores) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
     // `opencode-go` has a spec row but was never a `ProviderKind`, so the
@@ -304,29 +310,27 @@ fn parse_model_entry(spec: &str) -> Option<ModelEntry> {
         };
 
     let override_tiers = model_registry::override_tiers(spec);
-    let (tier, free, price) = match Model::from_spec(spec) {
-        Ok(m) => (m.tier.to_string(), m.is_free(), format_pricing(&m)),
-        Err(_) => (String::new(), false, None),
+    let (free, price) = match Model::from_spec(spec) {
+        Ok(m) => (m.is_free(), format_pricing(&m)),
+        Err(_) => (false, None),
     };
-    let tier = if override_tiers.is_empty() {
-        tier
-    } else {
-        override_tiers
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("/")
-    };
-    let tier = match (free, tier.is_empty()) {
-        (true, true) => FREE_LABEL.to_string(),
-        (true, false) => format!("{FREE_PREFIX}{tier}"),
-        (false, _) => tier,
-    };
-    let detail = match price {
-        Some(price) if !tier.is_empty() => format!("{tier}{PRICE_SEPARATOR}{price}"),
-        Some(price) => price,
-        None => tier,
-    };
+    // The row quotes the intelligence index first, then what it costs to run:
+    // a tier word told the reader nothing the tier shortcuts did not already.
+    let mut parts = Vec::new();
+    if let Some((score, estimated)) = scores.score(model_id) {
+        parts.push(if estimated {
+            format!("{SCORE_LABEL} ~{score:.1}")
+        } else {
+            format!("{SCORE_LABEL} {score:.1}")
+        });
+    }
+    if free {
+        parts.push(FREE_LABEL.to_string());
+    }
+    if let Some(price) = price {
+        parts.push(price);
+    }
+    let detail = parts.join(PRICE_SEPARATOR);
     let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
@@ -431,7 +435,8 @@ mod tests {
 
     #[test]
     fn parse_model_entry_valid() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry =
+            parse_model_entry("anthropic/claude-sonnet-4-20250514", &AaScores::default()).unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
         assert!(!entry.detail.is_empty());
@@ -439,16 +444,17 @@ mod tests {
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
-        let entry = parse_model_entry("anthropic/claude-sonnet-4-20250514").unwrap();
+        let entry =
+            parse_model_entry("anthropic/claude-sonnet-4-20250514", &AaScores::default()).unwrap();
         assert!(
-            !entry.detail.starts_with(FREE_PREFIX),
+            !entry.detail.contains(FREE_LABEL),
             "paid anthropic model must not be marked free"
         );
     }
 
     #[test]
     fn parse_model_entry_no_slash() {
-        assert!(parse_model_entry("no-slash").is_none());
+        assert!(parse_model_entry("no-slash", &AaScores::default()).is_none());
     }
 
     #[test_case(key(KeyCode::Char('!')),           ModelTier::Strong     ; "legacy_bang_strong")]
@@ -678,9 +684,9 @@ mod tests {
     #[test]
     fn zero_priced_discovery_marks_entry_free() {
         register_openrouter_models();
-        let entry = parse_model_entry(OX_SPEC).unwrap();
+        let entry = parse_model_entry(OX_SPEC, &AaScores::default()).unwrap();
         assert!(
-            entry.detail.starts_with(FREE_PREFIX),
+            entry.free && entry.detail == FREE_LABEL,
             "zero-priced discovery must mark the entry free"
         );
     }
@@ -688,17 +694,35 @@ mod tests {
     #[test]
     fn paid_discovery_not_marked_free() {
         register_openrouter_models();
-        let entry = parse_model_entry(&format!("openrouter/{PAID_ID}")).unwrap();
+        let entry =
+            parse_model_entry(&format!("openrouter/{PAID_ID}"), &AaScores::default()).unwrap();
         assert!(
-            !entry.detail.starts_with(FREE_PREFIX),
+            !entry.detail.contains(FREE_LABEL),
             "paid discovery must not mark the entry free"
         );
-        assert!(
-            entry
-                .detail
-                .ends_with(&format!("{PRICE_SEPARATOR}{PAID_PRICE_LABEL}")),
+        assert_eq!(
+            entry.detail, PAID_PRICE_LABEL,
             "paid discovery must show its price"
         );
+    }
+
+    #[test]
+    fn detail_quotes_the_cached_score_instead_of_a_tier() {
+        register_openrouter_models();
+        let scores = AaScores::parse(
+            r#"{"scores":{"paid-model":44.8,"stealth/ox-alpha":27.9},"estimated":["stealth/ox-alpha"]}"#,
+        )
+        .unwrap();
+
+        let paid = parse_model_entry(&format!("openrouter/{PAID_ID}"), &scores).unwrap();
+        assert_eq!(
+            paid.detail,
+            format!("AA 44.8{PRICE_SEPARATOR}{PAID_PRICE_LABEL}"),
+            "a measured score leads the row, tier words are gone"
+        );
+
+        let free = parse_model_entry(OX_SPEC, &scores).unwrap();
+        assert_eq!(free.detail, "AA ~27.9 · Free");
     }
 
     #[test]

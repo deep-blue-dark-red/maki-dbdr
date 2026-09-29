@@ -24,6 +24,7 @@ pub use api::util::command::{
     SessionRequest, Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand,
     WinEvent, WinView,
 };
+pub use api::util::loaded::{LoadedPlugins, LoadedPluginsReader};
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
 pub use key::{Key, RESERVED_KEYS, is_reserved};
@@ -56,6 +57,7 @@ pub mod test_support {
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
+    use crate::api::util::loaded::{LoadedPluginsReader, LoadedPluginsWriter};
     use crate::key::Key;
     use maki_storage::id::MakiId;
 
@@ -86,6 +88,21 @@ pub mod test_support {
     pub fn hint_writer_pair() -> (HintWriterHandle, HintReader) {
         let (writer, reader) = HintWriter::new();
         (HintWriterHandle(writer), reader)
+    }
+
+    /// Stands in for the Lua thread publishing its loaded-plugin set.
+    pub struct LoadedPluginsWriterHandle(LoadedPluginsWriter);
+
+    impl LoadedPluginsWriterHandle {
+        pub fn publish(&self, names: &[&str]) {
+            let names = names.iter().map(|name| Arc::from(*name)).collect();
+            self.0.publish(names);
+        }
+    }
+
+    pub fn loaded_plugins_pair() -> (LoadedPluginsWriterHandle, LoadedPluginsReader) {
+        let (writer, reader) = LoadedPluginsWriter::new();
+        (LoadedPluginsWriterHandle(writer), reader)
     }
 
     /// Observes which requests an [`crate::EventHandle`] sends, without a

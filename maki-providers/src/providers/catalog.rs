@@ -779,20 +779,23 @@ impl CatalogTransport {
                 );
                 body["model"] = serde_json::json!(model.id);
                 body["stream"] = serde_json::json!(true);
+                let url = format!(
+                    "{}{}",
+                    auth.base_url.as_deref().unwrap_or(""),
+                    MESSAGES_PATH
+                );
+                let json_body = serde_json::to_vec(&body)?;
+                super::log_api_request(&url, &json_body, &body, "messages");
                 let request = auth
                     .configure_request(
                         Request::builder()
                             .method("POST")
-                            .uri(format!(
-                                "{}{}",
-                                auth.base_url.as_deref().unwrap_or(""),
-                                MESSAGES_PATH
-                            ))
+                            .uri(url)
                             .header("user-agent", user_agent())
                             .header("content-type", "application/json")
                             .header("anthropic-version", ANTHROPIC_VERSION),
                     )
-                    .body(serde_json::to_vec(&body)?)?;
+                    .body(json_body)?;
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
                 let response = self.client.send_async(request).await?;
                 if response.status().as_u16() == 200 {

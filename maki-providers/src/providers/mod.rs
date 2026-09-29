@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_lite::StreamExt;
-use futures_lite::io::AsyncBufRead;
+use futures_lite::io::{AsyncBufRead, AsyncRead};
 use isahc::config::{Configurable, VersionNegotiation};
 use isahc::http::request::Builder;
 use serde::Deserialize;
@@ -17,6 +19,7 @@ use maki_storage::sessions::wire_logs_dir;
 
 use crate::AgentError;
 use crate::retry::RetryPolicy;
+use crate::wire_log;
 
 pub(crate) mod anthropic;
 pub(crate) mod aperture;
@@ -385,18 +388,136 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
 
 /// Path of the current session's `.mlog` file, keyed by the stable session id so
 /// every turn of a session lands in one file. `None` if logs are unavailable or
-/// there's no active session.
-#[allow(dead_code)]
-fn log_file_path() -> Option<std::path::PathBuf> {
+/// there's no active session. The wire-logs dir is resolved once per process.
+fn api_log_path() -> Option<std::path::PathBuf> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
     let session_id = maki_config::CURRENT_SESSION_ID
         .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
+        .ok()?
+        .clone()
         .filter(|id| !id.is_empty())?;
-    let dir = wire_logs_dir(&StateDir::resolve().ok()?);
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = DIR
+        .get_or_init(|| {
+            let dir = wire_logs_dir(&StateDir::resolve().ok()?);
+            std::fs::create_dir_all(&dir).ok()?;
+            Some(dir)
+        })
+        .as_ref()?;
     Some(dir.join(format!("{session_id}.mlog")))
 }
+
+/// One relaxed load is the whole disabled-path cost of wire logging.
+pub(crate) fn wire_log_enabled() -> bool {
+    maki_config::LOG_API.load(Ordering::Relaxed)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Log one request body. `array_key` names the messages array ("messages",
+/// "contents", ...) so unchanged messages intern to references in the log.
+/// Callers pass the bytes they are about to send — no re-serialization.
+pub(crate) fn log_api_request(uri: &str, json_body: &[u8], body: &Value, array_key: &str) {
+    if !wire_log_enabled() {
+        return;
+    }
+    let Some(path) = api_log_path() else {
+        return;
+    };
+    let fragments = wire_log::fragment_body(body, array_key);
+    wire_log::log_request(&path, now_ms(), uri, json_body, fragments);
+}
+
+/// Log a completed response body (streamed bytes captured by [`TeeBody`], an
+/// error body, or a non-streamed payload). `None` body (logging off) costs
+/// one relaxed load.
+pub(crate) fn log_api_response(status: u16, content_type: Option<&str>, body: Option<&[u8]>) {
+    let Some(body) = body else {
+        return;
+    };
+    let Some(path) = api_log_path() else {
+        return;
+    };
+    wire_log::log_response(
+        &path,
+        now_ms(),
+        status,
+        content_type.unwrap_or_default(),
+        body,
+    );
+}
+
+pub(crate) fn content_type_header(response: &isahc::Response<isahc::AsyncBody>) -> Option<String> {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Response-body tee: forwards every byte to the parser and, when wire logging
+/// is on, into a capture buffer. Off, the read path costs one `Option` check
+/// per chunk.
+pub(crate) struct TeeBody<R> {
+    inner: R,
+    capture: Option<Vec<u8>>,
+}
+
+impl<R> TeeBody<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            capture: wire_log_enabled().then(Vec::new),
+            inner,
+        }
+    }
+
+    pub(crate) fn into_capture(self) -> Option<Vec<u8>> {
+        self.capture
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for TeeBody<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let n = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, buf))?;
+        if n > 0
+            && let Some(capture) = &mut this.capture
+        {
+            capture.extend_from_slice(&buf[..n]);
+        }
+        Poll::Ready(Ok(n))
+    }
+}
+
+/// Tee a streamed response through [`TeeBody`], parse it, and log the raw bytes
+/// once the stream ends either way. `parse` is the provider's SSE parser.
+macro_rules! sse_captured {
+    ($response:expr, $event_tx:expr, $timeout:expr, $parse:expr) => {{
+        let status = $response.status().as_u16();
+        let content_type = crate::providers::content_type_header(&$response);
+        let mut tee = crate::providers::TeeBody::new($response.into_body());
+        let result = $parse(
+            futures_lite::io::BufReader::new(&mut tee),
+            $event_tx,
+            $timeout,
+        )
+        .await;
+        crate::providers::log_api_response(
+            status,
+            content_type.as_deref(),
+            tee.into_capture().as_deref(),
+        );
+        result
+    }};
+}
+pub(crate) use sse_captured;
 
 /// The `YYYYMMDD-<title>.mlog` symlink path for a session title, dated to the
 /// session's creation (`created_at`, Unix epoch seconds) so the link is stable

@@ -2228,8 +2228,9 @@ mod tests {
     /// The walk runs on its own thread, so anything comparing two answers has
     /// to wait for it or they are answers about different corpora. Asking
     /// again on the way is how a walk the host had no room to start yet still
-    /// gets started, which is what a reader does too.
-    fn walked(root: &Path) {
+    /// gets started, which is what a reader does too. The index comes back
+    /// held, so the registry cannot evict the walked corpus mid-test.
+    fn walked(root: &Path) -> maki_agent::FileIndex {
         let index = maki_agent::file_index(root);
         let deadline = Instant::now() + WALK_TIMEOUT;
         while !index.corpus().complete {
@@ -2237,6 +2238,7 @@ mod tests {
             index.refresh();
             std::thread::yield_now();
         }
+        index
     }
 
     fn files_opts(lua: &Lua, root: &Path, query: &str, limit: usize, highlights: bool) -> Table {
@@ -2501,6 +2503,10 @@ mod tests {
     fn a_plugin_picker_can_draw_a_ranked_highlighted_row_from_one_call() {
         let base = cwd_root().unwrap();
         let tmp = small_tree(&base);
+        // One call ranks and highlights in the same pass; the corpus it ranks
+        // is waited out (and held against eviction) so the call is not a
+        // race against the walk.
+        let _walked = walked(tmp.path());
         let lua = Lua::new();
         let tbl = fs_table(&lua);
         let opts = files_opts(&lua, tmp.path(), HIGHLIGHT_QUERY, SMALL_LIMIT, true);

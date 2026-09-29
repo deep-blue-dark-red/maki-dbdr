@@ -59,6 +59,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `multiedit` | `<cwd>/**` | Outside cwd requires permission |
 | `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
+| `ast_grep_replace` | `<cwd>/**` | Same |
 | `task` | `*` | Subagent spawning always allowed |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
@@ -69,7 +70,7 @@ These tools have no builtin allow rule, so they prompt (or follow your `default`
 - `websearch` - Web search queries
 - `webfetch` - URL fetching
 
-Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `index`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
+Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `ast_grep`, `index`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 
@@ -187,7 +188,7 @@ trust like the TUI, reading "Reject for this session" in an untrusted folder.
 When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
 
 - **bash**: `cargo test --all` becomes `cargo *`
-- **write / edit / multiedit / edit_lines / insert_lines**: `/path/to/file.rs` becomes `/path/to/**`
+- **write / edit / multiedit / edit_lines / insert_lines / ast_grep_replace**: `/path/to/file.rs` becomes `/path/to/**`
 - **MCP tools**: always `*` (per-tool, so allowing `deepwiki.search` will not cover `deepwiki.fetch`)
 - **webfetch / websearch** (and anything else gated): the exact URL or query string is stored as-is
 

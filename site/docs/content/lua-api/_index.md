@@ -6399,8 +6399,8 @@ buf:blit(fb32, 160, 100, { format = "bgra", char = "█" })
 
 System and environment utilities, modelled after `vim.uv`.
 
-Provides access to the working directory, home directory, and environment
-variables. None of these functions throw.
+Provides access to the working directory, home directory, process id,
+and environment variables. None of these functions throw.
 
 Filesystem location queries (`cwd`, `os_homedir`, `exepath`) need
 `fs_read`, while `os_getenv` reads the process environment, where
@@ -6497,6 +6497,25 @@ Requires the `env` [plugin permission](#plugin-permissions).
 
 ```lua
 local editor = maki.uv.os_getenv("EDITOR") or "vi"
+```
+
+---
+
+### `maki.uv.os_getpid()` {#maki-uv-os_getpid}
+
+```lua
+maki.uv.os_getpid()
+```
+
+Return the process id of the running maki. Like `vim.uv.os_getpid`. Useful
+for naming per-process files that other programs watch.
+
+**Returns:** (`integer`) Process id.
+
+**Example:**
+
+```lua
+local pid = maki.uv.os_getpid()
 ```
 
 

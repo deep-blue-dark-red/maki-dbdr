@@ -680,10 +680,13 @@ pub enum UiAction {
 pub struct UiAttachment(Arc<AtomicBool>);
 
 impl Default for UiAttachment {
-    /// Attached until a loop says otherwise. Headless runs and ACP hand Lua no
-    /// sender at all, so the bit only ever describes a loop that went away.
+    /// Detached until a loop claims the UI. The TUI attaches at the start of
+    /// every loop generation and detaches when it stops draining `UiAction`,
+    /// so the bit describes a loop that has not started yet or went away.
+    /// Headless runs and ACP never run a loop, so their roundtrips fail fast
+    /// instead of parking on a reply nobody is left to send.
     fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
+        Self(Arc::new(AtomicBool::new(false)))
     }
 }
 

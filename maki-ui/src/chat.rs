@@ -489,10 +489,13 @@ impl Chat {
         self.messages_panel.in_progress_count()
     }
 
-    /// Live output-token estimate from the streaming assistant text (chars / 4),
-    /// matching the convention used elsewhere for token approximation.
+    /// Live output-token estimate from the streaming assistant text and
+    /// thinking (chars / 4), matching the convention used elsewhere for token
+    /// approximation. Thinking bills as output, so it counts here too.
     pub fn streaming_output_tokens(&self) -> u32 {
-        (self.messages_panel.streaming_text_len() / 4) as u32
+        let chars =
+            self.messages_panel.streaming_text_len() + self.messages_panel.streaming_thinking_len();
+        (chars / 4) as u32
     }
 
     /// Live input-token count while the prompt is being uploaded, if known.
@@ -973,13 +976,19 @@ mod tests {
     const TASK_ID: &str = "toolu_01";
     const USER_TEXT: &str = "one more thing";
     const REPLY_TEXT: &str = "on it";
+    const STREAM_TEXT: &str = "four";
+    const STREAM_THINKING: &str = "reasoning";
 
     fn chat() -> Chat {
+        chat_with(UiConfig::default())
+    }
+
+    fn chat_with(config: UiConfig) -> Chat {
         Chat::new(
             MakiId::generate(),
             None,
             MAIN_NAME.into(),
-            UiConfig::default(),
+            config,
             maki_lua::EventHandle::disconnected_for_test(),
         )
     }
@@ -1004,6 +1013,25 @@ mod tests {
 
     fn text_delta(chat: &mut Chat, text: &str) {
         chat.handle_event(AgentEvent::TextDelta { text: text.into() }, None);
+    }
+
+    fn thinking_delta(chat: &mut Chat, text: &str) {
+        chat.handle_event(AgentEvent::ThinkingDelta { text: text.into() }, None);
+    }
+
+    #[test]
+    fn thinking_deltas_count_toward_output_tokens() {
+        // Speed 0 reveals pushed chars immediately, so the estimate is exact
+        let mut chat = chat_with(UiConfig {
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        });
+
+        text_delta(&mut chat, STREAM_TEXT);
+        thinking_delta(&mut chat, STREAM_THINKING);
+
+        let expected = (STREAM_TEXT.len() as u32 + STREAM_THINKING.len() as u32) / 4;
+        assert_eq!(chat.streaming_output_tokens(), expected);
     }
 
     #[test]
