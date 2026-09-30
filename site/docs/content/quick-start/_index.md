@@ -99,7 +99,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 ## Default model (optional)
 
 ```lua
--- ~/.config/maki/init.lua
+-- ~/.maki/init.lua
 maki.setup({
     provider = {
         default_model = "anthropic/claude-sonnet-4-6",

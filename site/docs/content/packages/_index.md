@@ -19,7 +19,7 @@ The entry files share one environment and use the API the
 ## Install from Git
 
 Declare managed packages in the global `init.lua`, normally
-`~/.config/maki/init.lua`:
+`~/.maki/init.lua`:
 
 ```lua
 maki.pack.add({

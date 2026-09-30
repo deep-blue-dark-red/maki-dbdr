@@ -645,7 +645,10 @@ fn determine_folder_tag(path: &std::path::Path, cwd: &std::path::Path) -> Folder
         current = parent;
     }
 
-    if path_str.contains(".config/maki/skills") {
+    if maki_storage::paths::config_search_dirs()
+        .iter()
+        .any(|dir| path.starts_with(dir.join("skills")))
+    {
         FolderTag::Maki
     } else if path.starts_with(&project_root) {
         FolderTag::Local

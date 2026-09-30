@@ -169,7 +169,7 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ### `create_plugin` {#create_plugin}
 
-Scaffold a bundled plugin for development of maki itself. Creates <path>/<name>/init.lua and plugin.toml, then reports required wiring steps; rebuilding maki is required to load it. For personal plugins, create ~/.config/maki/lua/<name>.lua and use /reload instead.
+Scaffold a bundled plugin for development of maki itself. Creates <path>/<name>/init.lua and plugin.toml, then reports required wiring steps; rebuilding maki is required to load it. For personal plugins, create ~/.maki/lua/<name>.lua and use /reload instead.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

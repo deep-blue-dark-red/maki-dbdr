@@ -9,7 +9,7 @@ const ALIASING: &str = r#"## Aliasing commands
 Prefer a different name for a command? `maki.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
 
 ```lua
--- ~/.config/maki/init.lua
+-- ~/.maki/init.lua
 local aliases = {
     { name = "/clear", target = "/new", description = "Alias for /new" },
     { name = "/resume", target = "/sessions", description = "Alias for /sessions" },
@@ -137,7 +137,7 @@ pub fn generate() -> String {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "1. User config: `~/.config/maki/commands/` (and legacy `~/.maki/commands/` if present)"
+        "1. User config: `~/.maki/commands/` (legacy `~/.config/maki/commands/` is still read)"
     )
     .unwrap();
     writeln!(out, "2. User third-party: `~/.claude/commands/`").unwrap();

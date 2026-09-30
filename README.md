@@ -12,11 +12,11 @@ This fork adds:
 * Plugin Manager for selecting Lua plugins on new sessions, with each plugin's registered tools (descriptions and input schemas) shown in the detail pane, including the `create-plugin` plugin.
 * Render performance optimizations and main-loop polling optimizations. 
 * Dynamic Claude Code-inspired status-bar rendering without spinners, optional Pi-inspired session rates (`PP/s`, `TG/s`, and `CR/s`), thinking-mode display formatting, optimized Markdown performance, and throttled rendering in unfocused mode.
-* `/export` Export to Markdown, session-name and date file to folder or clipboard. Same with json. `@` fuzzy file selection, configurable keybindings (ghostty style, `~/.config/maki/user.config`), and Claude-style two-tone pending-task indicators.
+* `/export` Export to Markdown, session-name and date file to folder or clipboard. Same with json. `@` fuzzy file selection, configurable keybindings (ghostty style, `~/.maki/user.config`), and Claude-style two-tone pending-task indicators.
 * Bundled plugins: `cronjob` (recurring headless runs as self-describing crontab lines, managed from chat), `status` (real-time NDJSON status feed per process for external dashboards), `ast_grep` (structural search & replace tool), `async` (background tool-call queue - spawn jobs, poll with `status`, block with `wait`, cancel), and `aa_scores` (daily-cached Artificial Analysis intelligence scores in the `/model` picker).
 * Full session wire-format logging with compressed, deduplicated HTTP data, viewed through the `mlog` binary. 
 * `/system_prompt` in `$EDITOR`, `/tool_prompt` showing the tool instructions sent to the model (MCP tools included), `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
-* `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.config/maki/user.config`.
+* `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.maki/user.config`.
 * Menu-consistency. New items `/q` / `quit`  maps to main's  `/exit`, and `/resume` maps to  `/session`.
 * Benchmarked optimized default system prompt, replacing the maki-main default; We on GLM 5.2, the Qwen 3.6 family and Deepseek V4 family on SWE and DeepSWE (public portions). 
    - The default maki system prompt is 1. not editable, hidden, and while is carefully handwritten and well-meaning prompt, scores poorly: it confuses models from its structure. Note e.g. 'index' tool is rarely used with it.
@@ -115,7 +115,7 @@ See [`FORK.md`](./FORK.md) for the complete feature list and merge-preservation 
 * OpenCode Go - `OPENCODE_API_KEY`. Models from the models.dev catalog.
 * Aperture - `APERTURE_HOST` (e.g. `https://your-host.tailnet.ts.net`). No API key needed, Tailscale handles auth.
 
-**Dynamic providers** - drop an executable script into `~/.config/maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
+**Dynamic providers** - drop an executable script into `~/.maki/providers/` to add custom providers or proxies. See [docs](https://maki.sh/docs/providers/#dynamic-providers) for details.
 
 > Providers as Lua plugins WIP!
 

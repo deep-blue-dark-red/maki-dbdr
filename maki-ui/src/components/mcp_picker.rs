@@ -181,7 +181,7 @@ mod tests {
                     tool_count: 5,
                     prompt_count: 0,
                     status: McpServerStatus::Running,
-                    config_path: PathBuf::from("/home/.config/maki/config.toml"),
+                    config_path: PathBuf::from("/home/.maki/config.toml"),
                     url: None,
                     oauth: None,
                     ca_file: None,

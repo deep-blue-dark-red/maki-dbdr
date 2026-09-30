@@ -27,7 +27,7 @@ ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 
 It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
-You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
+You can also set `base_url` for a built-in provider in `~/.maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
 ```toml
 [openai]
@@ -288,7 +288,7 @@ No hardcoded model catalog. Use any model ID supported by this provider.
 
 No hardcoded model catalog. Use any model ID supported by this provider.
 
-By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
+By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.maki/providers.toml`:
 
 ```toml
 [opencode]
@@ -366,7 +366,7 @@ New models start at the **medium** tier until you assign one in the picker.
 
 ## providers.toml
 
-`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+`providers.toml` lives in the config directory (`~/.maki/providers.toml` on Linux/macOS, `%USERPROFILE%\.maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
 
 1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
 2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
@@ -503,7 +503,7 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
 
 ## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.maki/providers/` on Linux/macOS, `%USERPROFILE%\.maki\providers\` on Windows). The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|

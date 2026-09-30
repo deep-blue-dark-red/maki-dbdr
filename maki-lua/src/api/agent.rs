@@ -409,14 +409,11 @@ async fn call_tool(
             let (trigger, scoped) = tctx.cancel.child();
             tctx.cancel = scoped;
             let run = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs);
-            match futures_lite::future::race(
-                async { Ok(run.await) },
-                async {
-                    token.cancelled().await;
-                    trigger.cancel();
-                    Err(KILLED_MSG.to_owned())
-                },
-            )
+            match futures_lite::future::race(async { Ok(run.await) }, async {
+                token.cancelled().await;
+                trigger.cancel();
+                Err(KILLED_MSG.to_owned())
+            })
             .await
             {
                 Ok(done) => done,

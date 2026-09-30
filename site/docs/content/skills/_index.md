@@ -16,7 +16,7 @@ Write one for anything you keep explaining: how you cut a release, how you write
 A skill is a directory with a `SKILL.md` inside. Maki looks for them every time the `skill` tool runs (and once at startup, to build the list). When two skills share a name, the one found last wins:
 
 1. The builtin `maki-plugin-dev` (if enabled)
-2. `~/.config/maki/skills/` (Windows: `%APPDATA%\maki\skills\`)
+2. `~/.maki/skills/` (Windows: `%USERPROFILE%\.maki\skills\`)
 3. `~/.claude/skills/`, `~/.config/opencode/skills/`, `~/.agents/skills/`
 4. In your project, walking from the current directory up to the `.git` root, at each step: `.maki/skills/`, `.claude/skills/`, `.opencode/skills/`, `.agents/skills/`
 
@@ -62,7 +62,7 @@ Skills are not slash commands: typing `/git-release` does nothing unless you als
 Maki ships one skill, `maki-plugin-dev`. It teaches the agent how to write maki Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough. Turn it off if you never write plugins:
 
 ```lua
--- ~/.config/maki/init.lua
+-- ~/.maki/init.lua
 maki.setup({
     plugins = {
         skill = { plugin_dev = false },

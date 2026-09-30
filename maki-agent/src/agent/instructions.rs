@@ -135,7 +135,7 @@ fn read_instruction(path: &Path, loaded: &LoadedInstructions) -> Option<(PathBuf
 fn collect_instruction_files(
     cwd: &str,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    legacy_config: Option<&Path>,
     loaded: &LoadedInstructions,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -170,7 +170,7 @@ fn collect_instruction_files(
         }
     }
 
-    for dir in maki_storage::paths::config_search_dirs_from(home, xdg_config) {
+    for dir in maki_storage::paths::config_search_dirs_from(home, legacy_config) {
         let path = dir.join(GLOBAL_INSTRUCTION_FILE);
         if let Some((canonical, content)) = read_instruction(&path, loaded) {
             let label = format!("Global instructions ({})", canonical.display());
@@ -186,17 +186,17 @@ pub fn load_instruction_text(cwd: &str) -> String {
     load_instruction_text_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::legacy_config_dir().ok().as_deref(),
     )
 }
 
 pub(crate) fn load_instruction_text_with_home(
     cwd: &str,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    legacy_config: Option<&Path>,
 ) -> String {
     let loaded = LoadedInstructions::new();
-    let files = collect_instruction_files(cwd, home, xdg_config, &loaded);
+    let files = collect_instruction_files(cwd, home, legacy_config, &loaded);
 
     let mut text = String::new();
     for (label, content) in files {
@@ -209,17 +209,17 @@ pub fn load_instructions(cwd: &str) -> Instructions {
     load_instructions_with_home(
         cwd,
         maki_storage::paths::home().as_deref(),
-        maki_storage::paths::xdg_config_dir().ok().as_deref(),
+        maki_storage::paths::legacy_config_dir().ok().as_deref(),
     )
 }
 
 pub(crate) fn load_instructions_with_home(
     cwd: &str,
     home: Option<&Path>,
-    xdg_config: Option<&Path>,
+    legacy_config: Option<&Path>,
 ) -> Instructions {
     let mut instr = Instructions::default();
-    let files = collect_instruction_files(cwd, home, xdg_config, &instr.loaded);
+    let files = collect_instruction_files(cwd, home, legacy_config, &instr.loaded);
 
     for (label, content) in files {
         instr.text.push_str(&format!("\n\n{label}:\n{content}"));

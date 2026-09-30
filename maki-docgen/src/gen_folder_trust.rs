@@ -61,7 +61,7 @@ shows no indicator.
 The project answers in a [permission prompt](/docs/permissions/#permission-prompts)
 still work and last until the session ends, labelled `Project (this session)`.
 For an answer that outlives the session, use `A` or `D` to save it in your own
-`~/.config/maki/permissions.toml`, or trust the folder.
+`~/.maki/permissions.toml`, or trust the folder.
 
 ## Managing Trust
 
@@ -95,7 +95,7 @@ maki.setup({
 })
 ```"#;
 
-const REST: &str = r#"Maki reads `trust` from the global `~/.config/maki/init.lua` only. A project
+const REST: &str = r#"Maki reads `trust` from the global `~/.maki/init.lua` only. A project
 `.maki/init.lua` that sets it has the table stripped and gets a warning, since a
 project shipping one would be granting itself trust.
 

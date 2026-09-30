@@ -31,7 +31,7 @@ history.
 
 ## Configuration
 
-Set `ui.notifications` in `~/.config/maki/init.lua`:
+Set `ui.notifications` in `~/.maki/init.lua`:
 
 ```lua
 maki.setup({

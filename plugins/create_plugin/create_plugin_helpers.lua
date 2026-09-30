@@ -57,7 +57,7 @@ plugins/ is compiled into maki, so wire the new plugin in before it loads:
 3. maki-docgen/src/gen_tools.rs - every tool it registers goes into SECTIONS, then `just gen-docs`.
 4. `just lint && just test`.
 
-a personal plugin does not belong here: ~/.config/maki/lua/%s.lua, required from init.lua, loads on
+a personal plugin does not belong here: ~/.maki/lua/%s.lua, required from init.lua, loads on
 /reload without a rebuild.]],
     dir,
     dir,

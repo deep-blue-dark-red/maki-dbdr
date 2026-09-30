@@ -11,7 +11,7 @@ Settings go in `init.lua`, a Lua script that calls `maki.setup()`. Same language
 
 Two places, both optional:
 
-- **Global**: `~/.config/maki/init.lua`
+- **Global**: `~/.maki/init.lua`
 - **Project**: `.maki/init.lua` in the active Git checkout, or in the working
   directory outside Git
 
@@ -95,7 +95,7 @@ Name of the color theme to load at startup, overriding the theme you last picked
 
 Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dark_daltonized_v2`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_maki`, `kanagawa_maki_ink`, `kanagawa_maki_lotus`, `kanagawa_maki_slate`, `kanagawa_maki_storm`, `kanagawa_maki_wave`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_maki`, `rose_pine_maki_bloom`, `rose_pine_maki_dusk`, `rose_pine_maki_haze`, `rose_pine_maki_midnight`, `rose_pine_maki_slate`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
-You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
+You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.maki/themes/`. If it reuses a built-in name, yours wins.
 
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
@@ -180,7 +180,7 @@ An entry with no port covers every port. A name you list is allowed whatever it 
 
 ### `trust`
 
-Answers the folder trust question in advance. Read from the global `~/.config/maki/init.lua` only, since a project file that could set it would be trusting itself:
+Answers the folder trust question in advance. Read from the global `~/.maki/init.lua` only, since a project file that could set it would be trusting itself:
 
 ```lua
 maki.setup({
@@ -240,7 +240,7 @@ Each plugin checks its own options at startup. A typo, a wrong type, or an unkno
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`. The old `tools` table is gone. If your config still uses it, Maki stops at startup and shows you the new form.
 
-This table is for bundled plugins only. Your own plugins go in `~/.config/maki/lua/`, see [Plugins](/docs/plugins/).
+This table is for bundled plugins only. Your own plugins go in `~/.maki/lua/`, see [Plugins](/docs/plugins/).
 
 ```lua
 maki.setup({
@@ -363,7 +363,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 | Purpose | Linux / macOS | Windows |
 |---------|---------------|---------|
-| Config | `~/.config/maki/` | `%APPDATA%\maki\` |
+| Config | `~/.maki/` | `%USERPROFILE%\.maki\` |
 | Data | `~/.local/share/maki/` | `%APPDATA%\maki\` |
 | State | `~/.local/state/maki/` | `%APPDATA%\maki\` |
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\maki\` |
@@ -371,7 +371,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.config/maki/` is still read as a legacy fallback, so files saved there by older versions keep working; anything maki writes lands in `~/.maki/`.
 
 ### Migrating from ~/.maki/
 
@@ -388,7 +388,7 @@ Safe to run more than once.
 On top of the project instruction files Maki loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:
 
 - `AGENTS.local.md` in any of those project directories for per-directory preferences (gitignored)
-- `~/.config/maki/AGENTS.md` for preferences that apply to all projects
+- `~/.maki/AGENTS.md` for preferences that apply to all projects
 
 All of these are added to the system prompt at the start of every session.
 

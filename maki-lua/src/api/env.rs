@@ -21,7 +21,7 @@ fn state_dir(_lua: &Lua) -> mlua::Result<Option<String>> {
 }
 
 /// Return the directory where maki looks for user configuration files.
-/// Typically something like `~/.config/maki`.
+/// Typically something like `~/.maki`.
 ///
 /// @return (string?) Config directory path, or nil if it cannot be determined.
 /// @example

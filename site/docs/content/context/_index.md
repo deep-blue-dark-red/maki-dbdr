@@ -40,14 +40,14 @@ At session start Maki walks from the project git root down to the working direct
 | 9 | `GEMINI.md` |
 | 10 | `CODING_AGENT.md` |
 
-After the match it always loads `AGENTS.local.md` from the same directory if present: that one is yours, keep it gitignored. Closer directories win on conflicts. Finally one global `~/.config/maki/AGENTS.md` for preferences that follow you across projects.
+After the match it always loads `AGENTS.local.md` from the same directory if present: that one is yours, keep it gitignored. Closer directories win on conflicts. Finally one global `~/.maki/AGENTS.md` for preferences that follow you across projects.
 
 ```
 ~/repo/AGENTS.md           loaded (root)
 ~/repo/AGENTS.local.md     loaded (yours, gitignored)
 ~/repo/api/CLAUDE.md       loaded when cwd is ~/repo/api, wins over root
 ~/repo/web/AGENTS.md       not loaded yet...
-~/.config/maki/AGENTS.md   loaded (global)
+~/.maki/AGENTS.md   loaded (global)
 ```
 
 That `web/AGENTS.md` is not dead weight. The first time the agent `read`s a file under a subdirectory whose instruction file was never loaded, Maki pulls it in. Monorepo rules live next to the code they govern and cost nothing until someone works there.

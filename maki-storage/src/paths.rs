@@ -22,7 +22,7 @@ struct Paths {
     state: PathBuf,
     logs: PathBuf,
     cache: PathBuf,
-    xdg_config: PathBuf,
+    legacy_config: PathBuf,
 }
 
 /// Lexical path normalization that never hits the filesystem.
@@ -223,32 +223,28 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path) -> (PathBuf, PathBuf) {
 fn resolve() -> Option<&'static Paths> {
     STRATEGY
         .get_or_init(|| {
+            let home_maki = etcetera::home_dir().ok()?.join(FALLBACK_DIR);
+            // An existing ~/.maki still absorbs state, logs and cache so the
+            // whole layout collapses into one portable directory.
+            let portable = Some(home_maki.clone()).filter(|d| d.is_dir());
             let s = etcetera::choose_base_strategy().ok()?;
-            let fallback_dir = etcetera::home_dir()
-                .ok()
-                .map(|h| h.join(FALLBACK_DIR))
-                .filter(|d| d.is_dir());
-            let xdg_config = s.config_dir().join(APP_NAME);
-            let (data, cache, config) = match &fallback_dir {
-                Some(dir) => (dir.clone(), dir.clone(), dir.clone()),
-                None => (
-                    s.data_dir().join(APP_NAME),
-                    s.cache_dir().join(APP_NAME),
-                    xdg_config.clone(),
-                ),
+            let legacy_config = s.config_dir().join(APP_NAME);
+            let (data, cache) = match &portable {
+                Some(dir) => (dir.clone(), dir.clone()),
+                None => (s.data_dir().join(APP_NAME), s.cache_dir().join(APP_NAME)),
             };
-            let (state, logs) = if fallback_dir.is_some() {
+            let (state, logs) = if portable.is_some() {
                 (data.clone(), data.clone())
             } else {
                 state_logs(&s, &data)
             };
             Some(Paths {
-                config,
+                config: home_maki,
                 data,
                 state,
                 logs,
                 cache,
-                xdg_config,
+                legacy_config,
             })
         })
         .as_ref()
@@ -271,9 +267,11 @@ pub fn config_dir() -> Result<PathBuf, std::io::Error> {
     ensure(&p.config)
 }
 
-pub fn xdg_config_dir() -> Result<PathBuf, std::io::Error> {
+/// Previous settings home (`~/.config/maki`), still read so existing setups
+/// keep working. Never created: it is read-only.
+pub fn legacy_config_dir() -> Result<PathBuf, std::io::Error> {
     let p = resolve().ok_or_else(err)?;
-    ensure(&p.xdg_config)
+    Ok(p.legacy_config.clone())
 }
 
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
@@ -324,14 +322,13 @@ pub fn legacy_home_dir() -> Option<PathBuf> {
         .filter(|d| d.is_dir())
 }
 
-/// Where to look for user config, best match first. Writes still go to
-/// `config_dir()`.
+/// Where to look for user config, best match first. Writes go to
+/// `config_dir()` (`~/.maki`).
 ///
-/// The two are not the same: `config_dir()` collapses to `~/.maki` the moment
-/// that directory exists, so anything that reads it alone goes blind to
-/// `~/.config/maki`, which is where the docs tell people to put their files.
+/// `~/.config/maki` follows as a read-only fallback, so files left there by
+/// older versions are still found.
 pub fn config_search_dirs() -> Vec<PathBuf> {
-    config_search_dirs_from(home().as_deref(), xdg_config_dir().ok().as_deref())
+    config_search_dirs_from(home().as_deref(), legacy_config_dir().ok().as_deref())
 }
 
 pub fn find_config_path(name: &str) -> Option<PathBuf> {
@@ -342,13 +339,14 @@ pub fn find_config_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Pure core of `config_search_dirs`: no env reads, no process-home fallback,
-/// so tests can hand it tempdirs.
-pub fn config_search_dirs_from(home: Option<&Path>, xdg_config: Option<&Path>) -> Vec<PathBuf> {
-    let legacy = home.map(|h| h.join(FALLBACK_DIR)).filter(|d| d.is_dir());
-    let xdg = xdg_config
+/// so tests can hand it tempdirs. `~/.maki` leads even when it does not exist
+/// yet; the legacy dir follows unless it names the same place.
+pub fn config_search_dirs_from(home: Option<&Path>, legacy: Option<&Path>) -> Vec<PathBuf> {
+    let primary = home.map(|h| h.join(FALLBACK_DIR));
+    let legacy = legacy
         .map(Path::to_path_buf)
-        .filter(|d| Some(d) != legacy.as_ref());
-    [legacy, xdg].into_iter().flatten().collect()
+        .filter(|d| Some(d) != primary.as_ref());
+    [primary, legacy].into_iter().flatten().collect()
 }
 
 #[cfg(test)]
@@ -498,51 +496,50 @@ mod tests {
     }
 
     #[test]
-    fn search_dirs_returns_legacy_and_xdg() {
+    fn search_dirs_puts_home_maki_first() {
         let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(FALLBACK_DIR);
-        let xdg = home.path().join(".config").join(APP_NAME);
-        fs::create_dir(&legacy).unwrap();
+        let primary = home.path().join(FALLBACK_DIR);
+        let legacy = home.path().join(".config").join(APP_NAME);
+        fs::create_dir(&primary).unwrap();
 
-        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
-        assert_eq!(dirs, vec![legacy, xdg]);
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&legacy));
+        assert_eq!(dirs, vec![primary, legacy]);
     }
 
     #[test]
-    fn search_dirs_omits_legacy_when_it_does_not_exist() {
+    fn search_dirs_lists_home_maki_even_when_missing() {
         let home = tempfile::tempdir().unwrap();
-        let xdg = home.path().join(".config").join(APP_NAME);
+        let primary = home.path().join(FALLBACK_DIR);
+        let legacy = home.path().join(".config").join(APP_NAME);
 
-        let dirs = config_search_dirs_from(Some(home.path()), Some(&xdg));
-        assert_eq!(dirs, vec![xdg]);
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&legacy));
+        assert_eq!(dirs, vec![primary, legacy]);
     }
 
     #[test]
-    fn search_dirs_omits_legacy_when_home_none() {
-        let xdg = tempfile::tempdir().unwrap();
+    fn search_dirs_without_home_is_legacy_only() {
+        let legacy = tempfile::tempdir().unwrap();
 
-        let dirs = config_search_dirs_from(None, Some(xdg.path()));
-        assert_eq!(dirs, vec![xdg.path().to_path_buf()]);
+        let dirs = config_search_dirs_from(None, Some(legacy.path()));
+        assert_eq!(dirs, vec![legacy.path().to_path_buf()]);
     }
 
     #[test]
-    fn search_dirs_omits_xdg_when_xdg_none() {
+    fn search_dirs_without_legacy_is_primary_only() {
         let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(FALLBACK_DIR);
-        fs::create_dir(&legacy).unwrap();
+        let primary = home.path().join(FALLBACK_DIR);
 
         let dirs = config_search_dirs_from(Some(home.path()), None);
-        assert_eq!(dirs, vec![legacy]);
+        assert_eq!(dirs, vec![primary]);
     }
 
     #[test]
     fn search_dirs_does_not_repeat_the_same_dir() {
         let home = tempfile::tempdir().unwrap();
-        let legacy = home.path().join(FALLBACK_DIR);
-        fs::create_dir(&legacy).unwrap();
+        let primary = home.path().join(FALLBACK_DIR);
 
-        let dirs = config_search_dirs_from(Some(home.path()), Some(&legacy));
-        assert_eq!(dirs, vec![legacy]);
+        let dirs = config_search_dirs_from(Some(home.path()), Some(&primary));
+        assert_eq!(dirs, vec![primary]);
     }
 
     #[test]

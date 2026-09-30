@@ -28,7 +28,7 @@ ANTHROPIC_BASE_URL=https://my-proxy.internal maki
 
 It wins over `providers.toml` and built-in defaults. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are the same names the official SDKs use, so an existing proxy setup carries over as is. Two exceptions: `OPENAI_BASE_URL` only redirects the platform API, never the ChatGPT Coding Plan backend; `XAI_BASE_URL` only redirects the public API-key endpoint, never the OAuth CLI proxy.
 
-You can also set `base_url` for a built-in provider in `~/.config/maki/providers.toml`. It overrides the built-in default and loses to the env var above:
+You can also set `base_url` for a built-in provider in `~/.maki/providers.toml`. It overrides the built-in default and loses to the env var above:
 
 ```toml
 [openai]
@@ -128,7 +128,7 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
     format!(
         r#"## providers.toml
 
-`providers.toml` lives in the config directory (`~/.config/maki/providers.toml` on Linux/macOS, `%APPDATA%\maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
+`providers.toml` lives in the config directory (`~/.maki/providers.toml` on Linux/macOS, `%USERPROFILE%\.maki\providers.toml` on Windows). It is the file for provider overrides and custom HTTP providers. Two jobs:
 
 1. Tweak a built-in (pick a plan, change its base URL, set `enable_free_models` for Opencode).
 2. Declare a custom provider that speaks OpenAI, Anthropic, or Google wire format.
@@ -255,7 +255,7 @@ fn dynamic_providers_section() -> String {
     format!(
         r#"## Dynamic Providers
 
-To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.config/maki/providers/` on Linux/macOS, `%APPDATA%\maki\providers\` on Windows). The script must handle these subcommands:
+To add a custom provider or proxy, drop an executable script into the config `providers/` directory (`~/.maki/providers/` on Linux/macOS, `%USERPROFILE%\.maki\providers\` on Windows). The script must handle these subcommands:
 
 | Subcommand | Timeout | What it does |
 |------------|---------|--------|

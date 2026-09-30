@@ -34,7 +34,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 {NAMES}
 
 Grants come from a `plugin.toml` next to the Lua file (for
-`~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
+`~/.maki/init.lua` that is `~/.maki/plugin.toml`):
 
 ```toml
 min_maki_version = "0.4.12"
@@ -89,8 +89,8 @@ reference is at the end of this document.
 
 Plugins live in the maki config dir. There are two of them, same layout:
 
-- `~/.config/maki/` - global, every project (if `~/.maki/` exists, maki reads
-  that one first)
+- `~/.maki/` - global, every project (`~/.config/maki/` still read as a
+  fallback)
 - `<project>/.maki/` - this project only
 
 ```
@@ -106,7 +106,7 @@ that directory, you cannot reach files outside it.
 
 ## Creating a plugin
 
-1. Write the code in `~/.config/maki/lua/<name>.lua`. The `maki` global is
+1. Write the code in `~/.maki/lua/<name>.lua`. The `maki` global is
    already there, nothing to import. For a project-only plugin use
    `<project>/.maki/` here and in every step below.
 
@@ -121,13 +121,13 @@ maki.api.register_tool({
 })
 ```
 
-2. Load it from `~/.config/maki/init.lua`, creating that file if missing:
+2. Load it from `~/.maki/init.lua`, creating that file if missing:
 
 ```lua
 require("hello")
 ```
 
-3. Grant the permissions it needs in `~/.config/maki/plugin.toml`, creating
+3. Grant the permissions it needs in `~/.maki/plugin.toml`, creating
    that file if missing. Without the file every gated call is denied.
 
 ```toml

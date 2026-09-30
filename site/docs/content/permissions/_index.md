@@ -78,7 +78,7 @@ Container tools like `batch` and `code_execution` prompt for each inner tool ind
 
 There are two permission files:
 
-- **Global**: `~/.config/maki/permissions.toml`
+- **Global**: `~/.maki/permissions.toml`
 - **Project**: `.maki/permissions.toml` in the active Git checkout, or in the
   working directory outside Git (takes precedence over global)
 
@@ -168,7 +168,7 @@ When a gated tool needs permission, Maki asks you.
 | `y` | Allow once (immediate) |
 | `s` | Allow for this session (confirm with `Enter` or `y`; any other key cancels) |
 | `a` | Always allow for this project (confirm; saved to `.maki/permissions.toml`) |
-| `A` | Always allow globally (confirm; saved to `~/.config/maki/permissions.toml`) |
+| `A` | Always allow globally (confirm; saved to `~/.maki/permissions.toml`) |
 | `n` | Open deny guidance editor (type optional guidance, then `Enter` to deny once; `Esc` cancels) |
 | `d` | Deny always for this project (confirm; saved to `.maki/permissions.toml`) |
 | `D` | Deny always globally (confirm) |
@@ -201,7 +201,7 @@ To skip prompts on gated tools, toggle YOLO with `/yolo`, or run with `--yolo`. 
 To start in YOLO mode every time:
 
 ```lua
--- ~/.config/maki/init.lua
+-- ~/.maki/init.lua
 maki.setup({
     always_yolo = true,
 })

@@ -65,7 +65,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `env`: reading the process environment, where secrets live
 
 Grants come from a `plugin.toml` next to the Lua file (for
-`~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
+`~/.maki/init.lua` that is `~/.maki/plugin.toml`):
 
 ```toml
 min_maki_version = "0.4.12"
@@ -1931,7 +1931,7 @@ maki.env.config_dir()
 ```
 
 Return the directory where maki looks for user configuration files.
-Typically something like `~/.config/maki`.
+Typically something like `~/.maki`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -6026,6 +6026,7 @@ Event tables by type:
 - `{type="key", key}` -- keypress. {key} is in canonical `maki.keymap` notation: `"q"`, `"<CR>"`, `"<Esc>"`, `"<C-n>"`, `"<S-Tab>"`.
 - `{type="resize", width, height}` -- terminal was resized.
 - `{type="paste", text}` -- bracketed paste.
+- `{type="click", row, col}` -- left click inside the window's content area. {row} is the 1-based buffer line clicked (the same numbering `win:set_cursor` takes), {col} the 1-based column. Clicks on border, title, or footer never arrive. Only windows opened with `focus = true` get click events.
 - `{type="close"}` -- window was closed externally.
 - `{type="timeout"}` -- no event arrived within {timeout_ms}.
 
@@ -6074,6 +6075,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `reserved_top` (`integer`) rows reserved at the top of the content area.
   - `split` (`string`) edge docking, "above", "below", "left", "right", "panel", or "".
   - `order` (`integer`) paint order among split windows.
+  - `focus` (`boolean`) true hands keyboard focus to this window.
   - `needs_input` (`boolean`) whether the window means the session needs user input.
 
 **Example:**
@@ -6684,6 +6686,10 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 -- {opts}:
 --   title, footer, cursor (initial index)
 --   submit_keys: extra submit keys besides <CR>
+--   submit_swaps: <CR> behaves like a live key — the "<CR>" entry in
+--     {live_keys} runs with the selected row, its returned list swaps in, and
+--     the picker stays open. With no "<CR>" live handler, Enter submits
+--     normally
 --   action_keys: keys that close the picker and report themselves, like { "R" }
 --     for a refresh binding. Use uppercase keys, lowercase ones keep feeding
 --     the filter

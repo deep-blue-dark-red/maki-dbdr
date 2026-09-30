@@ -358,7 +358,7 @@ pub enum ConfigError {
         "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
          (plugins can provide more than tools).\n\n\
          Fix your config with:\n\n    \
-         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/maki/init.lua\n\n\
+         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.maki/init.lua\n\n\
          Run it on .maki/init.lua too if you keep a project config. \
          A .bak backup is left next to the file."
     )]
@@ -2665,7 +2665,7 @@ pub fn append_permission_rule(
     effect: Effect,
     target: &PermissionTarget,
 ) -> Result<(), String> {
-    let dir = paths::config_search_dirs().into_iter().last();
+    let dir = paths::config_dir().ok();
     append_permission_rule_with_global(tool, scope, effect, target, dir)
 }
 
