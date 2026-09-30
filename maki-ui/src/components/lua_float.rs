@@ -300,7 +300,11 @@ impl FloatManager {
                 match win.cmd_rx.try_recv() {
                     Ok(WinCommand::SetConfig(patch)) => {
                         restack |= patch.zindex.is_some();
+                        let takes_focus = patch.focus == Some(true);
                         win.config.apply_patch(patch);
+                        if takes_focus {
+                            self.focused_id = Some(win.id);
+                        }
                     }
                     Ok(WinCommand::SetCursor(row)) => {
                         win.set_cursor(row);
@@ -663,6 +667,42 @@ impl FloatManager {
 
     pub fn contains(&self, pos: ratatui::layout::Position) -> bool {
         self.focused_rect.is_some_and(|r| r.contains(pos))
+    }
+
+    /// Routes a left click to the topmost focused float under {row}/{col}.
+    /// The click becomes a `WinEvent::Click` carrying the 1-based buffer
+    /// line, mapped through the window's scroll offset, so a plugin handles
+    /// clicks exactly like `set_cursor` rows. Returns whether a float
+    /// consumed the click; windows that did not ask for focus on open never
+    /// do, so panel clicks keep their text-selection behavior.
+    pub fn handle_click_at(&mut self, row: u16, col: u16) -> bool {
+        let pos = ratatui::layout::Position { x: col, y: row };
+        for idx in (0..self.windows.len()).rev() {
+            let win = &mut self.windows[idx];
+            if !win.on_screen
+                || !win.opened_focused
+                || win.config.split != Split::None
+                || !win.last_content.contains(pos)
+            {
+                continue;
+            }
+            let content_y = (row - win.last_content.y) as usize;
+            // Pinned top rows are the first buffer lines; the scroll band
+            // and the pinned bottom continue from there with the offset.
+            let buf_row = if content_y < win.config.reserved_top {
+                content_y
+            } else {
+                win.config.reserved_top + win.scroll_offset + (content_y - win.config.reserved_top)
+            };
+            if buf_row < win.cached_lines.len() {
+                let _ = win.event_tx.try_send(WinEvent::Click {
+                    row: buf_row + 1,
+                    col: col - win.last_content.x + 1,
+                });
+            }
+            return true;
+        }
+        false
     }
 
     pub fn scroll(&mut self, delta: i32) {
@@ -3117,5 +3157,42 @@ mod tests {
             "focus must not fall back to a panel window"
         );
         assert_eq!(mgr.windows.len(), 1, "panel window must survive");
+    }
+
+    #[test]
+    fn focused_percent_height_panel_renders_its_content() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _, _) = make_channels();
+        let buf = make_buf(&["hello stdout"]);
+        let cfg = FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Percent(60),
+            ..make_config()
+        };
+        mgr.open(buf, cfg, true, event_tx, cmd_rx);
+
+        let area = Rect::new(0, 0, 80, 40);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let mut y = 0;
+                for (idx, h) in mgr.panel_reqs() {
+                    mgr.view_panel(f, idx, Rect::new(0, y, area.width, h));
+                    y += h;
+                }
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("hello stdout"),
+            "panel must paint its buf, got: {text:?}"
+        );
     }
 }

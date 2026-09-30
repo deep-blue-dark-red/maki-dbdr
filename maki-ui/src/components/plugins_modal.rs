@@ -1,5 +1,6 @@
 use crate::components::Overlay;
 use crate::components::modal::Modal;
+use crate::components::{Wrap, move_index};
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_lua::{EventHandle, LoadedPlugins, PluginToolInfo};
@@ -7,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap as TextWrap};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,19 +89,11 @@ impl PluginsModal {
                 PluginsAction::None
             }
             KeyCode::Up => {
-                if !self.plugins.is_empty() {
-                    self.selected = if self.selected == 0 {
-                        self.plugins.len() - 1
-                    } else {
-                        self.selected - 1
-                    };
-                }
+                self.selected = move_index(self.selected, -1, self.plugins.len(), Wrap::Yes);
                 PluginsAction::None
             }
             KeyCode::Down => {
-                if !self.plugins.is_empty() {
-                    self.selected = (self.selected + 1) % self.plugins.len();
-                }
+                self.selected = move_index(self.selected, 1, self.plugins.len(), Wrap::Yes);
                 PluginsAction::None
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
@@ -253,7 +246,10 @@ impl PluginsModal {
                     Span::styled("Tool: ", t.tool_dim),
                     Span::styled(tool.name.to_string(), t.item.add_modifier(Modifier::BOLD)),
                 ]));
-                lines.push(Line::from(Span::styled(tool.description.clone(), t.item_desc)));
+                lines.push(Line::from(Span::styled(
+                    tool.description.clone(),
+                    t.item_desc,
+                )));
                 push_input_schema(&mut lines, &tool.schema, &t);
                 lines.push(Line::from(""));
             }
@@ -278,7 +274,7 @@ impl PluginsModal {
             lines.push(Line::from(Span::styled("No plugin selected", t.tool_dim)));
         }
 
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let para = Paragraph::new(lines).wrap(TextWrap { trim: false });
         frame.render_widget(para, inner);
     }
 }
@@ -310,10 +306,7 @@ fn push_input_schema(lines: &mut Vec<Line>, schema: &Value, t: &theme::Theme) {
         if let Some(desc) = prop.get("description").and_then(Value::as_str)
             && !desc.is_empty()
         {
-            lines.push(Line::from(Span::styled(
-                format!("    {desc}"),
-                t.item_desc,
-            )));
+            lines.push(Line::from(Span::styled(format!("    {desc}"), t.item_desc)));
         }
     }
 }
@@ -429,9 +422,11 @@ mod tests {
     fn screen(modal: &mut PluginsModal) -> String {
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| {
-            modal.view(f, f.area());
-        }).unwrap();
+        terminal
+            .draw(|f| {
+                modal.view(f, f.area());
+            })
+            .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())
     }
 
@@ -445,10 +440,19 @@ mod tests {
             .unwrap();
 
         let text = screen(&mut modal);
-        assert!(text.contains(TOOL_DESCRIPTION), "description missing:\n{text}");
-        assert!(text.contains("path string (required)"), "typed prop missing:\n{text}");
+        assert!(
+            text.contains(TOOL_DESCRIPTION),
+            "description missing:\n{text}"
+        );
+        assert!(
+            text.contains("path string (required)"),
+            "typed prop missing:\n{text}"
+        );
         assert!(text.contains(PATH_DESCRIPTION), "prop doc missing:\n{text}");
-        assert!(text.contains("limit integer"), "optional prop missing:\n{text}");
+        assert!(
+            text.contains("limit integer"),
+            "optional prop missing:\n{text}"
+        );
         assert!(!text.contains("limit integer (required)"));
     }
 

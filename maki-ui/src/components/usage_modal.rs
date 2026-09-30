@@ -18,7 +18,6 @@ use ratatui::widgets::Paragraph;
 use crate::components::ModalScroll;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::repaint::{Dirty, Watch};
 use crate::theme;
 
@@ -115,22 +114,12 @@ impl UsageModal {
         let theme = theme::current();
         let lines = build_lines(ctx, self.quota.get(), &theme);
 
-        let total = lines.len() as u16;
         let modal = Modal {
             title: TITLE,
             width_percent: 60,
             max_height_percent: 70,
         };
-        let (popup, inner) = modal.render(frame, area, total);
-        let viewport_h = inner.height;
-        self.scroll.update_dimensions(total, viewport_h);
-        let scroll = self.scroll.offset();
-
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
-
-        if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, u32::from(total), u32::from(scroll));
-        }
+        let (popup, _) = modal.render_lines(frame, area, lines, &mut self.scroll);
 
         let hint = Line::from(vec![
             Span::raw(" "),
@@ -523,6 +512,7 @@ mod tests {
 
     #[test]
     fn quota_ready_lines_include_labels_and_percentages() {
+        let _guard = theme::test_read_lock();
         let theme = crate::theme::current();
         let usage = ProviderUsage {
             plan: Some("lite".into()),
@@ -575,6 +565,7 @@ mod tests {
 
     #[test]
     fn quota_non_terminal_states_render_single_line() {
+        let _guard = theme::test_read_lock();
         let theme = crate::theme::current();
         let clock = ClockFormat::Hour24;
         assert_eq!(

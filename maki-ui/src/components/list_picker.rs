@@ -5,11 +5,11 @@ use nucleo_matcher::{Config, Matcher};
 
 use crate::animation::{self, active_spinner_str, animation_elapsed_ms};
 use crate::components::Overlay;
-use crate::components::hint_line;
 use crate::components::is_ctrl;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{Wrap, move_index};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -86,7 +86,6 @@ pub struct ListPicker<T> {
 
 #[derive(Clone)]
 enum FooterSpec {
-    Pairs(&'static [(&'static str, &'static str)]),
     Builder(fn() -> Line<'static>),
     Static(Line<'static>),
 }
@@ -94,7 +93,6 @@ enum FooterSpec {
 impl FooterSpec {
     fn build(&self) -> Line<'static> {
         match self {
-            Self::Pairs(hints) => hint_line(hints),
             Self::Builder(b) => b(),
             Self::Static(line) => line.clone(),
         }
@@ -183,15 +181,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn move_up(&mut self) {
-        let len = self.filtered.len();
-        if len == 0 {
-            return;
-        }
-        self.selected = if self.selected == 0 {
-            len - 1
-        } else {
-            self.selected - 1
-        };
+        self.selected = move_index(self.selected, -1, self.filtered.len(), Wrap::Yes);
         self.ensure_visible();
     }
 
@@ -216,15 +206,7 @@ impl<T: PickerItem> State<T> {
     }
 
     fn move_down(&mut self) {
-        let len = self.filtered.len();
-        if len == 0 {
-            return;
-        }
-        self.selected = if self.selected == len - 1 {
-            0
-        } else {
-            self.selected + 1
-        };
+        self.selected = move_index(self.selected, 1, self.filtered.len(), Wrap::Yes);
         self.ensure_visible();
     }
 

@@ -22,7 +22,7 @@ local function contains(haystack, needle, msg)
 end
 
 local function job(status)
-  return { status = status or lib.STATUS.QUEUED, tool = "bash" }
+  return { id = "job-1", status = status or lib.STATUS.QUEUED, tool = "bash" }
 end
 
 -- normalize_entry rejects with (nil, err), which plain assert would treat
@@ -118,16 +118,93 @@ case("counts_and_all_terminal", function()
   eq(lib.all_terminal({}), true, "empty queue is terminal")
 end)
 
+case("wait_deadline_always_set", function()
+  local now = os.time()
+  local zero = lib.wait_deadline(0)
+  eq(type(zero), "number", "zero timeout yields a deadline, never nil")
+  eq(zero <= now + 1, true, "zero timeout deadline is immediate")
+  eq(lib.wait_deadline(300) >= now + 300, true, "positive timeout deadline is in the future")
+end)
+
+case("panel_lines_and_items", function()
+  local jobs = { job(lib.STATUS.RUNNING), job(lib.STATUS.DONE) }
+  jobs[1].id, jobs[2].id = "job-1", "job-2"
+  jobs[1].name = "build"
+  jobs[1].label = "cargo build --release"
+  jobs[2].output = "a\nlast line"
+  local lines = lib.build_panel_lines(jobs)
+  eq(#lines, 2, "one panel line per job")
+  eq(lines[1][2][1], "cargo build --release", "panel line shows the command label")
+  local done_text = lines[2][4][1]
+  contains(done_text, "last line", "panel line carries the last output line")
+  local items = lib.build_items(jobs)
+  eq(#items, 2, "one picker item per job")
+  eq(items[1].id, "job-1", "item identity is the job id")
+  contains(items[1].label, "cargo build --release", "label carries the command")
+  eq(type(items[2].detail), "table", "command and last output are detail parts")
+  eq(items[2].detail[1][1], "bash", "command part comes first")
+  contains(items[2].detail[2][1], "last line", "last output part comes second")
+  eq(items[1].detail, "bash", "detail degrades to tool name")
+end)
+
+case("job_command_joins_header_spans", function()
+  eq(lib.job_command({ tool = "bash" }), "bash", "no header falls back to tool")
+  eq(
+    lib.job_command({ tool = "bash", header = { { "cargo build", "plain" }, { " --release", "plain" } } }),
+    "cargo build --release",
+    "header span texts join as-is"
+  )
+  eq(lib.job_command({}), "", "empty job yields empty command")
+end)
+
+case("last_output_line", function()
+  local running = job(lib.STATUS.RUNNING)
+  eq(lib.last_output_line(running), nil, "no output yet")
+  running.live_buf = setmetatable({ lines = { { { "partial line" } } } }, {
+    __index = function(_, k)
+      if k == "get_lines" then
+        return function(self)
+          return self.lines
+        end
+      end
+    end,
+  })
+  eq(lib.last_output_line(running), "partial line", "running reads the live buf")
+  local done = job(lib.STATUS.DONE)
+  done.output = "a\nb"
+  eq(lib.last_output_line(done), "b", "settled reads the output tail")
+  done.output = ""
+  eq(lib.last_output_line(done), nil, "empty output has no last line")
+  done.output = string.rep("x", lib.MAX_INLINE_OUTPUT + 10)
+  eq(#lib.last_output_line(done), lib.MAX_INLINE_OUTPUT, "long line capped")
+  eq(lib.last_output_line(done):sub(-3), "\xE2\x80\xA6", "cap ends with ellipsis")
+end)
+
+case("job_output_lines", function()
+  eq(
+    lib.job_output_lines(job(lib.STATUS.RUNNING), { "live line" }, 10)[1],
+    "    live line",
+    "live lines render as an indented tail"
+  )
+  local done = job(lib.STATUS.DONE)
+  done.output = "a\nb"
+  contains(table.concat(lib.job_output_lines(done, nil, 10), "\n"), "b", "settled job renders its output tail")
+  eq(lib.job_output_lines(job(lib.STATUS.DONE), nil, 10)[1], lib.NO_OUTPUT, "empty output uses the sentinel")
+end)
+
 case("render_status_lists_jobs_and_results", function()
   local jobs = { job(lib.STATUS.DONE), job(lib.STATUS.RUNNING), job() }
   jobs[1].id, jobs[2].id, jobs[3].id = "job-1", "job-2", "job-3"
   jobs[1].name = "build"
+  jobs[1].label = "cargo build"
   jobs[1].output = "line1\nline2"
   local text = lib.render_status(jobs, { results = true, tail = 10 })
   contains(text, "queue: 1 running, 1 queued, 1 terminal", "counts header")
-  contains(text, "job-1 build [done", "terminal job with name")
+  contains(text, "cargo build build [done", "terminal job with name")
   contains(text, "    line2", "result tail indented")
-  eq(lib.render_status(jobs, {}):find("line2", 1, true), nil, "no results when disabled")
+  local plain = lib.render_status(jobs, {})
+  eq(plain:find("line1", 1, true), nil, "no full tail when disabled")
+  contains(plain, "    line2", "last output line still shown when tails disabled")
 end)
 
 case("tail_lines_keeps_last_lines", function()
@@ -141,24 +218,138 @@ end)
 case("snapshot_roundtrip", function()
   local j = job(lib.STATUS.RUNNING)
   j.id, j.name, j.tool = "job-7", "build", "bash"
+  j.label = "sleep 900"
   j.output = nil
   local snap = lib.snapshot({ j })
   eq(snap.jobs[1].id, "job-7", "snapshot keeps id")
+  eq(snap.jobs[1].label, "sleep 900", "snapshot keeps label")
   local rebuilt = lib.jobs_from_snapshot(snap.jobs)
   eq(rebuilt[1].status, lib.STATUS.ERROR, "non-terminal restores as interrupted error")
   contains(rebuilt[1].output, "interrupted", "non-terminal gets interruption note")
+  eq(rebuilt[1].label, "sleep 900", "label survives the roundtrip")
   eq(lib.jobs_from_snapshot(lib.snapshot({ job(lib.STATUS.DONE) }).jobs)[1].status, lib.STATUS.DONE, "terminal kept")
 end)
 
 case("render_queue_lines_degrade_headers", function()
   local j = job()
-  j.id = "job-1"
   local lines = lib.render_queue_lines({ j })
   eq(#lines, 1, "one line per job")
-  eq(lines[1][2][1], "job-1", "id span present")
-  eq(lines[1][3][1], "bash", "header degrades to tool name")
-  j.header = { { "cargo build", "plain" } }
-  eq(lib.render_queue_lines({ j })[1][3][1], "cargo build", "header spans used when present")
+  eq(lines[1][2][1], "bash", "label degrades to tool name")
+  j.label = "cargo build"
+  eq(lib.render_queue_lines({ j })[1][2][1], "cargo build", "label shown when present")
+end)
+
+case("validate_batch_rejects_whole_batch_before_registration", function()
+  local ok_spec = { tool = "bash", params = { command = "echo hi" }, name = "ok-job" }
+  local specs, err = lib.validate_batch({ ok_spec, { tool = "bash", timeout_seconds = 0 } }, {})
+  eq(specs, nil, "no partial specs on late failure")
+  contains(err, "timeout_seconds", "error names the bad entry")
+
+  -- duplicate name within the batch
+  specs, err = lib.validate_batch({ ok_spec, { tool = "bash", params = { command = "x" }, name = "ok-job" } }, {})
+  eq(specs, nil, "intra-batch duplicate rejected")
+  contains(err, "already in use", "duplicate error message")
+
+  -- name colliding with a live queued job
+  local queued = job(lib.STATUS.QUEUED)
+  queued.name = "taken"
+  specs, err = lib.validate_batch({ { tool = "bash", params = {}, name = "taken" } }, { queued })
+  eq(specs, nil, "queue name collision rejected")
+
+  -- valid batch passes through normalized
+  specs = lib.validate_batch({ ok_spec, { tool = "bash", params = { command = "x" } } }, {})
+  eq(#specs, 2, "valid batch returns all specs")
+  eq(specs[1].name, "ok-job", "spec name kept")
+end)
+
+case("job_output_lines_caps_live_like_settled", function()
+  local many = {}
+  for i = 1, 12 do
+    many[i] = "line" .. i
+  end
+  local j = { status = lib.STATUS.RUNNING, output = "" }
+  local live = lib.job_output_lines(j, many, 5)
+  -- Same shape as the settled tail of the same output: dropped-line counter,
+  -- indented rows, last line intact.
+  local settled = lib.job_output_lines({
+    status = lib.STATUS.DONE,
+    output = table.concat(many, "\n"),
+  }, nil, 5)
+  eq(#live, 6, "live capped to max_lines plus counter")
+  contains(live[1], "7 earlier lines omitted", "live dropped-line counter")
+  eq(live[#live], "    line12", "live keeps last line indented")
+  eq(#settled, #live, "settled view same height as live view")
+  for i = 1, #live do
+    eq(settled[i], live[i], "settled row matches live row " .. i)
+  end
+end)
+
+case("kill_job_paths", function()
+  local done = job(lib.STATUS.DONE)
+  contains(lib.kill_job(done), "already", "terminal job reports its status")
+  eq(done.kill_requested, nil, "terminal kill sets nothing")
+
+  local running, handle = job(lib.STATUS.RUNNING), { kills = 0 }
+  function handle:kill()
+    self.kills = self.kills + 1
+  end
+  running.kill_handle = handle
+  contains(lib.kill_job(running), "killed", "running job reports the abort")
+  eq(running.kill_requested, true, "running kill marks the job")
+  eq(handle.kills, 1, "running kill fires the handle")
+
+  local queued = job(lib.STATUS.QUEUED)
+  contains(lib.kill_job(queued), "was queued", "queued job reports the pre-start kill")
+  eq(queued.status, lib.STATUS.KILLED, "queued kill settles the job")
+  eq(queued.output, lib.KILL_QUEUED_MSG, "queued kill uses the shared message")
+  contains(lib.kill_job(queued), "already", "second kill sees terminal")
+end)
+
+case("live_text_strips_span_styles", function()
+  local buf = {
+    get_lines = function()
+      return {
+        { { "hello " }, { "world", "dim" } },
+        { { "plain" } },
+      }
+    end,
+  }
+  eq(lib.live_text(buf), "hello world\nplain", "span texts joined per line")
+end)
+
+case("render_status_shows_live_tail_for_running_jobs", function()
+  local buf = {
+    get_lines = function()
+      return { { { "line1" } }, { { "line2" } }, { { "line3" } } }
+    end,
+  }
+  local running = job(lib.STATUS.RUNNING)
+  running.live_buf = buf
+  local text = lib.render_status({ running }, { live = true, tail = 2 })
+  contains(text, "line3", "live tail keeps the last line")
+  contains(text, "1 earlier lines omitted", "live tail caps with a counter")
+  eq(text:find("line1", 1, true), nil, "dropped live lines stay dropped")
+
+  local alone = lib.render_status({ running }, { results = true, tail = 2 })
+  eq(alone:find("line1", 1, true), nil, "results flag alone shows no full live tail")
+  contains(alone, "    line3", "results flag alone still shows the last live line")
+  eq(lib.render_status({ running }, {}):find("line2", 1, true), nil, "no live tail when disabled")
+  eq(
+    lib.render_status({ job(lib.STATUS.RUNNING) }, { live = true }):find("line", 1, true),
+    nil,
+    "running job without a buf renders bare"
+  )
+end)
+
+case("status_label_shows_killing_for_requested_kills", function()
+  local running = job(lib.STATUS.RUNNING)
+  running.started_at = os.time() - 5
+  contains(lib.status_label(running), "running", "plain running label")
+  running.kill_requested = true
+  eq(lib.status_label(running), "killing", "kill request shows as killing")
+  local killed = job(lib.STATUS.KILLED)
+  killed.kill_requested = true
+  contains(lib.status_label(killed), "killed", "terminal status wins over killing")
 end)
 
 if #failures > 0 then

@@ -1369,6 +1369,10 @@ through optional callbacks while the tool runs.
     annotation event. Must not yield.
   - `on_usage` (`function?`) called with a formatted cumulative token usage
     string. Must not yield.
+  - `kill` (`KillHandle?`) from `maki.agent.kill_handle()`. Calling
+    `handle:kill()` from another coroutine aborts the in-flight call:
+    the call fails with `"killed"` and any child processes (a bash
+    command's, say) die with it.
 
 **Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
@@ -1383,6 +1387,30 @@ local out, err = maki.agent.call_tool(ctx, "bash", {
 })
 if err then error(err) end
 print(out)
+```
+
+---
+
+### `maki.agent.kill_handle()` {#maki-agent-kill_handle}
+
+```lua
+maki.agent.kill_handle()
+```
+
+Create a kill switch to hand to `call_tool` as `opts.kill`. Call `:kill()`
+from any other coroutine to abort that call: it fails with `"killed"` and
+child processes die with it. Firing an already-killed handle is a no-op,
+and a handle that is never fired is inert — dropping or garbage-collecting
+it never kills anything.
+
+**Returns:** (`KillHandle`)
+
+**Example:**
+
+```lua
+local handle = maki.agent.kill_handle()
+maki.agent.call_tool(ctx, "bash", { command = "make" }, { kill = handle })
+handle:kill()
 ```
 
 ---
@@ -6667,6 +6695,10 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 --   key: function(item) -> string|nil, a row's identity. Rows sharing the
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
+--   refresh: function() -> items|nil, polled every {refresh_ms} (default 500)
+--     while the picker is open so rows track a changing source. Returning nil
+--     skips the swap, so callers re-build rows only when something changed
+--   refresh_ms: poll interval for {refresh}
 --
 -- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
 -- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
@@ -6907,6 +6939,8 @@ function ToolView.restore_markdown(output, is_error, opts)
 ### `require("maki.truncate")`
 
 ```lua
+local backoff = require("maki.utf8").backoff
+
 local function truncate(text, max_lines, max_bytes)
   if #text <= max_bytes then
     local n = 0
@@ -6928,12 +6962,7 @@ local function truncate(text, max_lines, max_bytes)
     local new_bytes = bytes + #line + 1
     if new_bytes > max_bytes then
       if #out == 0 then
-        -- Back off UTF-8 continuation bytes so no character is split in half.
-        local cut = max_bytes
-        while cut > 0 and line:find("^[\128-\191]", cut + 1) do
-          cut = cut - 1
-        end
-        out[1] = line:sub(1, cut)
+        out[1] = line:sub(1, backoff(line, max_bytes))
       end
       break
     end
@@ -6948,5 +6977,29 @@ local function truncate(text, max_lines, max_bytes)
 end
 
 return truncate
+```
+
+### `require("maki.utf8")`
+
+```lua
+local M = {}
+
+-- Largest cut at or before `i` where `s:sub(1, cut)` ends on a UTF-8
+-- codepoint boundary: walk back over continuation bytes (0x80..0xBF) so a
+-- byte offset never leaves half a character behind. Hand-rolled rather than
+-- built on utf8.offset, which errors when handed a continuation position.
+function M.backoff(s, i)
+  i = math.min(i, #s)
+  while i > 0 do
+    local b = s:byte(i + 1)
+    if not b or b < 0x80 or b >= 0xC0 then
+      break
+    end
+    i = i - 1
+  end
+  return i
+end
+
+return M
 ```
 

@@ -15,8 +15,8 @@ use crate::types::ThinkingFallback;
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
+use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, key_rotation, sort_models};
 
 pub(crate) struct LocalEndpointConfig {
     pub slug: &'static str,
@@ -71,16 +71,16 @@ impl LocalEndpoint {
         cfg: &'static LocalEndpointConfig,
         auth: Arc<Mutex<ResolvedAuth>>,
         timeouts: super::Timeouts,
-    ) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&cfg.compat, timeouts),
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&cfg.compat, timeouts)?,
             auth,
             key_pool: None,
             system_prefix: None,
             thinking_fallback: cfg.thinking_fallback,
             discovery_mode: cfg.discovery_mode,
             protocol: resolve_protocol_for_local(cfg.slug),
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -114,7 +114,7 @@ impl LocalEndpoint {
         let compat_config = &cfg.compat;
         let auth = ResolvedAuth::new(cfg.slug, headers)?.with_base_url(Some(base_url));
         Ok(Self {
-            compat: OpenAiCompatProvider::new(compat_config, timeouts),
+            compat: OpenAiCompatProvider::new(compat_config, timeouts)?,
             auth: Arc::new(Mutex::new(auth)),
             key_pool,
             system_prefix: None,
@@ -124,6 +124,8 @@ impl LocalEndpoint {
         })
     }
 }
+
+impl_stream_body!(LocalEndpoint);
 
 impl Provider for LocalEndpoint {
     fn stream_message<'a>(
@@ -137,9 +139,8 @@ impl Provider for LocalEndpoint {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-
             if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
+                let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let mut buf = String::new();
                 let system = super::with_prefix(&self.system_prefix, system, &mut buf);
                 let mut body = responses::build_body(model, messages, system, tools);
@@ -156,9 +157,7 @@ impl Provider for LocalEndpoint {
                 .await;
             }
 
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let (auth, mut body) = self.stream_body(&self.auth, model, messages, system, tools);
 
             opts.thinking
                 .apply_thinking(&mut body, model, self.thinking_fallback);
@@ -171,7 +170,7 @@ impl Provider for LocalEndpoint {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             match self.discovery_mode {
                 DiscoveryMode::None => self.compat.do_list_models(&auth).await,
                 DiscoveryMode::LlamaCpp => self.discover_llamacpp_models(&auth).await,
@@ -181,11 +180,7 @@ impl Provider for LocalEndpoint {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 }
 
@@ -313,7 +308,7 @@ impl LocalEndpoint {
                 })
             })
             .collect();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        sort_models(&mut models);
         Ok(models)
     }
 }
@@ -440,7 +435,7 @@ impl LocalEndpoint {
                 provider_info: None,
             })
             .collect();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        sort_models(&mut models);
         Ok(models)
     }
 }

@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::anthropic::shared;
 use super::openai::responses;
-use super::openai_compat;
+use super::openai_compat::{self, ToolShape};
 use crate::model::{Model, ModelFamily, ModelInfo, ModelPricing, ModelTier, lookup_entry};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::{ResolvedAuth, Timeouts};
@@ -79,8 +79,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Copilot::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Copilot::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 inventory::submit!(SPEC.config_row());
@@ -108,7 +110,7 @@ impl Copilot {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         auth::load_token()?;
         Ok(Self {
-            client: super::http_client(timeouts),
+            client: super::http_client(timeouts)?,
             stream_timeout: timeouts.stream,
             auth: Arc::default(),
             resolved_auth: None,
@@ -120,15 +122,15 @@ impl Copilot {
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
-    ) -> Self {
-        Self {
-            client: super::http_client(timeouts),
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            client: super::http_client(timeouts)?,
             stream_timeout: timeouts.stream,
             auth: Arc::default(),
             resolved_auth: Some(auth),
             system_prefix: None,
             models: Arc::default(),
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -138,10 +140,10 @@ impl Copilot {
 
     async fn auth(&self) -> Result<CopilotAuth, AgentError> {
         if let Some(auth) = &self.resolved_auth {
-            return copilot_auth_from_resolved(&auth.lock().unwrap());
+            return copilot_auth_from_resolved(&auth.lock().unwrap_or_else(|e| e.into_inner()));
         }
 
-        if let Some(auth) = self.auth.lock().unwrap().clone() {
+        if let Some(auth) = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return Ok(auth);
         }
 
@@ -153,17 +155,23 @@ impl Copilot {
             token: creds.api_key,
             endpoint,
         };
-        *self.auth.lock().unwrap() = Some(auth.clone());
+        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = Some(auth.clone());
         Ok(auth)
     }
 
     async fn model_endpoint(&self, model_id: &str) -> Result<Endpoint, AgentError> {
-        if let Some(model) = self.models.lock().unwrap().get(model_id).cloned() {
+        if let Some(model) = self
+            .models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model_id)
+            .cloned()
+        {
             return Ok(model.endpoint());
         }
 
         let models = self.fetch_models().await?;
-        let mut guard = self.models.lock().unwrap();
+        let mut guard = self.models.lock().unwrap_or_else(|e| e.into_inner());
         guard.clear();
         guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
         Ok(guard
@@ -221,7 +229,7 @@ impl Copilot {
         event_tx: &Sender<ProviderEvent>,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let wire_tools = openai_compat::convert_tools(tools);
+        let wire_tools = openai_compat::convert_tools(tools, ToolShape::ChatCompletions);
         let mut body = json!({
             "model": model.id,
             "messages": openai_compat::convert_messages(messages, system),
@@ -278,7 +286,7 @@ impl Copilot {
         .or_else(|| {
             self.models
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&model.id)
                 .map(CopilotModel::reasoning_info)
                 .map(Arc::new)
@@ -329,7 +337,12 @@ impl Copilot {
             .body(json_body)?;
         let response = self.client.send_async(request).await?;
         if response.status().is_success() {
-            super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
+            super::sse_captured!(
+                response,
+                event_tx,
+                self.stream_timeout,
+                super::anthropic::parse_sse
+            )
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -781,7 +794,7 @@ impl Provider for Copilot {
                 .iter()
                 .map(CopilotModel::model_info)
                 .collect::<Vec<_>>();
-            let mut guard = self.models.lock().unwrap();
+            let mut guard = self.models.lock().unwrap_or_else(|e| e.into_inner());
             guard.clear();
             guard.extend(models.into_iter().map(|model| (model.id.clone(), model)));
             Ok(infos)
@@ -790,8 +803,11 @@ impl Provider for Copilot {
 
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
-            *self.auth.lock().unwrap() = None;
-            self.models.lock().unwrap().clear();
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             Ok(())
         })
     }

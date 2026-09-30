@@ -40,11 +40,10 @@ pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaTyp
     if !was_file_uri && !is_absolute && !path_str.starts_with("~/") {
         return None;
     }
-    let path = if let Some(rest) = path_str.strip_prefix("~/") {
-        maki_storage::paths::home()?.join(rest)
-    } else {
-        PathBuf::from(&path_str)
-    };
+    if path_str.starts_with("~/") {
+        maki_storage::paths::home()?;
+    }
+    let path = maki_storage::paths::expand_tilde(Path::new(&path_str));
     let media_type = media_type_for(&path)?;
     Some((path, media_type))
 }

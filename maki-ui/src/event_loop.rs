@@ -655,7 +655,10 @@ impl<'t> EventLoop<'t> {
         });
         let mut slots = ModelSlots::new(startup_slot, Arc::clone(&model_policy), timeouts);
         let bg = spawn_model_fetch(Arc::clone(&model_policy));
-        let storage_writer = Arc::new(StorageWriter::new(storage.clone(), bg.warn_tx.clone()));
+        let storage_writer = Arc::new(
+            StorageWriter::new(storage.clone(), bg.warn_tx.clone())
+                .context("spawn storage writer thread")?,
+        );
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let ctx = SpawnCtx {
@@ -719,7 +722,7 @@ impl<'t> EventLoop<'t> {
             notifier,
             ctx,
             slots,
-            input: InputReader::spawn(),
+            input: InputReader::spawn().context("spawn input reader thread")?,
             warn_rx: bg.warn_rx,
             warn_tx: bg.warn_tx,
             models_rx: bg.models_rx,

@@ -63,7 +63,8 @@ pub type NewFn = fn(Timeouts) -> Result<Box<dyn Provider>, AgentError>;
 
 /// The third argument is the system prefix, which a fn-pointer type has no
 /// room to name.
-pub type WithAuthFn = fn(Arc<Mutex<ResolvedAuth>>, Timeouts, Option<String>) -> Box<dyn Provider>;
+pub type WithAuthFn =
+    fn(Arc<Mutex<ResolvedAuth>>, Timeouts, Option<String>) -> Result<Box<dyn Provider>, AgentError>;
 
 /// How maki builds a provider it does not read out of the catalog.
 #[derive(Debug, Clone, Copy)]

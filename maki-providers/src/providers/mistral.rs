@@ -14,8 +14,10 @@ use crate::spec::{
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
-use super::openai_compat::{MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::openai_compat::{
+    MODELS_PATH, OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body,
+};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
 
 const SLUG: &str = "mistral";
 const DISPLAY_NAME: &str = "Mistral";
@@ -99,8 +101,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Mistral::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Mistral::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 inventory::submit!(SPEC.config_row());
@@ -158,20 +162,23 @@ impl Mistral {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve("mistral", CONFIG.api_key_env)?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer("mistral", pool.current())?)),
             key_pool: Some(pool),
             system_prefix: None,
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
             key_pool: None,
             system_prefix: None,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -179,6 +186,8 @@ impl Mistral {
         self
     }
 }
+
+impl_stream_body!(Mistral);
 
 impl Provider for Mistral {
     fn stream_message<'a>(
@@ -192,10 +201,7 @@ impl Provider for Mistral {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let (auth, mut body) = self.stream_body(&self.auth, model, messages, system, tools);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::HIGH_ONLY, model);
             // Convert assistant messages to Mistral's expected format with thinking content
@@ -213,7 +219,7 @@ impl Provider for Mistral {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             self.compat
                 .fetch_and_parse_models(&auth, MODELS_PATH, |m| {
                     // Filter: only completion_chat capable models
@@ -259,11 +265,7 @@ impl Provider for Mistral {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     fn adjust_model(&self, model: &mut Model) {

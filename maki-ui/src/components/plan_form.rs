@@ -1,6 +1,7 @@
 use crate::components::form::{render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
+use crate::components::{Wrap, move_index};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -243,12 +244,11 @@ impl PlanForm {
         }
         match key_event.code {
             KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                self.selected = move_index(self.selected, -1, self.menu.rows.len(), Wrap::No);
                 PlanFormAction::Consumed
             }
             KeyCode::Down => {
-                let max = self.menu.rows.len().saturating_sub(1);
-                self.selected = (self.selected + 1).min(max);
+                self.selected = move_index(self.selected, 1, self.menu.rows.len(), Wrap::No);
                 PlanFormAction::Consumed
             }
             KeyCode::Char(' ') => {

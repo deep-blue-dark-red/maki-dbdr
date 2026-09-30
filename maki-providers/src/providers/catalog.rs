@@ -29,7 +29,7 @@ use crate::model::{Model, ModelInfo, ModelPricing};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::anthropic::shared;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, user_agent};
+use crate::providers::{ResolvedAuth, Timeouts, http_client, opencode, sort_models, user_agent};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
 const MESSAGES_PATH: &str = "/messages";
@@ -272,7 +272,7 @@ impl ProviderData {
                 Some(meta.model_info(model_id))
             })
             .collect();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        sort_models(&mut models);
         models
     }
 }
@@ -457,7 +457,7 @@ pub fn refresh_catalog() -> Result<(), AgentError> {
         .map_err(|e| config_error(format!("failed to resolve state dir: {e}")))?;
     let data = fetch_catalog_blocking(&state_dir)?;
     match SHARED_CATALOG.get() {
-        Some(catalog) => *catalog.lock().unwrap() = data,
+        Some(catalog) => *catalog.lock().unwrap_or_else(|e| e.into_inner()) = data,
         // Set instead of `get_or_init` so a cold catalog takes the fetch we just
         // did rather than kicking off `init_catalog_blocking` and fetching twice.
         None => drop(SHARED_CATALOG.set(Mutex::new(data))),
@@ -467,7 +467,9 @@ pub fn refresh_catalog() -> Result<(), AgentError> {
 
 /// Returns the list of all providers in alphabetical order.
 pub fn catalog_providers() -> Vec<ProviderData> {
-    let guard = init_shared_catalog_if_needed().lock().unwrap();
+    let guard = init_shared_catalog_if_needed()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     guard.all_providers()
 }
 
@@ -687,18 +689,20 @@ fn parse_model(model: &schema::CatalogModel) -> CatalogMeta {
     }
 }
 
-fn catalog_client() -> HttpClient {
+fn catalog_client() -> Result<HttpClient, AgentError> {
     isahc::HttpClient::builder()
         .connect_timeout(Duration::from_secs(10))
         .low_speed_timeout(1, Duration::from_secs(30))
         // curl carries http2 for OTLP.
         .version_negotiation(VersionNegotiation::http11())
         .build()
-        .expect("failed to build catalog HTTP client")
+        .map_err(|e| AgentError::Config {
+            message: format!("catalog http client: {e}"),
+        })
 }
 
 fn fetch_catalog_blocking(state_dir: &StateDir) -> Result<CatalogData, AgentError> {
-    let index = smol::block_on(fetch_remote_catalog_async(&catalog_client()))?;
+    let index = smol::block_on(fetch_remote_catalog_async(&catalog_client()?))?;
     smol::block_on(save_cached_catalog_async(&index));
     Ok(CatalogData::from_index(index, state_dir))
 }
@@ -735,12 +739,12 @@ pub(crate) struct CatalogTransport {
 }
 
 impl CatalogTransport {
-    pub(crate) fn new(timeouts: Timeouts) -> Self {
-        Self {
-            chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts),
-            client: http_client(timeouts),
+    pub(crate) fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
+        Ok(Self {
+            chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts)?,
+            client: http_client(timeouts)?,
             stream_timeout: timeouts.stream,
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -799,8 +803,12 @@ impl CatalogTransport {
                 debug!(model = %model.id, "sending Anthropic-format request via catalog");
                 let response = self.client.send_async(request).await?;
                 if response.status().as_u16() == 200 {
-                    crate::providers::anthropic::parse_sse(response, event_tx, self.stream_timeout)
-                        .await
+                    crate::providers::sse_captured!(
+                        response,
+                        event_tx,
+                        self.stream_timeout,
+                        crate::providers::anthropic::parse_sse
+                    )
                 } else {
                     Err(AgentError::from_response(response).await)
                 }
@@ -851,7 +859,7 @@ impl CatalogProvider {
         Ok(Self {
             auth: data.catalog_auth(state_dir, allow_free_fallback)?,
             data,
-            transport: CatalogTransport::new(timeouts),
+            transport: CatalogTransport::new(timeouts)?,
         })
     }
 }
@@ -1676,6 +1684,7 @@ mod tests {
     #[test_case("vision-model", true; "catalog_marks_model_as_vision")]
     #[test_case("text-model", false; "catalog_marks_model_as_text_only")]
     fn supports_vision_falls_back_to_catalog_for_builtins(model_id: &str, expected: bool) {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         let models = HashMap::from([
             (
@@ -1709,6 +1718,7 @@ mod tests {
     /// carrying a stale rate.
     #[test]
     fn catalog_answers_only_for_models_the_static_table_misses() {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
 
@@ -1737,6 +1747,7 @@ mod tests {
     /// it names the same model, so the curated row keeps it.
     #[test]
     fn a_relative_matched_by_prefix_loses_to_the_catalog_naming_the_model() {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
         let curated = &deepseek::SPEC.models()[0];
@@ -1768,6 +1779,7 @@ mod tests {
     /// metadata it already had.
     #[test]
     fn fields_the_catalog_omits_fall_through() {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         super::seed_catalog_for_tests(builtin_catalog(), state_dir);
         let curated = &deepseek::SPEC.models()[0];
@@ -1791,6 +1803,7 @@ mod tests {
     /// catalog silently shrinks the window we paid for.
     #[test]
     fn a_limit_the_catalog_omits_falls_through_to_the_manifest() {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         let index = single_provider_catalog(
             BUILTIN_SLUG,
@@ -1991,6 +2004,7 @@ mod tests {
 
     #[test]
     fn catalog_miss_falls_back_to_family() {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         super::warm_empty_catalog_for_tests(state_dir);
 
@@ -2003,6 +2017,7 @@ mod tests {
     /// the catalog keeps (`opencode`, `opencode-go`) list no spec models.
     #[test]
     fn discovery_beats_catalog_vision() {
+        let _guard = super::catalog_test_lock();
         let (_tmp, state_dir) = temp_state_dir();
         let models = HashMap::from([(
             "omen-alpha".into(),

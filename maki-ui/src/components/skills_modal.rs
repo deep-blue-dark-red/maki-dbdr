@@ -1,13 +1,14 @@
 use crate::components::Overlay;
 use crate::components::modal::Modal;
 use crate::components::settings_picker::UserSettings;
+use crate::components::{Wrap, move_index};
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap as TextWrap};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SkillsJson {
@@ -29,7 +30,6 @@ pub struct SkillInherit {
     pub path: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
     pub name: String,
@@ -162,15 +162,10 @@ impl SkillsModal {
                             || path.is_absolute()
                         {
                             let mut settings = UserSettings::load();
-                            let resolved = if let Some(stripped) = path_str.strip_prefix("~/") {
-                                if let Some(home) = maki_storage::paths::home() {
-                                    home.join(stripped).to_string_lossy().into_owned()
-                                } else {
-                                    path_str.clone()
-                                }
-                            } else {
-                                path_str.clone()
-                            };
+                            let resolved =
+                                maki_storage::paths::expand_tilde(std::path::Path::new(&path_str))
+                                    .to_string_lossy()
+                                    .into_owned();
                             if !settings.skills_dirs.contains(&resolved) {
                                 settings.skills_dirs.push(resolved);
                                 settings.save();
@@ -206,41 +201,11 @@ impl SkillsModal {
                 SkillsAction::None
             }
             KeyCode::Up => {
-                match self.focus {
-                    Focus::Folders => {
-                        if !self.folders.is_empty() {
-                            self.selected_folder = if self.selected_folder == 0 {
-                                self.folders.len() - 1
-                            } else {
-                                self.selected_folder - 1
-                            };
-                        }
-                    }
-                    Focus::Skills => {
-                        if !self.skills.is_empty() {
-                            self.selected_skill = if self.selected_skill == 0 {
-                                self.skills.len() - 1
-                            } else {
-                                self.selected_skill - 1
-                            };
-                        }
-                    }
-                }
+                self.move_focus(-1);
                 SkillsAction::None
             }
             KeyCode::Down => {
-                match self.focus {
-                    Focus::Folders => {
-                        if !self.folders.is_empty() {
-                            self.selected_folder = (self.selected_folder + 1) % self.folders.len();
-                        }
-                    }
-                    Focus::Skills => {
-                        if !self.skills.is_empty() {
-                            self.selected_skill = (self.selected_skill + 1) % self.skills.len();
-                        }
-                    }
-                }
+                self.move_focus(1);
                 SkillsAction::None
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
@@ -364,6 +329,19 @@ impl SkillsModal {
                 }
             },
             _ => SkillsAction::None,
+        }
+    }
+
+    fn move_focus(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Folders => {
+                self.selected_folder =
+                    move_index(self.selected_folder, delta, self.folders.len(), Wrap::Yes);
+            }
+            Focus::Skills => {
+                self.selected_skill =
+                    move_index(self.selected_skill, delta, self.skills.len(), Wrap::Yes);
+            }
         }
     }
 
@@ -604,7 +582,7 @@ impl SkillsModal {
 
         let details_paragraph = Paragraph::new(details_lines)
             .block(details_block)
-            .wrap(Wrap { trim: false });
+            .wrap(TextWrap { trim: false });
         frame.render_widget(details_paragraph, chunks[1]);
 
         popup

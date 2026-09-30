@@ -6,6 +6,7 @@ use mlua::{Lua, Result as LuaResult, Table};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+use super::util::convert::opt;
 use super::util::pair::{Pair, pair};
 
 thread_local! {
@@ -48,10 +49,6 @@ fn compile(needle: &str) -> Pattern {
         Normalization::Smart,
         AtomKind::Fuzzy,
     )
-}
-
-fn want(opts: Option<&Table>, key: &str) -> bool {
-    opts.and_then(|o| o.get::<bool>(key).ok()).unwrap_or(false)
 }
 
 /// Where the match landed in {text}, in the shape `maki.fs.fuzzy_files`
@@ -108,7 +105,7 @@ fn fuzzy(
     opts: Option<Table>,
 ) -> LuaResult<(Option<u32>, Option<Table>)> {
     let pattern = compile(&needle);
-    let paths = want(opts.as_ref(), "paths");
+    let paths = opt::<bool>(opts.as_ref(), "paths").unwrap_or(false);
     MATCHER.with_borrow_mut(|matcher| {
         matcher.config = config(paths);
         let mut buf = Vec::new();
@@ -151,12 +148,9 @@ fn fuzzy_list(
     haystacks: Table,
     opts: Option<Table>,
 ) -> LuaResult<Table> {
-    let limit = opts
-        .as_ref()
-        .and_then(|o| o.get::<usize>("limit").ok())
-        .unwrap_or(usize::MAX);
-    let want_highlights = want(opts.as_ref(), "highlights");
-    let paths = want(opts.as_ref(), "paths");
+    let limit = opt::<usize>(opts.as_ref(), "limit").unwrap_or(usize::MAX);
+    let want_highlights = opt::<bool>(opts.as_ref(), "highlights").unwrap_or(false);
+    let paths = opt::<bool>(opts.as_ref(), "paths").unwrap_or(false);
 
     let pattern = compile(&needle);
     MATCHER.with_borrow_mut(|matcher| {

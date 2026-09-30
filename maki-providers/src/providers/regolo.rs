@@ -18,8 +18,8 @@ use crate::spec::{
 use crate::types::{ModelUsageRow, ProviderUsage, UsageLimit};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
 
 const SLUG: &str = "regolo";
 const DISPLAY_NAME: &str = "Regolo";
@@ -82,8 +82,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Regolo::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Regolo::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 inventory::submit!(SPEC.config_row());
@@ -295,7 +297,7 @@ impl Regolo {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
                 CONFIG.slug,
                 pool.current(),
@@ -305,13 +307,16 @@ impl Regolo {
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
             key_pool: None,
             system_prefix: None,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -319,6 +324,8 @@ impl Regolo {
         self
     }
 }
+
+impl_stream_body!(Regolo);
 
 impl Provider for Regolo {
     fn stream_message<'a>(
@@ -332,10 +339,7 @@ impl Provider for Regolo {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let (auth, mut body) = self.stream_body(&self.auth, model, messages, system, tools);
             opts.thinking
                 .apply_reasoning_effort(&mut body, &dialect::STANDARD, model);
             self.compat
@@ -346,7 +350,7 @@ impl Provider for Regolo {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let ids = self
                 .compat
                 .do_list_models(&auth)
@@ -378,7 +382,7 @@ impl Provider for Regolo {
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let root = root_url(&self.compat.base_url(&auth));
             let key_body = self
                 .compat
@@ -414,11 +418,7 @@ impl Provider for Regolo {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 }
 

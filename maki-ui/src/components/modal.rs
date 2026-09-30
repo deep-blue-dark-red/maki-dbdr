@@ -1,9 +1,12 @@
+use crate::components::ModalScroll;
+use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::widgets::{Block, BorderType, Clear};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 pub const CHROME_LINES: u16 = 2;
 
@@ -38,6 +41,28 @@ impl Modal<'_> {
 
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
+        (popup, inner)
+    }
+
+    /// Draws the scrollable modal in one pass: chrome sized to the content,
+    /// scroll state synced to what fits, body, then the scrollbar if the
+    /// body overflows. Returns `(popup, inner)` like [`Self::render`].
+    pub fn render_lines(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        lines: Vec<Line<'static>>,
+        scroll: &mut ModalScroll,
+    ) -> (Rect, Rect) {
+        let total = lines.len() as u16;
+        let (popup, inner) = self.render(frame, area, total);
+        let viewport_h = inner.height;
+        scroll.update_dimensions(total, viewport_h);
+        let offset = scroll.offset();
+        frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);
+        if total > viewport_h {
+            render_vertical_scrollbar(frame, inner, u32::from(total), u32::from(offset));
+        }
         (popup, inner)
     }
 }

@@ -360,7 +360,12 @@ impl McpTransport for HttpTransport {
                 return;
             };
 
-            let _ = self.client.send_async(req).await;
+            // Best-effort by design: a failed session DELETE only leaves the
+            // server holding state until it times out. Silent, though, gave no
+            // way to tell an idle shutdown apart from a server never released.
+            if let Err(e) = self.client.send_async(req).await {
+                warn!(server = %self.name, error = %e, "MCP session DELETE failed");
+            }
         })
     }
 

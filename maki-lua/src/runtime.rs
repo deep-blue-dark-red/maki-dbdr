@@ -78,6 +78,7 @@ const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const FINAL_DRAIN_BUDGET: usize = 256;
 const NIL_WITHOUT_FINISH_MSG: &str =
     "handler returned nil without calling ctx:finish() or starting jobs";
+const NO_TASK_SCOPE_MSG: &str = "task accessor called outside a task scope";
 pub(crate) const CANCELLED_MSG: &str = "cancelled";
 const HANDLER_TIMEOUT_MSG: &str = "timeout";
 pub const MAX_INFLIGHT_TOOLS: usize = 64;
@@ -743,7 +744,7 @@ pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCe
 /// and only after registering, so a raising hook is contained either way
 /// instead of blowing up whoever armed it.
 pub(crate) fn register_cancel_hook(lua: &Lua, callback: Function) -> Result<(), mlua::Error> {
-    let handle = active_task(lua);
+    let handle = active_task(lua)?;
     let key = lua.create_registry_value(callback)?;
     let cancelled = {
         let mut cell = lock_cell(&handle);
@@ -818,7 +819,7 @@ struct BundledModules {
 
 impl BundledModules {
     fn bytecode(&self, rel_path: &str) -> Result<Option<Arc<Vec<u8>>>, mlua::Error> {
-        let mut cache = self.bytecode.lock().expect("bytecode cache");
+        let mut cache = self.bytecode.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cache.get(rel_path) {
             return Ok(Some(Arc::clone(cached)));
         }
@@ -843,7 +844,10 @@ type CodegenQueue = Option<Arc<Mutex<Vec<Function>>>>;
 
 fn queue_codegen(queue: &CodegenQueue, func: &Function) {
     if let Some(queue) = queue {
-        queue.lock().expect("codegen queue").push(func.clone());
+        queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(func.clone());
     }
 }
 
@@ -859,7 +863,7 @@ fn with_packs<R: Default>(
     let Some(store) = lua.app_data_ref::<crate::api::pack::PackStore>() else {
         return R::default();
     };
-    let mut declarations = store.lock().expect("pack declarations");
+    let mut declarations = store.lock().unwrap_or_else(|e| e.into_inner());
     f(&mut declarations)
 }
 
@@ -1387,10 +1391,14 @@ impl<F: Future> Future for ScopedFuture<F> {
     }
 }
 
-pub(crate) fn active_task(lua: &Lua) -> TaskHandle {
+/// The running task's handle. Falling back to a catchable Lua error rather
+/// than panicking: a plugin can reach this from `ctx:live_buf` /
+/// `ctx:set_deadline` / `ctx:finish`, and one plugin's invariant violation
+/// must not take the host down with it.
+pub(crate) fn active_task(lua: &Lua) -> Result<TaskHandle, mlua::Error> {
     lua.app_data_ref::<TaskHandle>()
         .map(|r| Arc::clone(&*r))
-        .expect("task accessor called outside a task scope")
+        .ok_or_else(|| mlua::Error::runtime(NO_TASK_SCOPE_MSG))
 }
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
@@ -1442,8 +1450,11 @@ pub(crate) fn job_task_id(lua: &Lua) -> Option<u64> {
     cell.owns_jobs.then_some(cell.id)
 }
 
-pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> R {
-    f(&mut lock_cell(&active_task(lua)).bufs)
+pub(crate) fn with_task_bufs<R>(
+    lua: &Lua,
+    f: impl FnOnce(&mut BufferStore) -> R,
+) -> Result<R, mlua::Error> {
+    Ok(f(&mut lock_cell(&active_task(lua)?).bufs))
 }
 
 /// A working wake lands in microseconds, so this is only about failing in
@@ -1500,7 +1511,12 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
     let queue = lua
         .app_data_ref::<SpawnQueue>()
         .ok_or_else(|| mlua::Error::runtime("spawn queue not initialized"))?;
-    queue.tx.send(task).ok();
+    // A closed receiver means the runtime is already draining; the task is
+    // dropped either way, but silently is what made a spurious no-op call
+    // indistinguishable from a working one.
+    if queue.tx.send(task).is_err() {
+        tracing::warn!("async task dropped: spawn queue receiver is closed");
+    }
     Ok(())
 }
 
@@ -2832,7 +2848,10 @@ impl LuaRuntime {
             }),
         )
         .await?;
-        Ok(config_store.lock().unwrap().take())
+        Ok(config_store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take())
     }
 }
 
@@ -4643,7 +4662,7 @@ mod tests {
     fn task_scope_drop_clears_buf_handler_slots() {
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, task_cell(None));
-        let handle = with_task_bufs(&lua, |store| store.create());
+        let handle = with_task_bufs(&lua, |store| store.create()).unwrap();
         let shared = Arc::clone(&handle.buf);
         lua.globals()
             .set("buf", lua.create_userdata(handle.clone()).unwrap())
@@ -5367,7 +5386,9 @@ mod tests {
         let (seen_tx, seen_rx) = flume::bounded(1);
         let hook = lua
             .create_function(move |lua, ()| {
-                seen_tx.send(active_task(lua)).ok();
+                if let Ok(handle) = active_task(lua) {
+                    seen_tx.send(handle).ok();
+                }
                 Ok(())
             })
             .unwrap();
@@ -5381,7 +5402,10 @@ mod tests {
 
         let seen = seen_rx.try_recv().expect(HOOK_NEVER_FIRED);
         assert!(Arc::ptr_eq(&seen, scope.handle()));
-        assert!(Arc::ptr_eq(&active_task(&lua), sibling.handle()));
+        assert!(Arc::ptr_eq(
+            &active_task(&lua).expect(HOOK_NEVER_FIRED),
+            sibling.handle()
+        ));
         assert!(
             sibling_rx.try_recv().is_err(),
             "an uncancelled task's hook must not fire with a sibling's cancel"

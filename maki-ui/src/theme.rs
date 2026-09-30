@@ -16,6 +16,8 @@ use syntect::highlighting::{
 const DEFAULT_THEME: &str = "dracula";
 const THEMES_DIR: &str = "themes";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
+#[cfg(test)]
+const SET_WITHOUT_LOCK: &str = "theme::set() called without theme::test_write_lock()";
 
 const HELIX_TO_TEXTMATE: &[(&str, &str)] = &[
     ("comment", "comment, comment punctuation.definition.comment"),
@@ -330,6 +332,11 @@ pub fn current() -> Guard<Arc<Theme>> {
 }
 
 pub fn set(theme: Theme) {
+    #[cfg(test)]
+    assert!(
+        WRITE_LOCK_HELD.with(|held| held.get()),
+        "{SET_WITHOUT_LOCK}: theme::set() changes the palette every other test is reading"
+    );
     // Order matters: install colors before bumping the counter, otherwise a
     // reader could see the new generation but bake with the old palette.
     THEME.store(Arc::new(theme));
@@ -356,12 +363,46 @@ pub fn generation() -> u64 {
 #[cfg(test)]
 static TEST_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+// Which thread holds the write lock, so `set` can insist on it. `RwLock`
+// cannot answer that itself — it does not report its holder — and without a
+// check the convention above is only as good as every test remembering it,
+// which is how a swap lands mid-assert and fails a test that did nothing
+// wrong.
+#[cfg(test)]
+thread_local! {
+    static WRITE_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds the write lock and marks this thread as its holder for as long as it
+/// lives. A plain [`std::sync::RwLockWriteGuard`] would do, except that
+/// dropping it would leave the marker set.
+#[cfg(test)]
+pub(crate) struct TestWriteGuard(std::sync::RwLockWriteGuard<'static, ()>);
+
+#[cfg(test)]
+impl std::ops::Deref for TestWriteGuard {
+    type Target = std::sync::RwLockWriteGuard<'static, ()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestWriteGuard {
+    fn drop(&mut self) {
+        WRITE_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
 /// Take this in any test that calls [`set`] or [`set_current_name`].
 #[cfg(test)]
-pub(crate) fn test_write_lock() -> std::sync::RwLockWriteGuard<'static, ()> {
+pub(crate) fn test_write_lock() -> TestWriteGuard {
     // A test that fails while holding the lock poisons it; the rest should
     // still run serialised rather than all fail behind it.
-    TEST_LOCK.write().unwrap_or_else(|e| e.into_inner())
+    let guard = TEST_LOCK.write().unwrap_or_else(|e| e.into_inner());
+    WRITE_LOCK_HELD.with(|held| held.set(true));
+    TestWriteGuard(guard)
 }
 
 /// Take this in any test whose assertions depend on the installed theme.
@@ -416,7 +457,7 @@ fn merge_theme_names(user_names: impl IntoIterator<Item = String>) -> Vec<String
 }
 
 pub fn set_current_name(name: &str) {
-    *CURRENT_NAME.lock().unwrap() = Some(name.to_owned());
+    *CURRENT_NAME.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_owned());
 }
 
 pub fn persist_theme(name: &str) {
@@ -432,7 +473,11 @@ fn read_theme_name() -> Option<String> {
 }
 
 pub fn current_theme_name() -> String {
-    if let Some(name) = CURRENT_NAME.lock().unwrap().clone() {
+    if let Some(name) = CURRENT_NAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
         return name;
     }
     read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
@@ -1513,6 +1558,7 @@ diff_new_line_nr = { fg = "red" }
 
     #[test]
     fn set_publishes_every_named_style_to_lua() {
+        let _guard = test_write_lock();
         set(tokyonight());
 
         for name in STYLE_NAMES {
@@ -1539,6 +1585,7 @@ diff_new_line_nr = { fg = "red" }
         name: &str,
         slot: fn(&UiStyle) -> Option<SegmentColor>,
     ) {
+        let _guard = test_write_lock();
         set(tokyonight());
 
         let published =

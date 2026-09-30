@@ -4,14 +4,12 @@ use crate::components::keybindings::{
     ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
 };
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = " Keybindings ";
@@ -205,25 +203,12 @@ impl HelpModal {
             }
         }
 
-        let total = lines.len() as u16;
         let modal = Modal {
             title: TITLE,
             width_percent: 50,
             max_height_percent: 80,
         };
-        let (popup, inner) = modal.render(frame, area, total);
-        let viewport_h = inner.height;
-        self.scroll.update_dimensions(total, viewport_h);
-        let scroll = self.scroll.offset();
-
-        let paragraph = Paragraph::new(lines).scroll((scroll, 0));
-        frame.render_widget(paragraph, inner);
-
-        if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, u32::from(total), u32::from(scroll));
-        }
-
-        popup
+        modal.render_lines(frame, area, lines, &mut self.scroll).0
     }
 }
 

@@ -47,6 +47,13 @@ impl CancelToken {
         self.0.cancelled.load(Ordering::Acquire)
     }
 
+    /// Fire from any clone of the token, any number of times. Unlike a
+    /// `CancelTrigger`, holding or dropping the token never fires by itself,
+    /// so it is safe to hand out as a kill switch.
+    pub fn fire(&self) {
+        self.0.fire();
+    }
+
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {
         if self.is_cancelled() {
             return Err("cancelled".into());
@@ -272,6 +279,21 @@ mod tests {
             smol::spawn(async move { trigger.cancel() }).detach();
             let result = token.race(std::future::pending::<()>()).await;
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn token_fire_works_from_a_clone_and_stays_safe_to_drop() {
+        smol::block_on(async {
+            let (_trigger, token) = CancelToken::new();
+            let handle = token.clone();
+            handle.fire();
+            assert!(token.is_cancelled(), "fire from a clone reaches the token");
+            handle.fire();
+            // Dropping the handle must not be a kill: only an explicit fire is.
+            drop(handle);
+            assert!(token.is_cancelled());
+            assert!(token.race(std::future::pending::<()>()).await.is_err());
         });
     }
 

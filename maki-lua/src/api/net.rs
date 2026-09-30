@@ -14,6 +14,7 @@ use regex::bytes::Regex;
 use smol::{Timer, unblock};
 use url::Url;
 
+use crate::api::util::convert::opt;
 use crate::api::util::pair::{Pair, try_pair};
 
 use crate::plugin_permissions::PluginPermissions;
@@ -276,11 +277,9 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
     let url = validate_and_upgrade_url(url, &allowed)?;
     let pin = check_ssrf(&url, &allowed).await?;
 
-    let method = opts
-        .and_then(|o| o.get::<String>("method").ok())
-        .unwrap_or_else(|| "GET".to_string());
+    let method = opt::<String>(opts, "method").unwrap_or_else(|| "GET".to_string());
 
-    let headers = if let Some(tbl) = opts.and_then(|o| o.get::<Table>("headers").ok()) {
+    let headers = if let Some(tbl) = opt::<Table>(opts, "headers") {
         let mut h = Vec::new();
         for pair in tbl.pairs::<String, String>() {
             let (k, v) = pair.map_err(|e| format!("invalid header: {e}"))?;
@@ -291,27 +290,21 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         Vec::new()
     };
 
-    let body = opts
-        .and_then(|o| o.get::<String>("body").ok())
+    let body = opt::<String>(opts, "body")
         .map(|s| s.into_bytes())
         .unwrap_or_default();
 
     let timeout = Duration::from_secs(
-        opts.and_then(|o| o.get::<u64>("timeout").ok())
+        opt::<u64>(opts, "timeout")
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS),
     );
 
-    let max_bytes = opts
-        .and_then(|o| o.get::<usize>("max_bytes").ok())
-        .unwrap_or(DEFAULT_MAX_BYTES);
+    let max_bytes = opt::<usize>(opts, "max_bytes").unwrap_or(DEFAULT_MAX_BYTES);
 
-    let retries = opts
-        .and_then(|o| o.get::<u32>("retry").ok())
-        .unwrap_or(MAX_RETRIES);
+    let retries = opt::<u32>(opts, "retry").unwrap_or(MAX_RETRIES);
 
-    let line_match = opts
-        .and_then(|o| o.get::<String>("line_match").ok())
+    let line_match = opt::<String>(opts, "line_match")
         .map(|pattern| Regex::new(&pattern).map_err(|e| format!("{INVALID_LINE_MATCH}: {e}")))
         .transpose()?;
 

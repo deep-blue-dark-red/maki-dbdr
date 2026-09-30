@@ -10,7 +10,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use super::ResolvedAuth;
+use super::{ResolvedAuth, SseLine, next_sse_event, sort_models, sse_error};
+use crate::model::Model;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
 };
@@ -58,19 +59,22 @@ pub(crate) struct OpenAiCompatProvider {
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(config: &'static OpenAiCompatConfig, timeouts: super::Timeouts) -> Self {
+    pub fn new(
+        config: &'static OpenAiCompatConfig,
+        timeouts: super::Timeouts,
+    ) -> Result<Self, AgentError> {
         let resolved_base_url = if config.slug.is_empty() {
             None
         } else {
             let providers = maki_config::providers::ProvidersConfig::load();
             maki_config::providers::configured_base_url(config.slug, providers.get(config.slug))
         };
-        Self {
-            client: super::http_client(timeouts),
+        Ok(Self {
+            client: super::http_client(timeouts)?,
             config,
             stream_timeout: timeouts.stream,
             resolved_base_url,
-        }
+        })
     }
 
     pub(crate) fn client(&self) -> &HttpClient {
@@ -131,13 +135,13 @@ impl OpenAiCompatProvider {
 
     pub fn build_body(
         &self,
-        model: &crate::model::Model,
+        model: &Model,
         messages: &[Message],
         system: &str,
         tools: &Value,
     ) -> Value {
         let wire_messages = convert_messages(messages, system);
-        let wire_tools = convert_tools(tools);
+        let wire_tools = convert_tools(tools, ToolShape::ChatCompletions);
 
         let mut body = json!({
             "model": model.id,
@@ -184,7 +188,7 @@ impl OpenAiCompatProvider {
 
     pub async fn do_stream(
         &self,
-        model: &crate::model::Model,
+        model: &Model,
         extra_headers: &[(&str, &str)],
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
@@ -235,7 +239,7 @@ impl OpenAiCompatProvider {
             .as_array()
             .map(|arr| arr.iter().filter_map(parse_fn).collect())
             .unwrap_or_default();
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        sort_models(&mut models);
         Ok(models)
     }
 
@@ -289,6 +293,31 @@ impl OpenAiCompatProvider {
             .await
     }
 }
+
+/// The prologue every chat-completions `stream_message` opens with: auth
+/// snapshot, prefixed system prompt, wire body. It becomes an inherent method
+/// per provider struct, expanded in the provider's own module because the
+/// fields it reads are module-private, so each call site stays one line.
+macro_rules! impl_stream_body {
+    ($provider:ident) => {
+        impl $provider {
+            fn stream_body(
+                &self,
+                auth: &::std::sync::Mutex<$crate::providers::ResolvedAuth>,
+                model: &$crate::model::Model,
+                messages: &[$crate::Message],
+                system: &str,
+                tools: &::serde_json::Value,
+            ) -> ($crate::providers::ResolvedAuth, ::serde_json::Value) {
+                let auth = auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut buf = String::new();
+                let system = $crate::providers::with_prefix(&self.system_prefix, system, &mut buf);
+                (auth, self.compat.build_body(model, messages, system, tools))
+            }
+        }
+    };
+}
+pub(crate) use impl_stream_body;
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
@@ -399,7 +428,16 @@ pub(crate) fn tool_parameters(tool: &Value) -> Value {
     }
 }
 
-pub fn convert_tools(anthropic_tools: &Value) -> Value {
+/// Which wire shape a dialect wants its tools in.
+#[derive(Clone, Copy)]
+pub(crate) enum ToolShape {
+    /// `{"type": "function", "function": {...}}` — chat completions.
+    ChatCompletions,
+    /// Flat, with `strict` pinned off — the Responses API.
+    Responses,
+}
+
+pub fn convert_tools(anthropic_tools: &Value, shape: ToolShape) -> Value {
     let Some(tools) = anthropic_tools.as_array() else {
         return json!([]);
     };
@@ -408,14 +446,26 @@ pub fn convert_tools(anthropic_tools: &Value) -> Value {
         tools
             .iter()
             .filter_map(|t| {
-                Some(json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.get("name")?,
-                        "description": t.get("description")?,
-                        "parameters": tool_parameters(t),
-                    }
-                }))
+                let name = t.get("name")?;
+                let description = t.get("description")?;
+                let parameters = tool_parameters(t);
+                Some(match shape {
+                    ToolShape::ChatCompletions => json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": description,
+                            "parameters": parameters,
+                        }
+                    }),
+                    ToolShape::Responses => json!({
+                        "type": "function",
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                        "strict": false,
+                    }),
+                })
             })
             .collect(),
     )
@@ -536,10 +586,13 @@ struct SseChunk {
     id: Option<String>,
 }
 
-struct ToolAccumulator {
-    id: String,
-    name: String,
-    arguments: String,
+pub(crate) struct ToolAccumulator {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+    /// Responses API only: the `output_index` a call is keyed by. Chat
+    /// completions index accumulators positionally instead.
+    pub(crate) output_index: Option<u64>,
 }
 
 impl ToolAccumulator {
@@ -560,7 +613,19 @@ impl ToolAccumulator {
             ),
             name: String::new(),
             arguments: String::new(),
+            output_index: None,
         }
+    }
+}
+
+/// The first non-empty text a stream emits carries the template's leading
+/// whitespace; trim only that first sighting, pass later deltas through.
+pub(crate) fn first_text(is_first: &mut bool, content: String) -> String {
+    if *is_first {
+        *is_first = false;
+        content.trim_start().to_string()
+    } else {
+        content
     }
 }
 
@@ -580,24 +645,20 @@ pub async fn parse_sse(
     let mut is_first_content = true;
     let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
+    while let Some(line) = next_sse_event(&mut lines, &mut deadline, stream_timeout).await? {
+        let SseLine::Data(data) = line else {
+            continue;
         };
 
         if data == STREAM_DONE {
             break;
         }
 
-        if data.contains("\"error\"")
-            && let Ok(ev) = serde_json::from_str::<super::SseErrorPayload>(data)
-        {
-            warn!(error_type = %ev.error.r#type, message = %ev.error.message, "SSE error in stream");
-            return Err(ev.into_agent_error());
+        if let Some(err) = sse_error(&data) {
+            return Err(err);
         }
 
-        let chunk: SseChunk = match serde_json::from_str(data) {
+        let chunk: SseChunk = match serde_json::from_str(&data) {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, raw_sse = %data, "failed to parse SSE chunk");
@@ -655,12 +716,7 @@ pub async fn parse_sse(
 
         match delta.content {
             Some(ContentDelta::String(content_str)) if !content_str.is_empty() => {
-                let content = if is_first_content {
-                    is_first_content = false;
-                    content_str.trim_start().to_string()
-                } else {
-                    content_str
-                };
+                let content = first_text(&mut is_first_content, content_str);
 
                 if !content.is_empty() {
                     text.push_str(&content);
@@ -692,12 +748,7 @@ pub async fn parse_sse(
                             }
                         }
                         ContentDeltaPart::Text { text: content_str } => {
-                            let content = if is_first_content {
-                                is_first_content = false;
-                                content_str.trim_start().to_string()
-                            } else {
-                                content_str
-                            };
+                            let content = first_text(&mut is_first_content, content_str);
 
                             if !content.is_empty() {
                                 text.push_str(&content);
@@ -827,7 +878,7 @@ data: [DONE]\n";
     #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION}) ; "missing_schema")]
     #[test_case(json!({"name": TOOL_NAME, "description": TOOL_DESCRIPTION, "input_schema": null}) ; "null_schema")]
     fn convert_tools_defaults_missing_parameters(tool: Value) {
-        let function = &convert_tools(&json!([tool]))[0]["function"];
+        let function = &convert_tools(&json!([tool]), ToolShape::ChatCompletions)[0]["function"];
         assert_eq!(function["name"], json!(TOOL_NAME), "{TOOL_MUST_SURVIVE}");
         assert_eq!(
             function["parameters"],
@@ -1111,7 +1162,7 @@ data: [DONE]\n";
             }
         }]);
 
-        let openai = convert_tools(&anthropic);
+        let openai = convert_tools(&anthropic, ToolShape::ChatCompletions);
         let tool = &openai[0];
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["function"]["name"], "bash");

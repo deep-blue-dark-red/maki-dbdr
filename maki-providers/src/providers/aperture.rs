@@ -15,7 +15,7 @@ use crate::spec::{
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 use maki_storage::id::SessionRef;
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
 use super::{ResolvedAuth, Timeouts, google};
 
 const HOST_ENV: &str = "APERTURE_HOST";
@@ -89,8 +89,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Aperture::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Aperture::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 inventory::submit!(SPEC.config_row());
@@ -184,7 +186,7 @@ fn path_prefix(spec: Option<&'static ProviderSpec>, merged: &OverrideFields) -> 
 /// Clone the shared auth, appending the path prefix to the host. The gateway
 /// forwards the resulting path to the upstream.
 fn routed_auth(auth: &Arc<Mutex<ResolvedAuth>>, prefix: &str) -> Arc<Mutex<ResolvedAuth>> {
-    let mut cloned = auth.lock().unwrap().clone();
+    let mut cloned = auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if !prefix.is_empty()
         && let Some(base) = cloned.base_url.as_deref()
     {
@@ -219,14 +221,13 @@ impl Aperture {
         let auth = Arc::new(Mutex::new(
             ResolvedAuth::new(CONFIG.slug, Vec::new())?.with_base_url(Some(base_url)),
         ));
-        Ok(Self::with_auth_and_overrides(
-            auth,
-            timeouts,
-            load_overrides(),
-        ))
+        Self::with_auth_and_overrides(auth, timeouts, load_overrides())
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: Timeouts) -> Self {
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: Timeouts,
+    ) -> Result<Self, AgentError> {
         Self::with_auth_and_overrides(auth, timeouts, load_overrides())
     }
 
@@ -236,14 +237,14 @@ impl Aperture {
         auth: Arc<Mutex<ResolvedAuth>>,
         timeouts: Timeouts,
         overrides: Overrides,
-    ) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
             timeouts,
             system_prefix: None,
             overrides,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -348,6 +349,8 @@ fn apply_adjustments(model: &mut Model, overrides: &Overrides) {
     model.supports_vision_override = ov.supports_vision.or(model.supports_vision_override);
 }
 
+impl_stream_body!(Aperture);
+
 impl Provider for Aperture {
     fn stream_message<'a>(
         &'a self,
@@ -367,7 +370,7 @@ impl Provider for Aperture {
             if let Some(spec) = spec
                 && let Some(native) = spec.native
             {
-                let provider = (native.with_auth)(auth, self.timeouts, self.system_prefix.clone());
+                let provider = (native.with_auth)(auth, self.timeouts, self.system_prefix.clone())?;
                 let request_model = native_route_model(model, spec, model_id);
                 return provider
                     .stream_message(
@@ -381,10 +384,7 @@ impl Provider for Aperture {
                     )
                     .await;
             }
-            let auth = auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
+            let (auth, body) = self.stream_body(&auth, model, messages, system, tools);
             self.compat
                 .do_stream(model, &[], &body, event_tx, &auth)
                 .await
@@ -393,7 +393,7 @@ impl Provider for Aperture {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let base = auth.base_url.as_deref().unwrap_or("");
             let text = self
                 .compat
@@ -410,12 +410,12 @@ impl Provider for Aperture {
             let ov = merged_override(&self.overrides, provider_id, &model_id);
             if let Some(spec) = routed_spec(provider_id, &ov)
                 && let Some(native) = spec.native
-            {
-                let routed = (native.with_auth)(
+                && let Ok(routed) = (native.with_auth)(
                     routed_auth(&self.auth, &path_prefix(Some(spec), &ov)),
                     self.timeouts,
                     self.system_prefix.clone(),
-                );
+                )
+            {
                 let full_id = std::mem::replace(&mut model.id, model_id);
                 routed.adjust_model(model);
                 model.id = full_id;
@@ -753,7 +753,7 @@ mod tests {
             Vec::new(),
         )));
         let aperture =
-            Aperture::with_auth_and_overrides(auth, Timeouts::default(), Overrides::new());
+            Aperture::with_auth_and_overrides(auth, Timeouts::default(), Overrides::new()).unwrap();
         let mut model = Model::from_spec("aperture/zai/glm-5.2").unwrap();
         assert!(!model.supports_thinking());
         aperture.adjust_model(&mut model);

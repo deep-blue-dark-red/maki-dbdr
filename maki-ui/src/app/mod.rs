@@ -61,8 +61,8 @@ use crate::components::status_bar::StatusBar;
 use crate::components::system_prompt_modal::{
     SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
 };
-use crate::components::tool_prompt_modal::ToolPromptModal;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::tool_prompt_modal::ToolPromptModal;
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
@@ -648,8 +648,12 @@ impl App {
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
         app.apply_stored_permissions(&app.state.session.meta);
-        *maki_config::CURRENT_SESSION_ID.lock().unwrap() = Some(app.state.session.id.to_string());
-        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(app.state.session.title.clone());
+        *maki_config::CURRENT_SESSION_ID
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(app.state.session.id.to_string());
+        *maki_config::CURRENT_SESSION_NAME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(app.state.session.title.clone());
         app
     }
 
@@ -1110,6 +1114,7 @@ impl App {
         try_picker!(self.rewind_picker);
         try_picker!(self.model_picker);
         try_picker!(self.file_picker);
+        try_picker!(self.goto_picker);
         let zone = self.zone_at(row, column)?.zone;
         self.scroll_zone(zone, delta);
         Some(zone)
@@ -1848,10 +1853,6 @@ impl App {
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
-            InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
-                vec![]
-            }
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
                 vec![]
@@ -2319,8 +2320,9 @@ impl App {
             }
             self.last_turn_at = Some(Instant::now());
             self.update_cache_miss_warning();
-            *maki_config::CURRENT_SESSION_NAME.lock().unwrap() =
-                Some(self.state.session.title.clone());
+            *maki_config::CURRENT_SESSION_NAME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(self.state.session.title.clone());
             self.chats[chat_idx].set_pending_turn_usage(tc.usage.format(tc.cost));
             if let Some(tool_id) = &subagent_id {
                 let formatted = tc.usage.format_sum_cost(self.chats[chat_idx].cost);
@@ -2697,7 +2699,10 @@ impl App {
                 vec![]
             }
             "/tool_prompt" => {
-                let built = self.btw_tools.as_ref().is_some_and(|s| !s.load().is_empty());
+                let built = self
+                    .btw_tools
+                    .as_ref()
+                    .is_some_and(|s| !s.load().is_empty());
                 if built {
                     let source = Arc::clone(self.btw_tools.as_ref().unwrap());
                     self.tool_prompt_modal.open(source);
@@ -3172,8 +3177,8 @@ impl App {
             return;
         }
         self.mention_pending = false;
-        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(&MENTION.to_string()) {
-            self.command_palette.sync(&val);
+        if let InputAction::Changed = self.input_box.handle_paste(&MENTION.to_string()) {
+            self.input_changed(InputWriter::Anyone);
         }
     }
 
@@ -3260,6 +3265,7 @@ impl App {
         try_picker!(self.model_picker);
         try_picker!(self.mcp_picker);
         try_picker!(self.login_picker);
+        try_picker!(self.settings_picker);
         if !self.is_main_chat() {
             return;
         }
@@ -3392,10 +3398,6 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
-}
-
-fn is_streaming_stop_key(key: KeyEvent) -> bool {
-    key::QUIT.matches(key) || key.code == KeyCode::Esc
 }
 
 fn spinner_style_from_str(s: &str) -> crate::animation::SpinnerStyle {

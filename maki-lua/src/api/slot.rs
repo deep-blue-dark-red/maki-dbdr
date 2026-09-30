@@ -174,11 +174,11 @@ enum PrevState {
 type PrevCell = Arc<Mutex<PrevState>>;
 
 fn take_state(cell: &PrevCell, next: PrevState) -> PrevState {
-    mem::replace(&mut cell.lock().expect("prev state poisoned"), next)
+    mem::replace(&mut cell.lock().unwrap_or_else(|e| e.into_inner()), next)
 }
 
 fn set_state(cell: &PrevCell, state: PrevState) {
-    *cell.lock().expect("prev state poisoned") = state;
+    *cell.lock().unwrap_or_else(|e| e.into_inner()) = state;
 }
 
 type DelegationFn = Box<dyn Fn(&str, Authority, &str) -> bool>;

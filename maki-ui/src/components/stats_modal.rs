@@ -8,13 +8,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
 use serde::Serialize;
 use std::cmp::Ordering;
 
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
-use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::{ModalScroll, hint_line};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -523,27 +521,17 @@ impl StatsModal {
         let idx = self.ordered_indices(turns);
         let lines = self.build_lines(turns, &idx, &theme);
 
-        let total = lines.len() as u16;
         let modal = Modal {
             title: TITLE,
             width_percent: 90,
             max_height_percent: 80,
         };
-        let (popup, inner) = modal.render(frame, area, total);
+        let (popup, inner) = modal.render_lines(frame, area, lines, &mut self.scroll);
         self.last_popup = popup;
-        let viewport_h = inner.height;
-        self.scroll.update_dimensions(total, viewport_h);
-        let scroll = self.scroll.offset();
 
         let leading = if self.searching { 3 } else { 2 };
-        self.header_y = Some(inner.y + scroll.saturating_sub(leading));
+        self.header_y = Some(inner.y + self.scroll.offset().saturating_sub(leading));
         self.col_x = column_ranges();
-
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
-
-        if total > viewport_h {
-            render_vertical_scrollbar(frame, inner, total.into(), scroll.into());
-        }
 
         popup
     }
@@ -854,6 +842,7 @@ fn tool_call_line(
     ])
 }
 
+#[cfg(test)]
 fn build_lines(turns: &[TurnSnapshot], theme: &crate::theme::Theme) -> Vec<Line<'static>> {
     if turns.is_empty() {
         return vec![Line::from(Span::styled(
@@ -1043,6 +1032,7 @@ mod tests {
     /// wrong column.
     #[test]
     fn header_and_row_cells_match_column_ranges() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let flat = |l: Line<'_>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
         let header = flat(header_row(&theme));
@@ -1092,6 +1082,7 @@ mod tests {
     /// 16-char name offset, landing under `time` ~44 columns to the left.
     #[test]
     fn tool_call_duration_sits_in_the_tool_column() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let rec = maki_agent::agent::turn_state::ToolCallRecord {
             id: "t1".into(),
@@ -1133,6 +1124,7 @@ mod tests {
     /// keeps names aligned across both cases.
     #[test]
     fn only_failed_tool_calls_are_marked() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let render = |is_error: bool| -> String {
             let rec = maki_agent::agent::turn_state::ToolCallRecord {
@@ -1214,6 +1206,7 @@ mod tests {
     /// leaving "ms" to blow past the header's column width.
     #[test]
     fn duration_columns_are_seconds_and_right_aligned_with_header() {
+        let _guard = theme::test_read_lock();
         // Rust's `{:>N}` pads by *character* count, not byte length — a
         // multi-byte glyph like the cache-miss mark (✓/𐄂) earlier in the
         // row would throw off a raw byte-offset comparison even when the
@@ -1292,6 +1285,7 @@ mod tests {
 
     #[test]
     fn empty_history_shows_placeholder_line() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let lines = build_lines(&[], &theme);
         assert_eq!(lines.len(), 1);
@@ -1310,6 +1304,7 @@ mod tests {
     /// zero.
     #[test]
     fn summary_line_shows_positive_zero_when_no_turn_has_a_cost() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let mut t1 = sample_turn(1);
         t1.cost = None;
@@ -1323,6 +1318,7 @@ mod tests {
 
     #[test]
     fn build_lines_includes_header_and_one_row_per_turn() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let turns = vec![sample_turn(1), sample_turn(2)];
         let lines = build_lines(&turns, &theme);
@@ -1337,6 +1333,7 @@ mod tests {
     /// 2 real turns" gets mislabeled as "5 turns".
     #[test]
     fn summary_counts_distinct_user_turns_not_rounds() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let mut r1 = sample_turn(1);
         r1.user_turn = 1;
@@ -1435,6 +1432,7 @@ mod tests {
 
     #[test]
     fn turn_row_shows_both_rates() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         // input 1200, cache_creation 0, ttfb 300ms -> 4.0k/s prefill.
         // output 340 over the 1.4s API call -> 243/s generation.
@@ -1488,6 +1486,7 @@ mod tests {
 
     #[test]
     fn turn_row_shows_cache_miss_mark() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let mut t = sample_turn(1);
         t.cache_miss = true;
@@ -1497,6 +1496,7 @@ mod tests {
 
     #[test]
     fn turn_label_uses_event_id() {
+        let _guard = theme::test_read_lock();
         let theme = theme::current();
         let first_turn = sample_turn(1);
         let line = turn_row(&first_turn, &theme);

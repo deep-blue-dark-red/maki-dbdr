@@ -1,4 +1,4 @@
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
+use mlua::{FromLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error message";
@@ -10,12 +10,21 @@ pub(crate) const NIL_TOOL_RESULT_ERR: &str = "tool returned nil without an error
 /// keeps every key while allocating per entry.
 const MAX_ARRAY_HOLES: usize = 4096;
 
+/// Read `key` from an optional options table; a missing key, an explicit
+/// nil and a wrong-typed value all answer `None`. The conversion error is
+/// dropped the way every call site did before this helper existed — this
+/// `.ok()` is the one place to change when a caller needs absent and
+/// mistyped apart.
+pub(crate) fn opt<T: FromLua>(opts: Option<&Table>, key: &str) -> Option<T> {
+    opts.and_then(|t| t.get::<Option<T>>(key).ok().flatten())
+}
+
 /// mlua reads `bool` by Lua truthiness and never fails, so `get::<bool>`
 /// answers `Ok(false)` for a missing key and quietly kills whatever
 /// `unwrap_or(true)` sat behind it. `Option<bool>` keeps absent apart from
 /// an explicit `false`.
 pub(crate) fn opt_bool(tbl: &Table, key: &str) -> Option<bool> {
-    tbl.get::<Option<bool>>(key).ok().flatten()
+    opt(Some(tbl), key)
 }
 
 pub(crate) fn lua_tool_result(values: mlua::MultiValue) -> Result<String, String> {

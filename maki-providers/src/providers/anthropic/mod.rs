@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::SessionRef;
 use serde::Deserialize;
@@ -27,7 +27,10 @@ use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseLine, Timeouts, key_rotation,
+    next_sse_event_spaced, sort_models,
+};
 
 const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
@@ -117,8 +120,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Anthropic::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Anthropic::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 /// Returns whether the fast-mode beta header must be attached. We re-check
@@ -343,7 +348,7 @@ impl Anthropic {
         let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         debug!(keys = pool.len(), "using API key authentication");
         Ok(Self {
-            client: super::http_client(timeouts),
+            client: super::http_client(timeouts)?,
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             system_prefix: None,
@@ -355,9 +360,9 @@ impl Anthropic {
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
-    ) -> Self {
-        Self {
-            client: super::http_client(timeouts),
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            client: super::http_client(timeouts)?,
             auth,
             key_pool: None,
             system_prefix: None,
@@ -366,7 +371,7 @@ impl Anthropic {
             // anthropic override would make every third-party endpoint look
             // first party and poll `/api/oauth/usage` against it.
             resolved_base_url: None,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -375,14 +380,14 @@ impl Anthropic {
     }
 
     fn url_for(&self, path: &str) -> String {
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
         let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
         format!("{}{path}", origin(base))
     }
 
     fn build_request(&self, method: &str, path: &str) -> isahc::http::request::Builder {
         let url = self.url_for(path);
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -419,7 +424,7 @@ impl Anthropic {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
+            super::sse_captured!(response, event_tx, self.stream_timeout, parse_sse)
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -453,7 +458,7 @@ impl Anthropic {
             after_id = page.last_id;
         }
 
-        models.sort_by(|a, b| a.id.cmp(&b.id));
+        sort_models(&mut models);
         Ok(models)
     }
 }
@@ -516,7 +521,7 @@ impl Provider for Anthropic {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
-            *self.auth.lock().unwrap() =
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             debug!("reloaded Anthropic auth from env");
             Ok(())
@@ -524,17 +529,13 @@ impl Provider for Anthropic {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
             if !usage_eligible(
-                &self.auth.lock().unwrap(),
+                &self.auth.lock().unwrap_or_else(|e| e.into_inner()),
                 self.resolved_base_url.as_deref(),
             ) {
                 return Ok(None);
@@ -604,46 +605,27 @@ struct ModelsPage {
 }
 
 pub(crate) async fn parse_sse(
-    response: isahc::Response<isahc::AsyncBody>,
+    reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let status = response.status().as_u16();
-    let content_type = super::content_type_header(&response);
-    let mut tee = super::TeeBody::new(response.into_body());
-    let result = read_sse(&mut tee, event_tx, stream_timeout).await;
-    super::log_api_response(
-        status,
-        content_type.as_deref(),
-        tee.into_capture().as_deref(),
-    );
-    result
-}
-
-async fn read_sse(
-    body: &mut super::TeeBody<isahc::AsyncBody>,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
-) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(body);
     let mut lines = reader.lines();
     let mut parser = shared::EventParser::new();
     let mut current_event = String::new();
     let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        if let Some(rest) = line.strip_prefix("event:") {
-            current_event = rest.strip_prefix(' ').unwrap_or(rest).to_string();
-            continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.strip_prefix(' ').unwrap_or(d),
-            None => continue,
+    while let Some(line) = next_sse_event_spaced(&mut lines, &mut deadline, stream_timeout).await? {
+        let data = match line {
+            SseLine::Event(event) => {
+                current_event = event;
+                continue;
+            }
+            SseLine::Other => continue,
+            SseLine::Data(data) => data,
         };
 
         if parser
-            .process(&current_event, data, event_tx)
+            .process(&current_event, &data, event_tx)
             .await?
             .is_break()
         {
@@ -658,6 +640,7 @@ async fn read_sse(
 mod tests {
     use super::*;
     use crate::{ContentBlock, EMPTY_RESPONSE_MARKER, ProviderEvent, Role, StopReason, TokenUsage};
+    use futures_lite::io::Cursor;
     use serde_json::{Value, json};
     use shared::build_wire_messages;
     use std::time::Duration;
@@ -769,7 +752,8 @@ mod tests {
         let provider = Anthropic::with_auth(
             Arc::new(Mutex::new(auth)),
             crate::providers::Timeouts::default(),
-        );
+        )
+        .unwrap();
         assert!(provider.resolved_base_url.is_none());
         assert!(!usage_eligible(
             &provider.auth.lock().unwrap(),
@@ -799,9 +783,8 @@ mod tests {
         assert_eq!(origin(input), expected);
     }
 
-    fn mock_response(data: impl Into<Vec<u8>>) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from(data.into());
-        isahc::Response::builder().status(200).body(body).unwrap()
+    fn mock_response(data: impl Into<Vec<u8>>) -> impl AsyncBufRead + Unpin {
+        Cursor::new(data.into())
     }
 
     #[test]

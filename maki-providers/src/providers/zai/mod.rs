@@ -10,7 +10,7 @@ use tracing::warn;
 use crate::model::{Model, ModelFamily, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
-use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
 use crate::spec::{
     ApertureRoute, AuthDoc, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
 };
@@ -19,7 +19,7 @@ use crate::{
     dialect,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
+use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, key_rotation};
 
 const SLUG: &str = "zai";
 const DISPLAY_NAME: &str = "Z.AI";
@@ -108,8 +108,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Zai::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Zai::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
@@ -202,20 +204,23 @@ impl Zai {
             auth.base_url = Some(url);
         }
         Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG_STANDARD, timeouts),
+            compat: OpenAiCompatProvider::new(&CONFIG_STANDARD, timeouts)?,
             auth: Arc::new(Mutex::new(auth)),
             key_pool: Some(pool),
             system_prefix: None,
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG_STANDARD, timeouts),
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&CONFIG_STANDARD, timeouts)?,
             auth,
             key_pool: None,
             system_prefix: None,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -223,6 +228,8 @@ impl Zai {
         self
     }
 }
+
+impl_stream_body!(Zai);
 
 impl Provider for Zai {
     fn stream_message<'a>(
@@ -236,10 +243,7 @@ impl Provider for Zai {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let (auth, mut body) = self.stream_body(&self.auth, model, messages, system, tools);
             if model.supports_thinking() {
                 opts.thinking
                     .apply_reasoning_effort(&mut body, &dialect::GLM, model);
@@ -262,14 +266,14 @@ impl Provider for Zai {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             self.compat.do_list_models(&auth).await
         })
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let body = self.compat.get_text(&auth, QUOTA_LIMIT_URL).await?;
             let parsed: QuotaResponse = serde_json::from_str(&body)?;
             Ok(Some(parsed.into()))
@@ -277,11 +281,7 @@ impl Provider for Zai {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     fn adjust_model(&self, model: &mut Model) {

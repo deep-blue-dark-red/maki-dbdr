@@ -172,7 +172,7 @@ fn build_app_with_session(
 }
 
 fn test_writer(dir: StateDir) -> StorageWriter {
-    StorageWriter::new(dir, flume::unbounded().0)
+    StorageWriter::new(dir, flume::unbounded().0).expect(crate::storage_writer::STORAGE_THREAD_MSG)
 }
 
 pub(crate) fn test_app() -> App {
@@ -4734,10 +4734,11 @@ fn tool_prompt_command_renders_the_modal() {
 
     let backend = TestBackend::new(TEST_AREA.width, TEST_AREA.height);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| {
-        app.view(frame);
-    })
-    .unwrap();
+    terminal
+        .draw(|frame| {
+            app.view(frame);
+        })
+        .unwrap();
     let screen: String = terminal
         .backend()
         .buffer()
@@ -8174,4 +8175,70 @@ fn model_change_forces_the_cache_miss_confirm() {
         app.submit_prompt(queued_msg("hi")),
         SubmitOutcome::Confirm
     ));
+}
+
+#[test]
+fn focused_right_split_renders_through_app_view() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    buf.append(maki_agent::SnapshotLine::plain("right-split-marker".into()));
+    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(
+        buf,
+        FloatConfig {
+            split: Split::Right,
+            width: Dimension::Percent(33),
+            ..FloatConfig::default()
+        },
+        true,
+        event_tx,
+        cmd_rx,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.view(frame);
+        })
+        .unwrap();
+    let text = buffer_text(terminal.backend().buffer());
+    assert!(
+        text.contains("right-split-marker"),
+        "right split must paint through the app view, got: {text}"
+    );
+}
+
+#[test]
+fn focused_bottom_panel_renders_through_app_view() {
+    let mut app = test_app();
+    let buf = Arc::new(SharedBuf::new());
+    buf.append(maki_agent::SnapshotLine::plain(
+        "bottom-panel-marker".into(),
+    ));
+    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(
+        buf,
+        FloatConfig {
+            split: Split::Panel,
+            height: Dimension::Percent(15),
+            ..FloatConfig::default()
+        },
+        true,
+        event_tx,
+        cmd_rx,
+    );
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.view(frame);
+        })
+        .unwrap();
+    let text = buffer_text(terminal.backend().buffer());
+    assert!(
+        text.contains("bottom-panel-marker"),
+        "bottom panel must paint through the app view, got: {text}"
+    );
 }

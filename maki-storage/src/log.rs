@@ -71,15 +71,31 @@ fn migrate_stale_logs(old_dir: &Path, new_dir: &Path) {
             continue;
         };
         if name == LOCK_FILE_NAME {
-            fs::remove_file(entry.path()).ok();
+            if let Err(e) = fs::remove_file(entry.path())
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                report(format_args!(
+                    "cannot remove {}: {e}",
+                    entry.path().display()
+                ));
+            }
             continue;
         }
         if rotated_index(name).is_none() {
             continue;
         }
         let dst = new_dir.join(name);
-        if !dst.exists() {
-            fs::rename(entry.path(), &dst).ok();
+        if !dst.exists()
+            && let Err(e) = fs::rename(entry.path(), &dst)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            // Left as it was, by design — but silent forever means a directory
+            // that never accepts the migration looks identical to one that did.
+            report(format_args!(
+                "cannot move {} to {}: {e}",
+                entry.path().display(),
+                dst.display()
+            ));
         }
     }
 }

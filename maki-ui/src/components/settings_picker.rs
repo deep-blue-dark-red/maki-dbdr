@@ -145,16 +145,7 @@ impl UserSettings {
         if raw == "cwd" {
             cwd.to_path_buf()
         } else {
-            let path_str = raw.to_string();
-            if let Some(stripped) = path_str.strip_prefix("~/") {
-                if let Some(home) = maki_storage::paths::home() {
-                    home.join(stripped)
-                } else {
-                    std::path::PathBuf::from(path_str)
-                }
-            } else {
-                std::path::PathBuf::from(path_str)
-            }
+            maki_storage::paths::expand_tilde(std::path::Path::new(raw))
         }
     }
 

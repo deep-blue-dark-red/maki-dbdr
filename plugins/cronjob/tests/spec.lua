@@ -55,10 +55,8 @@ case("validate_single_line", function()
   -- The corruption this guards against: a newline splits the job's single
   -- crontab line. The JSON half still parses, so the job stays visible and
   -- removable, but the command half becomes an orphan line cron chokes on.
-  local split = lib.build_line(
-    { name = "split", schedule = "@daily", cwd = "/tmp", prompt = "a\nb", yolo = true },
-    "/maki"
-  )
+  local split =
+    lib.build_line({ name = "split", schedule = "@daily", cwd = "/tmp", prompt = "a\nb", yolo = true }, "/maki")
   local jobs, broken = lib.parse_crontab(split)
   eq(#jobs, 1, "json half still parses")
   eq(#broken, 0, "no fragment carries the marker twice")
@@ -108,10 +106,8 @@ case("build_command", function()
   assert(not minimal:find("-m ", 1, true), "no model flag")
   assert(not minimal:find(">>", 1, true), "no log redirect")
 
-  local resuming = lib.build_command(
-    { name = "j", schedule = "@daily", cwd = "/tmp", prompt = "go", continue = true },
-    "/maki"
-  )
+  local resuming =
+    lib.build_command({ name = "j", schedule = "@daily", cwd = "/tmp", prompt = "go", continue = true }, "/maki")
   contains(resuming, "'/maki' -p -c ", "continue flag emitted")
 
   local with_env = lib.build_command({
@@ -142,10 +138,7 @@ case("build_line roundtrip", function()
 end)
 
 case("continue roundtrip", function()
-  local line = lib.build_line(
-    { name = "resumed", schedule = "@hourly", cwd = "/tmp", continue = true },
-    "/maki"
-  )
+  local line = lib.build_line({ name = "resumed", schedule = "@hourly", cwd = "/tmp", continue = true }, "/maki")
   local jobs = lib.parse_crontab(line)
   eq(jobs[1].job.continue, true, "continue survives the json payload")
 end)

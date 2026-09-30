@@ -265,6 +265,7 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
+| `picker_key` | string | `"<C-g>"` | - | Normal-mode key that opens the background jobs picker. |
 | `workers` | integer | `8` | 1 | Max concurrently running jobs. Spawn calls may lower this per call, never raise it. |
 
 ### `plugins.bash`

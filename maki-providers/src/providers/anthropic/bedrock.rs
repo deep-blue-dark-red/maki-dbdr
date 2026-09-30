@@ -495,14 +495,14 @@ impl Bedrock {
         })?;
         let base_url = env::var("ANTHROPIC_BEDROCK_BASE_URL").ok();
         Ok(Self {
-            client: super::super::http_client(timeouts),
+            client: super::super::http_client(timeouts)?,
             auth: Arc::new(Mutex::new(auth)),
             base_url,
         })
     }
 
     fn needs_refresh(&self) -> bool {
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
         match &auth.kind {
             AuthKind::SigV4 {
                 expires_at: Some(exp),
@@ -535,7 +535,7 @@ impl Provider for Bedrock {
                 debug!("Bedrock creds near expiry, refreshing before request");
                 self.reload_auth().await?;
             }
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let requested_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
             let long_context = requested_id.ends_with(shared::LONG_CONTEXT_SUFFIX);
             let model_id = shared::strip_long_context(&requested_id).to_string();
@@ -705,7 +705,7 @@ impl Provider for Bedrock {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let new_auth = resolve_bedrock_auth()?;
-            *self.auth.lock().unwrap() = new_auth;
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = new_auth;
             debug!("reloaded Bedrock auth from env");
             Ok(())
         })

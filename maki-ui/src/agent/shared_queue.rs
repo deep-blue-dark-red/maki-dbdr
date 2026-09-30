@@ -300,6 +300,7 @@ impl QueueReceiver {
         self.notify_rx.recv_async().await
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         lock(&self.items).len()
     }

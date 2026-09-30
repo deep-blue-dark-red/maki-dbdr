@@ -22,6 +22,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{Wrap, move_index};
 use crate::repaint::{Cadence, Dirty};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -531,8 +532,7 @@ fn move_selection(s: &mut Session, delta: isize) {
     // The user moving is the user choosing, which outranks a row a swap was
     // still trying to get back to.
     s.reselect = None;
-    let new = (s.selected as isize + delta).clamp(0, s.matches.len() as isize - 1);
-    s.selected = new as usize;
+    s.selected = move_index(s.selected, delta, s.matches.len(), Wrap::No);
     ensure_visible(s);
 }
 
@@ -1423,6 +1423,7 @@ mod tests {
 
     #[test]
     fn build_highlighted_line_truncates_from_the_tail() {
+        let _guard = theme::test_read_lock();
         let t = theme::current();
         let line = build_highlighted_line("verylongfilename.rs", &[], 5, false, &t);
         let text: String = line
@@ -1436,6 +1437,7 @@ mod tests {
 
     #[test]
     fn build_highlighted_line_unicode_width() {
+        let _guard = theme::test_read_lock();
         let t = theme::current();
         let line = build_highlighted_line("日本語.rs", &[], 6, false, &t);
         let text: String = line
@@ -1451,6 +1453,7 @@ mod tests {
     /// highlight onto the wrong characters of the kept tail.
     #[test]
     fn build_highlighted_line_keeps_matches_after_tail_cut() {
+        let _guard = theme::test_read_lock();
         let t = theme::current();
         let path = "dirs/preview.rs";
         let line = build_highlighted_line(path, &[11, 12], 6, false, &t);
@@ -1467,6 +1470,7 @@ mod tests {
     /// `e`.
     #[test]
     fn build_highlighted_line_highlights_whole_graphemes() {
+        let _guard = theme::test_read_lock();
         let t = theme::current();
         let line = build_highlighted_line(NFD_PATH, &NFD_MATCHED_UNITS, NFD_PATH.len(), false, &t);
         let spans: Vec<&str> = line.spans.iter().map(|s| s.content.as_ref()).collect();

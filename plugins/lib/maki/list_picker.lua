@@ -273,7 +273,9 @@ end
 
 -- {peer} comes from ListPicker._peer: rows sharing the selected row's key are
 -- the same thing underneath, so they get the tint.
-local function render_lines(items, selected, width, query, peer)
+local function render_lines(items, selected, width, query, peer, soft_selected)
+  -- Callers that resolve no softened style (tests) get the theme's own.
+  local sel_style = soft_selected or "selected"
   width = width or 80
   local words = split_words(query)
   -- On a very narrow window the pads themselves give way, so the row still
@@ -292,7 +294,7 @@ local function render_lines(items, selected, width, query, peer)
     for i, p in ipairs(parts) do
       local style = p[2] or DEFAULT_DETAIL_STYLE
       if is_sel then
-        style = "selected"
+        style = sel_style
       elseif is_peer then
         style = peer.detail_style(style)
       end
@@ -308,7 +310,7 @@ local function render_lines(items, selected, width, query, peer)
     local section = next_section(item, prev_section)
     local is_sel = (i == selected)
     local is_peer = not is_sel and sel_key ~= nil and peer.key(item) == sel_key
-    local style = is_sel and "selected" or (is_peer and peer_style or "item")
+    local style = is_sel and sel_style or (is_peer and peer_style or "item")
     local match_style = is_sel and "match_selected" or (is_peer and peer_match or "match")
 
     if section then
@@ -338,6 +340,24 @@ local function render_lines(items, selected, width, query, peer)
     lines[#lines + 1] = spans
   end
   return lines, item_lines
+end
+
+-- How far the selected row's background is pulled back toward a normal
+-- row's before it is used. The theme's own selection color is a full-strength
+-- band; over a long list that reads as a shout, so the picker lands it
+-- partway. The selection's foreground is kept whole for legibility.
+local SELECTED_BLEND = 0.45
+
+-- {style_of} is maki.ui.theme_style, passed in so a test can hand over its
+-- own. Resolved once per open: a theme cannot change while the float holds
+-- focus.
+function ListPicker._soften_selected(style_of)
+  local sel = style_of("selected") or {}
+  local item = style_of("item") or {}
+  if sel.bg ~= nil and item.bg ~= nil then
+    return { fg = sel.fg, bg = Color.lerp(item.bg, sel.bg, SELECTED_BLEND) }
+  end
+  return sel
 end
 
 -- The palette for rows that share an identity. {style_of} is
@@ -416,6 +436,10 @@ end
 -- {opts}:
 --   title, footer, cursor (initial index)
 --   submit_keys: extra submit keys besides <CR>
+--   submit_swaps: <CR> behaves like a live key — the "<CR>" entry in
+--     {live_keys} runs with the selected row, its returned list swaps in, and
+--     the picker stays open. With no "<CR>" live handler, Enter submits
+--     normally
 --   action_keys: keys that close the picker and report themselves, like { "R" }
 --     for a refresh binding. Use uppercase keys, lowercase ones keep feeding
 --     the filter
@@ -427,6 +451,10 @@ end
 --   key: function(item) -> string|nil, a row's identity. Rows sharing the
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
+--   refresh: function() -> items|nil, polled every {refresh_ms} (default 500)
+--     while the picker is open so rows track a changing source. Returning nil
+--     skips the swap, so callers re-build rows only when something changed
+--   refresh_ms: poll interval for {refresh}
 --
 -- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
 -- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
@@ -449,6 +477,7 @@ function ListPicker.open(items, opts)
   local key_fn = opts.key
   -- Resolved once: a theme cannot change while this float holds focus.
   local peer = key_fn and ListPicker._peer(key_fn, maki.ui.theme_style) or nil
+  local soft_selected = ListPicker._soften_selected(maki.ui.theme_style)
   local width
   local input = TextInput.new()
   local filtered, original_indices = filter_items(items, "")
@@ -462,7 +491,7 @@ function ListPicker.open(items, opts)
       content = { { { NO_MATCHES_LABEL, "dim" } } }
       item_lines = {}
     else
-      content, item_lines = render_lines(filtered, cursor, width, input:value(), peer)
+      content, item_lines = render_lines(filtered, cursor, width, input:value(), peer, soft_selected)
     end
     local r = input:render("\xe2\x9d\xaf ")
     for _, ln in ipairs(r.lines) do
@@ -499,21 +528,52 @@ function ListPicker.open(items, opts)
     return math.max(height - 2, 1)
   end
 
+  -- Live swaps (a live key or a refresh poll) keep the typed query and move
+  -- the cursor with the selected row's identity.
+  local function swap(new_items)
+    local selected = filtered[cursor]
+    local prev_key = key_fn and selected and key_fn(selected) or nil
+    items = new_items
+    filtered, original_indices = filter_items(items, input:value())
+    -- The host answers with a resize event the loop already re-renders
+    -- on, so there is no height bookkeeping here.
+    win:set_config({ height = content_height(items) + BORDER_CHROME })
+    move_cursor(ListPicker._select_after_swap(filtered, key_fn, prev_key, cursor))
+  end
+
+  local refresh_ms = opts.refresh and (opts.refresh_ms or 500) or nil
+
   buf:set_lines(build_lines())
   if #filtered > 0 then
     move_cursor(cursor)
   end
 
   while true do
-    local ev = win:recv()
-    if not ev or ev.type == "close" then
+    local ev = win:recv(refresh_ms)
+    if ev == nil or ev.type == "close" then
       return { type = "close" }
-    end
-
-    if ev.type == "resize" then
+    elseif ev.type == "timeout" then
+      if opts.refresh then
+        local fresh = opts.refresh()
+        if fresh then
+          swap(fresh)
+        end
+      end
+    elseif ev.type == "resize" then
       width = ev.width
       height = ev.height
       move_cursor(cursor)
+    elseif ev.type == "click" then
+      -- A click on a row selects and submits it, like moving the cursor
+      -- there and pressing Enter. Clicks on chrome (query line, blank
+      -- rows, the input line) match no item row and do nothing.
+      for i, line_no in pairs(item_lines) do
+        if line_no == ev.row then
+          move_cursor(i)
+          win:close()
+          return { type = "choice", index = original_indices[cursor], item = filtered[cursor] }
+        end
+      end
     elseif ev.type == "key" then
       if ev.key == "<Up>" then
         move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)
@@ -538,20 +598,20 @@ function ListPicker.open(items, opts)
         end
       elseif submit_keys[ev.key] then
         if #filtered > 0 then
-          win:close()
-          return { type = "choice", index = original_indices[cursor], item = filtered[cursor] }
+          local swap_handler = opts.submit_swaps and ev.key == "<CR>" and live_keys["<CR>"] or nil
+          local swapped = swap_handler and swap_handler(filtered[cursor]) or nil
+          if swapped then
+            swap(swapped)
+          else
+            win:close()
+            return { type = "choice", index = original_indices[cursor], item = filtered[cursor] }
+          end
         end
       elseif live_keys[ev.key] then
         local selected = filtered[cursor]
         local swapped = live_keys[ev.key](selected)
         if swapped then
-          local prev_key = key_fn and selected and key_fn(selected) or nil
-          items = swapped
-          filtered, original_indices = filter_items(items, input:value())
-          -- The host answers with a resize event the loop already re-renders
-          -- on, so there is no height bookkeeping here.
-          win:set_config({ height = content_height(items) + BORDER_CHROME })
-          move_cursor(ListPicker._select_after_swap(filtered, key_fn, prev_key, cursor))
+          swap(swapped)
         end
       elseif action_keys[ev.key] then
         win:close()

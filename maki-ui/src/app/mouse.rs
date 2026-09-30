@@ -58,6 +58,11 @@ impl App {
                     } else {
                         let zone = sel.zone;
                         self.selection_state = None;
+                        if !self.has_modal_overlay()
+                            && self.float_mgr.handle_click_at(event.row, event.column)
+                        {
+                            return;
+                        }
                         if self.stats_modal.is_open()
                             && zone == SelectionZone::Overlay
                             && self.stats_modal.handle_mouse_click(event.row, event.column)

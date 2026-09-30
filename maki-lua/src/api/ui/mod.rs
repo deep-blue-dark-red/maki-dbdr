@@ -15,7 +15,7 @@ use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
     InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
 };
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::{opt, opt_bool};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
@@ -142,14 +142,14 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 /// toast:line("copied!")
 #[lua_fn]
 fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
-    let scratch = opts.and_then(|t| opt_bool(&t, "scratch")).unwrap_or(false);
-    Ok(with_task_bufs(lua, |store| {
+    let scratch = opt::<bool>(opts.as_ref(), "scratch").unwrap_or(false);
+    with_task_bufs(lua, |store| {
         if scratch {
             store.create()
         } else {
             store.create_live()
         }
-    }))
+    })
 }
 
 /// Looks up a color the syntax theme names, such as "background",
@@ -239,13 +239,8 @@ fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 /// end
 #[lua_fn]
 async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
-    let independent = opts
-        .as_ref()
-        .and_then(|t| opt_bool(t, "independent"))
-        .unwrap_or(false);
-    let prefix = opts
-        .and_then(|t| t.get::<String>("prefix").ok())
-        .unwrap_or_default();
+    let independent = opt::<bool>(opts.as_ref(), "independent").unwrap_or(false);
+    let prefix = opt::<String>(opts.as_ref(), "prefix").unwrap_or_default();
     let segments = smol::unblock(move || {
         maki_highlight::pool::run(move || {
             if independent {

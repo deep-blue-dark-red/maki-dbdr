@@ -12,3 +12,7 @@ bench/results/
 /session-*.md
 /.claude/
 /codex-session-01a05652-96cc-7270-901a-1c1e3f623a77.md
+.mypy_cache/
+# Root-level scratch output (err*.txt, out.txt). Scoped to the root so the
+# word lists under maki-storage/src/words/ stay addable.
+/*.txt

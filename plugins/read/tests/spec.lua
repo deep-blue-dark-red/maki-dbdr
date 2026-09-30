@@ -19,11 +19,12 @@ end)
 case("truncate_utf8_boundary_safety", function()
   -- 2-byte: é = \xC3\xA9
   eq(truncate_bytes("caf\xC3\xA9", 10), "caf\xC3\xA9")
-  eq(truncate_bytes("caf\xC3\xA9!", 5), "caf...")
+  -- the cap lands right before '!', so the complete é stays
+  eq(truncate_bytes("caf\xC3\xA9!", 5), "caf\xC3\xA9...")
   eq(truncate_bytes("caf\xC3\xA9", 4), "caf...")
 
-  -- 3-byte: € = \xE2\x82\xAC — cut at each byte within the sequence
-  eq(truncate_bytes("ab\xE2\x82\xACd", 5), "ab...")
+  -- 3-byte: € = \xE2\x82\xAC — cap at a boundary keeps it, inside cuts it
+  eq(truncate_bytes("ab\xE2\x82\xACd", 5), "ab\xE2\x82\xAC...")
   eq(truncate_bytes("ab\xE2\x82\xAC", 4), "ab...")
   eq(truncate_bytes("ab\xE2\x82\xAC", 3), "ab...")
 
@@ -33,10 +34,10 @@ case("truncate_utf8_boundary_safety", function()
   eq(truncate_bytes(emoji, 3), "...")
   eq(truncate_bytes(emoji, 1), "...")
 
-  -- all multibyte: cutting within sequences
+  -- all multibyte: the cap on a codepoint boundary keeps whole chars
   local s = "\xC3\xA9\xC3\xA9\xC3\xA9"
-  eq(truncate_bytes(s, 4), "\xC3\xA9...")
-  eq(truncate_bytes(s, 2), "...")
+  eq(truncate_bytes(s, 4), "\xC3\xA9\xC3\xA9...")
+  eq(truncate_bytes(s, 2), "\xC3\xA9...")
 end)
 
 case("split_lines", function()

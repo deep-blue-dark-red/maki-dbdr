@@ -198,7 +198,7 @@ fn add(lua: &Lua, specs: Table, opts: Option<Table>) -> LuaResult<()> {
         });
     }
 
-    let mut declarations = store.lock().expect("pack declarations");
+    let mut declarations = store.lock().unwrap_or_else(|e| e.into_inner());
     if declarations.drained {
         return Err(mlua::Error::runtime(format!("pack.add: {AFTER_LOAD}")));
     }
@@ -264,7 +264,7 @@ fn enqueue(lua: &Lua, name: String) -> LuaResult<()> {
         .app_data_ref::<PackStore>()
         .ok_or_else(|| mlua::Error::runtime("pack: not available here"))?
         .clone();
-    let mut declarations = store.lock().expect("pack declarations");
+    let mut declarations = store.lock().unwrap_or_else(|e| e.into_inner());
     if declarations.drained {
         return Err(mlua::Error::runtime(format!("maki.packadd: {AFTER_LOAD}")));
     }
@@ -304,7 +304,7 @@ fn get(lua: &Lua, names: Option<Table>, opts: Option<Table>) -> LuaResult<Table>
         .app_data_ref::<PackStore>()
         .ok_or_else(|| mlua::Error::runtime("pack.get: not available here"))?
         .clone();
-    let declarations = store.lock().expect("pack declarations").clone();
+    let declarations = store.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let lock = crate::pack::read_lockfile(crate::pack::lockfile_path().as_deref())
         .ok_or_else(|| mlua::Error::runtime("pack.get: pack lockfile is unreadable"))?;
     let site = crate::pack::site_dir().ok();

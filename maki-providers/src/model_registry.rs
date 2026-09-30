@@ -28,11 +28,11 @@ const TIERS_FILE: &str = "model-tiers";
 static REGISTRY: OnceLock<RwLock<ModelRegistry>> = OnceLock::new();
 
 fn read() -> RwLockReadGuard<'static, ModelRegistry> {
-    registry().read().unwrap()
+    registry().read().unwrap_or_else(|e| e.into_inner())
 }
 
 fn write() -> RwLockWriteGuard<'static, ModelRegistry> {
-    registry().write().unwrap()
+    registry().write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn registry() -> &'static RwLock<ModelRegistry> {

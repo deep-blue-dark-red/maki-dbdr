@@ -70,8 +70,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(OpenAi::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        OpenAi::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 inventory::submit!(SPEC.config_row());

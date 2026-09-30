@@ -59,7 +59,10 @@ impl LoadedPlugins {
     fn sorted(mut plugins: Vec<LoadedPlugin>, generation: u64) -> Self {
         plugins.sort_unstable_by(|a, b| a.name.as_ref().cmp(&b.name));
         plugins.dedup_by(|a, b| a.name == b.name);
-        Self { plugins, generation }
+        Self {
+            plugins,
+            generation,
+        }
     }
 }
 

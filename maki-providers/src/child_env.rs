@@ -151,7 +151,11 @@ mod tests {
                 .env(explicit, SECRET)
                 .output()
                 .unwrap();
-            let want = if expected { format!("{SECRET}\n") } else { String::new() };
+            let want = if expected {
+                format!("{SECRET}\n")
+            } else {
+                String::new()
+            };
             assert_eq!(String::from_utf8_lossy(&seen.stdout), want, "{var}");
         }
     }

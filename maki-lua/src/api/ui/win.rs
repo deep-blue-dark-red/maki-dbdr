@@ -118,6 +118,12 @@ fn event_table(lua: &Lua, event: WinEvent) -> LuaResult<Table> {
             tbl.set("text", text)?;
             Ok(tbl)
         }
+        WinEvent::Click { row, col } => {
+            let tbl = tagged(lua, "click")?;
+            tbl.set("row", row)?;
+            tbl.set("col", col)?;
+            Ok(tbl)
+        }
         WinEvent::Close => tagged(lua, "close"),
     }
 }
@@ -136,6 +142,11 @@ const recv__doc: FnDoc = FnDoc {
         `\"<S-Tab>\"`.\n\
         - `{type=\"resize\", width, height}` -- terminal was resized.\n\
         - `{type=\"paste\", text}` -- bracketed paste.\n\
+        - `{type=\"click\", row, col}` -- left click inside the window's \
+        content area. {row} is the 1-based buffer line clicked (the same \
+        numbering `win:set_cursor` takes), {col} the 1-based column. Clicks \
+        on border, title, or footer never arrive. Only windows opened with \
+        `focus = true` get click events.\n\
         - `{type=\"close\"}` -- window was closed externally.\n\
         - `{type=\"timeout\"}` -- no event arrived within {timeout_ms}.",
     params: &[ParamDoc {
@@ -214,6 +225,7 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - reserved_top (integer): rows reserved at the top of the content area.
 ///   - split (string): edge docking, "above", "below", "left", "right", "panel", or "".
 ///   - order (integer): paint order among split windows.
+///   - focus (boolean): true hands keyboard focus to this window.
 ///   - needs_input (boolean): whether the window means the session needs user input.
 /// @return
 /// @example
@@ -254,6 +266,7 @@ fn set_config(_lua: &Lua, this: &WinHandle, opts: Table) -> LuaResult<()> {
     if let Ok(o) = opts.get::<u16>("order") {
         patch.order = Some(o);
     }
+    patch.focus = opt_bool(&opts, "focus");
     patch.needs_input = opt_bool(&opts, "needs_input");
     patch.width = try_parse_dimension(&opts, "width");
     patch.height = try_parse_dimension(&opts, "height");

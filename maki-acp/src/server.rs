@@ -123,10 +123,19 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let writer_task = smol::spawn(async move {
         let stdout = std::io::stdout();
         while let Ok(msg) = out_rx.recv_async().await {
+            // Serialize before touching stdout: a mid-object failure would
+            // otherwise leave a truncated frame for the client to parse, with
+            // no newline to mark where it ended.
+            let mut frame = Vec::with_capacity(256);
+            if let Err(e) = serde_json::to_writer(&mut frame, &msg) {
+                warn!(error = %e, "dropping unserializable ACP message");
+                continue;
+            }
+            frame.push(b'\n');
             let mut handle = stdout.lock();
-            if serde_json::to_writer(&mut handle, &msg).is_ok() {
-                let _ = handle.write_all(b"\n");
-                let _ = handle.flush();
+            if let Err(e) = handle.write_all(&frame).and_then(|()| handle.flush()) {
+                warn!(error = %e, "ACP stdout write failed; stopping writer");
+                return;
             }
         }
     });
@@ -472,7 +481,11 @@ fn ask_client(
     request: AgentRequest,
 ) -> i64 {
     let id = NEXT_OUTGOING_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    pending.lock().unwrap().asks.insert(id, ask);
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .asks
+        .insert(id, ask);
     send(
         out_tx,
         Request {
@@ -516,7 +529,11 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool 
             let response = ctx.cancel.race(guard.recv_async()).await;
             // Cleared while still holding the channel, so a stale id cannot
             // clobber whatever ask comes next.
-            pending.lock().unwrap().asks.remove(&id);
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .asks
+                .remove(&id);
             drop(guard);
 
             Ok(match response {
@@ -631,7 +648,13 @@ async fn close_session(srv: &mut Server, reason: SessionEndReason) {
     }
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
-    if let Some(id) = state.pending.lock().unwrap().prompt.take() {
+    if let Some(id) = state
+        .pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .prompt
+        .take()
+    {
         let resp = PromptResponse::new(StopReason::Cancelled);
         send(
             &srv.out_tx,
@@ -713,7 +736,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
     // One outstanding id per session, checked and set under the same guard:
     // `input_tx` is unbounded, so a second prompt would queue happily and
     // overwrite the first id, leaving that request unanswered forever.
-    let mut pending = session.pending.lock().unwrap();
+    let mut pending = session.pending.lock().unwrap_or_else(|e| e.into_inner());
     if pending.prompt.is_some() {
         return Err(AcpError::new(-32603, "a prompt is already running"));
     }
@@ -782,7 +805,12 @@ fn handle_notification(srv: &Server, method: &str) {
             if let Some(session) = &srv.session {
                 // Every answer still in flight belongs to the cancelled turn,
                 // so forget the ids and let them be dropped on arrival.
-                session.pending.lock().unwrap().asks.clear();
+                session
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .asks
+                    .clear();
                 let _ = session.handle.cancel_tx.try_send(());
             }
         }
@@ -793,7 +821,14 @@ fn handle_notification(srv: &Server, method: &str) {
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
     let id = raw.get("id").map(request_id).unwrap_or(RequestId::Null);
-    let ask = ask_id(&id).and_then(|id| session.pending.lock().unwrap().asks.remove(&id));
+    let ask = ask_id(&id).and_then(|id| {
+        session
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .asks
+            .remove(&id)
+    });
     let Some(ask) = ask else {
         warn!(%id, "response for an unknown request id");
         return;
@@ -1045,7 +1080,7 @@ fn start_event_pump(
 /// waiter that is already gone: it is dropped rather than left to sit in the
 /// map for the life of the session.
 fn finish_turn(pending: &PendingState) -> Option<RequestId> {
-    let mut pending = pending.lock().unwrap();
+    let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
     pending.asks.clear();
     pending.prompt.take()
 }

@@ -21,6 +21,7 @@ pub(crate) mod permission_prompt;
 pub(crate) mod plan_form;
 pub(crate) mod plugins_modal;
 pub(crate) mod progress_bar;
+pub(crate) mod prompt_view;
 pub mod queue_panel;
 pub(crate) mod rewind_picker;
 pub(crate) mod scrollbar;
@@ -99,6 +100,25 @@ pub(crate) fn apply_scroll_delta(offset: u16, delta: i32) -> u16 {
         offset.saturating_sub(delta as u16)
     } else {
         offset.saturating_add(delta.unsigned_abs() as u16)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Wrap {
+    Yes,
+    No,
+}
+
+/// The next selected index after moving `delta` through a list of `len`
+/// items. An empty list has nowhere to move, so the index is kept as is.
+pub(crate) fn move_index(index: usize, delta: isize, len: usize, wrap: Wrap) -> usize {
+    if len == 0 {
+        return index;
+    }
+    let next = (index as isize).saturating_add(delta);
+    match wrap {
+        Wrap::Yes => next.rem_euclid(len as isize) as usize,
+        Wrap::No => next.clamp(0, len as isize - 1) as usize,
     }
 }
 
@@ -516,5 +536,17 @@ mod tests {
     #[test_case(0, 5, 0    ; "clamp_underflow")]
     fn apply_scroll_delta_cases(offset: u16, delta: i32, expected: u16) {
         assert_eq!(apply_scroll_delta(offset, delta), expected);
+    }
+
+    #[test_case(3, -1, 0, Wrap::Yes => 3 ; "empty_list_up_keeps_index")]
+    #[test_case(3, 1, 0, Wrap::No => 3   ; "empty_list_down_keeps_index")]
+    #[test_case(0, -1, 5, Wrap::Yes => 4 ; "wraps_up_at_zero")]
+    #[test_case(0, -1, 5, Wrap::No => 0  ; "clamps_up_at_zero")]
+    #[test_case(4, 1, 5, Wrap::Yes => 0  ; "wraps_down_at_last")]
+    #[test_case(4, 1, 5, Wrap::No => 4   ; "clamps_down_at_last")]
+    #[test_case(0, -7, 3, Wrap::Yes => 2 ; "wraps_up_delta_exceeds_len")]
+    #[test_case(0, 7, 3, Wrap::No => 2   ; "clamps_down_delta_exceeds_len")]
+    fn move_index_cases(index: usize, delta: isize, len: usize, wrap: Wrap) -> usize {
+        move_index(index, delta, len, wrap)
     }
 }

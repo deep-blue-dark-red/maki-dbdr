@@ -2693,7 +2693,13 @@ fn append_global_permission(
     let path = global
         .ok_or_else(|| "cannot determine home directory".to_string())?
         .join(PERMISSIONS_FILE);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        // Same rule as the project copy: only "no file yet" may default to an
+        // empty document, because that document is written straight back.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read permissions: {e}")),
+    };
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| format!("failed to parse permissions: {e}"))?;
@@ -2719,7 +2725,14 @@ fn append_project_permission(
     let Some(path) = project_config.gated_path(GatedFile::Permissions) else {
         return Err(UNTRUSTED_PROJECT_WRITE.to_string());
     };
-    let existing = fs::read_to_string(&path).ok();
+    let existing = match fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        // Only "no file yet" may fall through to a fresh document. Any other
+        // error (EACCES, transient IO) must not be mistaken for absence: the
+        // empty parse below would be written back and wipe every saved rule.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("cannot read .maki/{PERMISSIONS_FILE}: {e}")),
+    };
     let mut doc: toml_edit::DocumentMut = existing
         .as_deref()
         .unwrap_or_default()

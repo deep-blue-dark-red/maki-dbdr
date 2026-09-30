@@ -18,6 +18,7 @@ use maki_storage::auth::{OAuthTokens, load_tokens, lock_tokens, save_tokens};
 use maki_storage::sessions::wire_logs_dir;
 
 use crate::AgentError;
+use crate::model::ModelInfo;
 use crate::retry::RetryPolicy;
 use crate::wire_log;
 
@@ -51,6 +52,8 @@ const EMPTY_SSE_ERROR_MESSAGE: &str = "provider sent an error frame with no deta
 const UNAUTHORIZED_STATUS: u16 = 401;
 const AUTHORIZATION_HEADER: &str = "authorization";
 const BEARER_PREFIX: &str = "Bearer ";
+const SSE_EVENT_PREFIX: &str = "event:";
+const SSE_DATA_PREFIX: &str = "data:";
 
 fn bearer_value(api_key: &str) -> String {
     format!("{BEARER_PREFIX}{api_key}")
@@ -261,6 +264,12 @@ pub(crate) fn with_prefix<'a>(
     }
 }
 
+/// One id ordering for every model list: stable across runs, so the picker
+/// and diffed catalogs do not reshuffle between fetches.
+pub(crate) fn sort_models(models: &mut [ModelInfo]) {
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
 pub(crate) fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -352,6 +361,15 @@ impl SseErrorPayload {
     }
 }
 
+/// The payload sniff every streamed-error path shares. *When* to sniff
+/// differs (a tagged `event:` line vs. an `"error"` key in the data), so
+/// callers keep their own trigger and this only parses and maps it.
+pub(crate) fn sse_error(data: &str) -> Option<AgentError> {
+    let ev = serde_json::from_str::<SseErrorPayload>(data).ok()?;
+    warn!(error_type = %ev.error.r#type, message = %ev.error.message, "SSE error in stream");
+    Some(ev.into_agent_error())
+}
+
 pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     lines: &mut futures_lite::io::Lines<R>,
     deadline: &mut Instant,
@@ -374,7 +392,66 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     result
 }
 
-pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
+/// One framing line of an SSE stream.
+pub(crate) enum SseLine {
+    Event(String),
+    Data(String),
+    /// Comments, blank keep-alives, anything the loops skip.
+    Other,
+}
+
+/// What sits between an SSE field's colon and its value. The OpenAI dialects
+/// trim both ends; Google and Anthropic drop exactly the one separating space
+/// and keep the rest verbatim (`event:  x` must not become `x`).
+enum SseFraming {
+    Trim,
+    StripSpace,
+}
+
+fn sse_value(rest: &str, framing: SseFraming) -> String {
+    match framing {
+        SseFraming::Trim => rest.trim().to_string(),
+        SseFraming::StripSpace => rest.strip_prefix(' ').unwrap_or(rest).to_string(),
+    }
+}
+
+async fn framing_line<R: AsyncBufRead + Unpin>(
+    lines: &mut futures_lite::io::Lines<R>,
+    deadline: &mut Instant,
+    stream_timeout: Duration,
+    framing: SseFraming,
+) -> Result<Option<SseLine>, AgentError> {
+    let Some(line) = next_sse_line(lines, deadline, stream_timeout).await? else {
+        return Ok(None);
+    };
+    if let Some(rest) = line.strip_prefix(SSE_EVENT_PREFIX) {
+        return Ok(Some(SseLine::Event(sse_value(rest, framing))));
+    }
+    if let Some(rest) = line.strip_prefix(SSE_DATA_PREFIX) {
+        return Ok(Some(SseLine::Data(sse_value(rest, framing))));
+    }
+    Ok(Some(SseLine::Other))
+}
+
+/// Next line as an `event:`, `data:` or other field, values trimmed.
+pub(crate) async fn next_sse_event<R: AsyncBufRead + Unpin>(
+    lines: &mut futures_lite::io::Lines<R>,
+    deadline: &mut Instant,
+    stream_timeout: Duration,
+) -> Result<Option<SseLine>, AgentError> {
+    framing_line(lines, deadline, stream_timeout, SseFraming::Trim).await
+}
+
+/// [`next_sse_event`] for framing that keeps everything after the first space.
+pub(crate) async fn next_sse_event_spaced<R: AsyncBufRead + Unpin>(
+    lines: &mut futures_lite::io::Lines<R>,
+    deadline: &mut Instant,
+    stream_timeout: Duration,
+) -> Result<Option<SseLine>, AgentError> {
+    framing_line(lines, deadline, stream_timeout, SseFraming::StripSpace).await
+}
+
+pub(crate) fn http_client(timeouts: Timeouts) -> Result<isahc::HttpClient, AgentError> {
     isahc::HttpClient::builder()
         .connect_timeout(timeouts.connect)
         .low_speed_timeout(LOW_SPEED_BYTES_PER_SEC, timeouts.low_speed)
@@ -383,7 +460,9 @@ pub(crate) fn http_client(timeouts: Timeouts) -> isahc::HttpClient {
         // tuned for HTTP/1.1, so pin it.
         .version_negotiation(VersionNegotiation::http11())
         .build()
-        .expect("failed to build HTTP client")
+        .map_err(|e| AgentError::Config {
+            message: format!("http client: {e}"),
+        })
 }
 
 /// Path of the current session's `.mlog` file, keyed by the stable session id so
@@ -732,10 +811,20 @@ impl<'a> KeyRotation<'a> {
         }
         self.auth
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .set_key_header(self.header.name(), self.header.value(self.pool.current()));
         true
     }
+}
+
+/// `Provider::keys` for every provider whose pool and auth sit in the usual
+/// fields; `None` when the provider has no pool (no key configured).
+pub(crate) fn key_rotation<'a>(
+    pool: &'a Option<KeyPool>,
+    auth: &'a Mutex<ResolvedAuth>,
+    header: KeyHeader,
+) -> Option<KeyRotation<'a>> {
+    Some(KeyRotation::new(pool.as_ref()?, auth, header))
 }
 
 #[cfg(test)]

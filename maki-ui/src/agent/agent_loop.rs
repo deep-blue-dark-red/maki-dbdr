@@ -555,7 +555,10 @@ mod tests {
         let beta_at = out.find(&format!("## {BETA}")).expect("beta section");
         assert!(alpha_at < beta_at, "request order must be kept:\n{out}");
         assert!(out.starts_with("2 tools enabled"), "{out}");
-        assert!(out.contains(ALPHA_INSTR) && out.contains(BETA_INSTR), "{out}");
+        assert!(
+            out.contains(ALPHA_INSTR) && out.contains(BETA_INSTR),
+            "{out}"
+        );
     }
 
     #[test_case(Some(""), "no description" ; "blank_description")]

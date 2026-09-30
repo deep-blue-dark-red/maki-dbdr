@@ -40,7 +40,7 @@ impl Xai {
         let storage = StateDir::resolve()?;
         let resolved = auth::resolve(&storage)?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(resolved)),
             storage: Some(storage),
             system_prefix: None,
@@ -50,13 +50,13 @@ impl Xai {
     pub(crate) fn with_auth(
         auth: Arc<Mutex<ResolvedAuth>>,
         timeouts: crate::providers::Timeouts,
-    ) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
             storage: None,
             system_prefix: None,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -65,7 +65,7 @@ impl Xai {
     }
 
     fn current_auth(&self) -> ResolvedAuth {
-        self.auth.lock().unwrap().clone()
+        self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn is_oauth(&self) -> bool {
@@ -76,7 +76,12 @@ impl Xai {
         let storage = self.storage.clone().ok_or_else(|| AgentError::Config {
             message: "OAuth refresh not available for externally-managed auth".into(),
         })?;
-        let rejected = self.auth.lock().unwrap().access_token().map(str::to_owned);
+        let rejected = self
+            .auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .access_token()
+            .map(str::to_owned);
         let resolved = smol::unblock(move || {
             match refreshed_tokens(
                 &storage,
@@ -94,7 +99,7 @@ impl Xai {
             }
         })
         .await?;
-        *self.auth.lock().unwrap() = resolved;
+        *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
         debug!("refreshed xAI OAuth token");
         Ok(())
     }
@@ -247,7 +252,7 @@ impl Provider for Xai {
                 return Ok(());
             };
             let resolved = smol::unblock(move || auth::resolve(&storage)).await?;
-            *self.auth.lock().unwrap() = resolved;
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) = resolved;
             debug!("reloaded xAI auth from storage");
             Ok(())
         })

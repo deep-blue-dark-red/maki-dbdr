@@ -8,6 +8,8 @@
 -- stays a pure flag flip + re-render, deterministic across replays.
 -- Async highlighting goes through `maki.async.run`; during restore the
 -- runtime runs those tasks inline before snapshotting.
+local backoff = require("maki.utf8").backoff
+
 local ToolView = {}
 ToolView.__index = ToolView
 
@@ -30,18 +32,7 @@ local function utf8_truncate_bytes(s, max_bytes)
   if max_bytes <= 0 then
     return ""
   end
-  local i = max_bytes
-  while i > 0 do
-    local next_b = s:byte(i + 1)
-    if not next_b or next_b < 0x80 or next_b >= 0xC0 then
-      break
-    end
-    i = i - 1
-  end
-  if i <= 0 then
-    return "…"
-  end
-  return s:sub(1, i) .. "…"
+  return s:sub(1, backoff(s, max_bytes)) .. "…"
 end
 
 local function line_text_bytes(line)

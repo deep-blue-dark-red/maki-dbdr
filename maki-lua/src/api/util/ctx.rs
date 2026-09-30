@@ -19,7 +19,7 @@ const DEADLINE_ALREADY_SET_MSG: &str = "ctx:set_deadline() already called";
 
 fn send_live_buf(lua: &mlua::Lua, buf: &mlua::AnyUserData) -> mlua::Result<()> {
     let shared = buf.borrow::<BufHandle>().map(|h| Arc::clone(&h.buf))?;
-    let task = active_task(lua);
+    let task = active_task(lua)?;
     let (live, sink) = {
         let mut cell = lock_cell(&task);
         cell.root_buf = Some(Arc::clone(&shared));
@@ -313,7 +313,7 @@ impl UserData for LuaCtx {
             if !matches!(this.caps, Caps::Handler { .. }) {
                 return Ok(this.cap_err_pair("set_deadline"));
             }
-            let handle = active_task(lua);
+            let handle = active_task(lua)?;
             let cell = handle.lock().unwrap_or_else(|e| e.into_inner());
             if cell.deadline_secs.get().is_some() {
                 return Err(mlua::Error::runtime(DEADLINE_ALREADY_SET_MSG));
@@ -375,7 +375,7 @@ impl UserData for LuaCtx {
                 .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
 
             if let Some(buf) = crate::api::ui::buf::buf_from_reply(&val) {
-                lock_cell(&active_task(lua)).root_buf = Some(buf);
+                lock_cell(&active_task(lua)?).root_buf = Some(buf);
             }
             let _ = tx.send(ToolCallReply::from_lua_value(lua, &val));
             Ok((Some(true), None))

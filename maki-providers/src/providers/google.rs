@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flume::Sender;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
 use maki_storage::id::{MakiId, SessionRef};
 use serde::Deserialize;
@@ -23,7 +23,10 @@ use crate::{
     StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, http_client, next_sse_line};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseLine, http_client, key_rotation,
+    next_sse_event_spaced, sort_models,
+};
 
 pub(crate) const SLUG: &str = "google";
 const DISPLAY_NAME: &str = "Google";
@@ -92,8 +95,8 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     _system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Google::with_auth(auth, timeouts))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(Google::with_auth(auth, timeouts)?))
 }
 
 inventory::submit!(SPEC.config_row());
@@ -125,7 +128,7 @@ impl Google {
         let resolved_base_url = resolve_google_base_url();
         let resolved = resolve_auth_from_key(pool.current(), resolved_base_url.clone())?;
         Ok(Self {
-            client: http_client(timeouts),
+            client: http_client(timeouts)?,
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             stream_timeout: timeouts.stream,
@@ -136,19 +139,23 @@ impl Google {
     pub(crate) fn with_auth(
         auth: Arc<Mutex<super::ResolvedAuth>>,
         timeouts: super::Timeouts,
-    ) -> Self {
-        let resolved_base_url = auth.lock().unwrap().base_url.clone();
-        Self {
-            client: http_client(timeouts),
+    ) -> Result<Self, AgentError> {
+        let resolved_base_url = auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .base_url
+            .clone();
+        Ok(Self {
+            client: http_client(timeouts)?,
             auth,
             key_pool: None,
             stream_timeout: timeouts.stream,
             resolved_base_url,
-        }
+        })
     }
 
     fn build_request(&self, method: &str, url: &str) -> isahc::http::request::Builder {
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
         auth.configure_request(
             Request::builder()
                 .method(method)
@@ -158,7 +165,7 @@ impl Google {
     }
 
     fn api_key(&self) -> String {
-        let auth = self.auth.lock().unwrap();
+        let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
         auth.headers
             .iter()
             .find(|(k, _)| k == API_KEY_HEADER)
@@ -168,7 +175,7 @@ impl Google {
 
     fn stream_url(&self, model_id: &str) -> String {
         let base = {
-            let auth = self.auth.lock().unwrap();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
             auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let encoded = super::urlenc(model_id);
@@ -177,7 +184,7 @@ impl Google {
 
     fn models_url(&self) -> String {
         let base = {
-            let auth = self.auth.lock().unwrap();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner());
             auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
         };
         let key = self.api_key();
@@ -237,7 +244,7 @@ impl Google {
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse(response, event_tx, self.stream_timeout).await
+            super::sse_captured!(response, event_tx, self.stream_timeout, parse_sse)
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -259,10 +266,12 @@ impl Provider for Google {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        let url = self.models_url();
-        let request = self.build_request("GET", &url).body(()).unwrap();
         let client = self.client.clone();
         Box::pin(async move {
+            let url = self.models_url();
+            // The URL embeds `auth.base_url` and the API key, both user config,
+            // so a malformed value fails here rather than poisoning a panic.
+            let request = self.build_request("GET", &url).body(())?;
             let mut response = client.send_async(request).await?;
             if response.status().as_u16() != 200 {
                 return Err(AgentError::from_response(response).await);
@@ -286,7 +295,7 @@ impl Provider for Google {
                     crate::model::ModelInfo::id_only(id)
                 })
                 .collect();
-            infos.sort_by(|a, b| a.id.cmp(&b.id));
+            sort_models(&mut infos);
             Ok(infos)
         })
     }
@@ -294,18 +303,14 @@ impl Provider for Google {
     fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async {
             let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
-            *self.auth.lock().unwrap() =
+            *self.auth.lock().unwrap_or_else(|e| e.into_inner()) =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
         })
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 }
 
@@ -584,28 +589,10 @@ fn push_or_extend_thinking(
 }
 
 async fn parse_sse(
-    response: isahc::Response<isahc::AsyncBody>,
+    reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let status = response.status().as_u16();
-    let content_type = super::content_type_header(&response);
-    let mut tee = super::TeeBody::new(response.into_body());
-    let result = read_sse(&mut tee, event_tx, stream_timeout).await;
-    super::log_api_response(
-        status,
-        content_type.as_deref(),
-        tee.into_capture().as_deref(),
-    );
-    result
-}
-
-async fn read_sse(
-    body: &mut super::TeeBody<isahc::AsyncBody>,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
-) -> Result<StreamResponse, AgentError> {
-    let reader = BufReader::new(body);
     let mut lines = reader.lines();
 
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -613,13 +600,12 @@ async fn read_sse(
     let mut stop_reason: Option<StopReason> = None;
     let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.strip_prefix(' ').unwrap_or(d),
-            _ => continue,
+    while let Some(line) = next_sse_event_spaced(&mut lines, &mut deadline, stream_timeout).await? {
+        let SseLine::Data(data) = line else {
+            continue;
         };
 
-        let chunk: SseResponse = match serde_json::from_str(data) {
+        let chunk: SseResponse = match serde_json::from_str(&data) {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "failed to parse Gemini SSE chunk");
@@ -705,6 +691,7 @@ async fn read_sse(
 mod tests {
     use super::*;
     use crate::model::{ModelPricing, ModelTier};
+    use futures_lite::io::Cursor;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -786,7 +773,7 @@ mod tests {
 
     #[test]
     fn google_build_body_basic() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
+        let google = Google::with_auth(test_auth(), test_timeouts()).unwrap();
         let model = test_model();
         let messages = vec![Message::user("hello".into())];
         let body = google.build_body(
@@ -805,7 +792,7 @@ mod tests {
 
     #[test]
     fn google_build_body_thinking_adaptive() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
+        let google = Google::with_auth(test_auth(), test_timeouts()).unwrap();
         let messages = vec![Message::user("think".into())];
         let body = google.build_body(
             &test_model(),
@@ -823,7 +810,7 @@ mod tests {
 
     #[test]
     fn google_build_body_thinking_budget() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
+        let google = Google::with_auth(test_auth(), test_timeouts()).unwrap();
         let messages = vec![Message::user("think hard".into())];
         let body = google.build_body(
             &test_model(),
@@ -1124,9 +1111,8 @@ mod tests {
         );
     }
 
-    fn mock_response(data: &'static [u8]) -> isahc::Response<isahc::AsyncBody> {
-        let body = isahc::AsyncBody::from_bytes_static(data);
-        isahc::Response::builder().status(200).body(body).unwrap()
+    fn mock_response(data: &'static [u8]) -> impl AsyncBufRead + Unpin {
+        Cursor::new(data)
     }
 
     #[test]

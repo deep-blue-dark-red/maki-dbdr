@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
-use maki_agent::cancel::{CancelMap, CancelSlot};
+use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -37,13 +37,14 @@ use tracing::info;
 
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
-use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
+use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result, opt};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
+const KILLED_MSG: &str = "killed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
 fn resolve_model_from_ctx(ctx: &AgentContext, tier: Option<&str>) -> Result<Model, String> {
@@ -141,12 +142,8 @@ async fn resolve_model(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
-    let tier_str = opts
-        .as_ref()
-        .and_then(|t| t.get::<Option<String>>("tier").ok().flatten());
-    let spec_str = opts
-        .as_ref()
-        .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
+    let tier_str = opt::<String>(opts.as_ref(), "tier");
+    let spec_str = opt::<String>(opts.as_ref(), "spec");
 
     let model = match spec_str {
         Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
@@ -349,6 +346,10 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///     annotation event. Must not yield.
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
+///   `kill` (KillHandle?) - from `maki.agent.kill_handle()`. Calling
+///     `handle:kill()` from another coroutine aborts the in-flight call:
+///     the call fails with `"killed"` and any child processes (a bash
+///     command's, say) die with it.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
 ///   Instruction files the child picks up (a subdirectory `AGENTS.md`) are
 ///   not in the text: they land on the calling tool's own result.
@@ -370,7 +371,7 @@ async fn call_tool(
     let input_json = lua_to_json(&lua, &input)?;
     let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
     let mut tctx = agent.to_tool_context();
-    let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
+    let (mut on_buf, mut on_ann, mut on_usage, mut rx, mut kill) = (None, None, None, None, None);
     if let Some(o) = opts {
         if let Some(secs) = o.get::<Option<u64>>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
@@ -378,6 +379,9 @@ async fn call_tool(
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
         on_usage = o.get::<Option<Function>>("on_usage")?;
+        kill = o
+            .get::<Option<mlua::UserDataRef<KillHandle>>>("kill")?
+            .map(|h| h.0.clone());
         if on_buf.is_some() || on_ann.is_some() || on_usage.is_some() {
             let (tx, r) = flume::unbounded();
             tctx.live_sink = Some(tx);
@@ -394,7 +398,32 @@ async fn call_tool(
         on_ann,
         on_usage,
     };
-    let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
+    let done = match kill {
+        None => dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await,
+        Some(token) => {
+            // The child runs detached on the Lua host, so dropping the wait
+            // alone abandons it. Cancelling a child of the run's token is
+            // what actually stops it: the child's LuaCtx carries this token,
+            // so its scope unwinds the handler and kills the OS jobs it
+            // spawned, while a parent cancel still propagates through.
+            let (trigger, scoped) = tctx.cancel.child();
+            tctx.cancel = scoped;
+            let run = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs);
+            match futures_lite::future::race(
+                async { Ok(run.await) },
+                async {
+                    token.cancelled().await;
+                    trigger.cancel();
+                    Err(KILLED_MSG.to_owned())
+                },
+            )
+            .await
+            {
+                Ok(done) => done,
+                Err(msg) => return Ok(err_pair(msg)),
+            }
+        }
+    };
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
@@ -405,6 +434,54 @@ async fn call_tool(
         cbs.deliver(ToolLive::Annotation(a)).await;
     }
     Ok(pair(interpreter_bridge::flatten(&done)))
+}
+
+/// Create a kill switch to hand to `call_tool` as `opts.kill`. Call `:kill()`
+/// from any other coroutine to abort that call: it fails with `"killed"` and
+/// child processes die with it. Firing an already-killed handle is a no-op,
+/// and a handle that is never fired is inert — dropping or garbage-collecting
+/// it never kills anything.
+///
+/// @return (KillHandle)
+/// @example
+/// local handle = maki.agent.kill_handle()
+/// maki.agent.call_tool(ctx, "bash", { command = "make" }, { kill = handle })
+/// handle:kill()
+#[lua_fn]
+fn kill_handle(lua: &Lua) -> LuaResult<KillHandle> {
+    let _ = lua;
+    Ok(KillHandle(CancelToken::none()))
+}
+
+/// Abort the call this handle was passed to. Safe to call more than once;
+/// later calls do nothing.
+///
+/// @return
+#[lua_fn]
+fn kill(_lua: &Lua, this: &KillHandle) -> LuaResult<()> {
+    this.0.fire();
+    Ok(())
+}
+
+/// Whether `:kill()` has fired for this handle.
+///
+/// @return (boolean)
+#[lua_fn]
+fn is_killed(_lua: &Lua, this: &KillHandle) -> LuaResult<bool> {
+    Ok(this.0.is_cancelled())
+}
+
+#[derive(Clone)]
+struct KillHandle(CancelToken);
+
+lua_class! {
+    /// A kill switch for a `maki.agent.call_tool` call.
+    ///
+    /// Create one with `maki.agent.kill_handle()`, pass it as `opts.kill`,
+    /// and call `:kill()` from another coroutine to abort the call. Child
+    /// processes the call spawned die with it. Firing twice is a no-op, and
+    /// a handle that is never fired is inert: dropping it never kills.
+    "maki.agent.KillHandle" => KillHandle, KILL_HANDLE_DOCS [kill, is_killed]
 }
 
 /// Create a new subagent session. The session inherits the parent model and
@@ -687,7 +764,7 @@ lua_table! {
     /// sess:close()
     /// ```
     "maki.agent" => pub(crate) fn create_agent_table(), DOCS [
-        resolve_model, system_prompt, tools, callable_tools, call_tool, session,
+        resolve_model, system_prompt, tools, callable_tools, call_tool, kill_handle, session,
     ]
 }
 

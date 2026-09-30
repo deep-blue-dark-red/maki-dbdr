@@ -6,6 +6,7 @@ use test_case::test_case;
 
 #[test_case("edit", include_str!("../../plugins/edit/tests/spec.lua") ; "edit_plugin_spec")]
 #[test_case("ast_grep", include_str!("../../plugins/ast_grep/tests/spec.lua") ; "ast_grep_plugin_spec")]
+#[test_case("async", include_str!("../../plugins/async/tests/spec.lua") ; "async_plugin_spec")]
 #[test_case("index", include_str!("../../plugins/index/tests/spec.lua") ; "index_plugin_spec")]
 #[test_case("lib", include_str!("../../plugins/lib/tests/spec.lua") ; "lib_spec")]
 #[test_case("list", include_str!("../../plugins/list/tests/spec.lua") ; "list_plugin_spec")]

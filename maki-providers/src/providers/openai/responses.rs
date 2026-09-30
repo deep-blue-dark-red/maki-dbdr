@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::providers::openai_compat::tool_parameters;
-use crate::providers::{ResolvedAuth, sse_error_status};
+use crate::providers::openai_compat::{ToolAccumulator, ToolShape, convert_tools, first_text};
+use crate::providers::{ResolvedAuth, SseLine, next_sse_event, sse_error, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -22,13 +22,13 @@ const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
 
 pub(crate) fn build_body(
-    model: &crate::model::Model,
+    model: &Model,
     messages: &[Message],
     system: &str,
     tools: &Value,
 ) -> Value {
     let input = convert_input(messages);
-    let wire_tools = convert_tools(tools);
+    let wire_tools = convert_tools(tools, ToolShape::Responses);
 
     let mut body = json!({
         "model": model.id,
@@ -140,27 +140,6 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
     Value::Array(input)
 }
 
-pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
-    let Some(tools) = anthropic_tools.as_array() else {
-        return json!([]);
-    };
-
-    Value::Array(
-        tools
-            .iter()
-            .filter_map(|t| {
-                Some(json!({
-                    "type": "function",
-                    "name": t.get("name")?,
-                    "description": t.get("description")?,
-                    "parameters": tool_parameters(t),
-                    "strict": false,
-                }))
-            })
-            .collect(),
-    )
-}
-
 static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
@@ -168,13 +147,16 @@ fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
 }
 
 fn summary_rejected(base: &str) -> bool {
-    init_summary_rejected().lock().unwrap().contains(base)
+    init_summary_rejected()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(base)
 }
 
 fn reject_summary(base: &str) {
     init_summary_rejected()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(base.to_owned());
 }
 
@@ -192,7 +174,7 @@ fn strip_summary(body: &mut Value) {
 
 pub(crate) async fn do_stream(
     client: &HttpClient,
-    model: &crate::model::Model,
+    model: &Model,
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
@@ -219,7 +201,7 @@ pub(crate) async fn do_stream(
 #[allow(clippy::too_many_arguments)]
 async fn post_responses(
     client: &HttpClient,
-    model: &crate::model::Model,
+    model: &Model,
     body: &Value,
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
@@ -256,13 +238,6 @@ async fn post_responses(
     }
 }
 
-struct ToolAccumulator {
-    output_index: u64,
-    call_id: String,
-    name: String,
-    arguments: String,
-}
-
 pub(crate) async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
@@ -279,25 +254,21 @@ pub(crate) async fn parse_sse(
     let mut deadline = Instant::now() + stream_timeout;
     let mut current_event = String::new();
 
-    while let Some(line) =
-        crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
-    {
-        if let Some(event_type) = line.strip_prefix("event:") {
-            current_event = event_type.trim().to_string();
-            continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
+    while let Some(line) = next_sse_event(&mut lines, &mut deadline, stream_timeout).await? {
+        let data = match line {
+            SseLine::Event(event) => {
+                current_event = event;
+                continue;
+            }
+            SseLine::Other => continue,
+            SseLine::Data(data) => data,
         };
 
         if current_event == "error" {
-            if let Ok(ev) = serde_json::from_str::<crate::providers::SseErrorPayload>(data) {
-                warn!(error_type = %ev.error.r#type, message = %ev.error.message, "SSE error in stream");
-                return Err(ev.into_agent_error());
+            if let Some(err) = sse_error(&data) {
+                return Err(err);
             }
-            let parsed: Value = serde_json::from_str(data).unwrap_or_default();
+            let parsed: Value = serde_json::from_str(&data).unwrap_or_default();
             let message = parsed["message"]
                 .as_str()
                 .unwrap_or("unknown error")
@@ -306,7 +277,7 @@ pub(crate) async fn parse_sse(
         }
 
         let parsed_event = if current_event.is_empty() {
-            serde_json::from_str::<Value>(data)
+            serde_json::from_str::<Value>(&data)
                 .ok()
                 .and_then(|value| value["type"].as_str().map(ToOwned::to_owned))
                 .unwrap_or_default()
@@ -316,19 +287,14 @@ pub(crate) async fn parse_sse(
 
         match parsed_event.as_str() {
             "response.output_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
-                    let delta = if is_first_content {
-                        is_first_content = false;
-                        delta.trim_start().to_string()
-                    } else {
-                        delta.to_string()
-                    };
+                    let delta = first_text(&mut is_first_content, delta.to_string());
                     if !delta.is_empty() {
                         text.push_str(&delta);
                         event_tx
@@ -339,7 +305,7 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.added" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -359,16 +325,16 @@ pub(crate) async fn parse_sse(
                             .await?;
                     }
                     tool_accumulators.push(ToolAccumulator {
-                        output_index,
-                        call_id,
+                        id: call_id,
                         name,
                         arguments: String::new(),
+                        output_index: Some(output_index),
                     });
                 }
             }
 
             "response.function_call_arguments.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -381,7 +347,9 @@ pub(crate) async fn parse_sse(
                 };
                 if !delta.is_empty() {
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
-                        tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                        tool_accumulators
+                            .iter_mut()
+                            .find(|a| a.output_index == Some(idx))
                     } else {
                         tool_accumulators.last_mut()
                     };
@@ -392,7 +360,7 @@ pub(crate) async fn parse_sse(
             }
 
             "response.in_progress" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -411,7 +379,7 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.done" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -429,14 +397,14 @@ pub(crate) async fn parse_sse(
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
                         tool_accumulators
                             .iter_mut()
-                            .find(|acc| acc.output_index == idx)
+                            .find(|acc| acc.output_index == Some(idx))
                     } else {
                         tool_accumulators.last_mut()
                     };
                     if let Some(acc) = acc {
                         let should_emit_start = acc.name.is_empty() && !name.is_empty();
-                        if acc.call_id.is_empty() {
-                            acc.call_id = call_id.clone();
+                        if acc.id.is_empty() {
+                            acc.id = call_id.clone();
                         }
                         if acc.name.is_empty() {
                             acc.name = name.clone();
@@ -447,7 +415,7 @@ pub(crate) async fn parse_sse(
                         if should_emit_start {
                             event_tx
                                 .send_async(ProviderEvent::ToolUseStart {
-                                    id: acc.call_id.clone(),
+                                    id: acc.id.clone(),
                                     name: acc.name.clone(),
                                 })
                                 .await?;
@@ -462,17 +430,17 @@ pub(crate) async fn parse_sse(
                                 .await?;
                         }
                         tool_accumulators.push(ToolAccumulator {
-                            output_index: tool_accumulators.len() as u64,
-                            call_id,
+                            id: call_id,
                             name,
                             arguments,
+                            output_index: Some(tool_accumulators.len() as u64),
                         });
                     }
                 }
             }
 
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -493,7 +461,7 @@ pub(crate) async fn parse_sse(
             }
 
             "response.completed" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -518,7 +486,7 @@ pub(crate) async fn parse_sse(
             }
 
             "response.incomplete" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -530,7 +498,7 @@ pub(crate) async fn parse_sse(
             }
 
             "response.failed" => {
-                let parsed: Value = match serde_json::from_str(data) {
+                let parsed: Value = match serde_json::from_str(&data) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -575,7 +543,7 @@ pub(crate) async fn parse_sse(
                 Value::Object(Default::default())
             }
         };
-        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+        content_blocks.push(ContentBlock::tool_use(acc.id, acc.name, input));
     }
 
     Ok(StreamResponse {
@@ -642,7 +610,7 @@ mod tests {
     #[test]
     fn convert_tools_defaults_missing_parameters() {
         let tools = json!([{ "name": TOOL_NAME, "description": TOOL_DESCRIPTION }]);
-        let converted = convert_tools(&tools);
+        let converted = convert_tools(&tools, ToolShape::Responses);
         assert_eq!(
             converted[0]["name"],
             json!(TOOL_NAME),

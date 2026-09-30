@@ -96,13 +96,13 @@ pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, Agent
     match protocol {
         Protocol::Anthropic => Ok(Box::new(super::anthropic::Anthropic::with_auth(
             auth, timeouts,
-        ))),
+        )?)),
         Protocol::Openai | Protocol::OpenaiResponses => Ok(Box::new(CustomOpenAiProvider {
-            compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts),
+            compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, timeouts)?,
             auth,
             protocol,
         })),
-        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts))),
+        Protocol::Google => Ok(Box::new(super::google::Google::with_auth(auth, timeouts)?)),
     }
 }
 
@@ -399,7 +399,7 @@ impl Provider for CustomOpenAiProvider {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
             if self.protocol == Protocol::OpenaiResponses {
                 let body = responses::build_body(model, messages, system, tools);
@@ -424,7 +424,7 @@ impl Provider for CustomOpenAiProvider {
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
-        let auth = self.auth.lock().unwrap().clone();
+        let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Box::pin(async move { self.compat.do_list_models(&auth).await })
     }
 }

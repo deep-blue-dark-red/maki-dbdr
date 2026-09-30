@@ -16,6 +16,7 @@
 
 local ToolView = require("maki.tool_view")
 local lib = require("async_lib")
+local jobs = require("async_jobs")
 
 local POLL_MS = 250
 local DEFAULT_WAIT_TIMEOUT = 300
@@ -28,7 +29,6 @@ local EMPTY_ERROR = "provide at least one job"
 local UNKNOWN_JOB_ERROR = "unknown job id or name"
 local SPAWN_CAP_ERROR = string.format("maximum of %d jobs per spawn", MAX_JOBS_PER_SPAWN)
 local QUEUE_FULL_ERROR = string.format("queue holds more than %d non-terminal jobs", MAX_ACTIVE_JOBS)
-local KILL_QUEUED_MSG = "cancelled before start"
 local OUT_OF_ORDER_NOTE =
   "Results arrive out of order as workers free up - always reference jobs by id or name, never by position."
 
@@ -36,11 +36,11 @@ local description = table.concat({
   "Queue independent tool calls in the background; spawn returns job ids immediately. Use batch when you want to wait for all calls, task for an autonomous subagent.",
   "",
   "- spawn (default): supply jobs as {tool, parameters, name?, timeout_seconds?}. Optional workers limits concurrency for this spawn.",
-  "- status: inspect jobs and result tails.",
+  "- status: inspect jobs; settled jobs show output tails, running jobs a live output tail.",
   "- wait: retrieve results for job_ids (ids or names; default all unfinished). Waits up to timeout_seconds (default 300; 0 returns immediately). A wait timeout does not stop jobs; wait again if needed.",
-  "- cancel: cancel job_ids (default all unfinished). Queued jobs never start; running jobs may continue, but their results are discarded. Cancellation does not undo side effects.",
+  "- cancel: cancel job_ids (default all unfinished). Queued jobs never start; running jobs are aborted, child processes killed, results discarded. Cancellation does not undo side effects.",
   "",
-  "Match results by id or name, never position. Use returned job ids to collect needed results before finishing; jobs end with the session. Do not call async inside a job.",
+  "Match results by name (ids remain accepted), never position. Use returned names to collect needed results before finishing; jobs end with the session. Do not call async inside a job.",
 }, "\n")
 
 local opts = maki.api.register_options({
@@ -48,6 +48,10 @@ local opts = maki.api.register_options({
     default = 8,
     min = 1,
     desc = "Max concurrently running jobs. Spawn calls may lower this per call, never raise it.",
+  },
+  picker_key = {
+    default = "<C-g>",
+    desc = "Normal-mode key that opens the background jobs picker.",
   },
 })
 
@@ -109,16 +113,23 @@ local pump
 local function settle(job, status, output)
   if lib.settle(job, status, output) then
     pump()
+    jobs.refresh()
   end
 end
 
 local function run_job(job)
   if job.kill_requested then
-    settle(job, lib.STATUS.KILLED, KILL_QUEUED_MSG)
+    settle(job, lib.STATUS.KILLED, lib.KILL_QUEUED_MSG)
     return
   end
+  local handle = maki.agent.kill_handle()
+  job.kill_handle = handle
   local text, err = maki.agent.call_tool(job.ctx, job.tool, job.params, {
     timeout = job.timeout,
+    kill = handle,
+    on_live_buf = function(b)
+      job.live_buf = b
+    end,
     on_annotation = function(a)
       job.annotation = a
     end,
@@ -126,6 +137,7 @@ local function run_job(job)
       job.usage = u
     end,
   })
+  job.kill_handle = nil
   if job.kill_requested then
     -- Keep the cancel reply's promise: the late result is not delivered.
     settle(job, lib.STATUS.KILLED, "killed; late result discarded")
@@ -226,7 +238,7 @@ end
 
 local function job_reply(jobs, extra)
   local out = {
-    llm_output = lib.render_status(jobs, { results = true, tail = RESULT_TAIL_LINES }),
+    llm_output = lib.render_status(jobs, { results = true, live = true, tail = RESULT_TAIL_LINES }),
     state = lib.snapshot(jobs),
   }
   for k, v in pairs(extra or {}) do
@@ -257,15 +269,13 @@ local function do_spawn(input, ctx)
     q.workers = math.max(1, math.min(math.floor(w), opts.workers))
   end
 
+  local specs, err = lib.validate_batch(entries, q.jobs)
+  if not specs then
+    return { llm_output = err, is_error = true }
+  end
+
   local spawned = {}
-  for _, entry in ipairs(entries) do
-    local spec, err = lib.normalize_entry(entry)
-    if not spec then
-      return { llm_output = err, is_error = true }
-    end
-    if spec.name and lib.name_taken(q.jobs, spec.name) then
-      return { llm_output = "job name already in use: " .. spec.name, is_error = true }
-    end
+  for _, spec in ipairs(specs) do
     local job = {
       id = "job-" .. q.next_id,
       name = spec.name,
@@ -282,6 +292,7 @@ local function do_spawn(input, ctx)
   end
   prune()
   pump()
+  jobs.refresh()
 
   local buf = maki.ui.buf()
   buf:set_lines(lib.render_queue_lines(spawned))
@@ -318,9 +329,9 @@ local function do_wait(input)
   if type(timeout) ~= "number" or timeout < 0 then
     return { llm_output = "timeout_seconds must be a number >= 0", is_error = true }
   end
-  local deadline = timeout > 0 and os.time() + math.floor(timeout) or nil
+  local deadline = lib.wait_deadline(timeout)
   while not lib.all_terminal(jobs) do
-    if deadline and os.time() >= deadline then
+    if os.time() >= deadline then
       break
     end
     maki.async.sleep(POLL_MS)
@@ -343,18 +354,7 @@ local function do_cancel(input)
     lines[1] = "nothing to cancel"
   end
   for _, job in ipairs(jobs) do
-    if lib.TERMINAL[job.status] then
-      lines[#lines + 1] = string.format("%s already %s", job.id, job.status)
-    elseif job.status == lib.STATUS.RUNNING then
-      job.kill_requested = true
-      lines[#lines + 1] = string.format(
-        "%s kill requested: the in-flight child call runs to its own timeout, then the result is discarded",
-        job.id
-      )
-    else
-      settle(job, lib.STATUS.KILLED, KILL_QUEUED_MSG)
-      lines[#lines + 1] = string.format("%s killed (was queued)", job.id)
-    end
+    lines[#lines + 1] = lib.kill_job(job)
   end
   return { llm_output = table.concat(lines, "\n"), state = lib.snapshot(jobs) }
 end
@@ -394,6 +394,10 @@ local function restore(_input, output, _is_error, rctx)
     { max_lines = tol.other, keep = "head" }
   )
 end
+
+jobs.setup(function()
+  return q.jobs
+end, lib.kill_job, opts.picker_key)
 
 maki.api.register_tool({
   name = "async",

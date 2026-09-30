@@ -43,7 +43,7 @@ pub(crate) fn create_setup_fn(lua: &Lua, store: ConfigStore) -> LuaResult<Functi
         let raw: RawConfig = lua
             .from_value(table)
             .map_err(|e| mlua::Error::runtime(e.to_string()))?;
-        let mut guard = store.lock().unwrap();
+        let mut guard = store.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return Err(mlua::Error::runtime(DOUBLE_SETUP_MSG));
         }

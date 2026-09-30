@@ -1,3 +1,5 @@
+local backoff = require("maki.utf8").backoff
+
 local M = {}
 
 M.MAX_TAGS = 50
@@ -393,15 +395,7 @@ function M.cap_read_output(s, hint)
   if #s <= M.MAX_FILE_BYTES then
     return s
   end
-  -- Back off UTF-8 continuation bytes so the cut never splits a codepoint.
-  local cut = M.MAX_FILE_BYTES
-  while cut > 0 do
-    local b = s:byte(cut + 1)
-    if b < 0x80 or b >= 0xC0 then
-      break
-    end
-    cut = cut - 1
-  end
+  local cut = backoff(s, M.MAX_FILE_BYTES)
   return s:sub(1, cut) .. "\n... (output truncated at " .. M.MAX_FILE_BYTES .. " bytes; " .. hint .. ")"
 end
 

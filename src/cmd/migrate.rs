@@ -92,7 +92,8 @@ fn move_auth(legacy_dir: &Path, target_dir: &Path) -> Result<()> {
         }
         move_file(&entry.path(), &dst)?;
         #[cfg(unix)]
-        fs::set_permissions(&dst, fs::Permissions::from_mode(AUTH_FILE_MODE)).ok();
+        fs::set_permissions(&dst, fs::Permissions::from_mode(AUTH_FILE_MODE))
+            .with_context(|| format!("restrict permissions on {}", tilde(&dst)))?;
     }
     fs::remove_dir(legacy_dir).ok();
 

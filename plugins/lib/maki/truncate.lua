@@ -1,3 +1,5 @@
+local backoff = require("maki.utf8").backoff
+
 local function truncate(text, max_lines, max_bytes)
   if #text <= max_bytes then
     local n = 0
@@ -19,12 +21,7 @@ local function truncate(text, max_lines, max_bytes)
     local new_bytes = bytes + #line + 1
     if new_bytes > max_bytes then
       if #out == 0 then
-        -- Back off UTF-8 continuation bytes so no character is split in half.
-        local cut = max_bytes
-        while cut > 0 and line:find("^[\128-\191]", cut + 1) do
-          cut = cut - 1
-        end
-        out[1] = line:sub(1, cut)
+        out[1] = line:sub(1, backoff(line, max_bytes))
       end
       break
     end

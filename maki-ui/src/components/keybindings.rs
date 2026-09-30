@@ -281,7 +281,7 @@ pub static CURRENT_BINDS: std::sync::OnceLock<std::sync::RwLock<ConfiguredKeybin
 pub fn get_configured_bind(name: &str) -> Option<Bind> {
     let binds =
         CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
-    let read = binds.read().unwrap();
+    let read = binds.read().unwrap_or_else(|e| e.into_inner());
     match name {
         "quit" => Some(read.quit),
         "help" => Some(read.help),
@@ -331,7 +331,7 @@ where
 {
     let binds =
         CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
-    let read = binds.read().unwrap();
+    let read = binds.read().unwrap_or_else(|e| e.into_inner());
     f(&read)
 }
 

@@ -74,6 +74,8 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(LocalEndpoint::with_auth(&OLLAMA, auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        LocalEndpoint::with_auth(&OLLAMA, auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }

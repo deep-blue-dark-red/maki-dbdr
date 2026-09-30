@@ -23,6 +23,8 @@
 -- Parity cases live in plugins/lib/tests/spec.lua (TRACE_CASES). Add one
 -- whenever you change handle_key semantics.
 
+local backoff = require("maki.utf8").backoff
+
 local R = { IGNORED = "ignored", MOVED = "moved", CHANGED = "changed" }
 
 -- Mirrors Rust char::is_ascii_whitespace: SP HT LF VT FF CR.
@@ -259,23 +261,11 @@ function TextInput:move_right()
 end
 
 -- Lua has no sticky-x. When jumping rows we clamp to end-of-line, or snap
--- to the codepoint boundary at-or-before the previous byte offset so we
--- never land inside a multibyte sequence. We step back over UTF-8
--- continuation bytes (0x80..0xBF) directly to stay independent of utf8.offset
--- which errors when given a continuation position.
+-- to the codepoint boundary at-or-before the byte offset so we never land
+-- inside a multibyte sequence.
 function TextInput:_snap_col_to_line()
   local ln = self.lines[self.line]
-  if self.col > #ln then
-    self.col = #ln
-    return
-  end
-  while self.col > 0 do
-    local b = ln:byte(self.col + 1)
-    if b == nil or b < 0x80 or b >= 0xC0 then
-      return
-    end
-    self.col = self.col - 1
-  end
+  self.col = backoff(ln, self.col)
 end
 
 function TextInput:move_up()

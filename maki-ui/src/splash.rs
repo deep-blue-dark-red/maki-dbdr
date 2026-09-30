@@ -625,6 +625,7 @@ todo_in_progress = { fg = "yellow" }
     /// truecolor and would make this pass or fail on test ordering.
     #[test]
     fn a_palette_accent_keeps_the_splash_free_of_truecolor() {
+        let _guard = theme::test_write_lock();
         theme::set(theme::Theme::from_toml(ANSI_THEME).expect(ANSI_THEME_NAME));
 
         let mut splash = Splash::new(true);

@@ -29,12 +29,14 @@ const THREAD_GONE: &str = "the highlight thread is gone";
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: OnceLock<flume::Sender<Job>> = OnceLock::new();
+/// `None` when thread creation failed, remembered so the failure is reported
+/// once rather than on every job.
+static JOBS: OnceLock<Option<flume::Sender<Job>>> = OnceLock::new();
 
-fn jobs() -> &'static flume::Sender<Job> {
+fn jobs() -> Option<&'static flume::Sender<Job>> {
     JOBS.get_or_init(|| {
         let (tx, rx) = flume::unbounded::<Job>();
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("highlight".into())
             .spawn(move || {
                 ON_HIGHLIGHT_THREAD.set(true);
@@ -43,10 +45,13 @@ fn jobs() -> &'static flume::Sender<Job> {
                         error!(panic = panic_message(&*payload), "highlight job panicked");
                     }
                 }
-            })
-            .expect("failed to spawn the highlight thread");
-        tx
+            });
+        if let Err(e) = &spawned {
+            error!(error = %e, "highlight thread unavailable; running jobs inline");
+        }
+        spawned.ok().map(|_| tx)
     })
+    .as_ref()
 }
 
 thread_local! {
@@ -79,8 +84,16 @@ pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     }
 }
 
+/// Runs `f` on the highlight thread when there is one, and inline when thread
+/// creation failed. Slower — the cache is what this thread exists to bound —
+/// but the caller still gets its result.
 pub fn spawn(f: impl FnOnce() + Send + 'static) {
-    let _ = jobs().send(Box::new(f));
+    match jobs() {
+        Some(tx) => {
+            let _ = tx.send(Box::new(f));
+        }
+        None => f(),
+    }
 }
 
 #[cfg(test)]

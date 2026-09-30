@@ -138,7 +138,9 @@ impl App {
         {
             return;
         }
-        *maki_config::CURRENT_SESSION_NAME.lock().unwrap() = Some(session.title.clone());
+        *maki_config::CURRENT_SESSION_NAME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(session.title.clone());
         maki_providers::update_api_log_symlink(
             &session.id.to_string(),
             self.published_name

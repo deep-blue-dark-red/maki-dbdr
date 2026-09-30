@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{AppDataRefMut, Lua, RegistryKey, Result as LuaResult, Table};
 
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::opt;
 use crate::api::util::pair::{Pair, pair};
 use crate::key::Key;
 
@@ -435,14 +435,8 @@ fn set(
         )));
     }
     let key = accept_key(&lhs)?;
-    let desc = opts
-        .as_ref()
-        .and_then(|o| o.get::<String>("desc").ok())
-        .unwrap_or_default();
-    let unique = opts
-        .as_ref()
-        .and_then(|o| opt_bool(o, "unique"))
-        .unwrap_or(false);
+    let desc = opt::<String>(opts.as_ref(), "desc").unwrap_or_default();
+    let unique = opt::<bool>(opts.as_ref(), "unique").unwrap_or(false);
     let registry_key = lua.create_registry_value(rhs)?;
     match store_mut(lua)?.set(key, registry_key, Arc::clone(&plugin), desc, unique) {
         SetOutcome::Free => {}

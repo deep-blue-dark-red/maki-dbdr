@@ -406,6 +406,7 @@ pub struct FloatConfigPatch {
     pub reserved_bottom: Option<usize>,
     pub reserved_top: Option<usize>,
     pub split: Option<Split>,
+    pub focus: Option<bool>,
     pub order: Option<u16>,
     pub visible: Option<bool>,
     pub needs_input: Option<bool>,
@@ -415,6 +416,7 @@ pub enum WinEvent {
     Key { key: Key },
     Resize { width: u16, height: u16 },
     Paste { text: String },
+    Click { row: usize, col: u16 },
     Close,
 }
 

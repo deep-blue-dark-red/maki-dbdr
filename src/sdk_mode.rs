@@ -643,7 +643,11 @@ pub fn run(params: SdkParams) -> Result<()> {
             model: startup_model.spec(),
         },
         // `set_permission_mode` can flip this mid-run, so read it per call.
-        move || match shared_for_mode.lock().unwrap().permission_mode {
+        move || match shared_for_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permission_mode
+        {
             PermissionMode::Plan => MODE_PLAN,
             _ => MODE_BUILD,
         },
@@ -687,7 +691,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                 let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
                 let images = content_images(&content);
                 let mode = {
-                    let mut shared = shared.lock().unwrap();
+                    let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
                     shared.turn_start = Instant::now();
                     shared.permission_mode
                 };
@@ -726,7 +730,11 @@ pub fn run(params: SdkParams) -> Result<()> {
                 let data = cr.response;
                 if let Some(req_id) = data.get("request_id").and_then(Value::as_str) {
                     let answer = decode_permission_response(&data);
-                    shared.lock().unwrap().permissions.resolve(req_id, answer);
+                    shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .permissions
+                        .resolve(req_id, answer);
                 }
             }
             "control_cancel_request" => {
@@ -738,7 +746,7 @@ pub fn run(params: SdkParams) -> Result<()> {
                 };
                 shared
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .permissions
                     .resolve(&ccr.request_id, PermissionAnswer::Deny);
             }
@@ -749,7 +757,11 @@ pub fn run(params: SdkParams) -> Result<()> {
     // stdin was the only source of permission answers, so a run still in
     // flight has to stop asking now: an unanswerable request parks the agent,
     // and a parked agent never ends the event stream the pump waits on.
-    shared.lock().unwrap().permissions.close();
+    shared
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .permissions
+        .close();
 
     let InteractiveHandle {
         input_tx,
@@ -845,7 +857,10 @@ fn handle_control_request(
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
-                    shared.lock().unwrap().permission_mode = mode;
+                    shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .permission_mode = mode;
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
@@ -862,7 +877,7 @@ fn handle_control_request(
             match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
                 Some(model) => {
                     let _ = handle.model_tx.send(model.clone());
-                    shared.lock().unwrap().model = model;
+                    shared.lock().unwrap_or_else(|e| e.into_inner()).model = model;
                     writer.emit_control_response(&cr.request_id, ok, None)
                 }
                 None => writer.emit_control_response(
@@ -965,7 +980,12 @@ impl EventPump {
     }
 
     fn model_id(&self) -> String {
-        self.shared.lock().unwrap().model.id.clone()
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .model
+            .id
+            .clone()
     }
 
     fn emit_stream(&self, events: Vec<Value>) -> Result<()> {
@@ -980,7 +1000,11 @@ impl EventPump {
         self.tool_inputs.clear();
         self.result_text.clear();
         self.cost = None;
-        self.shared.lock().unwrap().permissions.forget_outstanding();
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permissions
+            .forget_outstanding();
     }
 
     fn emit_turn_result(
@@ -990,7 +1014,13 @@ impl EventPump {
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        let duration_ms = self
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .turn_start
+            .elapsed()
+            .as_millis();
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
@@ -1122,7 +1152,7 @@ impl EventPump {
             }
             AgentEvent::PermissionRequest { id, tool, .. } => {
                 {
-                    let shared = self.shared.lock().unwrap();
+                    let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                     if shared.permission_mode == PermissionMode::BypassPermissions {
                         shared
                             .permissions
@@ -1142,7 +1172,7 @@ impl EventPump {
                 if !self
                     .shared
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .permissions
                     .ask(req_id.clone(), id.clone())
                 {

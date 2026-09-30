@@ -15,8 +15,10 @@ use crate::spec::{
 };
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, dialect};
 
-use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek};
+use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider, impl_stream_body};
+use super::{
+    KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts, deepseek, key_rotation, sort_models,
+};
 
 /// TensorX namespaces resold models by vendor, so DeepSeek ids arrive as
 /// `deepseek/deepseek-flash`.
@@ -83,8 +85,10 @@ fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(TensorX::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        TensorX::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 inventory::submit!(SPEC.config_row());
@@ -106,7 +110,7 @@ impl TensorX {
     pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
         let pool = KeyPool::resolve(CONFIG.slug, CONFIG.api_key_env)?;
         Ok(Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth: Arc::new(Mutex::new(ResolvedAuth::bearer(
                 CONFIG.slug,
                 pool.current(),
@@ -116,13 +120,16 @@ impl TensorX {
         })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: super::Timeouts) -> Self {
-        Self {
-            compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: super::Timeouts,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            compat: OpenAiCompatProvider::new(&CONFIG, timeouts)?,
             auth,
             key_pool: None,
             system_prefix: None,
-        }
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -130,6 +137,8 @@ impl TensorX {
         self
     }
 }
+
+impl_stream_body!(TensorX);
 
 impl Provider for TensorX {
     fn stream_message<'a>(
@@ -143,10 +152,7 @@ impl Provider for TensorX {
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
+            let (auth, mut body) = self.stream_body(&self.auth, model, messages, system, tools);
 
             let (has_thinking, has_reasoning_effort) =
                 crate::model_registry::provider_info::<TensorXModelInfo>("tensorx", &model.id)
@@ -182,7 +188,7 @@ impl Provider for TensorX {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
-            let auth = self.auth.lock().unwrap().clone();
+            let auth = self.auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let url = format!("{}/model/info", CONFIG.base_url);
             let text = self.compat.get_text(&auth, &url).await?;
             let body: Value = serde_json::from_str(&text)?;
@@ -191,17 +197,13 @@ impl Provider for TensorX {
                 .as_array()
                 .map(|arr| arr.iter().filter_map(model_info).collect())
                 .unwrap_or_default();
-            models.sort_by(|a, b| a.id.cmp(&b.id));
+            sort_models(&mut models);
             Ok(models)
         })
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        key_rotation(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 }
 

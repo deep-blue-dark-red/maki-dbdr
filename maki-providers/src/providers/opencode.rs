@@ -92,15 +92,17 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
 };
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
-    Ok(Box::new(Opencode::new(timeouts)))
+    Ok(Box::new(Opencode::new(timeouts)?))
 }
 
 fn create_with_auth(
     auth: Arc<Mutex<ResolvedAuth>>,
     timeouts: Timeouts,
     system_prefix: Option<String>,
-) -> Box<dyn Provider> {
-    Box::new(Opencode::with_auth(auth, timeouts).with_system_prefix(system_prefix))
+) -> Result<Box<dyn Provider>, AgentError> {
+    Ok(Box::new(
+        Opencode::with_auth(auth, timeouts)?.with_system_prefix(system_prefix),
+    ))
 }
 
 /// OpenCode asked clients to send one stable ID per conversation and warned
@@ -144,19 +146,22 @@ pub struct Opencode {
 }
 
 impl Opencode {
-    pub fn new(timeouts: Timeouts) -> Self {
-        Self {
-            transport: CatalogTransport::new(timeouts),
+    pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
+        Ok(Self {
+            transport: CatalogTransport::new(timeouts)?,
             auth: None,
             system_prefix: None,
-        }
+        })
     }
 
-    pub(crate) fn with_auth(auth: Arc<Mutex<ResolvedAuth>>, timeouts: Timeouts) -> Self {
-        Self {
+    pub(crate) fn with_auth(
+        auth: Arc<Mutex<ResolvedAuth>>,
+        timeouts: Timeouts,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
             auth: Some(auth),
-            ..Self::new(timeouts)
-        }
+            ..Self::new(timeouts)?
+        })
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
@@ -166,7 +171,9 @@ impl Opencode {
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
         Ok(smol::unblock(move || {
-            let guard = init_shared_catalog_if_needed().lock().unwrap();
+            let guard = init_shared_catalog_if_needed()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard.provider(ZEN_SLUG).map_or_else(Vec::new, |data| {
                 data.available_models(&guard.state_dir, data.free_models_enabled())
             })
@@ -185,12 +192,14 @@ impl Opencode {
         let session_id = session_id.cloned();
         let auth_override = self.auth.clone();
         smol::unblock(move || {
-            let guard = init_shared_catalog_if_needed().lock().unwrap();
+            let guard = init_shared_catalog_if_needed()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let (meta, provider_data) = guard.lookup(&sub_provider, &actual_id)?;
             let override_auth = auth_override
                 .filter(|_| SLUGS.contains(&provider_data.slug.as_str()))
                 .map(|auth| {
-                    let mut auth = auth.lock().unwrap().clone();
+                    let mut auth = auth.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     if auth.base_url.is_none() {
                         auth.base_url = provider_data.base_url.clone();
                     }

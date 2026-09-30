@@ -59,7 +59,6 @@ pub enum InputAction {
     Submit(Submission),
     ContinueLine,
     Changed,
-    PaletteSync(String),
     Passthrough(KeyEvent),
     None,
 }

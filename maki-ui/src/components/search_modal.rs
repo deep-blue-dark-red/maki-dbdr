@@ -4,6 +4,7 @@ use crate::components::Overlay;
 use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{Wrap, move_index};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -119,20 +120,13 @@ impl SearchModal {
     }
 
     fn move_up(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.matches.len() - 1);
-            self.ensure_visible();
-        }
+        self.selected = move_index(self.selected, -1, self.matches.len(), Wrap::Yes);
+        self.ensure_visible();
     }
 
     fn move_down(&mut self) {
-        if !self.matches.is_empty() {
-            self.selected = (self.selected + 1) % self.matches.len();
-            self.ensure_visible();
-        }
+        self.selected = move_index(self.selected, 1, self.matches.len(), Wrap::Yes);
+        self.ensure_visible();
     }
 
     fn ensure_visible(&mut self) {

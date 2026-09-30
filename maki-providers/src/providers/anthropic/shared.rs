@@ -404,9 +404,8 @@ impl EventParser {
                 }
             }
             "error" => {
-                if let Ok(ev) = serde_json::from_str::<super::super::SseErrorPayload>(data) {
-                    warn!(error_type = %ev.error.r#type, message = %ev.error.message, "SSE error event");
-                    return Err(ev.into_agent_error());
+                if let Some(err) = super::super::sse_error(data) {
+                    return Err(err);
                 }
                 warn!(raw = %data, "unparseable SSE error event");
                 return Err(AgentError::api(400, data.to_string()));

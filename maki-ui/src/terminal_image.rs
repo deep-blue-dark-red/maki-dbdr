@@ -23,28 +23,37 @@ const MAX_IMAGE_ROWS: u16 = 20;
 const FALLBACK_FONT_SIZE: FontSize = FontSize::new(10, 20);
 const DECODE_THREAD: &str = "inline-image";
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-static DECODE_JOBS: OnceLock<flume::Sender<DecodeJob>> = OnceLock::new();
+/// `None` when thread creation failed, remembered so the failure is reported
+/// once rather than on every image.
+static DECODE_JOBS: OnceLock<Option<flume::Sender<DecodeJob>>> = OnceLock::new();
 
 type DecodeJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// Decoding gets its own thread rather than `maki_highlight::pool`: that one is
 /// single threaded to bound syntect's regex cache, and a multi-megabyte decode
 /// queued ahead of the transcript's highlight jobs stalls the whole UI.
-fn decode_jobs() -> &'static flume::Sender<DecodeJob> {
-    DECODE_JOBS.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<DecodeJob>();
-        thread::Builder::new()
-            .name(DECODE_THREAD.into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    if catch_unwind(AssertUnwindSafe(job)).is_err() {
-                        tracing::error!("inline image decode panicked");
+/// `None` when the thread could not be created. The caller then drops the
+/// result sender, which [`Self::poll`] reads as `Failed`: no image, rather than
+/// a multi-megabyte decode stalling the UI thread it exists to stay off.
+fn decode_jobs() -> Option<&'static flume::Sender<DecodeJob>> {
+    DECODE_JOBS
+        .get_or_init(|| {
+            let (tx, rx) = flume::unbounded::<DecodeJob>();
+            let spawned = thread::Builder::new()
+                .name(DECODE_THREAD.into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        if catch_unwind(AssertUnwindSafe(job)).is_err() {
+                            tracing::error!("inline image decode panicked");
+                        }
                     }
-                }
-            })
-            .expect("failed to spawn the inline image thread");
-        tx
-    })
+                });
+            if let Err(e) = &spawned {
+                tracing::error!(error = %e, "inline image thread unavailable");
+            }
+            spawned.ok().map(|_| tx)
+        })
+        .as_ref()
 }
 
 pub(crate) fn invalidate() {
@@ -135,16 +144,6 @@ impl InlineImage {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_prepared(source: ImageSource, picker: &Picker, width: u16) -> Result<Self> {
-        let protocol = encode(&source, picker, width)?;
-        Ok(Self {
-            source,
-            state: ImageState::Ready { width, protocol },
-            fallback: None,
-        })
-    }
-
     pub fn source(&self) -> &ImageSource {
         &self.source
     }
@@ -190,11 +189,19 @@ impl InlineImage {
             height: self.height(),
             result,
         };
-        let _ = decode_jobs().send(Box::new(move || {
+        let job = Box::new(move || {
             if !tx.is_disconnected() {
                 let _ = tx.send(encode(&source, &picker, width));
             }
-        }));
+        });
+        match decode_jobs() {
+            Some(tx) => {
+                let _ = tx.send(job);
+            }
+            // Dropping `job` drops the result sender inside it, so `poll`
+            // lands on `Failed` instead of waiting forever.
+            None => drop(job),
+        }
     }
 
     pub fn poll(&mut self) -> Dirty {

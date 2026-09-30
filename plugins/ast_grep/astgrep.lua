@@ -8,6 +8,7 @@
 -- replacement a rewrite produced).
 
 local shorten_path = require("maki.shorten_path")
+local backoff = require("maki.utf8").backoff
 
 local M = {}
 
@@ -38,11 +39,7 @@ local function cut(text, max_bytes)
   if not max_bytes or #text <= max_bytes then
     return text
   end
-  local cut_at = max_bytes
-  while cut_at > 0 and text:find("^[\128-\191]", cut_at + 1) do
-    cut_at = cut_at - 1
-  end
-  return text:sub(1, cut_at) .. ELLIPSIS
+  return text:sub(1, backoff(text, max_bytes)) .. ELLIPSIS
 end
 
 --- `$NAME=value` bindings for one match, sorted so runs are reproducible and

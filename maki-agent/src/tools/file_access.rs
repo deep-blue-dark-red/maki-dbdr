@@ -77,7 +77,7 @@ impl FileAccess {
     /// exactly as long as it is in use. [`LOCK_PRUNE_AT`] only bounds the
     /// residue of dead `Weak`s left behind.
     fn lock_for(&self, key: &FileKey) -> FileLock {
-        let mut map = self.locks.lock().unwrap();
+        let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= LOCK_PRUNE_AT {
             map.retain(|_, weak| weak.strong_count() > 0);
         }
@@ -91,7 +91,10 @@ impl FileAccess {
     pub fn record_read(&self, key: &FileKey) {
         match get_mtime(key.as_path()) {
             Some(mtime) => {
-                self.mtimes.lock().unwrap().insert(key.clone(), mtime);
+                self.mtimes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone(), mtime);
             }
             None => warn!(
                 path = %key.as_path().display(),
@@ -101,7 +104,7 @@ impl FileAccess {
     }
 
     pub fn check_before_edit(&self, key: &FileKey) -> Result<(), String> {
-        let mut guard = self.mtimes.lock().unwrap();
+        let mut guard = self.mtimes.lock().unwrap_or_else(|e| e.into_inner());
         let Some(&recorded) = guard.get(key) else {
             return Ok(());
         };

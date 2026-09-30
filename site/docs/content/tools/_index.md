@@ -26,7 +26,7 @@ Commands run in <cwd> by default.
 
 ### `list` {#list}
 
-List directory contents. Returns entry names sorted alphabetically, directories first with a trailing /.
+List one directory: alphabetically sorted names, directories first with a trailing /. Hides AGENTS.md, CLAUDE.md, and COPILOT.md. Use glob for recursive filename searches.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -34,27 +34,29 @@ List directory contents. Returns entry names sorted alphabetically, directories 
 
 ### `read` {#read}
 
-Read a file. Returns contents with line numbers (1-indexed).
+Read a file range with 1-based line numbers. Supply path, offset (first line), and limit (line count). limit=0 reads to EOF, capped at 2000 lines by default. Absolute, relative, and ~/ paths are accepted.
+Use index first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `limit` | integer | yes | Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines). |
 | `offset` | integer | yes | Line number to start from (1-indexed). Use 1 for the first line. |
-| `path` | string | yes | Absolute path to the file |
+| `path` | string | yes | File path: absolute, relative, or ~/ |
 
 ### `write` {#write}
 
-Write content to a file, replacing existing content.
+Create a necessary new file with content; creates parent directories. Use edit or multiedit for existing files, including after an edit failure. This tool overwrites existing content by default; append=true adds to the end. Create documentation only when the user requests it.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `append` | boolean | no | Add content to the end of the file instead of replacing it |
-| `content` | string | yes | The complete file content to write |
+| `content` | string | yes | Complete content for a new file; when append=true, only the text to add |
 | `path` | string | yes | Absolute path to the file |
 
 ### `edit` {#edit}
 
-Replace an exact string match in a file.
+Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace and enough context to match once. replace_all=true replaces every occurrence in this file. new_string may be empty to delete text.
+For several changes in one file, use multiedit. If matching fails, re-read the target range and retry once with corrected text; do not switch to write.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -65,8 +67,8 @@ Replace an exact string match in a file.
 
 ### `multiedit` {#multiedit}
 
-Make multiple find-and-replace edits to a single file atomically.
-Prefer this over edit when making multiple changes to the same file.
+Apply several exact-text edits to one file atomically. Read the target ranges first; copy old_string without line numbers, preserving whitespace. Each must match once unless replace_all=true.
+Edits run in order against the previous edit's result. If any fails, nothing is written. On failure, re-read the target range and retry once with corrected text; do not switch to write.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -75,7 +77,7 @@ Prefer this over edit when making multiple changes to the same file.
 
 ### `edit_lines` {#edit_lines}
 
-Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.
+Replace the inclusive 1-based range start..end with new_string; an empty string deletes it. Use only with current line numbers from read output; earlier edits can shift them. Prefer edit for exact-text changes. Do not call through batch.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -96,7 +98,7 @@ Insert `new_string` after line `line`, or at the top with 0. Only include new li
 
 ### `glob` {#glob}
 
-Find files by glob pattern.
+Find files when you know a filename or path pattern, e.g. **/*.rs. Respects .gitignore; returns paths newest first. Use grep to search contents.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -105,7 +107,8 @@ Find files by glob pattern.
 
 ### `grep` {#grep}
 
-Search file contents using regex.
+Search file contents for a known symbol or regex. Returns line-numbered matches grouped by file, newest files first; respects .gitignore. Narrow with path/include and bound output with limit/context_before/context_after.
+Pass the regex without shell quotes; use normal JSON escaping (a literal [ is "\\[" in JSON). Multiline matching activates for \n, (?s), or (?m). Use bash with rg for counts, file-only results, or type filters.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -118,12 +121,12 @@ Search file contents using regex.
 
 ### `ast_grep` {#ast_grep}
 
-Structural (AST) search over the codebase via the ast-grep CLI: matches whole syntax nodes, not text.
+Search code by syntax structure. Supply pattern (code with metavariables, e.g. console.log($X)) or kind (node type, e.g. function_item). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | ESQuery-style node kind to match instead of a pattern, e.g. `function_item`. |
+| `kind` | string | no |  | Syntax node kind, e.g. function_item. Supply this or pattern. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to return |
 | `path` | string | no | cwd | Directory or file to search in |
@@ -133,12 +136,13 @@ Structural (AST) search over the codebase via the ast-grep CLI: matches whole sy
 
 ### `ast_grep_replace` {#ast_grep_replace}
 
-Rewrite every match of an ast-grep pattern in place.
+Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind. Supply rewrite; it may reuse pattern metavariables such as $X.
+Every match is changed: limit caps displayed matches, not edits. Returns replacements and the applied count. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | ESQuery-style node kind to match instead of a pattern, e.g. `function_item`. |
+| `kind` | string | no |  | Syntax node kind, e.g. function_item. Supply this or pattern. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to show |
 | `path` | string | yes |  | Absolute path to the file or directory to rewrite |
@@ -149,7 +153,7 @@ Rewrite every match of an ast-grep pattern in place.
 
 ### `index` {#index}
 
-Return a compact overview of a source file: imports, type definitions, function signatures, and structure with their line numbers surrounded by []. ~70-90% more efficient than reading the full file.
+Return a file outline: imports, types, and function signatures with [line numbers]. Call once before reading an unread code file, then use read for the needed range. Supports source code and Markdown; if the language is unsupported, use read.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -165,7 +169,7 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ### `create_plugin` {#create_plugin}
 
-Scaffold a new bundled plugin in the maki source tree, for developing maki itself.
+Scaffold a bundled plugin for development of maki itself. Creates <path>/<name>/init.lua and plugin.toml, then reports required wiring steps; rebuilding maki is required to load it. For personal plugins, create ~/.config/maki/lua/<name>.lua and use /reload instead.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -175,9 +179,21 @@ Scaffold a new bundled plugin in the maki source tree, for developing maki itsel
 
 ## Execution & Control
 
+### `async` {#async}
+
+Queue independent tool calls in the background; spawn returns job ids immediately. Use batch when you want to wait for all calls, task for an autonomous subagent.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `action` | string | no |  | One of "spawn" (default), "status", "wait", "cancel" |
+| `job_ids` | array | no | all unfinished jobs | wait/cancel: job ids or names |
+| `jobs` | array | no |  | spawn: jobs to queue, each { tool, parameters, name?, timeout_seconds? } or flat { tool, ...params } |
+| `timeout_seconds` | integer | no | 300; 0 returns immediately | wait: seconds to block before returning current statuses |
+| `workers` | integer | no |  | spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option |
+
 ### `batch` {#batch}
 
-Run independent tool calls in parallel (1-25). Not for dependent or output-filtering chains — use code_execution. Don't nest batch in batch.
+Run 1-25 independent tool calls in parallel and wait for all results. Each item: {tool: name, parameters: arguments}. Calls must not depend on each other's results or modify the same file. Use code_execution for dependencies or output filtering, async to keep working while tools run. Do not nest batch.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -185,20 +201,16 @@ Run independent tool calls in parallel (1-25). Not for dependent or output-filte
 
 ### `code_execution` {#code_execution}
 
-Run Python to chain dependent tool calls or filter their output. The same tools are async functions here: `r = await read(path='x')`. Tools return strings — parse them yourself. Concurrency: `a, b = await gather(read(path='a.py'), grep(pattern='x'))` — pass calls directly, never wrapped in `async def`. Libs: re, asyncio, sys, os, json. `open()` reads and writes text files. No imports, no network. 30s default timeout.
+Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings; parse as needed and print only useful results. For concurrency, use `await gather(index(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. Available modules: re, asyncio, sys, os, json. No imports or direct network access. open() supports text files; follow the same read/edit/write rules as direct calls. Default execution budget: 30s, excluding time waiting for tools.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `code` | string | yes |  | Python code to execute. Tools are async functions that return strings (not objects). You MUST await every call: `result = await read(path='/file', offset=1, limit=0)`. Use `await gather(...)` for concurrency. |
-| `timeout` | integer | no | 30 | Script execution timeout in seconds |
+| `code` | string | yes |  | Python script. Await tools, use their required arguments, and print the results you need to see. |
+| `timeout` | integer | no | 30 | Execution budget in seconds, excluding tool waits |
 
 ### `question` {#question}
 
-Use this tool when you need to ask the user questions during execution. This allows you to:
-- Gather user preferences or requirements
-- Clarify ambiguous instructions
-- Get decisions on implementation choices as you work
-- Offer choices to the user about what direction to take
+Ask the user for missing requirements or a decision needed to proceed. Group related questions in one call. Put the recommended option first, with "(Recommended)" in its label. Free-text answers are available by default; omit catch-all options. Set multiSelect=true only for multiple choices. Returns selected labels per question.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -208,12 +220,13 @@ Use this tool when you need to ask the user questions during execution. This all
 
 ### `task` {#task}
 
-Launch an autonomous subagent to perform tasks independently. Best combined with batch.
+Delegate a self-contained subgoal to a new agent. Use research (default) for read-only exploration or general for implementation. Include the objective, relevant context, file scope, and expected result in prompt; each call starts fresh.
+Use batch for independent subgoals; give implementation agents separate file ownership. Request a concise result with file:line references. The user does not see the result directly; summarize relevant findings. Use async for background tool calls.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
-| `model_tier` | string | no | Model tier (optional, omit to use current model, capped at current tier):<br>- "strong" (e.g. Opus): Deep reasoning, complex architecture, subtle bugs, most critical sections. ~5x cost of medium.<br>- "medium" (e.g. Sonnet): Balanced. Refactors, features, multi-file changes.<br>- "weak" (e.g. Haiku): Fast/cheap. Search, summarize, boilerplate, simple edits. |
+| `model_tier` | string | no | Model tier: strong for complex reasoning, medium for implementation, weak for simple search or edits. Omit to inherit; capped at the current tier. |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
@@ -221,7 +234,7 @@ Launch an autonomous subagent to perform tasks independently. Best combined with
 
 ### `todo_write` {#todo_write}
 
-Create or update a structured todo list to track tasks.
+Track work with 3+ steps. Create the list before starting and update after each completed step. Every call replaces the entire list: include all items and their current statuses. Before finishing, mark each completed or cancelled. Skip for trivial tasks.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -229,18 +242,18 @@ Create or update a structured todo list to track tasks.
 
 ### `memory` {#memory}
 
-Persistent, project-scoped scratchpad for learnings, patterns, decisions, and gotchas across sessions.
+Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Keep notes current; update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | - `list [tags]`: tag-grouped index, no bodies.<br>- `read path\|tags`: one body (path) or collated bodies (tags).<br>- `write path tags content`: create or overwrite a note.<br>- `delete path` |
+| `command` | string | yes | Action name only: list, read, write, or delete. Pass arguments in separate fields. list: optional tags, returns index. read: path or tags, returns bodies. write: path and content, optional tags, creates or overwrites. delete: path. |
 | `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
 ### `skill` {#skill}
 
-Load a task-specific playbook by name.
+Load instructions for a task-specific skill. Pass name to load it; omit name to list available skills.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -248,7 +261,7 @@ Load a task-specific playbook by name.
 
 ### `skill_test` {#skill_test}
 
-Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. Spawns a headless maki subprocess per test case, passing the skill body as system context, and checks the LLM response against expect_contains / expect_not_contains strings. Failures include elapsed time, exit code, and captured stderr/stdout tails; per-test `timeout_ms` overrides the 60s default.
+Test a skill using its SKILL.md tests frontmatter. Runs one headless maki subprocess per case and checks the response against expect_contains / expect_not_contains. Returns pass/fail details and failure output. Each case defaults to 60s; timeout_ms overrides it.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -258,7 +271,7 @@ Run behavioral smoke tests defined in a skill's SKILL.md `tests:` frontmatter. S
 
 ### `webfetch` {#webfetch}
 
-Fetch a URL and return its contents.
+Fetch a known URL as markdown (default), text, html, or json. HTTP is upgraded to HTTPS. Maximum response: 5MB; timeout up to 120s (default 30s). For large pages, call from code_execution and print only relevant sections. Use websearch to find URLs.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -268,23 +281,9 @@ Fetch a URL and return its contents.
 
 ### `websearch` {#websearch}
 
-Search the web for real-time information using Exa AI.
+Search the web for current information or external documentation using Exa AI.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
-
-## Additional tools
-
-### `async` {#async}
-
-Run tool calls in the background while you keep working. Typical loop: spawn slow jobs, do other work, wait for results, cancel what you no longer need.
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| `action` | string | no |  | One of "spawn" (default), "status", "wait", "cancel" |
-| `job_ids` | array | no | all unfinished jobs | wait/cancel: job ids or names |
-| `jobs` | array | no |  | spawn: jobs to queue, each { tool, parameters, name?, timeout_seconds? } or flat { tool, ...params } |
-| `timeout_seconds` | integer | no | 300; 0 returns immediately | wait: seconds to block before returning current statuses |
-| `workers` | integer | no |  | spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option |

@@ -26,6 +26,10 @@ use crate::AppSession;
 
 const SAVE_FAILED_PREFIX: &str = "Session save failed";
 const SAVE_RECOVERED: &str = "Session save recovered";
+/// The writer thread is how `pending` drains; without it every save would be
+/// reported and never land.
+#[cfg(test)]
+pub(crate) const STORAGE_THREAD_MSG: &str = "spawn storage writer thread";
 
 type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
 
@@ -49,7 +53,7 @@ pub struct StorageWriter {
 }
 
 impl StorageWriter {
-    pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> Self {
+    pub fn new(dir: StateDir, warn_tx: flume::Sender<String>) -> std::io::Result<Self> {
         let pending: Pending = Arc::default();
         let writer_pending = Arc::clone(&pending);
         let (wake, wake_rx) = flume::unbounded::<()>();
@@ -68,14 +72,15 @@ impl StorageWriter {
                 }
                 writer.flush(&writer_pending);
                 let _ = done_tx.send(writer.failing.into_iter().collect());
-            })
-            .expect("failed to spawn storage writer thread");
+            })?;
 
-        Self {
+        // Without the thread there is nothing to drain `pending`, so sessions
+        // would be reported saved and never written. Fail the start instead.
+        Ok(Self {
             pending,
             wake,
             done_rx,
-        }
+        })
     }
 
     pub fn send(&self, session: Arc<AppSession>, claim: SessionClaim) {
@@ -224,7 +229,10 @@ mod tests {
 
     fn writer(dir: &StateDir) -> (StorageWriter, flume::Receiver<String>) {
         let (warn_tx, warn_rx) = flume::unbounded();
-        (StorageWriter::new(dir.clone(), warn_tx), warn_rx)
+        (
+            StorageWriter::new(dir.clone(), warn_tx).expect(STORAGE_THREAD_MSG),
+            warn_rx,
+        )
     }
 
     fn drain(writer: StorageWriter) {

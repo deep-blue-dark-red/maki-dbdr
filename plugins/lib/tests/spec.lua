@@ -1244,6 +1244,22 @@ case("render_lines_empty_items", function()
   eq(#lines, 0)
 end)
 
+case("soften_selected_blends_selection_toward_item_background", function()
+  local styles = {
+    selected = { fg = "#ffffff", bg = "#ff0000" },
+    item = { fg = "#888888", bg = "#000000" },
+  }
+  local soft = ListPicker._soften_selected(function(name)
+    return styles[name]
+  end)
+  eq(soft.fg, "#ffffff", "selection foreground kept whole")
+  eq(soft.bg, "#730000", "background blended partway toward the row background")
+  local plain = ListPicker._soften_selected(function()
+    return { fg = "#ffffff" }
+  end)
+  eq(plain.bg, nil, "missing item background falls back to the theme style")
+end)
+
 case("render_lines_default_width_used", function()
   local items = { "test" }
   local lines_default = render_lines(items, 1)

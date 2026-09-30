@@ -62,6 +62,7 @@ impl Measure {
 /// be spurious and the row count is what gives it away, so every break waits
 /// here until the next one vouches for it. This stays out of [`Scan::run`]
 /// because [`total_rows`] runs on every resize and pays nothing for it.
+#[cfg(test)]
 pub(crate) fn breaks(line: &Line<'_>, width: u16, mut on_break: impl FnMut(Break)) {
     if width == 0 {
         return;

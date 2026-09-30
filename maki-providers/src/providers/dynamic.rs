@@ -547,7 +547,7 @@ pub fn create(slug: &str, timeouts: super::Timeouts) -> Result<Box<dyn Provider>
             message: format!("base provider '{}' has no constructor", meta.base.slug),
         });
     };
-    let inner = (native.with_auth)(auth.clone(), timeouts, meta.system_prefix.clone());
+    let inner = (native.with_auth)(auth.clone(), timeouts, meta.system_prefix.clone())?;
 
     Ok(Box::new(DynamicProvider {
         slug: &meta.slug,
@@ -643,20 +643,28 @@ impl RefreshGate {
         script_path: &Path,
         auth: &Arc<Mutex<ResolvedAuth>>,
     ) -> Result<(), AgentError> {
-        let before = self.winner.lock().unwrap().refreshes;
+        let before = self
+            .winner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refreshes;
         let _guard = self.lock.lock().await;
-        let winner = self.winner.lock().unwrap().clone();
+        let winner = self
+            .winner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if winner.refreshes != before {
             debug!("peer refreshed while we waited, skipping script run");
             if let Some(fresh) = winner.auth {
-                *auth.lock().unwrap() = fresh;
+                *auth.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
             }
             return Ok(());
         }
         run_auth_script(slug, script_path, auth, "refresh").await?;
-        *self.winner.lock().unwrap() = Winner {
+        *self.winner.lock().unwrap_or_else(|e| e.into_inner()) = Winner {
             refreshes: before + 1,
-            auth: Some(auth.lock().unwrap().clone()),
+            auth: Some(auth.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         };
         Ok(())
     }
@@ -681,7 +689,7 @@ async fn run_auth_script(
                 message: format!("{} {subcommand}: invalid JSON: {e}", script_path.display()),
             })?;
         let mut fresh = parsed.into_resolved(&slug)?;
-        let mut guard = auth.lock().unwrap();
+        let mut guard = auth.lock().unwrap_or_else(|e| e.into_inner());
         // A script that omits base_url keeps the resolved one; falling back to
         // the provider's default origin would silently repoint the token.
         if fresh.base_url.is_none() {

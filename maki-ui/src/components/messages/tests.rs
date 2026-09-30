@@ -1865,6 +1865,7 @@ fn header_snapshot_stamps_gen_on_top_level() {
 
 #[test]
 fn live_snapshot_uses_panel_generation() {
+    let _guard = theme::test_read_lock();
     // Read the generation rather than assuming 0: it is a process-wide counter
     // that never resets, so any earlier test swapping the theme moves it.
     let gen_at_build = theme::generation();

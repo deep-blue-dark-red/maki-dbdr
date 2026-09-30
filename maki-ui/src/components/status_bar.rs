@@ -18,8 +18,6 @@ use ratatui::widgets::Paragraph;
 
 use crate::repaint::{Cadence, Dirty};
 
-const TRUNCATE_PREFIX: &str = "..";
-const CWD_MODEL_SEPARATOR: &str = "  ";
 const FAST_LABEL: &str = " [fast]";
 const WORKFLOW_LABEL: &str = " [workflow]";
 const RESTRICTED_LABEL: &str = " [restricted]";
