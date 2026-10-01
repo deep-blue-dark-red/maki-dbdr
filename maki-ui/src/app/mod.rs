@@ -2079,6 +2079,11 @@ impl App {
                     format!("kv-cache-warm ping sent ({ping}/{WARM_MAX_PINGS})"),
                     theme::current().tool_success,
                 );
+            } else {
+                self.status_bar.flash_styled(
+                    format!("⚠ cache warm miss ({ping}/{WARM_MAX_PINGS})"),
+                    theme::current().status_retry_error,
+                );
             }
             return vec![];
         }
