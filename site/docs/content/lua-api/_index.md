@@ -6644,7 +6644,7 @@ return M
 ### `require("maki.dir_listing")`
 
 ```lua
--- Shared directory listing for index and list plugins, so every caller
+-- Shared directory listing for outline and list plugins, so every caller
 -- shows a directory the same way. Listing also loads the directory's
 -- instruction files onto the call.
 function M.list(path, ctx)

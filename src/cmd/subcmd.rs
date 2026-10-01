@@ -594,8 +594,8 @@ pub fn models(no_plugins: bool, no_jit: bool, refresh: bool, trust_mode: TrustMo
     Ok(())
 }
 
-pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
-    // Load-bearing binding: `index` is a Lua builtin, and dropping the host
+pub fn outline(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) -> Result<()> {
+    // Load-bearing binding: `outline` is a Lua builtin, and dropping the host
     // stops the Lua thread the tool runs on.
     let (_host, _config) = super::cli_stack(no_plugins, no_jit, trust_mode)?;
 
@@ -605,17 +605,17 @@ pub fn index(path: &str, no_plugins: bool, no_jit: bool, trust_mode: TrustMode) 
     let input = serde_json::json!({"path": abs_path.to_str().unwrap_or(path)});
     let reg = ToolRegistry::global_arc();
     let entry = reg
-        .get("index")
-        .ok_or_else(|| color_eyre::eyre::eyre!("index tool not registered"))?;
+        .get("outline")
+        .ok_or_else(|| color_eyre::eyre::eyre!("outline tool not registered"))?;
     let inv = entry
         .tool
         .parse(&input)
-        .map_err(|e| color_eyre::eyre::eyre!("parse index input: {e}"))?;
+        .map_err(|e| color_eyre::eyre::eyre!("parse outline input: {e}"))?;
     let ctx = maki_agent::tools::cli_tool_ctx();
     let result = smol::block_on(async { inv.execute(&ctx).await });
     match result.output {
         Ok(output) => print!("{}", output.as_text()),
-        Err(e) => bail!("index failed: {e}"),
+        Err(e) => bail!("outline failed: {e}"),
     }
     Ok(())
 }

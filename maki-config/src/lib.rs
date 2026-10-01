@@ -106,9 +106,9 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "edit",
     "glob",
     "grep",
-    "index",
     "list",
     "memory",
+    "outline",
     "question",
     "read",
     "sessions",
@@ -648,7 +648,7 @@ pub struct ToolOutputLinesFile {
     pub bash: Option<usize>,
     pub code_execution: Option<usize>,
     pub task: Option<usize>,
-    pub index: Option<usize>,
+    pub outline: Option<usize>,
     pub grep: Option<usize>,
     pub read: Option<usize>,
     pub write: Option<usize>,
@@ -664,7 +664,7 @@ impl ToolOutputLinesFile {
             bash,
             code_execution,
             task,
-            index,
+            outline,
             grep,
             read,
             write,
@@ -755,7 +755,9 @@ pub struct AgentFileConfig {
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
+    pub keep_cache_warm: Option<bool>,
     pub rtk: Option<bool>,
+    pub rstring: Option<bool>,
 }
 
 impl AgentFileConfig {
@@ -773,7 +775,9 @@ impl AgentFileConfig {
             compaction_instructions,
             post_compaction_instructions,
             stale_read_check,
-            rtk
+            keep_cache_warm,
+            rtk,
+            rstring
         );
     }
 }
@@ -1339,7 +1343,7 @@ pub struct ToolOutputLines {
     pub bash: usize,
     pub code_execution: usize,
     pub task: usize,
-    pub index: usize,
+    pub outline: usize,
     pub grep: usize,
     pub read: usize,
     pub write: usize,
@@ -1352,7 +1356,7 @@ impl ToolOutputLines {
         bash: 5,
         code_execution: 5,
         task: 5,
-        index: 3,
+        outline: 3,
         grep: 3,
         read: 3,
         write: 7,
@@ -1364,7 +1368,7 @@ impl ToolOutputLines {
         ("bash", Self::DEFAULT.bash),
         ("code_execution", Self::DEFAULT.code_execution),
         ("task", Self::DEFAULT.task),
-        ("index", Self::DEFAULT.index),
+        ("outline", Self::DEFAULT.outline),
         ("grep", Self::DEFAULT.grep),
         ("read", Self::DEFAULT.read),
         ("write", Self::DEFAULT.write),
@@ -1379,7 +1383,7 @@ impl ToolOutputLines {
             bash: f.bash.unwrap_or(d.bash),
             code_execution: f.code_execution.unwrap_or(d.code_execution),
             task: f.task.unwrap_or(d.task),
-            index: f.index.unwrap_or(d.index),
+            outline: f.outline.unwrap_or(d.outline),
             grep: f.grep.unwrap_or(d.grep),
             read: f.read.unwrap_or(d.read),
             write: f.write.unwrap_or(d.write),
@@ -1393,7 +1397,7 @@ impl ToolOutputLines {
             ("bash", self.bash),
             ("code_execution", self.code_execution),
             ("task", self.task),
-            ("index", self.index),
+            ("outline", self.outline),
             ("grep", self.grep),
             ("read", self.read),
             ("write", self.write),
@@ -1419,7 +1423,7 @@ impl ToolOutputLines {
             "bash" => self.bash,
             "code_execution" => self.code_execution,
             "task" => self.task,
-            "index" => self.index,
+            "outline" => self.outline,
             "grep" | "glob" | "ast_grep" => self.grep,
             "read" => self.read,
             "memory" => self.write,
@@ -1482,9 +1486,21 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
+        desc = "While a session is idle, replay the conversation in a tiny side request every 30 seconds so the provider's prompt cache outlives its TTL"
+    )]
+    pub keep_cache_warm: bool,
+
+    #[config(
+        default = true,
         desc = "Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed"
     )]
     pub rtk: bool,
+
+    #[config(
+        default = true,
+        desc = "Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows"
+    )]
+    pub rstring: bool,
 
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
@@ -1504,6 +1520,7 @@ impl AgentConfig {
             // The config field is the setting; `--no-rtk` is a per-run
             // override that can only turn it off.
             rtk: file.rtk.unwrap_or(true) && !no_rtk,
+            rstring: file.rstring.unwrap_or(true),
             max_output_bytes: file.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES),
             max_output_lines: file.max_output_lines.unwrap_or(DEFAULT_MAX_OUTPUT_LINES),
             max_continuation_turns: file
@@ -1518,6 +1535,7 @@ impl AgentConfig {
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
+            keep_cache_warm: file.keep_cache_warm.unwrap_or(true),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
@@ -2967,6 +2985,21 @@ mod tests {
     }
 
     #[test]
+    fn keep_cache_warm_defaults_on_and_overrides_off() {
+        let config = AgentConfig::from_file(AgentFileConfig::default(), false);
+        assert!(config.keep_cache_warm, "default on");
+
+        let config = AgentConfig::from_file(
+            AgentFileConfig {
+                keep_cache_warm: Some(false),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(!config.keep_cache_warm);
+    }
+
+    #[test]
     fn net_allowlist_is_empty_by_default_and_project_replaces_global() {
         let raw_with = |host: &str| RawConfig {
             net: NetFileConfig {
@@ -3331,8 +3364,8 @@ mod tests {
         assert_eq!(config.ui.tool_output_lines.bash, 20);
         assert_eq!(config.ui.tool_output_lines.read, 20);
         assert_eq!(
-            config.ui.tool_output_lines.index,
-            ToolOutputLines::DEFAULT.index
+            config.ui.tool_output_lines.outline,
+            ToolOutputLines::DEFAULT.outline
         );
     }
 
@@ -3986,7 +4019,7 @@ mod tests {
     #[test]
     fn merge_plugins_overlay_wins_per_key() {
         let mut base: RawConfig = toml::from_str(
-            "[plugins.index]\nenabled = true\n\
+            "[plugins.outline]\nenabled = true\n\
              [plugins.websearch]\nenabled = true\n\
              [plugins.grep]\nenabled = true\nsearch_result_limit = 200\nmax_line_bytes = 900\n",
         )
@@ -4000,7 +4033,7 @@ mod tests {
 
         base.merge(overlay);
         assert_eq!(
-            base.plugins["index"].enabled,
+            base.plugins["outline"].enabled,
             Some(true),
             "base-only key preserved"
         );
@@ -4104,7 +4137,7 @@ mod tests {
         assert!(config.plugins.names.contains(&"bash".to_string()));
         assert!(!config.plugins.names.contains(&"websearch".to_string()));
         assert!(
-            config.plugins.names.contains(&"index".to_string()),
+            config.plugins.names.contains(&"outline".to_string()),
             "untouched builtin stays"
         );
         assert_eq!(
@@ -4139,7 +4172,7 @@ mod tests {
             "disabled builtin removed"
         );
         assert!(
-            plugins.names.contains(&"index".to_string()),
+            plugins.names.contains(&"outline".to_string()),
             "untouched builtin stays"
         );
         assert!(

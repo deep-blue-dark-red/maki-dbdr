@@ -306,7 +306,7 @@ maki.setup({{
     }},
     plugins = {{
         bash = {{ timeout_secs = 180 }},
-        index = {{ max_file_size_mb = 4 }},
+        outline = {{ max_file_size_mb = 4 }},
     }},
 }})
 ```

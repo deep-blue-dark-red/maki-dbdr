@@ -143,13 +143,13 @@ maki --no-jit acp
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
 
-### `maki index`
+### `maki outline`
 
 ```bash
-maki index path/to/file.rs
+maki outline path/to/file.rs
 ```
 
-Runs the `index` tool on a file and prints the skeleton, so you can see what the agent will get before a session. Builtin plugins always load here; `--no-plugins` only skips user `init.lua`.
+Runs the `outline` tool on a file and prints the skeleton, so you can see what the agent will get before a session. Builtin plugins always load here; `--no-plugins` only skips user `init.lua`.
 
 ### `maki prompt`
 

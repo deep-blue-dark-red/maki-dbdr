@@ -14,7 +14,7 @@ Everything the model knows about your project passes through one context window,
 ```
 session start (paid every request)   on demand (paid when used)
 ──────────────────────────────────   ─────────────────────────────────
-system prompt                        file contents   read / index / grep
+system prompt                        file contents   read / outline / grep
 tool definitions                     skill bodies    skill tool
 instruction files (AGENTS.md, ...)   memory notes    memory tool
 memory tag names                     subdir rules    first read there

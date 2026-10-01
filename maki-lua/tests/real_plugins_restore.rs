@@ -20,10 +20,10 @@ const TODO_SRC: &str = include_str!("../../plugins/todo_write/init.lua");
 /// Only the real ToolView emits this when collapsed.
 const EXPAND_HINT: &str = "click to expand";
 /// Fixed caps so truncation tests don't depend on the product defaults. The
-/// index and read caps differ so a body rendered through the wrong view is
+/// outline and read caps differ so a body rendered through the wrong view is
 /// visibly different.
 const VIEW_CAP: usize = 3;
-const INDEX_VIEW_CAP: usize = 2;
+const OUTLINE_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
 const TODO_TOOL: &str = "todo_write";
 const TODO_ITEM: &str = "wire the panel";
@@ -37,7 +37,7 @@ fn session_ref() -> SessionRef {
 fn view_lines() -> ToolOutputLines {
     ToolOutputLines {
         other: VIEW_CAP,
-        index: INDEX_VIEW_CAP,
+        outline: OUTLINE_VIEW_CAP,
         read: READ_VIEW_CAP,
         ..ToolOutputLines::DEFAULT
     }
@@ -291,10 +291,10 @@ fn multiedit_batch_child_shows_full_numbered_diff() {
     );
 }
 
-const INDEX_TOOL: &str = "index";
+const INDEX_TOOL: &str = "outline";
 const LIVE_TOOL_USE_ID: &str = "live_id";
-/// More than the index view cap, exactly the read view cap, so a listing
-/// rendered through the index view is visibly truncated.
+/// More than the outline view cap, exactly the read view cap, so a listing
+/// rendered through the outline view is visibly truncated.
 const DIR_ENTRIES: [&str; READ_VIEW_CAP] = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"];
 const ENTRIES_SUFFIX: &str = " entries";
 
@@ -338,11 +338,11 @@ fn exec_live(host: &PluginHost, reg: &ToolRegistry, tool: &str, input: Value) ->
     }
 }
 
-/// A directory has no skeleton, so index shows the plain listing. Restore must
-/// rebuild that same listing view instead of the index skeleton view, which
-/// would truncate to the index cap and highlight the entries as code.
+/// A directory has no skeleton, so outline shows the plain listing. Restore must
+/// rebuild that same listing view instead of the outline skeleton view, which
+/// would truncate to the outline cap and highlight the entries as code.
 #[test]
-fn index_dir_renders_identically_live_and_restored() {
+fn outline_dir_renders_identically_live_and_restored() {
     let dir = tempfile::tempdir().unwrap();
     for name in DIR_ENTRIES {
         std::fs::write(dir.path().join(name), "").unwrap();

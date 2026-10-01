@@ -123,10 +123,11 @@ local function build_body(ctx, code)
 end
 
 local description = "Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. "
+  .. "Runs on monty, a restricted interpreter — not full CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. "
   .. "Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. "
   .. "Tools return strings; parse as needed and print only useful results. "
-  .. "For concurrency, use `await gather(index(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. "
-  .. "Available modules: re, asyncio, sys, os, json. No imports or direct network access. "
+  .. "For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. "
+  .. "Bundled stdlib only: re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata — anything else fails to import; no direct network access. "
   .. "open() supports text files; follow the same read/edit/write rules as direct calls. "
   .. "Default execution budget: 30s, excluding time waiting for tools."
 

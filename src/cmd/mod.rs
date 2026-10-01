@@ -221,8 +221,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 AuthAction::Status => subcmd::auth_status(&storage)?,
             }
         }
-        Some(Command::Index { path }) => {
-            subcmd::index(&path, cli.no_plugins, cli.no_jit, trust_mode)?;
+        Some(Command::Outline { path }) => {
+            subcmd::outline(&path, cli.no_plugins, cli.no_jit, trust_mode)?;
         }
         Some(Command::Models { refresh }) => {
             subcmd::models(cli.no_plugins, cli.no_jit, refresh, trust_mode)?

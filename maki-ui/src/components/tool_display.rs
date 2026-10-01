@@ -1123,12 +1123,12 @@ mod tests {
         assert_hr_fits(&tl, width);
     }
 
-    fn index_msg(body: &str) -> DisplayMessage {
+    fn outline_msg(body: &str) -> DisplayMessage {
         DisplayMessage {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: "index".into(),
+                name: "outline".into(),
             })),
             text: format!("src/lib.rs\n{body}"),
             tool_input: None,
@@ -1151,7 +1151,7 @@ mod tests {
     #[test]
     fn index_output_truncated_at_max_lines() {
         let body: String = (0..150).map(|i| format!("  line_{i}\n")).collect();
-        let msg = index_msg(&body);
+        let msg = outline_msg(&body);
         let tl = build_tool_lines(
             &msg,
             ToolStatus::Success,
@@ -1169,7 +1169,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: "index".into(),
+                name: "outline".into(),
             })),
             text: "src/lib.rs\nplain fallback".into(),
             tool_input: None,
@@ -1691,7 +1691,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: "index".into(),
+                name: "outline".into(),
             })),
             text: "src/lib.rs\nbody_text_here".into(),
             tool_input: None,
@@ -1725,7 +1725,7 @@ mod tests {
             role: DisplayRole::Tool(Box::new(ToolRole {
                 id: "t1".into(),
                 status: ToolStatus::Success,
-                name: "index".into(),
+                name: "outline".into(),
             })),
             text: "header\nbody_fallback".into(),
             tool_input: None,

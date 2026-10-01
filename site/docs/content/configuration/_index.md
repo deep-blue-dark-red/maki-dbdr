@@ -46,7 +46,7 @@ maki.setup({
     },
     plugins = {
         bash = { timeout_secs = 180 },
-        index = { max_file_size_mb = 4 },
+        outline = { max_file_size_mb = 4 },
     },
 })
 ```
@@ -114,7 +114,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `bash` | 5 |
 | `code_execution` | 5 |
 | `task` | 5 |
-| `index` | 3 |
+| `outline` | 3 |
 | `grep` | 3 |
 | `read` | 3 |
 | `write` | 7 |
@@ -135,7 +135,9 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
 | `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
+| `keep_cache_warm` | bool | `true` | - | While a session is idle, replay the conversation in a tiny side request every 30 seconds so the provider's prompt cache outlives its TTL |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
+| `rstring` | bool | `true` | - | Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows |
 
 ### `provider`
 
@@ -310,11 +312,11 @@ maki.setup({
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
 
-### `plugins.index`
+### `plugins.outline`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
+| `max_file_size_mb` | integer | `2` | 1 | Refuse to outline files larger than this many MB. |
 
 ### `plugins.read`
 

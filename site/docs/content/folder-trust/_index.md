@@ -112,7 +112,7 @@ stays a `Never` however the globs are written. Clear it with
 `paths` entry matches.
 
 The policy applies to the TUI, `-p`, the SDK and ACP. The utility subcommands
-(`maki index`, `maki models`, `maki prompt`, `maki mcp auth`) skip it, since a
+(`maki outline`, `maki models`, `maki prompt`, `maki mcp auth`) skip it, since a
 grant there would record a decision you never saw.
 
 ## Containers and CI

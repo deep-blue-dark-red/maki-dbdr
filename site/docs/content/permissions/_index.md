@@ -70,7 +70,7 @@ These tools have no builtin allow rule, so they prompt (or follow your `default`
 - `websearch` - Web search queries
 - `webfetch` - URL fetching
 
-Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `ast_grep`, `index`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
+Tools that never declare permission scopes (for example `read`, `glob`, `grep`, `ast_grep`, `outline`, `memory`, `skill`, `todo_write`) **skip** the permission manager entirely. They always run. If you need to block one of them, turn the plugin off in `init.lua` (`plugins.read = { enabled = false }`) rather than using `permissions.toml`.
 
 Container tools like `batch` and `code_execution` prompt for each inner tool individually.
 

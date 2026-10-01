@@ -230,8 +230,8 @@ pub enum Command {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// Run the index tool on a file to see how it looks like
-    Index { path: String },
+    /// Run the outline tool on a file to see how it looks like
+    Outline { path: String },
     /// Manage MCP server authentication
     Mcp {
         #[command(subcommand)]

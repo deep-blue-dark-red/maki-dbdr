@@ -53,7 +53,7 @@ const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("task", "Task"),
     ("multiedit", "MultiEdit"),
     ("code_execution", "CodeExecution"),
-    ("index", "Index"),
+    ("outline", "Outline"),
     ("memory", "Memory"),
     ("question", "Question"),
     ("skill", "Skill"),
@@ -1084,6 +1084,7 @@ impl EventPump {
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
+            | AgentEvent::CacheKeptWarm { .. }
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
@@ -1266,7 +1267,7 @@ mod tests {
     #[test_case("task", "Task")]
     #[test_case("multiedit", "MultiEdit")]
     #[test_case("code_execution", "CodeExecution")]
-    #[test_case("index", "Index")]
+    #[test_case("outline", "Outline")]
     #[test_case("memory", "Memory")]
     #[test_case("question", "Question")]
     fn maki_to_claude_roundtrip(maki: &str, claude: &str) {

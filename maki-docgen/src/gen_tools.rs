@@ -27,7 +27,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "grep",
             "ast_grep",
             "ast_grep_replace",
-            "index",
+            "outline",
             "view_image",
             "create_plugin",
         ],

@@ -7,7 +7,7 @@ local TRUNCATED_SUFFIX = indexer.TRUNCATED_SUFFIX
 local TRUNCATED_INFIX = " more truncated]"
 
 local opts = maki.api.register_options({
-  max_file_size_mb = { default = 2, min = 1, desc = "Refuse to index files larger than this many MB." },
+  max_file_size_mb = { default = 2, min = 1, desc = "Refuse to outline files larger than this many MB." },
 })
 
 local function split_trailing_range(line)
@@ -118,11 +118,11 @@ local function render_header(path, line_count)
   return buf
 end
 
-local function render_index(skeleton, path, ctx, ext, line_meta)
+local function render_outline(skeleton, path, ctx, ext, line_meta)
   local tol = ctx:tool_output_lines()
   local buf = maki.ui.buf()
   local view = ToolView.new(buf, {
-    max_lines = (tol and tol.index) or 5,
+    max_lines = (tol and tol.outline) or 5,
     keep = "head",
   })
   buf:on("click", function()
@@ -143,16 +143,16 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **index** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
+  content = "- Use the **outline** tool first on individual files to get their skeleton, then use the **read** tool with offset/limit for the specific section you need.",
 })
 
 maki.api.register_prompt_hint({
   slot = "efficient_tools",
-  content = "index",
+  content = "outline",
 })
 
 maki.api.register_tool({
-  name = "index",
+  name = "outline",
   kind = "read",
   description = [[Return a file outline: imports, types, and function signatures with [line numbers]. Call once before reading an unread code file, then use read for the needed range. Supports source code and Markdown; if the language is unsupported, use read.]],
 
@@ -171,7 +171,7 @@ maki.api.register_tool({
       return { body = dir_listing.view(output, ctx) }
     end
     local ext = input.path:match("%.([^%.]+)$") or ""
-    local buf, header = render_index(output, input.path, ctx, ext)
+    local buf, header = render_outline(output, input.path, ctx, ext)
     return { body = buf, header = header }
   end,
   handler = function(input, ctx)
@@ -234,7 +234,7 @@ maki.api.register_tool({
     end
 
     local ext = path:match("%.([^%.]+)$") or indexer.LANG_TO_EXT[lang] or ""
-    local buf, header = render_index(skeleton, path, ctx, ext, line_meta)
+    local buf, header = render_outline(skeleton, path, ctx, ext, line_meta)
     return {
       llm_output = skeleton:gsub("\n+$", ""),
       body = buf,

@@ -21,10 +21,10 @@ So Maki attacks the two multipliers: how much each step adds to context, and how
 
 ## Smaller results
 
-**index instead of read.** The `index` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent indexes first, then reads only the ranges it needs.
+**outline instead of read.** The `outline` tool returns a tree-sitter skeleton of a source file: imports, types, signatures, line numbers. Usually 70-90% smaller than the file itself. The agent outlines first, then reads only the ranges it needs.
 
 ```
-read main.rs                 index main.rs
+read main.rs                 outline main.rs
 ────────────                 ─────────────────────────────
 1400 lines in context        60 lines of signatures
                              + read offset=812 limit=40

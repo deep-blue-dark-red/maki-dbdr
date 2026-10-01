@@ -35,7 +35,7 @@ List one directory: alphabetically sorted names, directories first with a traili
 ### `read` {#read}
 
 Read a file range with 1-based line numbers. Supply path, offset (first line), and limit (line count). limit=0 reads to EOF, capped at 2000 lines by default. Absolute, relative, and ~/ paths are accepted.
-Use index first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.
+Use outline first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -151,7 +151,7 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
 | `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
 | `timeout` | integer | no | 60 | Timeout in seconds |
 
-### `index` {#index}
+### `outline` {#outline}
 
 Return a file outline: imports, types, and function signatures with [line numbers]. Call once before reading an unread code file, then use read for the needed range. Supports source code and Markdown; if the language is unsupported, use read.
 
@@ -201,7 +201,7 @@ Run 1-25 independent tool calls in parallel and wait for all results. Each item:
 
 ### `code_execution` {#code_execution}
 
-Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings; parse as needed and print only useful results. For concurrency, use `await gather(index(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. Available modules: re, asyncio, sys, os, json. No imports or direct network access. open() supports text files; follow the same read/edit/write rules as direct calls. Default execution budget: 30s, excluding time waiting for tools.
+Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. Runs on monty, a restricted interpreter — not full CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings; parse as needed and print only useful results. For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. Bundled stdlib only: re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata — anything else fails to import; no direct network access. open() supports text files; follow the same read/edit/write rules as direct calls. Default execution budget: 30s, excluding time waiting for tools.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

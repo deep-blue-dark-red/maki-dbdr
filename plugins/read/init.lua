@@ -8,7 +8,7 @@ local split_lines = helpers.split_lines
 
 local DESCRIPTION =
   [[Read a file range with 1-based line numbers. Supply path, offset (first line), and limit (line count). limit=0 reads to EOF, capped at 2000 lines by default. Absolute, relative, and ~/ paths are accepted.
-Use index first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.]]
+Use outline first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 

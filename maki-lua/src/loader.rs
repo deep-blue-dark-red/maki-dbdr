@@ -83,8 +83,8 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/thinking"),
     },
     BundledPlugin {
-        name: "index",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/index"),
+        name: "outline",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/outline"),
     },
     BundledPlugin {
         name: "webfetch",
@@ -2406,7 +2406,7 @@ mod bundled_manifests {
     /// only plugin another one reaches into: anything else a `require` names is
     /// the plugin's own file, already collected, or a virtual module such as
     /// `plugin_dev`. A plugin's own directory is taken whole rather than walked
-    /// from its entrypoint, because `index` builds its language module names at
+    /// from its entrypoint, because `outline` builds its language module names at
     /// runtime.
     fn runtime_sources(dir: &'static Dir<'static>) -> Vec<&'static str> {
         let mut sources = Vec::new();
