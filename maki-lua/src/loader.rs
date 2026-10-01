@@ -1970,9 +1970,10 @@ mod tests {
             })
             "#,
         );
-        for &pid in PromptId::ALL {
+        for pid in [PromptId::Research, PromptId::General] {
             assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
         }
+        assert!(contents(&slots, PromptId::System, Slot::EfficientTools).is_empty());
     }
 
     /// `conventions` lives on system and general but not research, so a default
@@ -2023,20 +2024,20 @@ mod tests {
             r#"
             maki.api.register_prompt_hint({
                 slot = "tool_usage",
-                prompt = { "system", "research" },
+                prompt = { "research", "general" },
                 content = "shared",
             })
             "#,
         );
         assert_eq!(
-            contents(&slots, PromptId::System, Slot::ToolUsage),
-            [CONTENT]
-        );
-        assert_eq!(
             contents(&slots, PromptId::Research, Slot::ToolUsage),
             [CONTENT]
         );
-        assert!(contents(&slots, PromptId::General, Slot::ToolUsage).is_empty());
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::ToolUsage),
+            [CONTENT]
+        );
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
     #[test]
@@ -2055,7 +2056,7 @@ mod tests {
         }
         let slots = host.event_handle().collect_prompt_slots();
         assert_eq!(
-            contents(&slots, PromptId::System, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::ToolUsage),
             ["from_aaa", "from_zzz"],
             "entries must be ordered by plugin name"
         );
@@ -2068,7 +2069,7 @@ mod tests {
         host.load_source(
             "multi",
             r#"
-            maki.api.register_prompt_hint({ slot = "tool_usage", prompt = "system", content = "usage" })
+            maki.api.register_prompt_hint({ slot = "tool_usage", prompt = "research", content = "usage" })
             maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
             "#,
         )
@@ -2077,7 +2078,7 @@ mod tests {
 
         let slots = handle.collect_prompt_slots();
         assert_eq!(
-            contents(&slots, PromptId::System, Slot::ToolUsage),
+            contents(&slots, PromptId::Research, Slot::ToolUsage),
             ["usage"]
         );
         assert_eq!(
@@ -2087,7 +2088,7 @@ mod tests {
 
         host.unload("multi").unwrap();
         let slots = handle.collect_prompt_slots();
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::Research, Slot::ToolUsage).is_empty());
         assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
 
@@ -2248,7 +2249,7 @@ mod tests {
         .unwrap();
         let slots = host.event_handle().collect_prompt_slots();
         assert_eq!(
-            contents(&slots, PromptId::System, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::ToolUsage),
             ["HINT"]
         );
         assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["SET"]);

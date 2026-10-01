@@ -435,14 +435,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_slots_emit_template_and_native_efficient_line() {
+    fn empty_slots_fill_and_subagents_emit_native_line() {
         let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
         assert!(out.starts_with("You are Maki"));
         assert!(
             !out.contains("{{"),
             "unfilled marker left in output:\n{out}"
         );
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}.")));
+        assert!(
+            !out.contains(NATIVE_EFFICIENT_LINE),
+            "efficient line was dropped from the default prompt:\n{out}"
+        );
+        let sub = assemble(PromptId::General, &ResolvedSlots::default(), "");
+        assert!(sub.contains(&format!("{NATIVE_EFFICIENT_LINE}.")));
     }
 
     /// One test to pin the whole System layout: every slot shows up, in order,
@@ -452,15 +457,12 @@ mod tests {
         let s = slots(
             PromptId::System,
             &[
-                (Slot::ToolUsage, "TOOL_USAGE"),
-                (Slot::EfficientTools, "EXTRA_TOOL"),
                 (Slot::Conventions, "CONVENTIONS"),
                 (Slot::AfterInstructions, "AFTER"),
             ],
         );
         let out = assemble(PromptId::System, &s, "INSTR");
-        let positions = ["TOOL_USAGE", "EXTRA_TOOL", "CONVENTIONS", "INSTR", "AFTER"]
-            .map(|needle| at(&out, needle));
+        let positions = ["CONVENTIONS", "INSTR", "AFTER"].map(|needle| at(&out, needle));
         assert!(
             positions.is_sorted(),
             "sections out of layout order ({positions:?}):\n{out}"
@@ -472,8 +474,8 @@ mod tests {
     #[test]
     fn tool_usage_hint_lands_inside_tool_usage_section() {
         const HINT: &str = "- HINT_LINE";
-        let s = slots(PromptId::System, &[(Slot::ToolUsage, HINT)]);
-        let out = assemble(PromptId::System, &s, "");
+        let s = slots(PromptId::General, &[(Slot::ToolUsage, HINT)]);
+        let out = assemble(PromptId::General, &s, "");
         let hint = at(&out, HINT);
         assert!(
             at(&out, "# Tool usage") < hint,
@@ -488,21 +490,21 @@ mod tests {
     #[test]
     fn efficient_tools_extras_join_native_list() {
         let s = slots(
-            PromptId::System,
+            PromptId::General,
             &[
-                (Slot::EfficientTools, "outline"),
+                (Slot::EfficientTools, "mcp_git"),
                 (Slot::EfficientTools, "foo"),
             ],
         );
-        let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, outline, foo.")));
+        let out = assemble(PromptId::General, &s, "");
+        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, mcp_git, foo.")));
     }
 
     #[test]
     fn same_slot_preserves_insertion_order() {
         let s = slots(
             PromptId::System,
-            &[(Slot::ToolUsage, "FIRST"), (Slot::ToolUsage, "SECOND")],
+            &[(Slot::Conventions, "FIRST"), (Slot::Conventions, "SECOND")],
         );
         let out = assemble(PromptId::System, &s, "");
         assert!(at(&out, "FIRST") < at(&out, "SECOND"));
@@ -542,8 +544,12 @@ mod tests {
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, EXTRA.")));
     }
 
-    #[test_case(PromptId::System, Slot::ToolUsage, true ; "system_tool_usage")]
-    #[test_case(PromptId::System, Slot::EfficientTools, true ; "system_efficient")]
+    #[test_case(PromptId::System, Slot::ToolUsage, false ; "system_no_tool_usage")]
+    #[test_case(PromptId::System, Slot::EfficientTools, false ; "system_no_efficient")]
+    #[test_case(PromptId::General, Slot::ToolUsage, true ; "general_tool_usage")]
+    #[test_case(PromptId::General, Slot::EfficientTools, true ; "general_efficient")]
+    #[test_case(PromptId::Research, Slot::ToolUsage, true ; "research_tool_usage")]
+    #[test_case(PromptId::Research, Slot::EfficientTools, true ; "research_efficient")]
     #[test_case(PromptId::System, Slot::Conventions, true ; "system_conventions")]
     #[test_case(PromptId::System, Slot::AfterInstructions, true ; "system_after")]
     #[test_case(PromptId::System, Slot::Identity, true ; "system_identity")]
@@ -656,7 +662,7 @@ mod tests {
             },
         );
         let out = assemble(PromptId::System, &s, "");
-        assert!(out.contains("Confirm a library exists in the project's dependency files"));
+        assert!(out.contains("Confirm a library is in the project's dependency files"));
         assert!(out.contains("- Extra rule"));
     }
 
