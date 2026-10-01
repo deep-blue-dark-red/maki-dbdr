@@ -12,7 +12,7 @@ Maki is an AI coding agent (like Claude Code and opencode) built in Rust to opti
 ## Workspace Structure
 
 ```
-/Users/mcp/git/maki/
+~/git/maki/
 ├── Cargo.toml              ← workspace root + dependencies
 ├── src/                    ← binary crate (maki binary)
 │   ├── main.rs             ← entry: install color_eyre, parse CLI, dispatch

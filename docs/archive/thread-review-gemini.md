@@ -29,18 +29,18 @@ graph TD
 ### Current Command Execution Flow
 
 When the LLM invokes the `bash` tool (implemented in
-[plugins/bash/init.lua](file:///Users/mcp/git/maki/plugins/bash/init.lua)), the
+[plugins/bash/init.lua](plugins/bash/init.lua)), the
 following happens:
 
 1. **Spawn**: `maki.fn.jobstart(command, callbacks)` is called. This delegates
    to `JobStore::start` in
-   [fn.rs](file:///Users/mcp/git/maki/maki-lua/src/api/fn.rs).
+   [fn.rs](maki-lua/src/api/fn.rs).
 2. **Reader Threads**: Maki spawns three standard OS threads (`job-stdout`,
    `job-stderr`, `job-wait`) to read from the command's pipes and send
    `JobEvent`s back via a `flume` channel.
 3. **Dispatch & Polling**: The tool handler returns `nil` to indicate
    asynchronous progress. This triggers `dispatch_async` in
-   [runtime.rs](file:///Users/mcp/git/maki/maki-lua/src/runtime.rs), which
+   [runtime.rs](maki-lua/src/runtime.rs), which
    enters a polling loop:
    - It drains stdout/stderr lines and runs the associated Lua callback
      functions on the local executor.
@@ -122,7 +122,7 @@ sequenceDiagram
 
 1. **Background Spawning**:
    - Introduce `maki.agent.spawn(agent_ctx, opts)` in
-     [agent.rs](file:///Users/mcp/git/maki/maki-lua/src/api/agent.rs).
+     [agent.rs](maki-lua/src/api/agent.rs).
    - This function does
      `smol::spawn(async move { agent.run(input).await }).detach()` and returns a
      `task_id` (string representation of the uuid/tool_use_id).

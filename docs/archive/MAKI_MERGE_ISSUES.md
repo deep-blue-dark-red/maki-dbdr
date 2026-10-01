@@ -1,13 +1,13 @@
 # MAKI fork merge — analysis & pain points
 
 Forensic + repair log for migrating Matthew's fork features (`forkv2`) into the
-current `main` of `/Users/mcp/git/maki` (a Ratatui Rust TUI workspace). Written
+current `main` of `~/git/maki` (a Ratatui Rust TUI workspace). Written
 2026-07-22.
 
 ## Repo layout (gotcha: not where you'd guess)
-- Working repo: `/Users/mcp/git/maki`. There is NO `forkv3` branch and NO
+- Working repo: `~/git/maki`. There is NO `forkv3` branch and NO
   `marki` dir (`marki` was a typo). `~/git/maki` is the right path.
-- Remotes: `upstream` = `/Users/mcp/git/maki-main`.
+- Remotes: `upstream` = `~/git/maki-main`.
 - Branches: `main` (HEAD = `16041b9f "Matthew fork merge"`), `forkv2`
   (Matthew's original features, `fb8527f3`), `maki-mcp` (a prior BOTCHED
   migration attempt).

@@ -9,7 +9,7 @@ reps = 5
 concurrency = 3
 
 [run]
-maki_bin = "/Users/mcp/git/maki/target/release/maki"
+maki_bin = "./target/release/maki"
 default_max_turns = 20
 default_timeout_s = 300
 keep_failed_workdirs = true
