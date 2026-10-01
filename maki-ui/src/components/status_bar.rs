@@ -99,7 +99,7 @@ pub struct StatusBarContext<'a> {
 }
 
 pub struct StatusBar {
-    flash: Option<(String, Instant)>,
+    flash: Option<(String, Style, Instant)>,
     /// Messages waiting for the line, oldest first.
     queued: VecDeque<String>,
     cwd_branch: String,
@@ -121,7 +121,13 @@ impl StatusBar {
     /// Shows {msg} now, replacing whatever was showing. It answers something
     /// the user just did, and they want the latest state, not the one before.
     pub fn flash(&mut self, msg: String) {
-        self.flash = Some((msg, Instant::now()));
+        self.flash_styled(msg, theme::current().status_notice);
+    }
+
+    /// [`Self::flash`] for messages whose meaning rides on a color, such as
+    /// the green cache keep-alive ping.
+    pub fn flash_styled(&mut self, msg: String, style: Style) {
+        self.flash = Some((msg, style, Instant::now()));
     }
 
     /// Shows {msg} once the line is free, behind anything already waiting.
@@ -132,12 +138,12 @@ impl StatusBar {
             self.queued.push_back(msg);
             return;
         }
-        self.flash = Some((msg, Instant::now()));
+        self.flash(msg);
     }
 
     #[cfg(test)]
     pub fn flash_text(&self) -> Option<&str> {
-        self.flash.as_ref().map(|(s, _)| s.as_str())
+        self.flash.as_ref().map(|(s, _, _)| s.as_str())
     }
 
     pub fn refresh_cwd(&mut self) {
@@ -168,7 +174,7 @@ impl StatusBar {
         if self
             .flash
             .as_ref()
-            .is_none_or(|(_, t)| t.elapsed() < self.flash_duration)
+            .is_none_or(|(_, _, t)| t.elapsed() < self.flash_duration)
         {
             return Dirty::NO;
         }
@@ -179,7 +185,10 @@ impl StatusBar {
     /// The one way a message leaves the line, so none can leave it without
     /// handing it to the next.
     fn show_next(&mut self) {
-        self.flash = self.queued.pop_front().map(|msg| (msg, Instant::now()));
+        self.flash = self
+            .queued
+            .pop_front()
+            .map(|msg| (msg, theme::current().status_notice, Instant::now()));
     }
 
     /// The bar spins for a whole turn, again while a restore is in flight, and
@@ -320,11 +329,8 @@ impl StatusBar {
             left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
         }
 
-        if let Some((ref msg, _)) = self.flash {
-            left_spans.push(Span::styled(
-                format!(" {msg}"),
-                theme::current().status_notice,
-            ));
+        if let Some((ref msg, style, _)) = self.flash {
+            left_spans.push(Span::styled(format!(" {msg}"), style));
         }
 
         let mut right_spans = Vec::new();

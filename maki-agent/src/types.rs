@@ -681,6 +681,15 @@ pub enum AgentEvent {
         images: Vec<ImageSource>,
     },
     QueueDrained,
+    /// An idle cache keep-alive ping finished, outside any run. Informational
+    /// only: nothing in the transcript or ledger changed.
+    CacheKeptWarm {
+        /// Prefix tokens the provider reported reading from the cache.
+        cache_read: u32,
+        /// 1-based ping count for the current idle stretch; a completed run
+        /// restarts the count.
+        ping: u32,
+    },
     Done {
         usage: TokenUsage,
         /// Billed cost for the whole run, `None` while nothing was priced.

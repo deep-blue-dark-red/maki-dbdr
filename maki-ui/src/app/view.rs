@@ -359,7 +359,9 @@ impl App {
             }
         }
         if self.stats_modal.is_open() {
-            let r = self.stats_modal.view(frame, full, &self.turn_history);
+            let r = self
+                .stats_modal
+                .view(frame, full, &self.turn_history, self.cache_warm);
             if r.width > 0 {
                 overlay_rect = r;
             }

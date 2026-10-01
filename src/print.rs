@@ -307,6 +307,7 @@ pub fn run(params: PrintParams) -> Result<()> {
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
+            | AgentEvent::CacheKeptWarm { .. }
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired

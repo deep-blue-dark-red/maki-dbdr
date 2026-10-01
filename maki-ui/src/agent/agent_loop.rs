@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use futures_lite::future;
 use maki_agent::agent::{self, AgentHooks};
 use maki_agent::mcp::config::McpServerStatus;
 use maki_agent::mcp::{McpHandle, McpSession};
@@ -17,12 +19,16 @@ use maki_agent::{
 };
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, ContextGauge, Message, Model};
+use maki_providers::{
+    AgentError, ContextGauge, Message, Model, RequestOptions, StreamResponse,
+    estimate_prompt_tokens,
+};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
-use tracing::error;
+use tracing::{error, warn};
 
 use super::ModelSlot;
+use super::keepwarm::{self, WarmOutcome, warm_messages};
 use super::run_cancels::RunCancels;
 use super::shared_queue::{self, QueueReceiver, QueueRun};
 
@@ -156,7 +162,60 @@ impl AgentLoop {
             return;
         }
 
-        while let Ok(()) = self.queue.recv_notify().await {
+        // Armed only by a completed run or a ping: at startup there is no warm
+        // cache to protect, and the first real turn pays the cache write
+        // either way.
+        let mut next_warm: Option<Instant> = None;
+        let mut warm_pings: u32 = 0;
+        // Consecutive misses: the first one usually means the TTL already
+        // lapsed (a retry storm kept the loop busy past it), and the next ping
+        // rewrites the cache, so one miss keeps pinging. Only a run clears it.
+        let mut warm_misses: u32 = 0;
+        // Set when the stretch stood down: a prompt arrived mid-ping, the
+        // prompt is too small, or misses look structural.
+        let mut warm_stop = false;
+        loop {
+            enum Wake {
+                Queue(Result<(), flume::RecvError>),
+                Warm,
+            }
+            let woke = future::race(
+                async { Wake::Queue(self.queue.recv_notify().await) },
+                async {
+                    match next_warm {
+                        Some(at) => {
+                            smol::Timer::at(at).await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                    Wake::Warm
+                },
+            )
+            .await;
+            match woke {
+                Wake::Queue(Err(_)) => return,
+                Wake::Queue(Ok(())) => {}
+                Wake::Warm => {
+                    match self.keep_warm(warm_pings + 1).await {
+                        WarmOutcome::Sent(cache_read) => {
+                            warm_pings += 1;
+                            warm_misses = if cache_read == 0 { warm_misses + 1 } else { 0 };
+                        }
+                        WarmOutcome::Failed => warm_pings += 1,
+                        WarmOutcome::StandDown => warm_stop = true,
+                    }
+                    warm_stop = warm_stop || warm_misses >= keepwarm::WARM_MAX_MISSES;
+                    next_warm = self.warm_deadline(warm_pings, warm_stop);
+                    if next_warm.is_none() && !warm_stop {
+                        warn!(
+                            pings = warm_pings,
+                            max = keepwarm::WARM_MAX_PINGS,
+                            "cache keep-alive budget spent; standing down until the next run"
+                        );
+                    }
+                }
+            }
+
             // An out-of-band change (an edited prompt override file) asks for
             // a republish even with nothing queued to run.
             if self.prompt_dirty.swap(false, Ordering::Relaxed) {
@@ -172,9 +231,106 @@ impl AgentLoop {
                 self.process_run(run, run_id).await;
             }
             if let Some(run_id) = last_run_id {
+                // The run just rewrote the cache's newest prefix, so the clock
+                // and the ping budget restart from it rather than from the
+                // last ping.
+                warm_pings = 0;
+                warm_misses = 0;
+                warm_stop = false;
+                next_warm = self.warm_deadline(warm_pings, warm_stop);
                 let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
                 self.queue
                     .publish_if_empty(|| event_tx.try_send(AgentEvent::QueueDrained));
+            }
+        }
+    }
+
+    /// Arms the next ping `WARM_INTERVAL` out while keep-warm is on, the
+    /// `WARM_MAX_PINGS` budget for this idle stretch lasts, and nothing
+    /// stood the stretch down.
+    fn warm_deadline(&self, pings: u32, stop: bool) -> Option<Instant> {
+        keepwarm::warm_scheduled(self.config.keep_cache_warm, pings, stop)
+            .then(|| Instant::now() + keepwarm::WARM_INTERVAL)
+    }
+
+    /// Replays the current conversation as a tiny side request so the
+    /// provider's prompt cache outlives its TTL. Response and usage are
+    /// discarded: nothing lands in history, ledger, or turn stats. A prompt
+    /// arriving mid-ping aborts it, and dropping a read-only request loses
+    /// nothing.
+    async fn keep_warm(&self, ping: u32) -> WarmOutcome {
+        let snapshot = warm_messages(self.history.as_slice());
+        let slots = self.lua_handle.collect_prompt_slots_async().await;
+        let system = self.system_prompt(&slots);
+        let slot = self.model_slot.load();
+        let base = base_tools(
+            &self.vars,
+            &slot.model,
+            &self.config,
+            self.mcp.is_some(),
+            false,
+        );
+        let tools = agent::request_tools(&base, self.mcp.as_ref());
+        let prompt_tokens = estimate_prompt_tokens(&snapshot, &system, &tools);
+        if !keepwarm::warm_due(prompt_tokens) {
+            warn!(
+                prompt_tokens,
+                "cache keep-alive stood down: prompt too small to keep warm"
+            );
+            return WarmOutcome::StandDown;
+        }
+
+        let (event_tx, event_rx) = flume::unbounded();
+        let ping_request = slot.provider.stream_message(
+            &slot.model,
+            &snapshot,
+            &system,
+            &tools,
+            &event_tx,
+            RequestOptions::default(),
+            Some(&self.session_id),
+        );
+        enum PingRace {
+            Ping(Result<StreamResponse, AgentError>),
+            Prompt,
+        }
+        let outcome = future::race(async { PingRace::Ping(ping_request.await) }, async {
+            let _ = self.queue.recv_notify().await;
+            PingRace::Prompt
+        })
+        .await;
+        // Held so provider sends into the channel never fail mid-request;
+        // dropped with the scope.
+        let _events = event_rx;
+        match outcome {
+            PingRace::Ping(Ok(response)) => {
+                warn!(
+                    model = %slot.model.id,
+                    cache_read = response.usage.cache_read,
+                    ping,
+                    "cache keep-alive sent"
+                );
+                EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID).try_send(
+                    AgentEvent::CacheKeptWarm {
+                        cache_read: response.usage.cache_read,
+                        ping,
+                    },
+                );
+                if response.usage.cache_read == 0 {
+                    warn!(
+                        model = %slot.model.id,
+                        "cache keep-alive missed; the next ping rebuilds the cache"
+                    );
+                }
+                WarmOutcome::Sent(response.usage.cache_read)
+            }
+            PingRace::Ping(Err(e)) => {
+                warn!(error = %e, model = %slot.model.id, ping, "cache keep-alive failed");
+                WarmOutcome::Failed
+            }
+            PingRace::Prompt => {
+                warn!("cache keep-alive aborted: a prompt arrived first");
+                WarmOutcome::StandDown
             }
         }
     }

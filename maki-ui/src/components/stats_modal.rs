@@ -2,6 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maki_providers::format_tokens;
+
+use crate::agent::keepwarm::WARM_MAX_PINGS;
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::Frame;
@@ -512,14 +514,20 @@ impl StatsModal {
         idx
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect, turns: &[TurnSnapshot]) -> Rect {
+    pub fn view(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        turns: &[TurnSnapshot],
+        warm: Option<CacheWarmPing>,
+    ) -> Rect {
         if !self.open {
             return Rect::default();
         }
 
         let theme = theme::current();
         let idx = self.ordered_indices(turns);
-        let lines = self.build_lines(turns, &idx, &theme);
+        let lines = self.build_lines(turns, &idx, warm, &theme);
 
         let modal = Modal {
             title: TITLE,
@@ -540,6 +548,7 @@ impl StatsModal {
         &mut self,
         turns: &[TurnSnapshot],
         idx: &[usize],
+        warm: Option<CacheWarmPing>,
         theme: &crate::theme::Theme,
     ) -> Vec<Line<'static>> {
         if turns.is_empty() {
@@ -554,7 +563,7 @@ impl StatsModal {
             lines.push(self.search_line(theme));
         }
         lines.push(Line::from(Span::styled(
-            summary_text(turns),
+            summary_text(turns, warm),
             theme.keybind_section,
         )));
         lines.push(Line::default());
@@ -618,6 +627,18 @@ impl StatsModal {
         }
         line
     }
+}
+
+/// The last idle cache keep-alive ping, for the `/stats` summary line. Kept
+/// apart from `TurnSnapshot` on purpose: pings are not turns and must not
+/// enter the per-turn table, token totals, or cost sum.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheWarmPing {
+    pub at: std::time::Instant,
+    /// Prefix tokens the ping read back from the provider's cache.
+    pub cache_read: u32,
+    /// 1-based ping count for the idle stretch; a completed run restarts it.
+    pub ping: u32,
 }
 
 impl crate::components::Overlay for StatsModal {
@@ -685,9 +706,21 @@ fn pinned_upstream(turns: &[TurnSnapshot]) -> Option<&str> {
         .find_map(|t| t.upstream.as_ref().and_then(|u| u.name.as_deref()))
 }
 
-/// Summary line above the table: turn and request counts, spend, and the
-/// upstream the session is pinned to.
-fn summary_text(turns: &[TurnSnapshot]) -> String {
+/// Human age for the summary line: `just now`, `4m ago`, `2h ago`.
+fn age_text(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
+/// Summary line above the table: turn and request counts, spend, the upstream
+/// the session is pinned to, and when the cache was last kept warm.
+fn summary_text(turns: &[TurnSnapshot], warm: Option<CacheWarmPing>) -> String {
     // `Sum for f64` folds from `-0.0` (the true IEEE-754 additive identity),
     // so summing zero costs (e.g. every turn used an unpriced/local model)
     // yields `-0.0`, which formats as "-0.0000" instead of "0.0000". `+ 0.0`
@@ -695,8 +728,21 @@ fn summary_text(turns: &[TurnSnapshot]) -> String {
     let total_cost: f64 = turns.iter().filter_map(|t| t.cost).sum::<f64>() + 0.0;
     let user_turns: std::collections::HashSet<usize> = turns.iter().map(|t| t.user_turn).collect();
     let pinned = pinned_upstream(turns).map_or_else(String::new, |u| format!(" · pinned {u}"));
+    let warm = warm.map_or_else(String::new, |w| {
+        let read = if w.cache_read > 0 {
+            format!(
+                "{} · ping {}/{}",
+                format_tokens(w.cache_read),
+                w.ping,
+                WARM_MAX_PINGS
+            )
+        } else {
+            format!("miss · ping {}/{}", w.ping, WARM_MAX_PINGS)
+        };
+        format!(" · cache warm {} ({read})", age_text(w.at.elapsed()))
+    });
     format!(
-        "{PREFIX}{} turns · {} requests · ${total_cost:.4} total{pinned}",
+        "{PREFIX}{} turns · {} requests · ${total_cost:.4} total{pinned}{warm}",
         user_turns.len(),
         turns.len(),
     )
@@ -852,7 +898,10 @@ fn build_lines(turns: &[TurnSnapshot], theme: &crate::theme::Theme) -> Vec<Line<
     }
 
     let mut lines = vec![
-        Line::from(Span::styled(summary_text(turns), theme.keybind_section)),
+        Line::from(Span::styled(
+            summary_text(turns, None),
+            theme.keybind_section,
+        )),
         Line::default(),
         header_row(theme),
     ];
@@ -1462,16 +1511,16 @@ mod tests {
         t2.upstream = named("Baidu");
 
         assert!(
-            summary_text(&[t1.clone(), t2.clone()]).ends_with("· pinned Baidu"),
+            summary_text(&[t1.clone(), t2.clone()], None).ends_with("· pinned Baidu"),
             "got: {:?}",
-            summary_text(&[t1.clone(), t2.clone()])
+            summary_text(&[t1.clone(), t2.clone()], None)
         );
 
         // A turn that reports no upstream doesn't unpin the session; the last
         // one that named an upstream is still where requests land.
         let t3 = sample_turn(3);
         assert!(
-            summary_text(&[t1, t2, t3]).ends_with("· pinned Baidu"),
+            summary_text(&[t1, t2, t3], None).ends_with("· pinned Baidu"),
             "a nameless turn cleared the pin"
         );
     }
@@ -1480,8 +1529,51 @@ mod tests {
     /// upstream, so there is no pin to speak of.
     #[test]
     fn summary_omits_the_pin_for_direct_providers() {
-        let summary = summary_text(&[sample_turn(1)]);
+        let summary = summary_text(&[sample_turn(1)], None);
         assert!(!summary.contains("pinned"), "got: {summary:?}");
+    }
+
+    #[test]
+    fn summary_appends_the_keep_alive_when_pinged_and_omits_it_when_not() {
+        let summary = summary_text(&[sample_turn(1)], None);
+        assert!(!summary.contains("cache warm"), "got: {summary:?}");
+
+        let warm = CacheWarmPing {
+            at: std::time::Instant::now(),
+            cache_read: 98_000,
+            ping: 3,
+        };
+        let summary = summary_text(&[sample_turn(1)], Some(warm));
+        assert!(
+            summary.ends_with(&format!(
+                "· cache warm just now (98.0k · ping 3/{WARM_MAX_PINGS})"
+            )),
+            "got: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn summary_marks_a_missed_keep_alive() {
+        let warm = CacheWarmPing {
+            at: std::time::Instant::now(),
+            cache_read: 0,
+            ping: 1,
+        };
+        let summary = summary_text(&[sample_turn(1)], Some(warm));
+        assert!(
+            summary.ends_with(&format!(
+                "· cache warm just now (miss · ping 1/{WARM_MAX_PINGS})"
+            )),
+            "got: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn age_text_buckets_by_magnitude() {
+        use std::time::Duration;
+        assert_eq!(age_text(Duration::from_secs(5)), "just now");
+        assert_eq!(age_text(Duration::from_secs(240)), "4m ago");
+        assert_eq!(age_text(Duration::from_secs(7200)), "2h ago");
     }
 
     #[test]

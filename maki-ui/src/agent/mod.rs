@@ -1,4 +1,5 @@
 mod agent_loop;
+pub(crate) mod keepwarm;
 mod model_slots;
 mod run_cancels;
 pub(crate) mod shared_queue;

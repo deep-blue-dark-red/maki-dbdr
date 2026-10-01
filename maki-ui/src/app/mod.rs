@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
+use crate::agent::keepwarm::WARM_MAX_PINGS;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -56,7 +57,7 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::settings_picker::{SettingsPicker, SettingsPickerAction, UserSettings};
 use crate::components::skills_modal::{SkillsAction, SkillsModal};
-use crate::components::stats_modal::{StatsModal, TurnSnapshot};
+use crate::components::stats_modal::{CacheWarmPing, StatsModal, TurnSnapshot};
 use crate::components::status_bar::StatusBar;
 use crate::components::system_prompt_modal::{
     SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
@@ -70,6 +71,7 @@ use crate::components::{
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::theme;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -413,6 +415,8 @@ pub struct App {
     /// One row per completed turn this session, shown by `/stats`. Grows
     /// for the life of the session; cleared on `/new`.
     pub(super) turn_history: Vec<TurnSnapshot>,
+    /// Last idle cache keep-alive ping, shown in `/stats`' summary line.
+    pub(super) cache_warm: Option<CacheWarmPing>,
     /// Monotonic 0-based index handed out to each `TurnComplete` as its
     /// `event_id` (the simple "turn" column). Never reset within a session.
     pub(super) event_id_counter: usize,
@@ -588,6 +592,7 @@ impl App {
             last_turn_stats: None,
             last_done_info: None,
             turn_history: Vec::new(),
+            cache_warm: None,
             event_id_counter: 0,
             pending_turn_stats: Vec::new(),
             stats_modal: StatsModal::new(),
@@ -2063,6 +2068,21 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, envelope: Envelope) -> Vec<Action> {
+        if let AgentEvent::CacheKeptWarm { cache_read, ping } = envelope.event {
+            self.cache_warm = Some(CacheWarmPing {
+                at: Instant::now(),
+                cache_read,
+                ping,
+            });
+            if cache_read > 0 {
+                self.status_bar.flash_styled(
+                    format!("kv-cache-warm ping sent ({ping}/{WARM_MAX_PINGS})"),
+                    theme::current().tool_success,
+                );
+            }
+            return vec![];
+        }
+
         if let AgentEvent::RenameResult { title } = envelope.event {
             self.apply_rename(title);
             return vec![];
