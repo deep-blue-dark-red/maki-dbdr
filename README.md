@@ -6,7 +6,7 @@ An AI coding agent optimized for minimal use of context tokens, while providing 
 
 This fork adds:
 
-* `/stats` with per-API usage, tool-call and duration tracking, cache-hit/miss transactions, and itemized per-call cost.
+* `/stats` with per-API usage, tool-call and duration tracking, cache-hit/miss transactions, itemized per-call cost, and a pre-send cache-miss warning.
 * Strict OpenRouter provider pinning so models with multiple providers keep warm prompt caches.
 * Skills Manager for choosing which skills enter the system prompt. `create-skill` ships by default.
 * Plugin Manager for selecting Lua plugins on new sessions, with each plugin's registered tools (descriptions and input schemas) shown in the detail pane, including the `create-plugin` plugin.
@@ -34,11 +34,29 @@ Q: why a fork (and not a PR?) Libertarian leanings; forks are better. Feel free 
 
 ![Dynamic status bar, session stats, and thinking-mode display](./screenshots/render-status.png)
 
+### Resolved system prompt
+
+![Resolved system prompt viewer with template, identity, tone, instructions, and sources sections](./screenshots/resolved_system_prompt_live_edits.png)
+
+`/system_prompt` shows the fully resolved prompt — what the model actually receives — with your live edits applied; jump between template, identity, tone, instructions, and sources, and edit it in `$EDITOR`.
+
 ### `/stats`
 
 ![Per-call API statistics](./screenshots/stats.png)
 
 Inspect every API call and tool use duration, metadata, whether there was a cache hit, who the provider was, PP/s and TG/s statistics and itemized cost for the current session.
+
+### Cache-miss warning
+
+![Cache miss warning before resending the full context, with token count, estimated cost, and cache limits](./screenshots/cache_miss_warning.jpg)
+
+After a cancel or cache expiry, maki warns before a resend would likely miss the prompt cache — showing tokens going out as input, estimated cost, and the provider's cache limits — so you can choose to proceed, hit Enter to resend, or `/new`.
+
+### Background jobs (`async`)
+
+![Background jobs pane with the todo list and a running async job](./screenshots/background-jobs-async.jpg)
+
+Spawn tool calls into a background queue and keep prompting while they run: poll with `status`, block with `wait`, or cancel; the Jobs pane streams live progress next to the todo list.
 
 ### Skills Manager `/skills`
 
