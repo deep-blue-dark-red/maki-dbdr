@@ -43,6 +43,7 @@ use crate::runtime::{
 };
 
 const TOOL_NAME_MAX: usize = 64;
+const RSTRING_TOOL: &str = "bash";
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
@@ -320,6 +321,16 @@ struct LuaToolInvocation {
     start_annotation: Option<StartAnnotation>,
 }
 
+/// rstring stream-tier filter on the lua→agent boundary: bash output above
+/// [`maki_rstring::MIN_BYTES`] collapses to volatile-merged lines. Errors,
+/// small outputs and outputs it cannot shrink pass through untouched.
+fn compress_llm_output(enabled: bool, tool: &str, out: String) -> String {
+    if !enabled || tool != RSTRING_TOOL || out.len() < maki_rstring::MIN_BYTES {
+        return out;
+    }
+    maki_rstring::compress_if_useful(out)
+}
+
 impl ToolInvocation for LuaToolInvocation {
     fn start_header(&self) -> HeaderFuture {
         if !self.has_header_fn {
@@ -536,6 +547,7 @@ impl ToolInvocation for LuaToolInvocation {
                     let state = reply.state;
                     ToolExecResult {
                         output: reply.result.map(|s| {
+                            let s = compress_llm_output(ctx.config.rstring, tool.as_ref(), s);
                             if let Some(source) = image {
                                 ToolOutput::Image { source, text: s }
                             } else if let Some(diff) = reply.diff {
@@ -1857,6 +1869,54 @@ mod tests {
     #[test_case::test_case(&"a".repeat(TOOL_NAME_MAX + 1), false ; "too_long")]
     fn tool_name_validation(name: &str, expected: bool) {
         assert_eq!(is_valid_tool_name(name), expected);
+    }
+
+    const VOLATILE_LINE: &str = "2026-09-29T10:22:02.831781Z level=WARN provider=anthropic";
+
+    fn repetitive_output() -> String {
+        let later = VOLATILE_LINE.replace("10:22:02", "18:44:59");
+        let mut out = String::new();
+        while out.len() < maki_rstring::MIN_BYTES {
+            out.push_str(VOLATILE_LINE);
+            out.push('\n');
+            out.push_str(&later);
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test_case::test_case(true, RSTRING_TOOL)]
+    #[test_case::test_case(false, RSTRING_TOOL)]
+    #[test_case::test_case(true, "read")]
+    fn output_below_threshold_passes_through(enabled: bool, tool: &str) {
+        let out = repetitive_output()[..maki_rstring::MIN_BYTES - 1].to_string();
+        assert_eq!(compress_llm_output(enabled, tool, out.clone()), out);
+    }
+
+    #[test_case::test_case(false, RSTRING_TOOL ; "disabled")]
+    #[test_case::test_case(true, "read" ; "other_tool")]
+    fn repetitive_output_untouched_when_gated(enabled: bool, tool: &str) {
+        let out = repetitive_output();
+        assert_eq!(compress_llm_output(enabled, tool, out.clone()), out);
+    }
+
+    #[test]
+    fn repetitive_bash_output_collapses() {
+        let compressed = compress_llm_output(true, RSTRING_TOOL, repetitive_output());
+        assert!(compressed.contains(" [x"), "{compressed}");
+        assert!(compressed.contains("10:22:02"), "{compressed}");
+        assert!(
+            compressed.len() < maki_rstring::MIN_BYTES / 10,
+            "{compressed}"
+        );
+    }
+
+    #[test]
+    fn incompressible_bash_output_passes_through() {
+        let out = (0..maki_rstring::MIN_BYTES / 8)
+            .map(|i| format!("distinct line {i}\n"))
+            .collect::<String>();
+        assert_eq!(compress_llm_output(true, RSTRING_TOOL, out.clone()), out);
     }
 
     #[test_case::test_case(

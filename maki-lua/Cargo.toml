@@ -21,6 +21,7 @@ maki-lua-macro = { workspace = true }
 maki-markdown = { workspace = true }
 maki-pack = { workspace = true }
 maki-providers = { workspace = true }
+maki-rstring = { workspace = true }
 mlua = { workspace = true }
 nucleo-matcher = { workspace = true }
 serde = { workspace = true }

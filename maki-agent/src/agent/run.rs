@@ -289,11 +289,19 @@ impl<'h> Agent<'h> {
             .map(|e| (e.message, e.images, e.preamble))
             .chain([(message, images, preamble)]);
         let mut prompt = None;
+        let rstring = self.config.rstring;
         for (message, images, preamble) in burst {
             let kept = self
                 .filter_user_message(message, images.len(), source)
                 .await?
                 .map(|text| {
+                    // After the hooks judged what the user typed, a pasted
+                    // log collapses like any other machine-generated bulk.
+                    let text = if rstring && text.len() > maki_rstring::MIN_BYTES {
+                        maki_rstring::compress_if_useful(text)
+                    } else {
+                        text
+                    };
                     prompt = Some(text.clone());
                     Message::user_with_images(text, images)
                 });
@@ -2409,6 +2417,77 @@ mod tests {
                 steers(&drain_events(&event_rx)),
                 [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
             );
+        });
+    }
+
+    const RSTRING_INPUT_LINE: &str = "2026-09-29T10:22:02.831781Z level=WARN provider=anthropic";
+
+    fn repetitive_user_message() -> String {
+        let later = RSTRING_INPUT_LINE.replace("10:22:02", "18:44:59");
+        let mut msg = String::new();
+        while msg.len() <= maki_rstring::MIN_BYTES {
+            msg.push_str(RSTRING_INPUT_LINE);
+            msg.push('\n');
+            msg.push_str(&later);
+            msg.push('\n');
+        }
+        msg
+    }
+
+    #[test]
+    fn long_user_input_collapses_into_history() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut input = default_input();
+            input.message = repetitive_user_message();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let seen = history.as_slice()[0].user_text().expect("kept message");
+            assert!(seen.contains(" [x"), "{seen}");
+            assert!(seen.contains(RSTRING_INPUT_LINE), "{seen}");
+            assert!(seen.len() < maki_rstring::MIN_BYTES / 10, "{seen}");
+        });
+    }
+
+    #[test]
+    fn long_user_input_verbatim_when_rstring_disabled() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.config.rstring = false;
+            let mut input = default_input();
+            let msg = repetitive_user_message();
+            input.message = msg.clone();
+
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some(msg.as_str()));
+        });
+    }
+
+    #[test]
+    fn short_user_input_stays_verbatim() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert_eq!(history.as_slice()[0].user_text(), Some("hello"));
         });
     }
 

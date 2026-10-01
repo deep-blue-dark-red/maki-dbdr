@@ -58,6 +58,7 @@ members = [
   "maki-otel",
   "maki-pack",
   "maki-providers",
+  "maki-rstring",
   "maki-storage",
   "maki-config-macro",
   "maki-lua-macro",
@@ -79,6 +80,7 @@ maki-acp = { path = "maki-acp" }
 maki-config = { path = "maki-config" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
+maki-rstring = { path = "maki-rstring" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }

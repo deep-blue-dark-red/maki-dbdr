@@ -2738,6 +2738,7 @@ dependencies = [
  "maki-config",
  "maki-otel",
  "maki-providers",
+ "maki-rstring",
  "maki-storage",
  "nucleo-matcher",
  "open",
@@ -2852,6 +2853,7 @@ dependencies = [
  "maki-markdown",
  "maki-pack",
  "maki-providers",
+ "maki-rstring",
  "maki-storage",
  "mlua",
  "nucleo-matcher",
@@ -2995,6 +2997,14 @@ dependencies = [
  "url",
  "wait-timeout",
  "zstd",
+]
+
+[[package]]
+name = "maki-rstring"
+version = "0.5.6"
+dependencies = [
+ "serde_json",
+ "test-case",
 ]
 
 [[package]]
