@@ -18,10 +18,13 @@ This fork adds:
 * `/system_prompt` in `$EDITOR`, `/tool_prompt` showing the tool instructions sent to the model (MCP tools included), `/goto` turn navigation, and `/checkpoint` summaries without restarting the session.
 * `/logs` in `$EDITOR` or through a command configured in `/settings`, with user configuration stored in `~/.maki/user.config`.
 * Menu-consistency. New items `/q` / `quit`  maps to main's  `/exit`, and `/resume` maps to  `/session`.
-* Benchmarked optimized default system prompt, replacing the maki-main default; We on GLM 5.2, the Qwen 3.6 family and Deepseek V4 family on SWE and DeepSWE (public portions). 
-   - The default maki system prompt is 1. not editable, hidden, and while is carefully handwritten and well-meaning prompt, scores poorly: it confuses models from its structure. Note e.g. 'index' tool is rarely used with it.
-   - We used model guidance (Fable, Qwen GLM) then then benchmarked various suggestions across the two benchmarks and picked the best scoring average. We did a similar approach to compaction prompt.
-   - You can edit your system-prompt effortlessly from `/system_prompt` (in $EDITOR), its not hidden in code now. 
+* Benchmark-optimized default system prompt, replacing maki-main's; evaluated on GLM 5.2, the Qwen 3.6 family, and the DeepSeek V4 family against SWE-bench and DeepSWE (public splits).
+  * maki-main's default prompt is hidden in code and not editable. It's a careful, well-meaning piece of hand-writing, but its structure confuses models — with it, for example, the `index` tool is rarely used.
+  * Candidates were drafted with model guidance (Fable, Qwen, GLM), benchmarked across both suites, and the best average scorer shipped. The compaction prompt got the same treatment.
+  * The system prompt is no longer buried in source — edit it anytime via `/system_prompt` in `$EDITOR`.
+* Benchmark-optimized tool-call descriptions, tuned with the same methodology as the system prompt.
+  * Every built-in tool's description and input schema was rewritten for instruction-following and token economy, re-benchmarked across the same models and suites; the winners shipped.
+  * Nothing is hidden — see the exact tool instructions the model receives (MCP tools included) with `/tool_prompt`.
    
 This fork maintains maki/main's feature parity and merges from main often, typically every tagged release.
 
