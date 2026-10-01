@@ -11,7 +11,10 @@ use isahc::{AsyncReadResponseExt, error::ErrorKind as HttpErrorKind};
 use serde_json::Value;
 
 use crate::{
-    providers::opencode::{self, NonLoginError},
+    providers::{
+        opencode::{self, NonLoginError},
+        zai,
+    },
     retry::RetryKind,
 };
 
@@ -144,8 +147,16 @@ impl AgentError {
     /// is pointless. The kinds are priced differently, so the retry loop needs
     /// more than a yes or no.
     pub fn retry_kind(&self) -> Option<RetryKind> {
-        if self.is_context_overflow() || self.is_quota_exhausted() {
+        if self.is_context_overflow()
+            || self.is_quota_exhausted()
+            || self.is_permanent_account_error()
+        {
             return None;
+        }
+        // A plan gate clears within a few attempts on live traffic, so it
+        // draws the bounded rate-limit budget instead of ending the run.
+        if self.is_plan_gated_error() {
+            return Some(RetryKind::RateLimit);
         }
         match self {
             Self::Api { status: 429, .. } => Some(RetryKind::RateLimit),
@@ -254,6 +265,36 @@ impl AgentError {
         self.non_login_error().is_some_and(|error| error.is_quota)
     }
 
+    /// Z.AI answers account-level restrictions (a plan without this model, an
+    /// empty balance) behind a 429 or a 5xx. No key, wait, or retry cures
+    /// them; treating the 429s as throttles burned thousands of attempts
+    /// against requests that could never succeed.
+    fn is_permanent_account_error(&self) -> bool {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
+            return false;
+        };
+        (*status == 429 || *status >= 500) && zai::permanent_account_body(message)
+    }
+
+    /// `1311` says the subscription does not include the model, but the
+    /// gateway answers it intermittently for models it does include, and
+    /// recorded stretches end in success at a median of three retries. It
+    /// retries on the bounded budget rather than killing the run, and never
+    /// the unbounded hinted one: the storm this replaces parked turns for
+    /// hours on a routing decision.
+    fn is_plan_gated_error(&self) -> bool {
+        let Self::Api {
+            status, message, ..
+        } = self
+        else {
+            return false;
+        };
+        (*status == 429 || *status >= 500) && zai::plan_gated_body(message)
+    }
+
     pub fn is_unsupported_reasoning_summary(&self) -> bool {
         let Self::Api { message, .. } = self else {
             return false;
@@ -274,8 +315,11 @@ impl AgentError {
     /// and fine for the next one.
     pub fn should_rotate_key(&self) -> bool {
         // A plan quota is per-account, so the other keys are just as spent and
-        // walking the pool only burns them in turn.
+        // walking the pool only burns them in turn. Same for the permanent
+        // restrictions and plan gates: the account is the problem, not the key.
         !self.is_quota_exhausted()
+            && !self.is_permanent_account_error()
+            && !self.is_plan_gated_error()
             && matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
     }
 
@@ -285,6 +329,18 @@ impl AgentError {
         }
         match self {
             Self::Config { message } => message.clone(),
+            // The provider's own words name the actual problem (plan, model,
+            // balance); the wrapper only says what maki did about it.
+            Self::Api { message, .. }
+                if self.is_permanent_account_error() || self.is_plan_gated_error() =>
+            {
+                let detail = api_error_detail(message);
+                if self.is_permanent_account_error() {
+                    format!("model not available on this plan, not retrying: {detail}")
+                } else {
+                    format!("model not available on this plan, gave up retrying: {detail}")
+                }
+            }
             Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
             Self::Api { status: 529, .. } => "provider is overloaded, try again later".into(),
             Self::Api { status, .. } if *status >= 500 => format!("server error ({status})"),
@@ -339,6 +395,11 @@ impl AgentError {
     /// an error built any other way answers `None` and the caller falls back on
     /// its own backoff.
     pub fn retry_after(&self) -> Option<Duration> {
+        // A plan gate can arrive with a `Retry-After`, but the hint feeds the
+        // unbounded hinted budget, and a gate is an attempt-count problem.
+        if self.is_plan_gated_error() {
+            return None;
+        }
         match self {
             Self::Api { retry_after, .. } => *retry_after,
             _ => None,
@@ -350,6 +411,9 @@ impl AgentError {
             return error.message;
         }
         match self {
+            Self::Api { .. } if self.is_plan_gated_error() => {
+                "Plan gate: model not in this subscription, backing off".into()
+            }
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
             Self::Api { status, .. } if *status >= 500 => format!("Server error ({status})"),
@@ -392,6 +456,19 @@ fn is_connect_failure(e: &isahc::Error) -> bool {
         e.kind(),
         HttpErrorKind::ConnectionFailed | HttpErrorKind::NameResolution
     )
+}
+
+/// The message body of an account-level rejection, in the provider's own
+/// words; the envelope around it is maki's to write.
+fn api_error_detail(message: &str) -> String {
+    serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|body| {
+            body.pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| message.to_owned())
 }
 
 /// Only the delta-seconds form ("30", "60"). The HTTP-date form is legal but
@@ -437,8 +514,66 @@ mod tests {
         AgentError::api(status, message)
     }
 
+    /// The retry storm root cause: a plan gate draws the bounded rate-limit
+    /// budget (the gateway clears it within attempts), while an empty balance
+    /// or expired plan ends the run and a genuine throttle keeps its backoff.
+    #[test]
+    fn zai_plan_gate_is_bounded_but_a_throttle_stays_retryable() {
+        let gated = api_msg(429, ZAI_PLAN_BODY);
+        assert_eq!(gated.retry_kind(), Some(RetryKind::RateLimit));
+        assert!(!gated.should_rotate_key());
+        assert_eq!(
+            api_msg(500, ZAI_PLAN_BODY).retry_kind(),
+            Some(RetryKind::RateLimit)
+        );
+        assert_eq!(api_msg(429, ZAI_EMPTY_BALANCE_BODY).retry_kind(), None);
+        assert!(api_msg(429, ZAI_THROTTLE_BODY).retry_kind().is_some());
+    }
+
+    /// A plan gate that arrives with a `Retry-After` must not reach the
+    /// unbounded hinted budget; a genuine throttle keeps its hint.
+    #[test]
+    fn zai_plan_gate_ignores_the_retry_after_hint() {
+        let gated = AgentError::Api {
+            status: 429,
+            message: ZAI_PLAN_BODY.into(),
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(gated.retry_after(), None);
+        let throttle = AgentError::Api {
+            status: 429,
+            message: ZAI_THROTTLE_BODY.into(),
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(throttle.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn zai_plan_gate_message_says_what_the_provider_said() {
+        let message = api_msg(429, ZAI_PLAN_BODY).user_message();
+        assert!(
+            message.starts_with("model not available on this plan, gave up retrying"),
+            "{message}"
+        );
+        assert!(message.contains("GLM-5.3-Highspeed"), "{message}");
+        assert_eq!(
+            api_msg(429, ZAI_PLAN_BODY).retry_message(),
+            RETRY_PLAN_GATE_MESSAGE
+        );
+        assert!(
+            api_msg(429, ZAI_EMPTY_BALANCE_BODY)
+                .user_message()
+                .contains("not retrying")
+        );
+    }
+
     const SUMMARY_BODY: &str = r#"{"error":{"message":"Your organization must be verified to generate reasoning summaries.","param":"reasoning.summary","code":"unsupported_value"}}"#;
     const UNKNOWN_PARAMETER_BODY: &str = r#"{"error":{"message":"Unknown parameter: 'reasoning.summary'.","param":"reasoning.summary","code":"unknown_parameter"}}"#;
+    const ZAI_PLAN_BODY: &str =
+        r#"{"error":{"code":"1311","message":"当前订阅套餐暂未开放GLM-5.3-Highspeed权限"}}"#;
+    const ZAI_EMPTY_BALANCE_BODY: &str = r#"{"error":{"code":"1113","message":"账户已欠费"}}"#;
+    const ZAI_THROTTLE_BODY: &str = r#"{"error":{"code":"1302","message":"触发速率限制"}}"#;
+    const RETRY_PLAN_GATE_MESSAGE: &str = "Plan gate: model not in this subscription, backing off";
     const NULL_CODE_BODY: &str =
         r#"{"error":{"message":"bad request","param":"reasoning.summary","code":null}}"#;
     const MESSAGE_ONLY_BODY: &str =

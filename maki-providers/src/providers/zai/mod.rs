@@ -117,15 +117,29 @@ fn create_with_auth(
 const QUOTA_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 
 /// Z.AI serves permanent account problems behind a 429: `1113` is an empty
-/// balance, `1309` an expired coding plan, `1311` a model the plan does not
-/// include. Waiting cures none of them, so `stream_message` rewrites them
-/// to 402, which the retry loop treats as final.
-const PERMANENT_CODES: [&str; 3] = ["1113", "1309", "1311"];
+/// balance, `1309` an expired coding plan. Waiting cures none of them, so
+/// `stream_message` rewrites them to 402, which the retry loop treats as
+/// final. `1311` (a model the plan does not include) is deliberately not
+/// here: the gateway answers it intermittently even for included models, and
+/// logged stretches end in success at a median of three retries, so it draws
+/// the bounded rate-limit budget via `AgentError::retry_kind` instead.
+const PERMANENT_CODES: [&str; 2] = ["1113", "1309"];
+
+const PLAN_GATED_CODE: &str = "1311";
 
 fn permanent_account_error(status: u16, message: &str) -> bool {
-    (status == 429 || status >= 500)
-        && (PERMANENT_CODES.iter().any(|code| message.contains(code))
-            || message.contains("nsufficien"))
+    (status == 429 || status >= 500) && permanent_account_body(message)
+}
+
+/// The body half of [`permanent_account_error`], shared with
+/// `AgentError::retry_kind`: any provider whose gateway answers in Z.AI's
+/// format carries these, not just the `zai` one.
+pub(crate) fn permanent_account_body(message: &str) -> bool {
+    PERMANENT_CODES.iter().any(|code| message.contains(code)) || message.contains("nsufficien")
+}
+
+pub(crate) fn plan_gated_body(message: &str) -> bool {
+    message.contains(PLAN_GATED_CODE)
 }
 
 /// First GLM that takes thinking parameters at all. A floor instead of a prefix
@@ -371,7 +385,7 @@ mod tests {
     const RATE_LIMITED_BODY: &str = r#"{"error":{"code":"1302","message":"触发速率限制"}}"#;
 
     /// A real throttle on the same status must keep its backoff.
-    #[test_case(429, PLAN_LACKS_MODEL_BODY, true ; "plan_lacks_model")]
+    #[test_case(429, PLAN_LACKS_MODEL_BODY, false ; "plan_gate_is_not_permanent")]
     #[test_case(429, INSUFFICIENT_BODY, true ; "insufficient_balance")]
     #[test_case(500, INSUFFICIENT_BODY, true ; "insufficient_balance_on_5xx")]
     #[test_case(429, RATE_LIMITED_BODY, false ; "rate_limit_stays_retryable")]

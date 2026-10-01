@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use flume::Sender;
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use maki_config::ModelPolicy;
 use maki_storage::id::SessionRef;
@@ -113,7 +113,7 @@ pub fn from_model_fallback(model: &mut Model, timeouts: Timeouts) -> Box<dyn Pro
     match from_model(model, timeouts) {
         Ok(provider) => provider,
         Err(e) => {
-            warn!(error = %e, "provider creation failed, using unconfigured provider");
+            info!(error = %e, "provider creation failed, using unconfigured provider");
             Box::new(UnconfiguredProvider)
         }
     }
@@ -225,7 +225,7 @@ pub async fn fetch_all_models(
     for spec in ProviderRegistry::builtins() {
         let slug = spec.slug;
         let Ok(provider) = smol::unblock(move || provider_for_slug(slug, timeouts)).await else {
-            warn!(provider = slug, "failed to create provider, skipping");
+            info!(provider = slug, "failed to create provider, skipping");
             continue;
         };
         let display_name = spec.display_name;
