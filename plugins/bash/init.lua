@@ -256,7 +256,8 @@ local description = [[Execute a bash command.
 Commands run in ]] .. cwd .. [[ by default.
 
 Use for git, builds, tests, rg, and shell operations such as mv/cp/rm. Use dedicated tools to read or edit file contents. Set workdir instead of cd; provide a 3-5 word description. Join dependent commands with &&; batch independent calls.
-Commands must be non-interactive. Use tail=N instead of piping to tail to preserve live output. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.]]
+Commands must be non-interactive. Use tail=N instead of piping to tail to preserve live output. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.
+Output above 2KB is rstring-compressed before it reaches you: `line [xN]` means N lines differed only in volatile values (timestamps, uuids, epoch runs, temp paths), and a run of uniform JSON objects becomes one `<rec cols>` header followed by TSV rows. Load-bearing text (paths, versions, error codes, short numbers) is always verbatim.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
@@ -335,12 +336,12 @@ maki.api.register_tool({
     local buf, view = create_bash_view(command, ctx)
     local timeout_secs = output:match("^tool bash timed out after (%d+)s$")
     if timeout_secs then
-      view:append({ { "Timed out after " .. timeout_secs .. "s", "dim" } })
+      view:append({ { "Timed out after " .. timeout_secs .. "s", "tool_error" } })
     elseif is_error then
       local body, code = output:match("^(.-)\nExit code: (%d+)$")
       if body then
         view:append_text(body)
-        view:append({ { "Exit code: " .. code, "dim" } })
+        view:append({ { "Exit code: " .. code, "tool_error" } })
       else
         view:append_text(output)
       end
@@ -418,7 +419,7 @@ maki.api.register_tool({
       end
 
       if is_error then
-        view:append({ { "Exit code: " .. exit_code, "dim" } })
+        view:append({ { "Exit code: " .. exit_code, "tool_error" } })
       end
       view:finish()
 
@@ -427,24 +428,25 @@ maki.api.register_tool({
 
     view:append({ { "Waiting for output...", "dim" } })
 
+    -- stderr wears the error color so failing builds stand out from stdout;
+    -- the text the model reads stays unmarked, both streams read alike.
+    local function stream(line, style)
+      if not has_output then
+        has_output = true
+        view:clear()
+      end
+      append_line(output_parts, line)
+      view:append(style and { { line, style } } or line)
+    end
+
     maki.fn.jobstart(command, {
       cwd = workdir,
       env = { GIT_TERMINAL_PROMPT = "0" },
       on_stdout = function(_, line)
-        if not has_output then
-          has_output = true
-          view:clear()
-        end
-        append_line(output_parts, line)
-        view:append(line)
+        stream(line)
       end,
       on_stderr = function(_, line)
-        if not has_output then
-          has_output = true
-          view:clear()
-        end
-        append_line(output_parts, line)
-        view:append(line)
+        stream(line, "tool_error")
       end,
       on_exit = function(_, code)
         finish(code)
