@@ -20,6 +20,7 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
+use maki_agent::tools::registry::plain_tool_args;
 use maki_agent::tools::{
     DescriptionContext, HeaderResult, PermissionScopes, RegistryError, Tool, ToolAudience,
     ToolFilter, ToolLive, ToolRegistry, ToolSource,
@@ -2895,6 +2896,7 @@ async fn compute_header(
     tool: &str,
     input: &Value,
 ) -> HeaderResult {
+    let fallback = || HeaderResult::plain(plain_tool_args(input));
     let Some((func, input_lua)) = plugin_fn(
         lua,
         plugins,
@@ -2904,7 +2906,7 @@ async fn compute_header(
         |tk| tk.header.as_ref(),
         input,
     ) else {
-        return HeaderResult::plain(tool.to_string());
+        return fallback();
     };
 
     let result = run_detached(lua, func.call_async::<LuaValue>(input_lua)).await;
@@ -2912,16 +2914,16 @@ async fn compute_header(
     match result {
         Ok(LuaValue::String(s)) => match s.to_str() {
             Ok(s) => HeaderResult::plain(s.to_owned()),
-            Err(_) => HeaderResult::plain(tool.to_string()),
+            Err(_) => fallback(),
         },
         Ok(LuaValue::UserData(ud)) => match ud.borrow::<BufHandle>() {
             Ok(h) => HeaderResult::Styled(h.buf.take()),
-            Err(_) => HeaderResult::plain(tool.to_string()),
+            Err(_) => fallback(),
         },
-        Ok(_) => HeaderResult::plain(tool.to_string()),
+        Ok(_) => fallback(),
         Err(e) => {
             tracing::warn!(plugin, tool, error = %e, "header fn call failed");
-            HeaderResult::plain(tool.to_string())
+            fallback()
         }
     }
 }

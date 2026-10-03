@@ -116,6 +116,46 @@ pub enum HeaderResult {
     Styled(BufferSnapshot),
 }
 
+/// Byte cap for a single rendered argument value in a fallback header.
+const HEADER_ARG_VALUE_MAX_BYTES: usize = 64;
+/// Byte cap for the whole rendered argument summary.
+const HEADER_ARGS_MAX_BYTES: usize = 200;
+
+/// Fallback tool header body: the argument values, space separated, for tools
+/// with no richer `header` rendering (e.g. MCP). The tool name is deliberately
+/// omitted -- the display already renders `{name}> ` before this.
+pub fn plain_tool_args(input: &Value) -> String {
+    let Value::Object(fields) = input else {
+        return String::new();
+    };
+    let mut header = String::new();
+    let mut appended = 0usize;
+    for value in fields.values() {
+        if value.is_null() {
+            continue;
+        }
+        let rendered = match value {
+            Value::String(s) => s.replace(['\n', '\r'], " "),
+            other => other.to_string(),
+        };
+        if rendered.is_empty() {
+            continue;
+        }
+        let rendered = super::truncate_bytes(&rendered, HEADER_ARG_VALUE_MAX_BYTES);
+        let part = if appended == 0 {
+            rendered.to_string()
+        } else {
+            format!(" {rendered}")
+        };
+        if appended + part.len() > HEADER_ARGS_MAX_BYTES {
+            break;
+        }
+        appended += part.len();
+        header.push_str(&part);
+    }
+    header
+}
+
 impl HeaderResult {
     pub fn plain(text: String) -> Self {
         Self::Plain(text)
@@ -569,6 +609,47 @@ mod tests {
     const ANY_TOOL_NAME: &str = "schemaless";
     const EMPTY_SCHEMA_REJECTED: &str =
         "strict providers reject a function whose parameters is empty";
+
+    #[test]
+    fn plain_tool_args_renders_scalar_args_without_the_name() {
+        // Keys declared in sorted order: serde_json may iterate sorted or in
+        // insertion order (preserve_order unifies on from maki-acp), and only
+        // this order renders the same either way.
+        let input = json!({"limit": 5, "query": "rust async"});
+        assert_eq!(plain_tool_args(&input), "5 rust async");
+    }
+
+    #[test]
+    fn plain_tool_args_skips_null_and_empty_args() {
+        let input = json!({"a": null, "b": "", "c": "keep"});
+        assert_eq!(plain_tool_args(&input), "keep");
+    }
+
+    #[test]
+    fn plain_tool_args_flattens_newlines_and_truncates_long_values() {
+        let long = "ab ".repeat(40); // 120 bytes, exceeds the per-value cap
+        let input = json!({"cmd": "line1\nline2", "long": long});
+        let truncated = format!("{}...", &"ab ".repeat(40)[..HEADER_ARG_VALUE_MAX_BYTES]);
+        assert_eq!(plain_tool_args(&input), format!("line1 line2 {truncated}"));
+    }
+
+    #[test]
+    fn plain_tool_args_stops_at_summary_budget() {
+        let long = "x".repeat(HEADER_ARG_VALUE_MAX_BYTES + 10);
+        let input = json!({"a": long, "b": "y"});
+        let truncated = format!("{}...", &long[..HEADER_ARG_VALUE_MAX_BYTES]);
+        assert_eq!(plain_tool_args(&input), format!("{truncated} y"));
+    }
+
+    #[test]
+    fn plain_tool_args_without_object_input_is_empty() {
+        assert_eq!(plain_tool_args(&json!("raw")), "");
+    }
+
+    #[test]
+    fn plain_tool_args_without_args_is_empty_so_the_name_never_duplicates() {
+        assert_eq!(plain_tool_args(&json!({})), "");
+    }
 
     fn mock(name: &str) -> Arc<dyn Tool> {
         mock_tool(name, ToolAudience::all())

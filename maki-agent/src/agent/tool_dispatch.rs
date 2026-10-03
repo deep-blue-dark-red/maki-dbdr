@@ -13,7 +13,9 @@ use crate::agent::CallInstructions;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
-use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
+use crate::tools::registry::{
+    InstalledHook, RegisteredTool, Tool, ToolInvocation, plain_tool_args,
+};
 use crate::tools::{
     CallOrigin, Deadline, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience,
     ToolContext, truncate_bytes,
@@ -775,7 +777,7 @@ async fn run_local_tool(
     origin: CallOrigin,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
-    emit_raw_start(ctx, origin, &id, &tool_id, name.to_owned(), input);
+    emit_raw_start(ctx, origin, &id, &tool_id, plain_tool_args(input), input);
     let tool_ctx = ToolContext {
         tool_use_id: Some(id.clone()),
         ..ctx.clone()
@@ -867,7 +869,7 @@ async fn execute_mcp_tool(
     origin: CallOrigin,
     ask: Option<&str>,
 ) -> ToolDoneEvent {
-    emit_raw_start(ctx, origin, id, &tool, format!("mcp: {tool}"), input);
+    emit_raw_start(ctx, origin, id, &tool, plain_tool_args(input), input);
     let done = |output: String, is_error: bool| ToolDoneEvent {
         call: None,
         id: id.to_owned(),
@@ -2184,8 +2186,37 @@ mod tests {
                 panic!("expected ToolStart, got {:?}", envelope.event);
             };
             assert_eq!(start.tool.as_ref(), "local_echo");
-            assert_eq!(start.summary, "local_echo");
+            assert_eq!(
+                start.summary, "/a",
+                "header carries the args, not the name; the display renders `name>` itself"
+            );
             assert_eq!(start.raw_input, Some(input));
+        });
+    }
+
+    #[test]
+    fn mcp_tool_header_shows_args_without_duplicating_the_name() {
+        smol::block_on(async {
+            let (tx, rx) = flume::unbounded::<crate::Envelope>();
+            let event_tx = crate::EventSender::new(tx, 0);
+            let ctx = with_mcp(
+                crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None),
+                &stub_mcp(&[PROBE_QUALIFIED]),
+            );
+            let _ = dispatch(&ctx, PROBE_WIRE, &serde_json::json!({})).await;
+            let AgentEvent::ToolStart(start) = rx
+                .try_recv()
+                .expect("ToolStart must be emitted before the tool completes")
+                .event
+            else {
+                panic!("expected ToolStart");
+            };
+            assert_eq!(start.tool.as_ref(), PROBE_QUALIFIED);
+            assert_eq!(
+                start.summary, "",
+                "an arg-less tool has no header body; the display already renders `name>`"
+            );
+            assert_ne!(start.summary.as_str(), start.tool.as_ref());
         });
     }
 

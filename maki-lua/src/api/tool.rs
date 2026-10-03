@@ -10,7 +10,7 @@ use flume::Sender;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
-use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
+use maki_agent::tools::registry::{RegisteredTool, ToolRegistry, plain_tool_args};
 use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use maki_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
@@ -361,7 +361,7 @@ fn reads_files(command: &str) -> bool {
 impl ToolInvocation for LuaToolInvocation {
     fn start_header(&self) -> HeaderFuture {
         if !self.has_header_fn {
-            return HeaderFuture::Ready(HeaderResult::plain(self.tool.to_string()));
+            return HeaderFuture::Ready(HeaderResult::plain(plain_tool_args(&self.input)));
         }
         let (reply_tx, reply_rx) = flume::bounded::<HeaderResult>(1);
         let tool = Arc::clone(&self.tool);
