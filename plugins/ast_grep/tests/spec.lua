@@ -9,6 +9,9 @@ local FILE = maki.fs.abspath("/tmp/maki_astgrep_spec/a.rs")
 local OTHER_FILE = maki.fs.abspath("/tmp/maki_astgrep_spec/b.rs")
 local LONG_LINE = string.rep("α", 10)
 local META_A = "$A=2 $Z=1"
+local MULTI_NODE_ERR = "Multiple AST nodes are detected. Please check the pattern source"
+local BAD_KIND_ERR = "Cannot parse kind as a valid selector."
+local UNRELATED_ERR = "error: some other failure"
 
 local function match(file, line, text, extra)
   local m = {
@@ -46,6 +49,23 @@ case("validate_requires_a_selector", function()
   eq(core.validate({}, false), core.SEARCH_REQUIRED)
   eq(core.validate({ kind = "function_item" }, false), nil)
   eq(core.validate({ pattern = "fn $F() {}" }, false), nil)
+end)
+
+case("validate_prefers_pattern_when_both_are_given", function()
+  local input = { pattern = "fn $F() {}", kind = "function_item" }
+
+  local invalid, note = core.validate(input, false)
+
+  eq(invalid, nil)
+  eq(note, core.BOTH_NOTE)
+  eq(input.kind, nil)
+  eq(table.concat(core.json_argv(input), " "), "ast-grep run -p fn $F() {} --json=compact")
+end)
+
+case("failure_detail_appends_the_fix_for_known_errors", function()
+  has(core.failure_detail(MULTI_NODE_ERR), core.HINTS["Multiple AST nodes are detected"])
+  has(core.failure_detail(BAD_KIND_ERR), core.HINTS["Cannot parse kind as a valid selector"])
+  eq(core.failure_detail(UNRELATED_ERR), UNRELATED_ERR)
 end)
 
 case("validate_requires_rewrite_and_path", function()

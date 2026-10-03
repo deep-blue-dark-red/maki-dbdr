@@ -19,11 +19,18 @@ M.SEARCH_REQUIRED =
   "error: pattern or kind is required (pattern: an AST snippet like `fn $F() { $BODY }`; kind: a node kind like `function_item`)"
 M.REWRITE_REQUIRED = "error: rewrite is required (the replacement snippet, free to reuse the pattern's metavariables)"
 M.PATH_REQUIRED = "error: path is required (absolute path to the file or directory to rewrite)"
+M.BOTH_NOTE = "note: both pattern and kind supplied; ran with pattern, kind ignored"
 M.MATCH_FMT = "%d matches in %d %s"
 M.CHANGED_FMT = "%d changes in %d %s"
 M.APPLIED_FMT = "Applied %s."
 M.LIMIT_FMT = "... (%d of %d matches shown; raise `limit` for more)"
 M.STRICTNESS = { "cst", "smart", "ast", "relaxed", "signature", "template" }
+
+--- ast-grep's usage errors are terse; the fix for the two we hit most.
+M.HINTS = {
+  ["Multiple AST nodes are detected"] = "pattern must be one node; sequences go in a block like `if $C { $$$BODY }`",
+  ["Cannot parse kind as a valid selector"] = "kind must be a tree-sitter node kind like `function_item`",
+}
 
 local JSON_FLAG = "--json=compact"
 local GLOB_FLAG = "--globs"
@@ -142,9 +149,16 @@ function M.apply_argv(input)
   return base_argv(input, { REWRITE_FLAG, input.rewrite, UPDATE_FLAG })
 end
 
+--- ast-grep rejects -p and -k in one run, so a call carrying both keeps the
+--- pattern and answers with a note instead of dying on an exit-2 retry.
 function M.validate(input, needs_path)
   if not input.pattern and not input.kind then
     return M.SEARCH_REQUIRED
+  end
+  local note
+  if input.kind and input.pattern then
+    input.kind = nil
+    note = M.BOTH_NOTE
   end
   if needs_path then
     if not input.rewrite or input.rewrite == "" then
@@ -154,7 +168,7 @@ function M.validate(input, needs_path)
       return M.PATH_REQUIRED
     end
   end
-  return nil
+  return nil, note
 end
 
 --- Matches from an ast-grep `--json=compact` run, grouped per file. Answers
@@ -244,6 +258,16 @@ end
 
 function M.limit_note(shown, total)
   return string.format(M.LIMIT_FMT, shown, total)
+end
+
+--- Usage errors get their fix appended; this text is all the model sees.
+function M.failure_detail(detail)
+  for trigger, fix in pairs(M.HINTS) do
+    if detail:find(trigger, 1, true) then
+      return detail .. "\n" .. fix
+    end
+  end
+  return detail
 end
 
 --- How many changes the apply run reported, falling back to what the preview

@@ -71,7 +71,7 @@ local function run_ast_grep(args, timeout_ms)
       return result
     end
     local stderr = result.stderr or ""
-    local detail = trim(stderr ~= "" and stderr or stdout)
+    local detail = core.failure_detail(trim(stderr ~= "" and stderr or stdout))
     return nil,
       string.format("error: ast-grep failed (exit %d): %s", result.exit_code, detail ~= "" and detail or "no output")
   end
@@ -223,24 +223,24 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **ast_grep** tool for structural search by code pattern (metavariables like `$F`), and **ast_grep_replace** to rewrite those matches. Prefer **grep** for plain text/regex search.",
+  content = "- Use the **ast_grep** tool for structural search by code pattern (metavariables like `$F`), and **ast_grep_replace** to rewrite those matches. Prefer **grep** for plain text/regex search. ast_grep takes exactly one of pattern/kind; a pattern is one node, sequences go inside `{ $$$ }`.",
 })
 
 maki.api.register_tool({
   name = "ast_grep",
   kind = "search",
-  description = [[Search code by syntax structure. Supply pattern (code with metavariables, e.g. console.log($X)) or kind (node type, e.g. function_item). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.]],
+  description = [[Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one node per call (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens must exist in the source (`0..$N`, not `(0..$N)`). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.]],
 
   schema = {
     type = "object",
     properties = {
       pattern = {
         type = "string",
-        description = "AST pattern: code with metavariables, e.g. `fn $F() { $BODY }`. One of `pattern`/`kind`.",
+        description = "AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written.",
       },
       kind = {
         type = "string",
-        description = "Syntax node kind, e.g. function_item. Supply this or pattern.",
+        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both.",
       },
       lang = {
         type = "string",
@@ -277,7 +277,7 @@ maki.api.register_tool({
   end,
 
   handler = function(input, ctx)
-    local invalid = core.validate(input, false)
+    local invalid, note = core.validate(input, false)
     if invalid then
       return error_output(invalid)
     end
@@ -307,6 +307,9 @@ maki.api.register_tool({
     if total > shown then
       output = output .. "\n" .. core.limit_note(shown, total)
     end
+    if note then
+      output = output .. "\n" .. note
+    end
     output = truncate(with_stderr(output, result.stderr), output_limits.resolve(opts, ctx))
 
     return {
@@ -324,7 +327,7 @@ maki.api.register_tool({
   mutable_path = "path",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
-  description = [[Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind. Supply rewrite; it may reuse pattern metavariables such as $X.
+  description = [[Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind (exactly one of them, never both — pattern wins if both are given). Supply rewrite; it may reuse pattern metavariables such as $X.
 Every match is changed: limit caps displayed matches, not edits. Returns replacements and the applied count. Requires ast-grep on PATH.]],
 
   schema = {
@@ -332,11 +335,11 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
     properties = {
       pattern = {
         type = "string",
-        description = "AST pattern: code with metavariables, e.g. `fn $F() { $BODY }`. One of `pattern`/`kind`.",
+        description = "AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written.",
       },
       kind = {
         type = "string",
-        description = "Syntax node kind, e.g. function_item. Supply this or pattern.",
+        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both.",
       },
       rewrite = {
         type = "string",
@@ -382,7 +385,7 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
   end,
 
   handler = function(input, ctx)
-    local invalid = core.validate(input, true)
+    local invalid, note = core.validate(input, true)
     if invalid then
       return error_output(invalid)
     end
@@ -413,6 +416,9 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
     local applied = core.applied_count(applied_run.stdout, total)
     local changes = core.plural_files(core.CHANGED_FMT, applied, #entries)
     local output = core.format(entries) .. "\n" .. string.format(core.APPLIED_FMT, changes)
+    if note then
+      output = output .. "\n" .. note
+    end
     output = truncate(with_stderr(output, preview.stderr), output_limits.resolve(opts, ctx))
 
     return {

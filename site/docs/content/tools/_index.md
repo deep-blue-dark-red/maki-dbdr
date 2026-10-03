@@ -121,32 +121,32 @@ Pass the regex without shell quotes; use normal JSON escaping (a literal [ is "\
 
 ### `ast_grep` {#ast_grep}
 
-Search code by syntax structure. Supply pattern (code with metavariables, e.g. console.log($X)) or kind (node type, e.g. function_item). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.
+Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one node per call (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens must exist in the source (`0..$N`, not `(0..$N)`). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | Syntax node kind, e.g. function_item. Supply this or pattern. |
+| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to return |
 | `path` | string | no | cwd | Directory or file to search in |
-| `pattern` | string | no |  | AST pattern: code with metavariables, e.g. `fn $F() { $BODY }`. One of `pattern`/`kind`. |
+| `pattern` | string | no |  | AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
 | `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
 | `timeout` | integer | no | 60 | Timeout in seconds |
 
 ### `ast_grep_replace` {#ast_grep_replace}
 
-Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind. Supply rewrite; it may reuse pattern metavariables such as $X.
+Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind (exactly one of them, never both — pattern wins if both are given). Supply rewrite; it may reuse pattern metavariables such as $X.
 Every match is changed: limit caps displayed matches, not edits. Returns replacements and the applied count. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | Syntax node kind, e.g. function_item. Supply this or pattern. |
+| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to show |
 | `path` | string | yes |  | Absolute path to the file or directory to rewrite |
-| `pattern` | string | no |  | AST pattern: code with metavariables, e.g. `fn $F() { $BODY }`. One of `pattern`/`kind`. |
+| `pattern` | string | no |  | AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
 | `rewrite` | string | yes |  | Replacement snippet, may use the pattern's metavariables |
 | `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
 | `timeout` | integer | no | 60 | Timeout in seconds |
