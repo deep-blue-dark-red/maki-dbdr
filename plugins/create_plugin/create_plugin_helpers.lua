@@ -6,14 +6,12 @@ local DEFAULT_DESCRIPTION = "TODO: one sentence on what this tool does and when 
 
 local ERR_NAME =
   "error: name must start with a lowercase letter and keep only lowercase letters, digits and underscores"
+local ERR_CONFIG_DIR = "error: cannot determine the maki config directory"
 local ERR_EXISTS = "error: plugin already exists: "
 local ERR_MKDIR = "error: cannot create "
 local ERR_WRITE = "error: cannot write "
 
--- The skeleton loads and answers, so the wiring steps are all that stand
--- between a scaffold and a working tool. %q keeps whatever the caller said
--- about the tool inside one Lua literal.
-local INIT_SOURCE = [[
+local MODULE_SOURCE = [[
 local DESCRIPTION = %q
 
 maki.api.register_tool({
@@ -43,33 +41,29 @@ maki.api.register_tool({
 })
 ]]
 
-local function wiring(name, dir)
+local function wiring(name, dir, module, manifest_created)
+  local manifest_note = manifest_created and ("created " .. dir .. "/plugin.toml\n")
+    or (dir .. "/plugin.toml already exists, extend it if the tool needs permissions\n")
   return string.format(
-    [[created %s/init.lua and %s/plugin.toml
-
-plugins/ is compiled into maki, so wire the new plugin in before it loads:
-1. maki-lua/src/loader.rs - a BundledPlugin entry in BUNDLED_PLUGINS, above `memory` when its tool
-   writes files:
-   BundledPlugin { name: "%s", dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/%s") },
-2. maki-config/src/lib.rs - "%s" into DEFAULT_BUILTINS (alphabetical) to load it by default, or
-   OPTIONAL_BUILTINS to ship it off; a tool declaring permission = "fs_write" joins FILE_WRITE_TOOLS
-   and memory's WRITE_TOOLS.
-3. maki-docgen/src/gen_tools.rs - every tool it registers goes into SECTIONS, then `just gen-docs`.
-4. `just lint && just test`.
-
-a personal plugin does not belong here: ~/.maki/lua/%s.lua, required from init.lua, loads on
-/reload without a rebuild.]],
+    [[created %s
+%s
+finish wiring it in %s:
+1. init.lua - add require("%s"), creating the file if missing.
+2. plugin.toml - grant the tool's permissions under [permissions]; without the entry every gated call is denied.
+3. ask the user to run /reload (or restart maki); no rebuild needed.]],
+    module,
+    manifest_note,
     dir,
-    dir,
-    name,
-    name,
-    name,
     name
   )
 end
 
-function M.plugins_dir(path)
-  return maki.fs.abspath(path)
+function M.config_dir(path)
+  if path then
+    return maki.fs.abspath(path)
+  end
+  local dir = maki.env.config_dir()
+  return dir and maki.fs.abspath(dir) or nil
 end
 
 function M.handler(input)
@@ -78,29 +72,39 @@ function M.handler(input)
     return { llm_output = ERR_NAME, is_error = true }
   end
 
-  local dir = maki.fs.joinpath(M.plugins_dir(input.path), name)
-  if maki.fs.metadata(dir) then
-    return { llm_output = ERR_EXISTS .. dir, is_error = true }
+  local dir = M.config_dir(input.path)
+  if not dir then
+    return { llm_output = ERR_CONFIG_DIR, is_error = true }
   end
 
-  local made, mkdir_err = maki.fs.mkdir(dir, { parents = true })
+  local module = maki.fs.joinpath(dir, "lua", name .. ".lua")
+  if maki.fs.metadata(module) then
+    return { llm_output = ERR_EXISTS .. module, is_error = true }
+  end
+
+  local lua_dir = maki.fs.joinpath(dir, "lua")
+  local made, mkdir_err = maki.fs.mkdir(lua_dir, { parents = true })
   if not made then
-    return { llm_output = ERR_MKDIR .. dir .. ": " .. tostring(mkdir_err), is_error = true }
+    return { llm_output = ERR_MKDIR .. lua_dir .. ": " .. tostring(mkdir_err), is_error = true }
   end
 
   local description = input.description or DEFAULT_DESCRIPTION
-  local files = {
-    { path = maki.fs.joinpath(dir, "init.lua"), content = string.format(INIT_SOURCE, description, name, name) },
-    { path = maki.fs.joinpath(dir, "plugin.toml"), content = MANIFEST },
-  }
-  for _, file in ipairs(files) do
-    local written, write_err = maki.fs.write(file.path, file.content)
-    if not written then
-      return { llm_output = ERR_WRITE .. file.path .. ": " .. tostring(write_err), is_error = true }
-    end
+  local written, write_err = maki.fs.write(module, string.format(MODULE_SOURCE, description, name, name))
+  if not written then
+    return { llm_output = ERR_WRITE .. module .. ": " .. tostring(write_err), is_error = true }
   end
 
-  return { llm_output = wiring(name, dir) }
+  local manifest = maki.fs.joinpath(dir, "plugin.toml")
+  local manifest_created = false
+  if not maki.fs.metadata(manifest) then
+    local ok, err = maki.fs.write(manifest, MANIFEST)
+    if not ok then
+      return { llm_output = ERR_WRITE .. manifest .. ": " .. tostring(err), is_error = true }
+    end
+    manifest_created = true
+  end
+
+  return { llm_output = wiring(name, dir, module, manifest_created) }
 end
 
 return M

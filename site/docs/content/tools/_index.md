@@ -169,13 +169,13 @@ View an image file (png, jpeg, gif, webp) so you can actually see it; it is retu
 
 ### `create_plugin` {#create_plugin}
 
-Scaffold a bundled plugin for development of maki itself. Creates <path>/<name>/init.lua and plugin.toml, then reports required wiring steps; rebuilding maki is required to load it. For personal plugins, create ~/.maki/lua/<name>.lua and use /reload instead.
+Scaffold a personal plugin in the maki config directory. Creates lua/<name>.lua (and plugin.toml if missing), then reports the remaining wiring steps; loaded by /reload, no rebuild.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | no | What the scaffolded tool should do, in one sentence |
 | `name` | string | yes | New plugin name: lowercase letters, digits and underscores, starting with a letter |
-| `path` | string | yes | Absolute path to the plugins directory to create it in, the plugins/ of a maki checkout |
+| `path` | string | no | Config directory to scaffold into (a .maki directory); defaults to the global config dir (~/.maki) |
 
 ## Execution & Control
 
