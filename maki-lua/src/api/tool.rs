@@ -186,6 +186,26 @@ impl PendingTool {
 
 pub(crate) type PendingTools = Arc<Mutex<Vec<PendingTool>>>;
 
+/// A view a plugin declares for a tool it does not provide, keyed by the
+/// tool's exact name. The tool itself lives elsewhere -- an MCP server's, or
+/// any name the registry holds -- so there is no handler here, only rendering.
+pub(crate) struct PendingView {
+    pub(crate) name: Arc<str>,
+    pub(crate) restore: RegistryKey,
+}
+
+pub(crate) type PendingViews = Arc<Mutex<Vec<PendingView>>>;
+
+/// What one load collects from the plugin file while it runs: the tools and
+/// views it declared and the permission rules it named. Committed to the
+/// owner when the load finishes, dropped when it fails.
+#[derive(Clone, Default)]
+pub(crate) struct PendingLoad {
+    pub(crate) tools: PendingTools,
+    pub(crate) views: PendingViews,
+    pub(crate) rules: PendingRules,
+}
+
 /// A rule as declared, before it is checked against the tool it names. Native
 /// and scoped by construction. [`resolve_rules`] turns it into the effective
 /// [`PermissionRule`].
@@ -584,7 +604,6 @@ impl ToolInvocation for LuaToolInvocation {
                                 tool.as_ref(),
                                 s,
                             );
-
                             if let Some(source) = image {
                                 ToolOutput::Image { source, text: s }
                             } else if let Some(diff) = reply.diff {
@@ -770,11 +789,76 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 #[lua_fn]
 fn register_tool(
     lua: &Lua,
-    #[ctx] pending: PendingTools,
+    #[ctx] pending: PendingLoad,
     #[ctx] permissions: PluginPermissions,
     spec: Table,
 ) -> LuaResult<()> {
-    register_tool_from_lua(lua, &spec, pending, &permissions)
+    register_tool_from_lua(lua, &spec, pending.tools, &permissions)
+}
+
+/// Foreign names carry dots ("compilerbrain.ReplaceMember"), so this is
+/// looser than a native tool name's, which forbids them.
+fn is_valid_view_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= TOOL_NAME_MAX
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+}
+
+/// Declare how a tool this plugin does not provide is rendered. The tool
+/// lives elsewhere -- an MCP server's tool is the usual case -- so there is
+/// no handler, schema or permission to give; the view only shapes what the
+/// transcript shows for its results.
+///
+/// The tool is named exactly as calls report it. Restores run whenever the
+/// call finishes and when a session holding it is reopened; a restore that
+/// returns nil (or a tool result your view does not handle) leaves the plain
+/// text standing, so parse narrowly and fall back freely.
+///
+/// Call this at the top level of your plugin file (during load).
+///
+/// @param spec table View specification:
+///   name    (string)   Required. Exact tool name, e.g. "myserver.ReplaceThing".
+///   restore (function) Required. Same contract as register_tool's restore:
+///                      receives `(input, output, is_error, ctx)`, returns a
+///                      BufHandle (or nil to keep the default plain text).
+/// @return
+/// @example
+/// maki.api.register_tool_view({
+///   name = "compilerbrain.ReplaceMember",
+///   restore = function(input, output, is_error, ctx)
+///     local rows = parse_rows(output)
+///     if not rows then return nil end
+///     local buf = maki.ui.buf()
+///     for _, row in ipairs(rows) do buf:line(row) end
+///     return buf
+///   end,
+/// })
+#[lua_fn]
+fn register_tool_view(lua: &Lua, #[ctx] pending: PendingLoad, spec: Table) -> LuaResult<()> {
+    let name: String = spec
+        .get("name")
+        .map_err(|_| mlua::Error::runtime("register_tool_view: missing 'name'"))?;
+    if !is_valid_view_name(&name) {
+        return Err(mlua::Error::runtime(format!(
+            "register_tool_view: invalid name '{name}'"
+        )));
+    }
+    let restore: Function = spec
+        .get("restore")
+        .map_err(|_| mlua::Error::runtime("register_tool_view: missing 'restore'"))?;
+    pending
+        .views
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(PendingView {
+            name: Arc::from(name.as_str()),
+            restore: lua.create_registry_value(restore)?,
+        });
+    Ok(())
 }
 
 /// Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -811,11 +895,7 @@ fn register_tool(
 ///   scope = notes_dir .. "/**",
 /// })
 #[lua_fn]
-fn register_permission_rule(
-    _lua: &Lua,
-    #[ctx] pending_rules: PendingRules,
-    spec: Table,
-) -> LuaResult<()> {
+fn register_permission_rule(_lua: &Lua, #[ctx] pending: PendingLoad, spec: Table) -> LuaResult<()> {
     for entry in spec.pairs::<String, LuaValue>() {
         let (key, _) = entry.map_err(|_| {
             mlua::Error::runtime("register_permission_rule: spec keys must be strings")
@@ -872,7 +952,8 @@ fn register_permission_rule(
         )));
     }
 
-    pending_rules
+    pending
+        .rules
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(PendingRule {
@@ -1195,8 +1276,8 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingLoad, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending, permissions), register_tool_view(pending), register_permission_rule(pending), register_command(plugin),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1205,15 +1286,14 @@ lua_table! {
 
 pub(crate) fn create_api_table(
     lua: &Lua,
-    pending: PendingTools,
-    pending_rules: PendingRules,
+    pending: PendingLoad,
     permissions: PluginPermissions,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, pending_rules, permissions, plugin, opts)?;
+    add_tool_fns(&t, lua, pending, permissions, plugin, opts)?;
     run_command__register(&t, lua, ui_action_tx)?;
     Ok(t)
 }

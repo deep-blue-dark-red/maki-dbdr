@@ -105,6 +105,7 @@ mod tests {
 
     use super::{DocKind, api_docs};
     use crate::api::create_maki_global;
+    use crate::api::tool::PendingLoad;
     use crate::plugin_permissions::PluginPermissions;
 
     fn resolve_table(maki: &Table, path: &str) -> Table {
@@ -141,8 +142,7 @@ mod tests {
         let (ui_tx, _ui_rx) = flume::unbounded();
         let maki = create_maki_global(
             &lua,
-            Arc::default(),
-            Arc::default(),
+            PendingLoad::default(),
             Arc::from("docs-test"),
             Some(ui_tx),
             &PluginPermissions::trusted(),

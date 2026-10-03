@@ -460,6 +460,49 @@ maki.api.register_tool({
 
 ---
 
+### `maki.api.register_tool_view()` {#maki-api-register_tool_view}
+
+```lua
+maki.api.register_tool_view({spec})
+```
+
+Declare how a tool this plugin does not provide is rendered. The tool
+lives elsewhere -- an MCP server's tool is the usual case -- so there is
+no handler, schema or permission to give; the view only shapes what the
+transcript shows for its results.
+
+The tool is named exactly as calls report it. Restores run whenever the
+call finishes and when a session holding it is reopened; a restore that
+returns nil (or a tool result your view does not handle) leaves the plain
+text standing, so parse narrowly and fall back freely.
+
+Call this at the top level of your plugin file (during load).
+
+**Parameters:**
+
+- `{spec}` (`table`) View specification:
+  - `name` (`string`) Required. Exact tool name, e.g. "myserver.ReplaceThing".
+  - `restore` (`function`) Required. Same contract as register_tool's restore:
+    receives `(input, output, is_error, ctx)`, returns a
+    BufHandle (or nil to keep the default plain text).
+
+**Example:**
+
+```lua
+maki.api.register_tool_view({
+  name = "compilerbrain.ReplaceMember",
+  restore = function(input, output, is_error, ctx)
+    local rows = parse_rows(output)
+    if not rows then return nil end
+    local buf = maki.ui.buf()
+    for _, row in ipairs(rows) do buf:line(row) end
+    return buf
+  end,
+})
+```
+
+---
+
 ### `maki.api.register_permission_rule()` {#maki-api-register_permission_rule}
 
 ```lua

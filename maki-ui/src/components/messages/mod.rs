@@ -28,13 +28,14 @@ use crate::theme;
 use crate::update;
 use maki_config::{ClockFormat, ToolOutputLines, UiConfig};
 use ratatui_image::picker::Picker;
-
+use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
 use super::scrollbar::render_vertical_scrollbar;
 use super::streaming_content::StreamingContent;
+use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     BufferSnapshot, EventSender, ImageSource, InstructionBlock, NO_FILES_FOUND, SharedBuf,
     ToolDoneEvent, ToolOutput, ToolStartEvent,
@@ -349,15 +350,62 @@ impl MessagesPanel {
             }
             _ => {}
         }
+        // The foreign-view probe reads the message, so gather what it needs
+        // while `msg` is still borrowed, and only ask after the borrow ends.
+        let foreign_input = msg.tool_raw_input.clone();
+        let has_snapshot = msg.render_snapshot.is_some();
+        let output = Arc::clone(&event.output);
         msg.tool_output = Some(event.output);
         msg.live_output = None;
+        let foreign_restore = foreign_input.filter(|_| !has_snapshot).and_then(|input| {
+            self.foreign_view_restore(&event.tool, &event.id, &output, event.is_error, input)
+        });
+        if let Some(item) = foreign_restore
+            && let Some(tx) = self.restore_event_tx.clone()
+        {
+            self.lua_event_handle.request_restore(item, tx);
+        }
         self.rebuild_tool_segment(&event.id);
+    }
+
+    /// A finished tool the registry has never heard of is an MCP call, whose
+    /// plain text stands in until a plugin claims its view. Ask lua to render
+    /// it; a missing view never replies, so the text stays.
+    fn foreign_view_restore(
+        &self,
+        tool: &Arc<str>,
+        tool_use_id: &str,
+        output: &ToolOutput,
+        is_error: bool,
+        input: Arc<Value>,
+    ) -> Option<maki_lua::RestoreItem> {
+        if output.structured_display_text().is_some()
+            || output.as_text().is_empty()
+            || ToolRegistry::global().get(tool).is_some()
+        {
+            return None;
+        }
+        let mut item = maki_lua::RestoreItem {
+            tool: Arc::clone(tool),
+            tool_use_id: tool_use_id.to_owned(),
+            output: output.as_text(),
+            input,
+            is_error,
+            tool_output_lines: self.tool_output_lines,
+            theme_gen: Some(crate::theme::generation()),
+            clicks: Vec::new(),
+            state: output.state().cloned(),
+            session_id: None,
+            task_id: None,
+            reason: maki_lua::RestoreReason::Rerender,
+        };
+        self.stamp_chat(&mut item);
+        Some(item)
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
         self.update_tool(tool_id, |msg| msg.text = summary.to_owned());
     }
-
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.update_tool(tool_id, |msg| append_annotation(&mut msg.annotation, model));
     }

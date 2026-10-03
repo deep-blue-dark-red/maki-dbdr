@@ -2554,3 +2554,47 @@ fn replace_past_the_end_is_a_noop() {
     assert!(text.contains(DONE_TEXT), "{UNTOUCHED_MSG}: {text}");
     assert!(!text.contains(ERROR_TEXT), "{UNTOUCHED_MSG}: {text}");
 }
+
+#[test]
+fn foreign_tool_done_requests_a_lua_view_restore() {
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(UiConfig::default(), handle);
+    let (tx, _rx) = flume::unbounded();
+    panel.set_restore_channel(Some(maki_agent::EventSender::new(tx, 0)));
+    let mut ev = start("t1", "compilerbrain.ReplaceMember");
+    ev.raw_input = Some(serde_json::json!({ "symbolId": "M:Lib.Queue.Flush" }));
+    panel.tool_start(ev);
+    let mut done_ev = done("t1");
+    done_ev.tool = "compilerbrain.ReplaceMember".into();
+    done_ev.output = Arc::new(ToolOutput::Plain("Accepted: true".into()));
+    panel.tool_done(done_ev);
+    let item = probe
+        .try_recv_restore_item()
+        .expect("a foreign tool's view restore is requested at done");
+    assert_eq!(&*item.tool, "compilerbrain.ReplaceMember");
+    assert_eq!(item.output, "Accepted: true");
+    assert_eq!(item.reason, maki_lua::RestoreReason::Rerender);
+    assert_eq!(
+        item.input.as_ref(),
+        &serde_json::json!({ "symbolId": "M:Lib.Queue.Flush" })
+    );
+}
+
+#[test]
+fn structured_tool_done_never_requests_a_foreign_view() {
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(UiConfig::default(), handle);
+    let (tx, _rx) = flume::unbounded();
+    panel.set_restore_channel(Some(maki_agent::EventSender::new(tx, 0)));
+    panel.tool_start(start("t1", "grep"));
+    let mut done_ev = done("t1");
+    done_ev.tool = GREP_TOOL_NAME.into();
+    done_ev.output = Arc::new(ToolOutput::GrepResult {
+        entries: Vec::new(),
+    });
+    panel.tool_done(done_ev);
+    assert!(
+        probe.try_recv_restore_item().is_none(),
+        "structured outputs render in Rust; lua never sees them"
+    );
+}

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use maki_agent::AgentEvent;
 use maki_agent::tools::ToolRegistry;
+use maki_agent::{SnapshotLine, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_lua::{PluginHost, RestoreReason};
 use maki_storage::id::SessionRef;
@@ -70,6 +71,7 @@ fn batch_state() -> Value {
 struct Restored {
     body: String,
     header: String,
+    lines: Arc<Vec<SnapshotLine>>,
 }
 
 fn restore_item(
@@ -125,10 +127,14 @@ fn run_restore(host: &PluginHost, item: maki_lua::RestoreItem) -> Restored {
     let mut out = Restored {
         body: String::new(),
         header: String::new(),
+        lines: Arc::default(),
     };
     for env in rx.drain() {
         match env.event {
-            AgentEvent::ToolSnapshot { snapshot, .. } => out.body = snapshot.text(),
+            AgentEvent::ToolSnapshot { snapshot, .. } => {
+                out.body = snapshot.text();
+                out.lines = snapshot.lines.clone();
+            }
             AgentEvent::ToolHeaderSnapshot { snapshot, .. } => out.header = snapshot.text(),
             _ => {}
         }
@@ -439,4 +445,221 @@ fn batch_child_restore_sees_the_chat_and_reason() {
             r.body
         );
     }
+}
+
+const COMPILERBRAIN_SRC: &str = include_str!("../../plugins/compilerbrain/init.lua");
+/// Mirrors the tool result the MCP surface renders: `Key: value` scalars and
+/// the tabular diff block, cells quoted with JSON-style escapes, `null` for
+/// a side the change did not touch.
+const REPLACE_MEMBER_OUTPUT: &str = concat!(
+    "Accepted: true\n",
+    "Tier: FullProjectAndDependents\n",
+    "FilePath: src/Editor/Queue.cs\n",
+    "LineChanges:\n",
+    "  [3]{Removed,Added,StartLine,EndLine}:\n",
+    "    \"            if (path is null || hunk.Count == 0) return;\",",
+    "\"            if (path is not null && hunk.Count > 0)\",257,257\n",
+    "    null,\"            {\",261,261\n",
+    "    \"            docs.Add(new RepoDoc(embed, $\\\"{path}\\\\n{body}\\\"));\",null,261,261\n",
+    "FixDistance: 0\n",
+    "UnfixableErrors: 0",
+);
+/// A rejection carries no diff block, so the view must leave the text plain.
+const REPLACE_MEMBER_REJECTED: &str = concat!(
+    "Accepted: false\n",
+    "Tier: PreFlight\n",
+    "Message: Rejected; the session is unchanged.",
+);
+
+fn compilerbrain_host() -> PluginHost {
+    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    host.load_source("compilerbrain", COMPILERBRAIN_SRC)
+        .unwrap();
+    host
+}
+
+#[test]
+fn compilerbrain_restore_renders_the_tabular_diff() {
+    let host = compilerbrain_host();
+    let r = restore(
+        &host,
+        "compilerbrain.ReplaceMember",
+        json!({ "symbolId": "M:Lib.Queue.Flush", "code": "void Flush() {}" }),
+        REPLACE_MEMBER_OUTPUT,
+        None,
+        Vec::new(),
+    );
+    let text = &r.body;
+    assert!(text.contains("Queue.cs"), "file header: {text}");
+    assert!(
+        text.contains("Tier: FullProjectAndDependents"),
+        "tier: {text}"
+    );
+    assert!(
+        text.contains("-             if (path is null || hunk.Count == 0) return;"),
+        "removed row: {text}"
+    );
+    assert!(
+        text.contains("+             if (path is not null && hunk.Count > 0)"),
+        "added row: {text}"
+    );
+    assert!(text.contains("+             {"), "insert-only row: {text}");
+    assert!(
+        text.contains(r#"-             docs.Add(new RepoDoc(embed, $"{path}\n{body}"));"#),
+        "escapes decode and the delete-only row is unnumbered add side free: {text}"
+    );
+    assert!(
+        !text.contains("FixDistance"),
+        "scalars outside the view stay out: {text}"
+    );
+    // Gutter: removals carry their pre-edit line number, additions a blank one.
+    let removed_line = text
+        .lines()
+        .find(|l| l.contains("if (path is null"))
+        .unwrap();
+    let added_line = text
+        .lines()
+        .find(|l| l.contains("if (path is not null"))
+        .unwrap();
+    assert!(
+        removed_line.trim_start().starts_with("257 "),
+        "gutter number: {removed_line:?}"
+    );
+    assert!(
+        added_line.starts_with("    + "),
+        "blank gutter on additions: {added_line:?}"
+    );
+}
+
+#[test]
+fn compilerbrain_rejected_result_keeps_the_plain_text() {
+    let host = compilerbrain_host();
+    let r = restore(
+        &host,
+        "compilerbrain.ReplaceMember",
+        json!({ "symbolId": "M:Lib.Queue.Flush", "code": "void Flush() {}" }),
+        REPLACE_MEMBER_REJECTED,
+        None,
+        Vec::new(),
+    );
+    assert!(
+        r.body
+            .contains("Message: Rejected; the session is unchanged."),
+        "rejection payload passes through: {}",
+        r.body
+    );
+    assert!(
+        r.body.contains("Accepted: false"),
+        "no diff block means nothing was rewritten: {}",
+        r.body
+    );
+}
+
+#[test]
+fn minimal_foreign_view_restores() {
+    const SRC: &str = r#"
+maki.api.register_tool_view({
+  name = "other.Tool",
+  restore = function(input, output, is_error, ctx)
+    local buf = maki.ui.buf()
+    buf:line("view-says-hi")
+    return buf
+  end,
+})
+"#;
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("minview", SRC).unwrap();
+    let r = restore(&host, "other.Tool", json!({}), "raw text", None, Vec::new());
+    assert!(r.body.contains("view-says-hi"), "body: {}", r.body);
+    assert!(
+        reg.get("other.Tool").is_none(),
+        "a view is rendering only; it must never join the model's tool list"
+    );
+}
+
+#[test]
+fn compilerbrain_batch_rows_group_by_file() {
+    const BATCH_OUTPUT: &str = concat!(
+        "Accepted: true\n",
+        "Tier: FullProjectAndDependents\n",
+        "Changes:\n",
+        "  [3]{FilePath,Removed,Added,StartLine,EndLine}:\n",
+        "    src/A.cs,\"    var a = 1;\",\"    var a = 2;\",10,10\n",
+        "    src/A.cs,null,\"    var b = 3;\",12,12\n",
+        "    src/B.cs,\"    Old();\",null,4,4\n",
+    );
+    let host = compilerbrain_host();
+    let r = restore(
+        &host,
+        "compilerbrain.BatchEdit",
+        json!({}),
+        BATCH_OUTPUT,
+        None,
+        Vec::new(),
+    );
+    let text = &r.body;
+    let mut files = text.lines().filter(|l| l.contains(".cs"));
+    assert!(
+        files.by_ref().any(|l| l.contains("A.cs")),
+        "file header per group: {text}"
+    );
+    assert!(
+        text.contains("+     var a = 2;") && text.contains("-     var a = 1;"),
+        "replace row both sides: {text}"
+    );
+    assert!(text.contains("+     var b = 3;"), "insert row: {text}");
+    assert!(text.contains("-     Old();"), "delete row: {text}");
+}
+
+/// The UI seeds named styles at startup; the bare harness has none, and
+/// without a diff background the plugin's highlight pass (correctly) bails.
+fn seed_diff_styles() {
+    let bg = maki_highlight::SegmentColor::Rgb((0x1F, 0x3D, 0x1F));
+    maki_highlight::set_ui_styles(
+        [("diff_old", bg), ("diff_new", bg)]
+            .into_iter()
+            .map(|(name, bg)| {
+                (
+                    name.to_owned(),
+                    maki_highlight::UiStyle {
+                        bg: Some(bg),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+    );
+}
+
+#[test]
+fn compilerbrain_diff_lines_get_syntax_spans() {
+    seed_diff_styles();
+    let host = compilerbrain_host();
+    let r = restore(
+        &host,
+        "compilerbrain.ReplaceMember",
+        json!({}),
+        REPLACE_MEMBER_OUTPUT,
+        None,
+        Vec::new(),
+    );
+    let line = r
+        .lines
+        .iter()
+        .find(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+                .contains("hunk.Count > 0")
+        })
+        .expect("added code line in view");
+    assert!(
+        line.spans.iter().any(
+            |s| matches!(s.style, SpanStyle::Inline(ref i) if i.fg.is_some() && i.bg.is_some())
+        ),
+        "syntax fg over the diff bg: {:?}",
+        line.spans
+    );
 }

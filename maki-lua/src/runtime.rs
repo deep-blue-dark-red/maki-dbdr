@@ -52,7 +52,8 @@ use crate::api::slot::{
     run_host_chain, run_host_chain_with,
 };
 use crate::api::tool::{
-    LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission,
+    LuaTool, PendingRules, PendingTool, PendingTools, PendingView, PendingViews, ToolCallReply,
+    ToolPermission,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::{HintStore, WinStore};
@@ -2095,6 +2096,9 @@ struct ToolKeys {
 
 struct PluginOwner {
     tools: HashMap<Arc<str>, ToolKeys>,
+    /// Views this plugin declared for tools it does not provide (an MCP
+    /// server's tool the plugin renders results for).
+    views: HashMap<Arc<str>, PendingView>,
     /// What this load granted the plugin. Kept past the load so a slot layer
     /// can be weighed against the authority of each call it filters.
     permissions: PluginPermissions,
@@ -2112,6 +2116,7 @@ struct LuaRuntime {
     _watchdog: Watchdog,
     lua: Lua,
     pending: PendingTools,
+    pending_views: PendingViews,
     plugin_rules: Arc<PluginRuleStore>,
     plugins: PluginMap,
     /// Published after every load and unload: the UI asks this instead of the
@@ -2151,6 +2156,7 @@ impl LuaRuntime {
                 source: e,
             })?;
         let pending: PendingTools = Arc::new(Mutex::new(Vec::new()));
+        let pending_views: PendingViews = Arc::default();
 
         let watchdog = Watchdog::spawn(&lua, Arc::clone(&shutdown));
 
@@ -2227,6 +2233,7 @@ impl LuaRuntime {
             _watchdog: watchdog,
             lua,
             pending,
+            pending_views,
             plugin_rules,
             plugins,
             loaded_plugins,
@@ -2456,6 +2463,22 @@ impl LuaRuntime {
         }
     }
 
+    fn drain_pending_views(&self) -> Vec<PendingView> {
+        self.pending_views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    fn discard_pending_views(&mut self, views: Vec<PendingView>) {
+        for key in views.into_iter().map(|v| v.restore) {
+            if let Err(e) = self.lua.remove_registry_value(key) {
+                tracing::warn!(error = %e, "failed to drop lua registry key on rollback");
+            }
+        }
+    }
+
     fn build_env(
         &self,
         maki: mlua::Table,
@@ -2539,6 +2562,12 @@ impl LuaRuntime {
             "leftover pending tools from previous load"
         );
         self.discard_pending(stale);
+        let stale_views = self.drain_pending_views();
+        debug_assert!(
+            stale_views.is_empty(),
+            "leftover pending views from previous load"
+        );
+        self.discard_pending_views(stale_views);
 
         // Scoped to this load so a failed load simply drops its rules; only a
         // successful load commits them to the store.
@@ -2551,8 +2580,11 @@ impl LuaRuntime {
         });
         let maki = create_maki_global(
             &self.lua,
-            Arc::clone(&self.pending),
-            Arc::clone(&pending_rules),
+            crate::api::tool::PendingLoad {
+                tools: Arc::clone(&self.pending),
+                views: Arc::clone(&self.pending_views),
+                rules: Arc::clone(&pending_rules),
+            },
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             &permissions,
@@ -2628,8 +2660,8 @@ impl LuaRuntime {
             self.rollback_load(&name, stale, pack_ops_checkpoint);
             return Err(map_err(e));
         }
-
         let pending = self.drain_pending();
+        let pending_views = self.drain_pending_views();
 
         let registry_entries: Vec<(Arc<dyn Tool>, ToolSource)> = pending
             .iter()
@@ -2661,6 +2693,7 @@ impl LuaRuntime {
             .collect();
 
         if let Err(e) = self.registry.replace_plugin(&name, registry_entries) {
+            self.discard_pending_views(pending_views);
             self.rollback_load(&name, pending, pack_ops_checkpoint);
             return Err(match e {
                 RegistryError::NameConflict { name: n, .. } => PluginError::NameConflict {
@@ -2695,6 +2728,10 @@ impl LuaRuntime {
             name.clone(),
             PluginOwner {
                 tools: keys,
+                views: pending_views
+                    .into_iter()
+                    .map(|v| (v.name.clone(), v))
+                    .collect(),
                 permissions: permissions.clone(),
                 revision_guard,
             },
@@ -2712,6 +2749,7 @@ impl LuaRuntime {
     /// keymaps, hints and slots it published on the way.
     fn rollback_load(&mut self, plugin: &str, pending: Vec<PendingTool>, pack_ops: usize) {
         self.discard_pending(pending);
+        self.discard_pending_views(self.drain_pending_views());
         with_packs(&self.lua, |packs| packs.pending.truncate(pack_ops));
         self.clear_plugin(plugin);
     }
@@ -2929,13 +2967,17 @@ async fn compute_header(
 }
 
 async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Option<RestoreReply> {
-    let (func, plugin_name) = {
+    let (plugin_name, func) = {
         let plugins = plugins.borrow();
-        let (pname, tk) = plugins.iter().find_map(|(pname, owner)| {
-            owner.tools.get(&*item.tool).map(|tk| (pname.clone(), tk))
+        let (pname, key) = plugins.iter().find_map(|(pname, owner)| {
+            let key = owner
+                .tools
+                .get(&*item.tool)
+                .and_then(|tk| tk.restore.as_ref())
+                .or_else(|| owner.views.get(&*item.tool).map(|v| &v.restore))?;
+            Some((pname.clone(), key))
         })?;
-        let key = tk.restore.as_ref()?;
-        (lua.registry_value::<Function>(key).ok()?, pname)
+        (pname, lua.registry_value::<Function>(key).ok()?)
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
     let thread = lua.create_thread(func).ok()?;
@@ -3050,6 +3092,17 @@ fn spawn_restore(
     item: RestoreItem,
     event_tx: maki_agent::EventSender,
 ) {
+    // A tool no plugin provides a handler or a view for (every MCP call on a
+    // server without a rendering plugin) has nothing to restore through, so
+    // the batch barrier never waits on one.
+    if !rt
+        .plugins
+        .borrow()
+        .values()
+        .any(|owner| owner.tools.contains_key(&*item.tool) || owner.views.contains_key(&*item.tool))
+    {
+        return;
+    }
     rt.evict_warm(&item.tool_use_id);
     let tracker = restores.track();
     let lua = rt.lua.clone();
