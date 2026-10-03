@@ -3003,7 +3003,9 @@ dependencies = [
 name = "maki-rstring"
 version = "0.5.7"
 dependencies = [
+ "criterion",
  "serde_json",
+ "sha2",
  "test-case",
 ]
 

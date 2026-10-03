@@ -331,6 +331,33 @@ fn compress_llm_output(enabled: bool, tool: &str, out: String) -> String {
     maki_rstring::compress_if_useful(out)
 }
 
+/// Read-shaped commands dump file bytes verbatim, and the model routinely
+/// quotes that view as `edit`/`write` old_string — a compressed view would
+/// poison the match. Verb check on the first token of each pipeline segment;
+/// deliberate over-approximation (correctness beats the missed compression).
+fn reads_files(command: &str) -> bool {
+    command
+        .split(['|', ';', '&', '\n'])
+        .filter_map(|seg| seg.split_whitespace().next())
+        .any(|verb| {
+            matches!(
+                verb,
+                "cat"
+                    | "head"
+                    | "tail"
+                    | "nl"
+                    | "tac"
+                    | "bat"
+                    | "sed"
+                    | "awk"
+                    | "jq"
+                    | "xxd"
+                    | "od"
+                    | "base64"
+            )
+        })
+}
+
 impl ToolInvocation for LuaToolInvocation {
     fn start_header(&self) -> HeaderFuture {
         if !self.has_header_fn {
@@ -457,6 +484,11 @@ impl ToolInvocation for LuaToolInvocation {
         let plugin = self.plugin;
         let tool = self.tool;
         let input = self.input;
+        let compress_exempt = tool.as_ref() == RSTRING_TOOL
+            && input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(reads_files);
         let tx = self.tx;
         let tool_timeout = self.timeout;
 
@@ -547,7 +579,12 @@ impl ToolInvocation for LuaToolInvocation {
                     let state = reply.state;
                     ToolExecResult {
                         output: reply.result.map(|s| {
-                            let s = compress_llm_output(ctx.config.rstring, tool.as_ref(), s);
+                            let s = compress_llm_output(
+                                ctx.config.rstring && !compress_exempt,
+                                tool.as_ref(),
+                                s,
+                            );
+
                             if let Some(source) = image {
                                 ToolOutput::Image { source, text: s }
                             } else if let Some(diff) = reply.diff {
@@ -1876,7 +1913,7 @@ mod tests {
     fn repetitive_output() -> String {
         let later = VOLATILE_LINE.replace("10:22:02", "18:44:59");
         let mut out = String::new();
-        while out.len() < maki_rstring::MIN_BYTES {
+        while out.len() < maki_rstring::MIN_BYTES * 4 {
             out.push_str(VOLATILE_LINE);
             out.push('\n');
             out.push_str(&later);
@@ -1902,13 +1939,11 @@ mod tests {
 
     #[test]
     fn repetitive_bash_output_collapses() {
-        let compressed = compress_llm_output(true, RSTRING_TOOL, repetitive_output());
+        let out = repetitive_output();
+        let compressed = compress_llm_output(true, RSTRING_TOOL, out.clone());
         assert!(compressed.contains(" [x"), "{compressed}");
         assert!(compressed.contains("10:22:02"), "{compressed}");
-        assert!(
-            compressed.len() < maki_rstring::MIN_BYTES / 10,
-            "{compressed}"
-        );
+        assert!(compressed.len() < out.len() / 10, "{compressed}");
     }
 
     #[test]
@@ -1917,6 +1952,24 @@ mod tests {
             .map(|i| format!("distinct line {i}\n"))
             .collect::<String>();
         assert_eq!(compress_llm_output(true, RSTRING_TOOL, out.clone()), out);
+    }
+
+    #[test_case::test_case("cat /etc/hosts" ; "cat")]
+    #[test_case::test_case("sed -n '1,60p' src/main.rs" ; "sed_range")]
+    #[test_case::test_case("tail -50 /var/log/app.log" ; "tail")]
+    #[test_case::test_case("git diff | head -80" ; "pipe_to_head")]
+    #[test_case::test_case("jq . config.json" ; "jq")]
+    #[test_case::test_case("awk '{print $1}' data.csv" ; "awk")]
+    fn read_commands_exempt(command: &str) {
+        assert!(reads_files(command), "{command}");
+    }
+
+    #[test_case::test_case("cargo test" ; "cargo")]
+    #[test_case::test_case("rg TODO src/" ; "ripgrep")]
+    #[test_case::test_case("git log --oneline" ; "git_log")]
+    #[test_case::test_case("echo hello" ; "echo")]
+    fn transform_commands_still_compress(command: &str) {
+        assert!(!reads_files(command), "{command}");
     }
 
     #[test_case::test_case(

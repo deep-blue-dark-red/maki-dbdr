@@ -137,7 +137,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
 | `keep_cache_warm` | bool | `true` | - | While a session is idle, replay the conversation in a tiny side request every 30 seconds so the provider's prompt cache outlives its TTL |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
-| `rstring` | bool | `true` | - | Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows |
+| `rstring` | bool | `true` | - | Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking byte runs of 48+ chars are masked inline to `[masked r=<hash> n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked |
 
 ### `provider`
 

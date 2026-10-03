@@ -9,6 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 test-case = { workspace = true }
+
+[[bench]]
+name = "entropy_mask"
+harness = false

@@ -2425,7 +2425,7 @@ mod tests {
     fn repetitive_user_message() -> String {
         let later = RSTRING_INPUT_LINE.replace("10:22:02", "18:44:59");
         let mut msg = String::new();
-        while msg.len() <= maki_rstring::MIN_BYTES {
+        while msg.len() <= maki_rstring::MIN_BYTES * 4 {
             msg.push_str(RSTRING_INPUT_LINE);
             msg.push('\n');
             msg.push_str(&later);
@@ -2443,7 +2443,8 @@ mod tests {
                 &mut history,
             );
             let mut input = default_input();
-            input.message = repetitive_user_message();
+            let msg = repetitive_user_message();
+            input.message = msg.clone();
 
             agent.run(input).await.unwrap();
             drop(agent);
@@ -2451,7 +2452,7 @@ mod tests {
             let seen = history.as_slice()[0].user_text().expect("kept message");
             assert!(seen.contains(" [x"), "{seen}");
             assert!(seen.contains(RSTRING_INPUT_LINE), "{seen}");
-            assert!(seen.len() < maki_rstring::MIN_BYTES / 10, "{seen}");
+            assert!(seen.len() < msg.len() / 10, "{seen}");
         });
     }
 

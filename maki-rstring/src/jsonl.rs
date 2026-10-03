@@ -7,7 +7,7 @@ use crate::{cluster, mask};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub fn try_columnar(text: &str) -> Option<String> {
+pub fn try_columnar(text: &str, table: &mut crate::side::SideTable) -> Option<String> {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() < 4 {
         return None;
@@ -64,5 +64,5 @@ pub fn try_columnar(text: &str) -> Option<String> {
         body.push('\n');
     }
     // volatile-merge over rows: identical modulo timestamps/UUIDs -> [xN]
-    Some(cluster::run(&body))
+    Some(cluster::run(&body, table))
 }
