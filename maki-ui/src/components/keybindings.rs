@@ -206,7 +206,7 @@ impl Default for ConfiguredKeybindings {
             delete_word: ctrl_bind!('w', "delete_word"),
             search: ctrl_bind!('f', "search"),
             file_picker: ctrl_bind!('s', "file_picker"),
-            change_cwd: ctrl_bind!('d', "change_cwd"),
+            change_cwd: ctrl_bind!('l', "change_cwd"),
             toggle_verbose: ctrl_bind!('o', "toggle_verbose"),
             open_editor: Bind {
                 code: KeyCode::Char('p'),
@@ -505,7 +505,7 @@ pub mod key {
     pub const SEARCH: Bind = ctrl_bind!('f', "search");
     pub const FILE_PICKER: Bind = ctrl_bind!('s', "file_picker");
     pub const TOGGLE_VERBOSE: Bind = ctrl_bind!('o', "toggle_verbose");
-    pub const CHANGE_CWD: Bind = ctrl_bind!('d', "change_cwd");
+    pub const CHANGE_CWD: Bind = ctrl_bind!('l', "change_cwd");
     pub const OPEN_EDITOR: Bind = Bind {
         code: KeyCode::Char('p'),
         modifiers: KeyModifiers::ALT,
