@@ -1,19 +1,26 @@
 [package]
 name = "maki-rstring"
 version.workspace = true
-edition.workspace = true
+# Upstream rstring is edition 2021, and its code is vendored here as-is.
+edition = "2021"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Token-efficient, semantically-preserving compression for agent sessions and tool output"
 
 [dependencies]
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tokie = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-test-case = { workspace = true }
+tiktoken-rs = { workspace = true }
+
+[[bench]]
+name = "tiers"
+harness = false
 
 [[bench]]
 name = "entropy_mask"

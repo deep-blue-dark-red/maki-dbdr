@@ -15,6 +15,8 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::cancel::RunInterrupt;
+
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1174,6 +1176,17 @@ pub struct SubagentInfo {
     pub opts: Option<RequestOptions>,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
+    /// The pane's handle on the session: raises a stop on the run in flight
+    /// without ending the session, and reports whether the session is still
+    /// there to answer. A stop raised with no run in flight is dropped rather
+    /// than killing the next one.
+    #[serde(skip)]
+    pub run_interrupt: Option<RunInterrupt>,
+    /// Free-form text the user typed into this subagent's pane. Drained by the
+    /// session's [`crate::InterruptSource`], so it steers the run in flight
+    /// instead of waiting for the next `prompt`.
+    #[serde(skip)]
+    pub input_tx: Option<flume::Sender<String>>,
 }
 
 #[derive(Debug, Clone)]

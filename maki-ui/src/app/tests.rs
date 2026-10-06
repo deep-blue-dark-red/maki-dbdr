@@ -13,11 +13,12 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    TurnCompleteEvent,
+    McpSnapshot, McpSnapshotReader, RunInterrupt, SharedBuf, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -310,13 +311,15 @@ fn done_event() -> Msg {
 }
 
 fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
-    subagent_info_with_tx(parent_id, name, None)
+    subagent_info_with_tx(parent_id, name, None, None, None)
 }
 
 fn subagent_info_with_tx(
     parent_id: &str,
     name: &str,
     answer_tx: Option<flume::Sender<String>>,
+    input_tx: Option<flume::Sender<String>>,
+    run_interrupt: Option<RunInterrupt>,
 ) -> SubagentInfo {
     SubagentInfo {
         parent_tool_use_id: parent_id.into(),
@@ -325,7 +328,16 @@ fn subagent_info_with_tx(
         model: None,
         opts: None,
         answer_tx,
+        input_tx,
+        run_interrupt,
     }
+}
+
+/// A task the user is still talking to: a session nothing has stopped, so the
+/// pane may steer it and pause it. Every other subagent in the suite carries no
+/// run handle at all, which is what a finished session looks like from here.
+fn live_run_interrupt() -> RunInterrupt {
+    RunInterrupt::new(CancelToken::none(), CancelToken::none())
 }
 
 fn subagent_msg(event: AgentEvent, parent_id: &str, name: Option<&str>) -> Msg {
@@ -2152,8 +2164,9 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
 }
 
 /// Escaping out of a subagent takes the single-chat cancel path instead of the
-/// sweep over the whole turn, and that path has to land the task in `error`
-/// too, or it spins forever.
+/// sweep over the whole turn. The first Esc only interrupts and leaves the task
+/// usable; dismissing it is what has to land the task in `error`, or it spins
+/// forever.
 #[test]
 fn cancelling_from_inside_a_subagent_reports_error() {
     let mut app = app_with_subagent();
@@ -4263,7 +4276,13 @@ fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Recei
     app.answer_tx = Some(main_tx);
     app.update(Msg::Agent(Box::new(Envelope {
         event: AgentEvent::TextDelta { text: "x".into() },
-        subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
+        subagent: Some(subagent_info_with_tx(
+            id,
+            "research",
+            Some(sub_tx),
+            None,
+            None,
+        )),
         run_id: 1,
     })));
     (app, sub_rx, main_rx)
@@ -4294,7 +4313,13 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 scopes: vec!["ls".into()],
                 reason: None,
             },
-            subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
+            subagent: Some(subagent_info_with_tx(
+                parent,
+                RESEARCH_NAME,
+                Some(tx),
+                None,
+                None,
+            )),
             run_id: 1,
         })));
     }
@@ -4386,6 +4411,295 @@ fn send_to_agent_unknown_subagent_falls_back_to_main() {
 
     assert_eq!(main_rx.try_recv().unwrap(), "");
     assert_eq!(app.pending_input, PendingInput::None);
+}
+
+const STEERED_TEXT: &str = "also check the tests";
+
+fn task_pane_app(input_tx: Option<flume::Sender<String>>) -> (App, flume::Receiver<String>) {
+    let (main_tx, main_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.answer_tx = Some(main_tx);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(subagent_info_with_tx(
+            TASK_ID,
+            RESEARCH_NAME,
+            None,
+            input_tx.clone(),
+            input_tx.as_ref().map(|_| live_run_interrupt()),
+        )),
+        run_id: 1,
+    })));
+    app.active_chat = 1;
+    (app, main_rx)
+}
+
+fn task_pane_without_task() -> (App, flume::Receiver<String>) {
+    task_pane_app(None)
+}
+
+fn task_pane_with_dropped_task() -> (App, flume::Receiver<String>) {
+    let (input_tx, input_rx) = flume::unbounded();
+    drop(input_rx);
+    task_pane_app(Some(input_tx))
+}
+
+/// A focused task pane is a conversation with that task: the text reaches the
+/// task's own channel and the bubble lands in the pane the user is looking at.
+/// Sending it to the parent instead would answer the wrong agent.
+#[test]
+fn task_pane_input_reaches_that_task_and_stays_in_its_pane() {
+    let (input_tx, input_rx) = flume::unbounded();
+    let (mut app, main_rx) = task_pane_app(Some(input_tx));
+    let main_count = app.chats[0].message_count();
+
+    let actions = app.handle_submit(Submission {
+        text: STEERED_TEXT.into(),
+        images: vec![],
+    });
+
+    assert!(
+        actions.is_empty(),
+        "steering a task must not start a parent run"
+    );
+    assert_eq!(input_rx.try_recv().unwrap(), STEERED_TEXT);
+    assert!(main_rx.is_empty(), "the parent must never read task input");
+    assert_eq!(app.chats[0].message_count(), main_count);
+    assert_eq!(app.chats[1].message_count(), 2);
+    assert_eq!(app.chats[1].last_message_text(), STEERED_TEXT);
+}
+
+#[test_case(task_pane_without_task as fn() -> (App, flume::Receiver<String>) ; "task_never_had_a_channel")]
+#[test_case(task_pane_with_dropped_task as fn() -> (App, flume::Receiver<String>) ; "task_dropped_its_receiver")]
+fn task_pane_input_without_a_live_task_is_refused(mk: fn() -> (App, flume::Receiver<String>)) {
+    let (mut app, main_rx) = mk();
+
+    let actions = app.handle_submit(Submission {
+        text: STEERED_TEXT.into(),
+        images: vec![],
+    });
+
+    assert!(actions.is_empty());
+    assert!(
+        main_rx.is_empty(),
+        "a dead task must not fall back to the parent"
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(SUBAGENT_INPUT_DEAD_ERR));
+}
+
+/// Only text crosses the channel, so a task pane never draws an attachment it
+/// could not deliver, and an image with no text sends no empty steer.
+#[test]
+fn task_pane_refuses_images_it_cannot_deliver() {
+    const IMAGE_TEXT: &str = "what does this screenshot show?";
+    const UNDELIVERED_IMAGE: &str = "a task pane drew an image it never sent";
+
+    let img = ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="));
+    let (input_tx, input_rx) = flume::unbounded();
+    let (mut app, main_rx) = task_pane_app(Some(input_tx));
+
+    let actions = app.handle_submit(Submission {
+        text: IMAGE_TEXT.into(),
+        images: vec![img.clone()],
+    });
+
+    assert!(actions.is_empty());
+    assert_eq!(input_rx.try_recv().unwrap(), IMAGE_TEXT);
+    assert_eq!(app.status_bar.flash_text(), Some(SUBAGENT_TEXT_ONLY_MSG));
+    let bubble = app.chats[1]
+        .message_at(app.chats[1].message_count() - 1)
+        .unwrap();
+    assert_eq!(bubble.text, IMAGE_TEXT);
+    assert!(bubble.images.is_empty(), "{UNDELIVERED_IMAGE}");
+    let sent = app.chats[1].message_count();
+
+    app.status_bar.clear_flash();
+    let actions = app.handle_submit(Submission {
+        text: String::new(),
+        images: vec![img],
+    });
+
+    assert!(actions.is_empty());
+    assert!(input_rx.is_empty(), "an image alone must send nothing");
+    assert!(main_rx.is_empty(), "the parent must never read task input");
+    assert_eq!(
+        app.chats[1].message_count(),
+        sent,
+        "an image alone must draw no bubble"
+    );
+    assert_eq!(app.status_bar.flash_text(), Some(SUBAGENT_TEXT_ONLY_MSG));
+}
+
+const LOST_LISTENING_TASK: &str = "a task the user is still talking to lost its pane";
+const STALE_SUBAGENT_EVENT: &str = "a listening subagent's event was dropped as stale";
+const DUPLICATED_TASK_PANE: &str = "a trailing event pushed a second pane for the same task";
+const STALE_TRAILING_RENDERED: &str = "a trailing event of a forgotten task still rendered";
+const SILENCED_LISTENING_TASK: &str = "the spared task stopped receiving";
+
+fn two_task_app(live_tx: flume::Sender<String>, dead_tx: flume::Sender<String>) -> App {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for (id, tx) in [("live", live_tx), ("dead", dead_tx)] {
+        let run = (id == "live").then(live_run_interrupt);
+        app.update(Msg::Agent(Box::new(Envelope {
+            event: AgentEvent::TextDelta { text: "x".into() },
+            subagent: Some(subagent_info_with_tx(
+                id,
+                RESEARCH_NAME,
+                None,
+                Some(tx),
+                run,
+            )),
+            run_id: 1,
+        })));
+    }
+    app
+}
+
+/// A task still listening is what the user is still talking to, so ending the
+/// run spares its pane and its routing while dropping the tasks that are gone.
+/// The run's stragglers must land in the pane a task already has — never in a
+/// second pane, and never in one whose routing the run end took.
+#[test]
+fn run_end_spares_the_tasks_still_listening() {
+    const PANE_COUNT: usize = 3;
+    const TRAILING_TEXT: &str = "queued behind the run's end";
+
+    let (live_tx, _live_rx) = flume::unbounded();
+    let (dead_tx, dead_rx) = flume::unbounded();
+    drop(dead_rx);
+    let mut app = two_task_app(live_tx, dead_tx);
+    finish_subagent(&mut app, "live", false);
+    finish_subagent(&mut app, "dead", false);
+
+    end_turn(&mut app);
+
+    assert!(app.chat_index.contains_key("live"), "{LOST_LISTENING_TASK}");
+    assert!(app.subagent_inputs.contains_key("live"));
+    assert!(!app.chat_index.contains_key("dead"));
+    assert!(!app.subagent_inputs.contains_key("dead"));
+    assert_eq!(app.chats.len(), PANE_COUNT);
+
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: TRAILING_TEXT.into(),
+        },
+        "dead",
+        None,
+        1,
+    ));
+    app.chats[2].flush();
+    assert_eq!(app.chats.len(), PANE_COUNT, "{DUPLICATED_TASK_PANE}");
+    assert_eq!(app.chats[2].last_message_text(), TRAILING_TEXT);
+
+    app.run_id += 1;
+    let dead_messages = app.chats[2].message_count();
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: TRAILING_TEXT.into(),
+        },
+        "dead",
+        None,
+        1,
+    ));
+    app.chats[2].flush();
+    assert_eq!(app.chats.len(), PANE_COUNT, "{DUPLICATED_TASK_PANE}");
+    assert_eq!(
+        app.chats[2].message_count(),
+        dead_messages,
+        "{STALE_TRAILING_RENDERED}"
+    );
+
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::TextDelta {
+            text: TRAILING_TEXT.into(),
+        },
+        "live",
+        None,
+        1,
+    ));
+    app.chats[1].flush();
+    assert_eq!(
+        app.chats[1].last_message_text(),
+        TRAILING_TEXT,
+        "{SILENCED_LISTENING_TASK}"
+    );
+}
+
+/// Run end spares a live task's answer routing the way it spares its input,
+/// so a permission answer that lands afterwards still reaches that task
+/// instead of falling back to the main agent.
+#[test_case(true  ; "task_still_listening")]
+#[test_case(false ; "task_gone")]
+fn run_end_spares_only_the_answers_still_live(spare: bool) {
+    const LOST_ANSWER_ROUTING: &str = "run end must spare exactly the live answer routing";
+
+    let (sub_tx, sub_rx) = flume::unbounded();
+    let (main_tx, _main_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.answer_tx = Some(main_tx);
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta { text: "x".into() },
+        subagent: Some(subagent_info_with_tx(
+            TASK_ID,
+            RESEARCH_NAME,
+            Some(sub_tx),
+            None,
+            spare.then(live_run_interrupt),
+        )),
+        run_id: 1,
+    })));
+    if !spare {
+        drop(sub_rx);
+    }
+
+    end_turn(&mut app);
+
+    assert_eq!(
+        app.subagent_answers.contains_key(TASK_ID),
+        spare,
+        "{LOST_ANSWER_ROUTING}"
+    );
+}
+
+/// The first event of a task no pane has opened yet opens one even under a
+/// run id that has moved on: those are the task's first words, not a
+/// straggler's.
+#[test]
+fn subagent_events_outlive_the_run_that_opened_them() {
+    const STALE_DELTA: &str = "after the run moved on";
+
+    let (input_tx, _input_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 2;
+
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::TextDelta {
+            text: STALE_DELTA.into(),
+        },
+        subagent: Some(subagent_info_with_tx(
+            TASK_ID,
+            RESEARCH_NAME,
+            None,
+            Some(input_tx),
+            Some(live_run_interrupt()),
+        )),
+        run_id: 1,
+    })));
+
+    assert!(
+        app.chat_index.contains_key(TASK_ID),
+        "{STALE_SUBAGENT_EVENT}"
+    );
+    assert_eq!(app.chats.len(), 2);
+    app.chats[1].flush();
+    assert_eq!(app.chats[1].last_message_text(), STALE_DELTA);
 }
 
 /// Output that mutates a segment already on screen, rather than appending a
@@ -6843,9 +7157,25 @@ fn app_with_active_subagent() -> App {
     app
 }
 
+/// A task pane whose session is still listening, so Esc pauses it first and
+/// only a second Esc dismisses it.
+fn app_with_live_task() -> App {
+    let (input_tx, _input_rx) = flume::unbounded();
+    task_pane_app(Some(input_tx)).0
+}
+
+const PAUSE_LEFT_BEHIND: &str = "dismissing a task must clear its pause";
+
 #[test]
 fn double_esc_in_subagent_cancels_subagent() {
-    let mut app = app_with_active_subagent();
+    let mut app = app_with_live_task();
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+    // The first one only interrupts: the session goes on, so the user can
+    // prompt it again instead of losing it.
+    assert!(actions.is_empty());
+    assert_eq!(app.status_bar.flash_text().unwrap(), SUBAGENT_PAUSED_MSG);
+
     app.last_esc = Some(Instant::now());
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
     assert_eq!(actions.len(), 1);
@@ -6854,6 +7184,78 @@ fn double_esc_in_subagent_cancels_subagent() {
         Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
     ));
     assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+    assert!(app.paused_tasks.is_empty(), "{PAUSE_LEFT_BEHIND}");
+}
+
+/// Stopping a task's run makes its tool return, so the parent marks the pane
+/// finished straight after the pause. The flash promised "Esc again to
+/// dismiss", so that Esc has to land on a pane nothing else is answering for.
+#[test]
+fn a_paused_task_pane_can_still_be_dismissed() {
+    const NO_DISMISS: &str = "the dismiss Esc went nowhere on a paused task";
+
+    let mut app = app_with_live_task();
+    app.last_esc = Some(Instant::now());
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert_eq!(app.status_bar.flash_text(), Some(SUBAGENT_PAUSED_MSG));
+
+    finish_subagent_task(&mut app, false);
+    assert!(app.chats[1].is_finished());
+
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(actions.len() == 1, "{NO_DISMISS}");
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
+    ));
+    assert!(app.paused_tasks.is_empty(), "{PAUSE_LEFT_BEHIND}");
+}
+
+/// A task handed off with `listen` was never this run's to end. Terminalizing
+/// the turn must leave its pane and its routing alone, or the user is left
+/// steering a task the app has already written off.
+#[test]
+fn turn_end_leaves_a_listening_task_answering() {
+    const WROTE_OFF: &str = "the turn end finished a task the user is still talking to";
+
+    let (input_tx, input_rx) = flume::unbounded();
+    let (mut app, _main_rx) = task_pane_app(Some(input_tx));
+
+    end_turn(&mut app);
+
+    assert!(!app.chats[1].is_finished(), "{WROTE_OFF}");
+    assert!(app.chat_index.contains_key(TASK_ID), "{WROTE_OFF}");
+    let actions = app.handle_submit(Submission {
+        text: STEERED_TEXT.into(),
+        images: vec![],
+    });
+    assert!(actions.is_empty(), "{WROTE_OFF}");
+    assert_eq!(input_rx.try_recv().unwrap(), STEERED_TEXT);
+}
+
+/// Esc promises a pause only to a task still there to read it. A pane whose
+/// session has gone would be promising "type to continue" to nothing, so the
+/// dismiss path takes it instead.
+#[test]
+fn esc_without_a_live_task_dismisses_instead_of_pausing() {
+    let mut app = app_with_live_task();
+    // A closed session leaves the pane with neither routing.
+    app.subagent_runs.remove(TASK_ID);
+    app.subagent_inputs.remove(TASK_ID);
+
+    app.last_esc = Some(Instant::now());
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(
+        &actions[0],
+        Action::CancelSubagent { tool_use_id } if tool_use_id == TASK_ID
+    ));
+    assert!(app.paused_tasks.is_empty(), "{PAUSE_LEFT_BEHIND}");
+    assert_ne!(app.status_bar.flash_text(), Some(SUBAGENT_PAUSED_MSG));
     assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
 }
 
@@ -7958,6 +8360,68 @@ fn stats_records_a_row_per_turn_and_patches_tool_stats() {
     assert!(!app.turn_history[0].tool_calls[0].is_error);
     assert_eq!(app.turn_history[0].tool_calls[1].tool, "read");
     assert!(app.turn_history[0].tool_calls[1].is_error);
+}
+
+/// TG only counts the window where tokens were actually arriving — the
+/// agent's stream time minus its wait for the first byte — so a slow prefill
+/// doesn't deflate the rate. PP still divides the whole round, since
+/// processing is what fills it.
+#[test]
+fn tg_rate_covers_the_streaming_window_only() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.start_turn_timer();
+    app.round_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+
+    app.update(agent_msg(turn_complete_full(
+        TokenUsage {
+            input: 1000,
+            output: 500,
+            ..Default::default()
+        },
+        1,
+        false,
+    )));
+
+    let stats = app.last_turn_stats.expect("turn stats recorded");
+    // 500 tokens over the 1034ms that followed the 200ms first byte, not the
+    // 2s round.
+    assert!(
+        (stats.tg_tps - 500.0 / 1.034).abs() < 0.01,
+        "expected the streaming-window rate, got {}",
+        stats.tg_tps
+    );
+    assert!(
+        (stats.pp_tps - 500.0).abs() < 1.0,
+        "expected pp over the whole round, got {}",
+        stats.pp_tps
+    );
+}
+
+/// A turn the agent reports no first-byte time for streamed nothing to
+/// measure, so TG falls back to the whole round rather than showing 0.
+#[test]
+fn tg_rate_falls_back_to_the_round_without_a_ttfb() {
+    let mut app = test_app();
+    app.run_id = 1;
+    app.start_turn_timer();
+    app.round_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+
+    app.update(agent_msg(turn_complete(
+        TokenUsage {
+            output: 500,
+            ..Default::default()
+        },
+        "test-model",
+        None,
+    )));
+
+    let stats = app.last_turn_stats.expect("turn stats recorded");
+    assert!(
+        (stats.tg_tps - 250.0).abs() < 1.0,
+        "expected the round rate, got {}",
+        stats.tg_tps
+    );
 }
 
 #[test]

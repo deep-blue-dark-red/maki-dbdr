@@ -11,14 +11,42 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use event_listener::Event;
 
 struct Shared {
-    cancelled: AtomicBool,
+    /// A stop aimed at the run in flight. [`rearm`](Shared::rearm) clears it
+    /// for the next run rather than a counter moving past it, so a stop raised
+    /// with no run in flight goes stale instead of killing the next one.
+    stopped: AtomicBool,
+    /// A stop that outranks every rearm: a parent's cancel, a trigger's own
+    /// drop, or an explicit [`fire`](CancelToken::fire). Never cleared, so it
+    /// is a kill switch rather than a switch a run can flip back.
+    ended: AtomicBool,
     event: Event,
 }
 
 impl Shared {
+    fn fresh() -> Arc<Self> {
+        Arc::new(Self {
+            stopped: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
+            event: Event::new(),
+        })
+    }
+
     fn fire(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.ended.store(true, Ordering::Release);
         self.event.notify(usize::MAX);
+    }
+
+    fn interrupt(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.event.notify(usize::MAX);
+    }
+
+    fn rearm(&self) {
+        self.stopped.store(false, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.ended.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire)
     }
 }
 
@@ -29,29 +57,43 @@ pub struct CancelTrigger(Arc<Shared>);
 
 impl CancelToken {
     pub fn new() -> (CancelTrigger, Self) {
-        let shared = Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
-            event: Event::new(),
-        });
+        let shared = Shared::fresh();
         (CancelTrigger(Arc::clone(&shared)), Self(shared))
     }
 
     pub fn none() -> Self {
-        Self(Arc::new(Shared {
-            cancelled: AtomicBool::new(false),
-            event: Event::new(),
-        }))
+        Self(Shared::fresh())
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.0.is_cancelled()
     }
 
     /// Fire from any clone of the token, any number of times. Unlike a
     /// `CancelTrigger`, holding or dropping the token never fires by itself,
     /// so it is safe to hand out as a kill switch.
+    ///
+    /// Sticky: no [`rearm`](Self::rearm) takes it back, so a cancel can never
+    /// be lost to the run that happened to be opening.
     pub fn fire(&self) {
         self.0.fire();
+    }
+
+    /// Stops the run in flight and nothing else. The next
+    /// [`rearm`](Self::rearm) opens past it, so an interrupt raised with no
+    /// run in flight is dropped rather than killing the run after it.
+    ///
+    /// One store, so an interrupt and a rearm cannot interleave into a stop
+    /// aimed at a run that has already ended.
+    pub fn interrupt(&self) {
+        self.0.interrupt();
+    }
+
+    /// Opens the next run: a stop aimed at an earlier run stops counting,
+    /// while a stop from above — which a new run must not clear — keeps the
+    /// token cancelled.
+    pub fn rearm(&self) {
+        self.0.rearm();
     }
 
     pub async fn race<T>(&self, future: impl Future<Output = T>) -> Result<T, String> {
@@ -91,6 +133,41 @@ impl CancelToken {
     }
 }
 
+/// A frontend's handle on the run a session has in flight, kept next to the
+/// session's own lifetime token so one value answers both questions the pane
+/// asks: can this task still read an interrupt, and does it have a run to stop?
+#[derive(Clone)]
+pub struct RunInterrupt {
+    session: CancelToken,
+    run: CancelToken,
+}
+
+impl RunInterrupt {
+    pub fn new(session: CancelToken, run: CancelToken) -> Self {
+        Self { session, run }
+    }
+
+    /// Stops the run in flight, leaving the session free to run again.
+    pub fn interrupt(&self) {
+        self.run.interrupt();
+    }
+
+    /// Whether the session is still there to answer. A session that has closed,
+    /// been cancelled from above, or belonged to a run that ended without
+    /// parking it is gone; one the user is still talking to is not.
+    pub fn is_live(&self) -> bool {
+        !self.session.is_cancelled()
+    }
+}
+
+impl std::fmt::Debug for RunInterrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunInterrupt")
+            .field("live", &self.is_live())
+            .finish()
+    }
+}
+
 impl CancelTrigger {
     pub fn cancel(self) {
         self.0.fire();
@@ -115,11 +192,21 @@ impl Drop for CancelTrigger {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CancelSlot(u64);
 
+/// One session's registration under a key: the slot its owner retires by,
+/// the trigger whose drop fires that session's token, and whether the work
+/// outlives the run that opened it.
+struct Registration {
+    slot: CancelSlot,
+    /// Held, never read. Dropping it is what fires the token of the session
+    /// that registered it.
+    _trigger: CancelTrigger,
+    /// Work that outlives its run, which [`CancelMap::cancel_all`] honours.
+    parked: bool,
+}
+
 #[derive(Default)]
 struct Entry {
-    /// Held, never read. Dropping a trigger is what fires the token of the
-    /// session that registered it.
-    registrations: Vec<(CancelSlot, CancelTrigger)>,
+    registrations: Vec<Registration>,
     cancelled: bool,
 }
 
@@ -161,7 +248,11 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         // Under a cancelled id the trigger is dropped instead of stored, and
         // that drop is what fires the token, so the session is born cancelled.
         if !entry.cancelled {
-            entry.registrations.push((slot, trigger));
+            entry.registrations.push(Registration {
+                slot,
+                _trigger: trigger,
+                parked: false,
+            });
         }
         slot
     }
@@ -173,9 +264,20 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         let Some(entry) = map.get_mut(id) else {
             return;
         };
-        entry
-            .registrations
-            .retain(|&(registered, _)| registered != slot);
+        entry.registrations.retain(|reg| reg.slot != slot);
+    }
+
+    /// Marks one registration as work that outlives the run that opened it, so
+    /// [`cancel_all`](Self::cancel_all) leaves it be. Cancelling the id still
+    /// reaches it, and retiring it still stops it.
+    pub fn park(&self, id: &K, slot: CancelSlot) {
+        let mut map = self.lock();
+        let Some(entry) = map.get_mut(id) else {
+            return;
+        };
+        if let Some(registration) = entry.registrations.iter_mut().find(|reg| reg.slot == slot) {
+            registration.parked = true;
+        }
     }
 
     /// Cancels every registration under {id} and marks the id, so a session
@@ -187,9 +289,20 @@ impl<K: Eq + std::hash::Hash> CancelMap<K> {
         entry.registrations.clear();
     }
 
-    /// The run that owned these is over: stop what is still registered and drop
-    /// the marks with it, so no cancel of this run leaks into the next one.
+    /// The run that owned these is over: stop what it still has registered and
+    /// drop the marks with it, so no cancel of one run leaks into the next.
+    /// Parked work outlives its run and stays registered under its id.
     pub fn cancel_all(&self) {
+        let mut map = self.lock();
+        for entry in map.values_mut() {
+            entry.registrations.retain(|reg| reg.parked);
+        }
+        map.retain(|_, entry| !entry.registrations.is_empty());
+    }
+
+    /// Stops everything, parked work included. Respawn or shutdown: this map is
+    /// done, whatever it was in the middle of.
+    pub fn release_all(&self) {
         self.lock().clear();
     }
 
@@ -305,6 +418,76 @@ mod tests {
         assert!(!trigger.fires(&other_token));
     }
 
+    const STALE_STOP: &str = "a stop aimed at a finished run must not kill the next one";
+    const REARM_TOOK_THE_CANCEL: &str = "rearm must not take back a cancel that outranks it";
+    const LOST_INTERRUPT: &str = "an interrupt of the run in flight did not stop it";
+
+    /// An interrupt raised with no run in flight goes stale at the next
+    /// `rearm` instead of killing the run that opens after it.
+    #[test]
+    fn interrupt_raised_between_runs_is_dropped_by_rearm() {
+        let (_trigger, token) = CancelToken::new();
+        token.interrupt();
+        token.rearm();
+        assert!(!token.is_cancelled(), "{STALE_STOP}");
+    }
+
+    #[test]
+    fn interrupt_stops_the_run_it_lands_in() {
+        smol::block_on(async {
+            let (_trigger, token) = CancelToken::new();
+            token.rearm();
+            token.interrupt();
+            token.cancelled().await;
+            assert!(token.is_cancelled(), "{LOST_INTERRUPT}");
+        });
+    }
+
+    /// `fire` is the kill switch its doc promises: no rearm takes it back, so a
+    /// cancel cannot be lost to the run that happened to be opening.
+    #[test]
+    fn fire_outranks_rearm() {
+        let (_trigger, token) = CancelToken::new();
+        token.fire();
+        token.rearm();
+        assert!(token.is_cancelled(), "{REARM_TOOK_THE_CANCEL}");
+    }
+
+    /// A run's stop token sits two levels below the owner that can cancel it
+    /// from the outside, and the propagation down is asynchronous: once it has
+    /// landed, no rearm of any descendant may forget it again.
+    #[test]
+    fn parent_cancel_survives_the_descendants_rearm() {
+        smol::block_on(async {
+            let (parent_trigger, parent) = CancelToken::new();
+            let (_child_trigger, child) = parent.child();
+            let (_grand_trigger, grandchild) = child.child();
+
+            parent_trigger.cancel();
+            grandchild.cancelled().await;
+            child.rearm();
+            grandchild.rearm();
+
+            assert!(grandchild.is_cancelled(), "{LOST_CANCEL}");
+        });
+    }
+
+    /// What a task pane reads: the session outlives a run of its own, so a
+    /// still-listening session is live and an interrupted one stays live too.
+    #[test]
+    fn run_interrupt_reports_the_session_not_the_run() {
+        let (session_trigger, session) = CancelToken::new();
+        let (_run_trigger, run) = session.child();
+        let handle = RunInterrupt::new(session.clone(), run.clone());
+
+        run.interrupt();
+        assert!(handle.is_live(), "an interrupted run leaves the session");
+        assert!(run.is_cancelled());
+
+        session_trigger.cancel();
+        assert!(!handle.is_live(), "a cancelled session is gone for good");
+    }
+
     const KEY: &str = "x";
     const OTHER_KEY: &str = "y";
     const LOST_CANCEL: &str = "the cancel left no mark for the session after it";
@@ -400,5 +583,62 @@ mod tests {
 
         map.cancel(key());
         assert!(tok2.is_cancelled());
+    }
+
+    const LOST_PARK: &str = "parked work died with the run that opened it";
+    const HELD_PARK: &str = "parked work outlived the release that should stop it";
+    const LOST_PARK_CANCEL: &str = "cancelling the id did not reach parked work";
+
+    /// A session the user is still talking to outlives the run that opened it,
+    /// so ending that run must spare it while stopping its siblings.
+    #[test]
+    fn cancel_map_parked_work_outlives_the_run_that_opened_it() {
+        let map = CancelMap::new();
+        let (parked, parked_token) = CancelToken::new();
+        let (sibling, sibling_token) = CancelToken::new();
+        let slot = map.insert(key(), parked);
+        map.insert(OTHER_KEY.to_owned(), sibling);
+        map.park(&key(), slot);
+
+        map.cancel_all();
+        assert!(!parked_token.is_cancelled(), "{LOST_PARK}");
+        assert!(sibling_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_map_cancel_still_reaches_parked_work() {
+        let map = CancelMap::new();
+        let (parked, token) = CancelToken::new();
+        let slot = map.insert(key(), parked);
+        map.park(&key(), slot);
+
+        map.cancel(key());
+        assert!(token.is_cancelled(), "{LOST_PARK_CANCEL}");
+    }
+
+    /// How a parked session ends itself: retiring its registration drops the
+    /// trigger, and that drop is what fires its token.
+    #[test]
+    fn cancel_map_retire_stops_parked_work() {
+        let map = CancelMap::new();
+        let (parked, token) = CancelToken::new();
+        let slot = map.insert(key(), parked);
+        map.park(&key(), slot);
+
+        map.retire(&key(), slot);
+        assert!(token.is_cancelled());
+    }
+
+    /// Respawn and shutdown end the whole map, parked work included.
+    #[test]
+    fn cancel_map_release_all_stops_parked_work_too() {
+        let map = CancelMap::new();
+        let (parked, token) = CancelToken::new();
+        let slot = map.insert(key(), parked);
+        map.park(&key(), slot);
+
+        map.release_all();
+        assert!(token.is_cancelled(), "{HELD_PARK}");
+        assert!(!map.has_key(&key()));
     }
 }

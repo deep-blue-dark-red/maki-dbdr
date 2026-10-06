@@ -6,8 +6,8 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use maki_rstring::mask::{ENTROPY_RUN_MIN, mask_entropy};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use maki_rstring::mask::{mask_entropy, ENTROPY_RUN_MIN};
 use maki_rstring::side::SideTable;
 
 const SIZE: usize = 64 * 1024;

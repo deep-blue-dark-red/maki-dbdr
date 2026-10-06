@@ -52,7 +52,7 @@ const SCENARIO_NO_SUMMARY_THEN_RECOVER: &str = "no_summary_then_recover";
 /// Stubs keyed by `opts.name` (the task's `description`). `maki.json` and
 /// `maki.async` stay real so schema validation and semaphore behavior are tested.
 const STUB_PRELUDE: &str = r#"
-recorder = { prompts = {}, closed = 0, sessions = 0, acquired = 0, released = 0 }
+recorder = { prompts = {}, closed = 0, listening = 0, finished = 0, sessions = 0, acquired = 0, released = 0 }
 
 -- Spy wrapper: the real semaphore does the work, counters track that every
 -- permit is explicitly released (gc would silently hide a leak).
@@ -150,6 +150,13 @@ maki.agent.session = function(ctx, opts)
   end
   function sess:close()
     recorder.closed = recorder.closed + 1
+    recorder.finished = recorder.finished + 1
+  end
+  -- A session left listening outlives the tool call: the user keeps talking
+  -- to it in its own pane. Either way it is handed off exactly once.
+  function sess:listen()
+    recorder.listening = recorder.listening + 1
+    recorder.finished = recorder.finished + 1
   end
   return sess
 end
@@ -163,6 +170,8 @@ maki.api.register_tool({
     local snap = {
       sessions = recorder.sessions,
       closed = recorder.closed,
+      listening = recorder.listening,
+      finished = recorder.finished,
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       thinking = recorder.thinking,
@@ -354,7 +363,9 @@ fn structured_happy_path_returns_validated_json() {
 
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
+    // A result worth building on leaves the session listening, not closed.
+    assert_eq!(snap["listening"], json!(1));
+    assert_eq!(snap["closed"], json!(0));
     assert_eq!(snap["prompt_count"], json!(1));
     assert_eq!(snap["has_local_tools"], json!(true));
     assert!(snap["first_ack"].is_string(), "valid input must be acked");
@@ -389,7 +400,8 @@ fn invalid_then_valid_recovers_within_one_prompt() {
     assert!(snap["second_ack"].is_string(), "valid retry must be acked");
     assert!(snap.get("second_err").is_none_or(Value::is_null));
     assert_eq!(snap["prompt_count"], json!(1));
-    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["listening"], json!(1));
+    assert_eq!(snap["closed"], json!(0));
 }
 
 #[test]
@@ -409,7 +421,9 @@ fn missing_structured_output_nudges_then_errors() {
         let nudge = snap["prompts"][i].as_str().expect("nudge prompt missing");
         assert!(nudge.contains(STRUCTURED_OUTPUT_TOOL), "got: {nudge}");
     }
+    // An error is the end of the task: close the session, never hand it off.
     assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["listening"], json!(0));
 }
 
 #[test]
@@ -441,6 +455,7 @@ fn prompt_error_maps_to_sub_agent_error() {
     assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
     let snap = probe(&reg);
     assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["listening"], json!(0));
 }
 
 /// Esc during a sub-agent run: the prompt hands back both an error and
@@ -466,7 +481,11 @@ fn plain_path_returns_text_without_local_tools() {
     assert_eq!(snap["has_local_tools"], json!(false));
     assert_eq!(snap["prompt_count"], json!(1));
     assert_eq!(snap["prompts"][0], json!(TASK_PROMPT));
-    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["finished"], json!(1));
+    // A result worth building on leaves the session listening rather than
+    // closed, so the user can keep talking to the task in its own pane.
+    assert_eq!(snap["listening"], json!(1));
+    assert_eq!(snap["closed"], json!(0));
 }
 
 #[test]
@@ -484,7 +503,8 @@ fn no_summary_nudges_then_recovers() {
     assert_eq!(snap["prompt_count"], json!(2));
     let nudge = snap["prompts"][1].as_str().expect("nudge prompt missing");
     assert!(nudge.contains(SUMMARY_NUDGE_FRAGMENT), "got: {nudge}");
-    assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["listening"], json!(1));
+    assert_eq!(snap["closed"], json!(0));
 }
 
 #[test]
@@ -495,7 +515,9 @@ fn no_summary_errors_after_nudges() {
 
     let snap = probe(&reg);
     assert_eq!(snap["prompt_count"], json!(1 + MAX_STRUCTURED_RETRIES));
+    // The failing nudges end the task: the session is closed, not listening.
     assert_eq!(snap["closed"], json!(1));
+    assert_eq!(snap["listening"], json!(0));
 }
 
 /// Spy counters catch a leaked permit even when gc would silently reclaim it.

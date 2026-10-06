@@ -2029,7 +2029,7 @@ mod tests {
     #[test]
     fn incompressible_bash_output_passes_through() {
         let out = (0..maki_rstring::MIN_BYTES / 8)
-            .map(|i| format!("distinct line {i}\n"))
+            .map(|i| format!("row {i} key {}\n", i * 7 + 3))
             .collect::<String>();
         assert_eq!(compress_llm_output(true, RSTRING_TOOL, out.clone()), out);
     }

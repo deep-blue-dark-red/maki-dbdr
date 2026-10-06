@@ -77,7 +77,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
-    SharedMessages, SubagentInfo,
+    RunInterrupt, SharedMessages, SubagentInfo,
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
@@ -146,6 +146,7 @@ const PLAN_FORM_ANSWER_WAIT: Duration =
 /// still beats it.
 const PLAN_ACTION_ANSWER_WAIT: Duration =
     Duration::from_secs(PLAN_ROW_HANDLER_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
+const MILLIS_PER_SEC: f64 = 1_000.0;
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -178,6 +179,14 @@ pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (ali
 
 pub(crate) const INPUT_NOT_LIVE_ERR: &str =
     "the chat input is not on screen, so it cannot be edited";
+
+/// A focused task pane is a conversation with that task. There is no parent
+/// run to fall back on, so a task that is gone has nowhere to send the text.
+const SUBAGENT_INPUT_DEAD_ERR: &str = "that task is no longer running and cannot read input";
+const SUBAGENT_PAUSED_MSG: &str = "task interrupted — type to continue, Esc again to dismiss";
+/// A task's channel carries text only, so an attachment can neither reach
+/// the task nor be drawn into the pane as if it had.
+const SUBAGENT_TEXT_ONLY_MSG: &str = "tasks only receive text — no image was sent";
 
 /// Who has moved the chat input since the last tick, and the buffer version
 /// that writer left behind.
@@ -443,8 +452,9 @@ pub struct App {
     /// resets to ~0s every time a tool call happens mid-turn.
     turn_start: Option<Instant>,
     /// Anchor for just the *current* internal round, used to compute that
-    /// round's pp/tg tokens-per-second. Reset every `TurnComplete`, unlike
-    /// `turn_start`.
+    /// round's prompt-processing rate. Reset every `TurnComplete`, unlike
+    /// `turn_start`. The generation rate doesn't need it — that comes from
+    /// the agent's own stream timing on `TurnComplete`.
     round_start: Option<Instant>,
     /// Last non-zero output-token count seen this turn, carried forward so
     /// the status bar still shows `↓ N t` while a tool call is running and
@@ -504,6 +514,15 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    /// Free-form text typed into a task pane. Separate from `subagent_answers`
+    /// because that channel speaks tagged permission replies and is only read
+    /// while a prompt is up (`TaggedAnswer` drops anything else).
+    subagent_inputs: HashMap<String, flume::Sender<String>>,
+    /// Stops the run a task has in flight and reports whether the task is
+    /// still there, which is what the pause and the text path both key off.
+    subagent_runs: HashMap<String, RunInterrupt>,
+    /// Esc already interrupted these once; the next Esc dismisses them.
+    paused_tasks: Vec<String>,
     pub(crate) verbose: bool,
 }
 
@@ -640,6 +659,9 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            subagent_inputs: HashMap::new(),
+            subagent_runs: HashMap::new(),
+            paused_tasks: Vec::new(),
             verbose: false,
         };
         let startup_settings = UserSettings::load();
@@ -1744,7 +1766,9 @@ impl App {
         if !self.is_main_chat() {
             return match key.code {
                 KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
-                KeyCode::Esc if !self.chats[self.active_chat].is_finished() => {
+                // A paused task's pane goes finished when its tool returns, so
+                // liveness is what keeps the dismiss Esc reachable after it.
+                KeyCode::Esc if self.task_pane_takes_esc() => {
                     if let Some(t) = self.last_esc.take()
                         && t.elapsed() < self.status_bar.flash_duration
                     {
@@ -2024,6 +2048,10 @@ impl App {
             return self.quit();
         }
 
+        if self.active_chat != 0 {
+            return self.submit_to_subagent(sub);
+        }
+
         if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
             let cmd = prefix.command.trim();
             if cmd == "cd" || cmd.starts_with("cd ") {
@@ -2042,14 +2070,54 @@ impl App {
         self.submit_or_queue(sub.into())
     }
 
+    /// A focused task pane talks to its own task: the text is queued for the
+    /// run in flight and lands at its next turn boundary. The bubble is drawn
+    /// here rather than on `QueueItemConsumed`, which the parent keeps for its
+    /// own deferred messages.
+    ///
+    /// Only text crosses the channel, so an attachment is refused rather than
+    /// sent as an empty steer and drawn as delivered.
+    fn submit_to_subagent(&mut self, sub: Submission) -> Vec<Action> {
+        if sub.text.is_empty() {
+            self.flash(SUBAGENT_TEXT_ONLY_MSG.into());
+            return vec![];
+        }
+        let Some(task_id) = self.chats[self.active_chat]
+            .task_id()
+            .map(|id| id.to_string())
+        else {
+            self.flash(SUBAGENT_INPUT_DEAD_ERR.into());
+            return vec![];
+        };
+        let Some(tx) = self
+            .subagent_inputs
+            .get(&task_id)
+            .filter(|_| self.task_is_listening(&task_id))
+            .cloned()
+        else {
+            self.flash(SUBAGENT_INPUT_DEAD_ERR.into());
+            return vec![];
+        };
+        if tx.try_send(sub.text.clone()).is_err() {
+            self.flash(SUBAGENT_INPUT_DEAD_ERR.into());
+            return vec![];
+        }
+        self.paused_tasks.retain(|id| id != &task_id);
+        if !sub.images.is_empty() {
+            self.flash(SUBAGENT_TEXT_ONLY_MSG.into());
+        }
+        self.chats[self.active_chat].show_user_message(sub.text, Vec::new());
+        vec![]
+    }
+
     fn handle_cancel(&mut self) -> Vec<Action> {
         let cancelled_run = self.run_id;
         self.run_id += 1;
         self.retry_info = None;
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
-        self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.clear();
+        self.retain_resolved_subagents(TaskOutcome::Error, CANCELLED_TEXT);
+        self.forget_run_subagents();
         self.shell.cancel_all();
         for chat in &mut self.chats {
             chat.flush();
@@ -2065,6 +2133,21 @@ impl App {
         }]
     }
 
+    /// Esc in a task pane interrupts the run without ending the session: the
+    /// user prompts it again and it goes on from where it stopped. A second Esc
+    /// is the user dismissing the task outright.
+    /// Whether the focused pane still has an Esc to answer: it is either still
+    /// running, or a task the user paused and has not dismissed yet.
+    fn task_pane_takes_esc(&self) -> bool {
+        !self.chats[self.active_chat].is_finished() || self.active_task_is_listening()
+    }
+
+    fn active_task_is_listening(&self) -> bool {
+        self.chats[self.active_chat]
+            .task_id()
+            .is_some_and(|id| self.task_is_listening(id.as_ref()))
+    }
+
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
         let tool_use_id = self
             .chat_index
@@ -2078,8 +2161,26 @@ impl App {
 
         self.chats[self.active_chat].flush();
         self.chats[self.active_chat].cancel_in_progress();
+
+        if !self.paused_tasks.contains(&tool_use_id) {
+            // A pause is only worth promising to a task still there to read
+            // it; anything else has no run left to stop, so the pane goes with
+            // the task.
+            if let Some(run) = self.subagent_runs.get(&tool_use_id)
+                && run.is_live()
+            {
+                run.interrupt();
+                self.paused_tasks.push(tool_use_id);
+                self.flash(SUBAGENT_PAUSED_MSG.into());
+                return vec![];
+            }
+        }
+
         self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(&tool_use_id);
+        self.subagent_inputs.remove(&tool_use_id);
+        self.subagent_runs.remove(&tool_use_id);
+        self.paused_tasks.retain(|id| id != &tool_use_id);
         self.permission_prompt.drop_subagent(&tool_use_id);
 
         vec![Action::CancelSubagent { tool_use_id }]
@@ -2134,7 +2235,7 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        if envelope.run_id != self.run_id && self.subagent_event_is_stale(&envelope.subagent) {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -2252,7 +2353,7 @@ impl App {
                 // `TurnComplete` fires once per internal continuation round
                 // (tool calls make the agent auto-continue), not once per
                 // user-facing turn. `round_start` measures just this round
-                // (for pp/tg rate), while `turn_start` keeps running from
+                // (for the pp rate), while `turn_start` keeps running from
                 // the true start of the turn so the displayed duration
                 // reflects total time, not the latest round alone.
                 let round_elapsed = self
@@ -2261,13 +2362,25 @@ impl App {
                     .map(|start| start.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
                 let total = tc.usage.input + tc.usage.cache_creation + tc.usage.cache_read;
-                let (pp_tps, tg_tps) = if round_elapsed > 0.0 {
-                    (
-                        total as f64 / round_elapsed,
-                        tc.usage.output as f64 / round_elapsed,
-                    )
+                let pp_tps = if round_elapsed > 0.0 {
+                    total as f64 / round_elapsed
                 } else {
-                    (0.0, 0.0)
+                    0.0
+                };
+                // Generation is only decoded while tokens are arriving, so
+                // the agent's own stream timing drops the wait for its first
+                // byte. A turn that never streamed (a compaction) reports no
+                // such window and falls back to the whole round.
+                let stream_secs = tc
+                    .ttfb_ms
+                    .zip(tc.duration_ms)
+                    .map(|(ttfb, api)| api.saturating_sub(ttfb))
+                    .filter(|&ms| ms > 0)
+                    .map_or(round_elapsed, |ms| ms as f64 / MILLIS_PER_SEC);
+                let tg_tps = if tc.usage.output > 0 && stream_secs > 0.0 {
+                    tc.usage.output as f64 / stream_secs
+                } else {
+                    0.0
                 };
                 let cum = &self.state.token_usage;
                 let cum_total = cum.input + cum.cache_creation + cum.cache_read;
@@ -2460,8 +2573,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    self.forget_run_subagents();
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
                     if self.exit_on_done {
@@ -2479,11 +2591,10 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
                     self.terminalize_turn(&message);
+                    self.forget_run_subagents();
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
                     self.fire_session_autocmd(
                         "TurnError",
                         serde_json::json!({ "message": message }),
@@ -2511,15 +2622,48 @@ impl App {
         }
     }
 
+    /// A subagent's events carry the run id of the run that opened them, so a
+    /// run id that has moved on only rules out what the run already let go:
+    /// routing that still names the task keeps rendering (the pane outlives
+    /// the run), and a task no pane has opened yet still opens one. An id
+    /// `chat_index` already dropped trails a run that forgot the task, and
+    /// resolving it again would push a second pane for the same task.
+    fn subagent_event_is_stale(&self, subagent: &Option<SubagentInfo>) -> bool {
+        let Some(sub) = subagent else {
+            return true;
+        };
+        let id = sub.parent_tool_use_id.as_str();
+        !self.chat_index.contains_key(id)
+            && self
+                .chats
+                .iter()
+                .any(|chat| chat.task_id().is_some_and(|tid| tid.as_ref() == id))
+    }
+
     fn resolve_or_create_chat(&mut self, subagent: &SubagentInfo) -> usize {
         let id = &subagent.parent_tool_use_id;
         if let Some(&idx) = self.chat_index.get(id.as_str()) {
+            return idx;
+        }
+        // Panes are never removed, so a task whose routing the run forgot
+        // answers in the pane it already has; a second one would show the
+        // same task twice.
+        if let Some(idx) = self.chats.iter().position(|chat| {
+            chat.task_id()
+                .is_some_and(|tid| tid.as_ref() == id.as_str())
+        }) {
             return idx;
         }
         let idx = self.chats.len();
         self.chat_index.insert(id.clone(), idx);
         if let Some(ref tx) = subagent.answer_tx {
             self.subagent_answers.insert(id.clone(), tx.clone());
+        }
+        if let Some(ref tx) = subagent.input_tx {
+            self.subagent_inputs.insert(id.clone(), tx.clone());
+        }
+        if let Some(ref run) = subagent.run_interrupt {
+            self.subagent_runs.insert(id.clone(), run.clone());
         }
         self.chats[0].update_tool_summary(id, &subagent.name);
         if let Some(ref model) = subagent.model {
@@ -3245,9 +3389,29 @@ impl App {
         ])
     }
 
-    fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
-        self.retain_resolved_subagents(outcome, text);
-        self.chat_index.clear();
+    /// Drops what a run opened, sparing the tasks still listening: the pane and
+    /// every routing keyed to them stay for as long as the session behind them
+    /// is there to answer. Everything hangs off `subagent_runs` because that is
+    /// the one map that says whether the task is gone.
+    fn forget_run_subagents(&mut self) {
+        self.subagent_runs.retain(|_, run| run.is_live());
+        self.subagent_inputs
+            .retain(|id, _| self.subagent_runs.contains_key(id));
+        self.subagent_answers
+            .retain(|id, _| self.subagent_runs.contains_key(id));
+        self.paused_tasks
+            .retain(|id| self.subagent_runs.contains_key(id));
+        self.chat_index
+            .retain(|id, _| self.subagent_runs.contains_key(id));
+    }
+
+    /// Whether the task is still there to answer: the session has not closed,
+    /// has not been cancelled from above, and did not belong to a run that
+    /// ended without handing it off.
+    fn task_is_listening(&self, task_id: &str) -> bool {
+        self.subagent_runs
+            .get(task_id)
+            .is_some_and(|run| run.is_live())
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
@@ -3263,15 +3427,24 @@ impl App {
     /// Marks unfinished subagent chats as ended and drops them from
     /// `chat_index`, so the session records only the children that really
     /// completed.
+    ///
+    /// A task still listening is none of that run's business: its pane and its
+    /// routing stay, so the user can go on talking to it after the turn ends.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
-        self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
-                true
-            } else {
-                self.chats[sub_idx].mark_finished(outcome, text);
-                false
+        let stale: Vec<String> = self
+            .chat_index
+            .iter()
+            .filter(|entry| {
+                !self.chats[*entry.1].is_finished() && !self.task_is_listening(entry.0.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(&idx) = self.chat_index.get(&id) {
+                self.chats[idx].mark_finished(outcome, text);
             }
-        });
+            self.chat_index.remove(&id);
+        }
         self.sync_subagents();
     }
 

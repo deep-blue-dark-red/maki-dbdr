@@ -131,9 +131,10 @@ impl AgentHandles {
     }
 
     /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
+    /// Parked subagents included, which a run ending would have spared.
     pub(crate) fn cancel_all(&self) {
         self.cancels.cancel_all();
-        self.subagent_cancels.cancel_all();
+        self.subagent_cancels.release_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {

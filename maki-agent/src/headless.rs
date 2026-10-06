@@ -182,6 +182,10 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
         // Outlives `agent`, so dropping it writes the transcript once the agent
         // that produced it is gone, without this body saying so.
         let mut turn = track.turn(model.spec());
+        // The turn's own map, so every session it opened can be ended with it
+        // below: there is no pane out here to steer one, and a session that
+        // outlived the prompt would keep the run streaming after its `Done`.
+        let subagent_cancels = Arc::new(CancelMap::new());
         let mut agent = Agent::new(
             AgentParams {
                 provider,
@@ -200,7 +204,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
                 timeouts: params.timeouts,
                 file_access: FileAccess::fresh(),
                 prompt_slots: Arc::new(params.prompt_slots),
-                subagent_cancels: Arc::new(CancelMap::new()),
+                subagent_cancels: Arc::clone(&subagent_cancels),
                 ledger: Arc::new(RunLedger::default()),
                 registry: Arc::clone(ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
@@ -221,6 +225,7 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
             ))
             .await;
         drop(agent);
+        subagent_cancels.release_all();
 
         if let Err(e) = result {
             error!(error = %e, "agent error");
@@ -396,6 +401,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             // Outlives `agent`, so this turn is on disk before the next prompt
             // is read, without the loop body remembering to write it.
             let mut turn = track.turn(model.spec());
+            // The turn's own map, so every session it opened can be ended with
+            // it below. A session outliving the turn would outlive the only
+            // thing that could ever reach it: there is no pane out here.
+            let subagent_cancels = Arc::new(CancelMap::new());
             let mut agent = Agent::new(
                 AgentParams {
                     provider: Arc::clone(&provider),
@@ -409,7 +418,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     timeouts: params.timeouts,
                     file_access: Arc::clone(&file_access),
                     prompt_slots: Arc::clone(&params.prompt_slots),
-                    subagent_cancels: Arc::new(CancelMap::new()),
+                    subagent_cancels: Arc::clone(&subagent_cancels),
                     ledger: Arc::new(RunLedger::default()),
                     registry: Arc::clone(ToolRegistry::global_arc()),
                     audience: ToolAudience::MAIN,
@@ -426,6 +435,10 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             let result = agent.run(input).await;
             drop(agent);
             cancel_task.cancel().await;
+            // Every session, the ones handed off to `listen` included: nothing
+            // out here can steer them, so keeping one alive would only strand
+            // a run no user can stop.
+            subagent_cancels.release_all();
 
             if let Err(ref e) = result {
                 error!(error = %e, "agent error");

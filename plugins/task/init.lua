@@ -210,15 +210,15 @@ local function handler(input, ctx)
     end
 
     if err then
-      -- A result alongside the error means the run was cut short after
-      -- streaming some text, and half a transcript beats a bare error.
-      if result then
+      local paused = result and result.paused
+      if result and result.text then
         return {
           llm_output = "sub-agent interrupted (" .. err .. "). Partial output:\n" .. result.text,
           is_error = true,
+          paused = paused,
         }
       end
-      return { llm_output = "sub-agent error: " .. err, is_error = true }
+      return { llm_output = "sub-agent error: " .. err, is_error = true, paused = paused }
     end
     if validator and not captured then
       local msg = last_errors and (STRUCTURED_INVALID_ERROR .. ":\n" .. last_errors) or STRUCTURED_MISSING_ERROR
@@ -231,7 +231,14 @@ local function handler(input, ctx)
   end)
 
   if sess then
-    sess:close()
+    -- A result worth building on, or one the user merely interrupted, leaves
+    -- the session listening: text the user sends to its pane starts another
+    -- turn there. Anything else is the end.
+    if ok and (not out.is_error or out.paused) then
+      sess:listen()
+    else
+      sess:close()
+    end
   end
   permit:release()
   if not ok then

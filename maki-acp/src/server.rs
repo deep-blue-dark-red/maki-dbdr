@@ -1552,6 +1552,8 @@ mod tests {
             model: None,
             opts: None,
             answer_tx,
+            input_tx: None,
+            run_interrupt: None,
         }
     }
 

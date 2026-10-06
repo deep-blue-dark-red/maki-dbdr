@@ -1550,8 +1550,9 @@ tools).
 - `{message}` (`string`) User message to send.
 
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
-failure. A run cut short after streaming some text hands you both: the
-error and a `{ text = <what it streamed> }` table.
+failure. A run cut short hands you both: the error and a table carrying
+`text` (what it streamed, when there was any) and `paused`, which is `true`
+when the session is only interrupted and can be prompted again.
 
 **Example:**
 
@@ -1561,6 +1562,24 @@ if err then error(err) end
 print(r.text)
 print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ```
+
+---
+
+### `Session:listen()` {#Session-listen}
+
+```lua
+Session:listen()
+```
+
+Keep the session answering after this call returns. Text the user sends
+afterwards starts the next turn, and text sent while a turn is running still
+steers it. The session closes itself when it is cancelled from above — the
+user dismissing the task, a respawn, a shutdown — not when the run that
+opened it ends, which is the whole point of handing it off.
+
+Use it instead of `:close()` where the session still has something to say.
+Nothing else changes: the history reaches the parent on close either way.
+Calling it again is a no-op: one driver owns the session.
 
 ---
 

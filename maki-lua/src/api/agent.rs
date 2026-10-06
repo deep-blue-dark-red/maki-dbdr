@@ -3,13 +3,14 @@
 
 use std::collections::HashMap;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex as AsyncMutex;
 use futures::future::{Either, select};
 use maki_agent::agent::{LoadedInstructions, tool_dispatch};
-use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
+use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken, CancelTrigger};
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::registry::ToolRegistry;
 use maki_agent::tools::schema::sanitize_tool_input_schema;
@@ -19,8 +20,9 @@ use maki_agent::tools::{
 };
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, DoneReason,
-    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
-    RunLedger, SessionEvents, SubagentInfo, ToolDoneEvent, event_stream,
+    EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, ExtractedCommand, History, InputSource,
+    InterruptSource, McpSession, RunInterrupt, RunLedger, SessionEvents, SubagentInfo,
+    ToolDoneEvent, event_stream,
 };
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
@@ -645,6 +647,7 @@ async fn session(
     let sub_event_tx = stream_guard.sender(agent_ctx.event_tx.run_id());
     let parent_tx = agent_ctx.event_tx.clone();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (input_tx, input_rx) = flume::unbounded::<String>();
 
     let subagent_info: Arc<OnceLock<SubagentInfo>> = Arc::new(OnceLock::new());
     let (usage_tx, usage_rx) = flume::unbounded();
@@ -665,9 +668,16 @@ async fn session(
         .tool_use_id
         .clone()
         .unwrap_or_else(|| format!("session-{}", MakiId::generate()));
-    // Registered before the session runs so the child token does not fire
-    // on drop and kill the subagent at birth.
-    let (child_trigger, child_cancel) = agent_ctx.cancel.child();
+    // The registration, not the run that opened it, is what ends a session:
+    // a `listen`ing one outlives that run on purpose, and only an external
+    // cancel of its id, a respawn, or its own close stops it. So this token
+    // deliberately has no parent — `agent_ctx.cancel` fires at every run end,
+    // which would kill the session the moment it was handed off.
+    let (child_trigger, child_cancel) = CancelToken::new();
+    // One level down, so stopping the session stops the run with it. Rearmed
+    // per prompt: a stop raised for one run (an interrupt) never reaches the
+    // next, while a cancel from above outlives every rearm.
+    let (run_trigger, run_stop) = child_cancel.child();
     // Several sessions can share one `ui_id`, so keep the slot and retire
     // only ours on close instead of clearing the whole key.
     let cancel_slot = agent_ctx
@@ -718,9 +728,18 @@ async fn session(
         loaded_instructions: LoadedInstructions::new(),
         sub_event_tx,
         stream_guard: Some(stream_guard),
-        child_cancel,
+        child_cancel: child_cancel.clone(),
+        _run_trigger: run_trigger,
+        run_stop: run_stop.clone(),
+        run_interrupt: RunInterrupt::new(child_cancel, run_stop),
         answer_rx: Arc::new(AsyncMutex::new(answer_rx)),
         answer_tx: Some(answer_tx),
+        steer: Some(Arc::new(SteerSource {
+            rx: input_rx,
+            thinking: opts.thinking,
+            fast: opts.fast,
+        })),
+        input_tx: Some(input_tx),
         parent_cancels: Arc::clone(&agent_ctx.subagent_cancels),
         ui_id,
         cancel_slot,
@@ -731,15 +750,14 @@ async fn session(
         usage: TokenUsage::default(),
         usage_rx,
         start: Instant::now(),
-        closed: false,
     };
 
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
+        listening: AtomicBool::new(false),
     })?;
     Ok((Some(sess), None))
 }
-
 lua_table! {
     /// Subagent primitives for plugins that need to talk to an LLM.
     ///
@@ -824,6 +842,39 @@ async fn dispatch_racing_live(
     }
 }
 
+/// Turns text typed into a subagent's pane into queued commands, so it reaches
+/// the run at the next turn boundary like any other interrupt. Going through
+/// [`InterruptSource`] is what keeps the message, its display bubble and the
+/// run's continuation in one place, instead of a second injection path.
+struct SteerSource {
+    rx: flume::Receiver<String>,
+    thinking: ThinkingConfig,
+    fast: bool,
+}
+
+impl InterruptSource for SteerSource {
+    fn poll(&self) -> Option<ExtractedCommand> {
+        let mut inputs = Vec::new();
+        while let Ok(text) = self.rx.try_recv() {
+            inputs.push(AgentInput {
+                message: text,
+                mode: AgentMode::Build,
+                images: Vec::new(),
+                preamble: Vec::new(),
+                earlier: Vec::new(),
+                thinking: self.thinking,
+                fast: self.fast,
+                workflow: false,
+                prompt: None,
+                // Not `Tui`: pane text reaches this plugin-owned session over
+                // `input_tx`, and hooks must see one source per session.
+                source: InputSource::Plugin,
+            });
+        }
+        (!inputs.is_empty()).then_some(ExtractedCommand::Interrupt(inputs))
+    }
+}
+
 struct SessionState {
     params: AgentParams,
     system: String,
@@ -846,9 +897,32 @@ struct SessionState {
     /// [`EventSender`] clones alive past the run, so the relay cannot key off
     /// sender disconnect.
     stream_guard: Option<EventStreamGuard>,
-    child_cancel: maki_agent::cancel::CancelToken,
+    /// Ends the session: an external cancel of its id, a respawn, or
+    /// [`close`](Self::close). Never the run that opened it, which a listening
+    /// session outlives.
+    child_cancel: CancelToken,
+    /// Kept alive only so its drop fires [`run_stop`](Self::run_stop) with the
+    /// session, never earlier: close() cannot interleave with a run, since
+    /// every run holds this same lock to its end, so it never needs the
+    /// trigger to stop one.
+    _run_trigger: CancelTrigger,
+    /// Stops the run in flight and nothing else. Rearmed per prompt, so an
+    /// interrupt of one run never reaches the next, while a cancel of the
+    /// session keeps the token cancelled through every rearm.
+    run_stop: CancelToken,
+    /// What the task pane holds: it stops the run in flight and reports
+    /// whether the session is still there to answer.
+    run_interrupt: RunInterrupt,
     answer_rx: Arc<AsyncMutex<flume::Receiver<String>>>,
     answer_tx: Option<flume::Sender<String>>,
+    /// Polled at every turn boundary, so text the user typed into the pane
+    /// lands before the next model call rather than waiting for another
+    /// `prompt`. Lives here so it spans the whole session, not one run.
+    ///
+    /// `None` once closed: dropping the source is what drops the receiver,
+    /// which is how a frontend tells a listening session from a gone one.
+    steer: Option<Arc<SteerSource>>,
+    input_tx: Option<flume::Sender<String>>,
     parent_cancels: Arc<CancelMap<String>>,
     /// Stable identity for UI, cancel, and history. Falls back to a synthetic
     /// id for workflow-mode sessions (no model-issued tool call exists).
@@ -863,16 +937,22 @@ struct SessionState {
     usage: TokenUsage,
     usage_rx: flume::Receiver<TokenUsage>,
     start: Instant,
-    closed: bool,
 }
 
 impl SessionState {
     fn close(&mut self) {
-        if self.closed {
+        // Taken first and unconditionally: dropping the source drops the
+        // receiver, which is what stops a listening session's driver.
+        self.steer.take();
+        // Ending the session is what closing means, and it is the one signal
+        // both a parked driver and the pane's liveness check read: it wakes the
+        // driver, and it tells a frontend to stop steering a session on its way
+        // out. The run token below it inherits.
+        self.child_cancel.fire();
+        // The guard is taken exactly once, so the flush below runs exactly once.
+        if self.stream_guard.take().is_none() {
             return;
         }
-        self.closed = true;
-        self.stream_guard.take();
         self.parent_cancels.retire(&self.ui_id, self.cancel_slot);
         let messages = std::mem::replace(&mut self.history, History::new(Vec::new())).into_vec();
         let _ = self.parent_event_tx.send(AgentEvent::SubagentHistory {
@@ -891,10 +971,16 @@ impl SessionState {
 
 struct LuaSession {
     inner: Arc<AsyncMutex<SessionState>>,
+    /// Set by [`listen`], which hands the session to a driver task: dropping
+    /// the userdata is then not the end of it, that task is the one to close.
+    listening: AtomicBool,
 }
 
 impl Drop for LuaSession {
     fn drop(&mut self) {
+        if self.listening.load(Ordering::Acquire) {
+            return;
+        }
         match self.inner.try_lock() {
             Some(mut s) => s.close(),
             // Prompt still in flight: close asynchronously so history
@@ -907,37 +993,38 @@ impl Drop for LuaSession {
     }
 }
 
-/// Send a message to the subagent and wait for its full response. The agent
-/// loop runs to completion, calling tools as needed. Conversation history is
-/// kept across calls, so you can have a multi-turn conversation.
-///
-/// The returned table has fields: `text` (string), `duration_ms` (integer),
-/// `input_tokens` (integer), `output_tokens` (integer). `text` is an empty
-/// string when the subagent produced no text block (e.g. it only called
-/// tools).
-///
-/// @param message string User message to send.
-/// @return (table?, string?) Result table on success, or `(nil, err)` on
-/// failure. A run cut short after streaming some text hands you both: the
-/// error and a `{ text = <what it streamed> }` table.
-/// @example
-/// local r, err = sess:prompt("What files are in this project?")
-/// if err then error(err) end
-/// print(r.text)
-/// print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
-#[lua_fn]
-async fn prompt(
-    lua: Lua,
-    this: mlua::UserDataRef<LuaSession>,
-    message: String,
-) -> LuaResult<Pair<Table>> {
-    let inner = Arc::clone(&this.inner);
-    drop(this);
-    let mut guard = inner.lock().await;
-    let s = &mut *guard;
-    if s.closed {
-        return Ok((None, Some(SESSION_CLOSED_ERR.to_owned())));
+/// What one [`run_prompt`] produced, Lua-free so the table stays in `prompt`.
+enum PromptOutcome {
+    Finished(PromptTurn),
+    /// A run cut short after streaming some text: the error and what it got out.
+    /// `paused` says the session is only interrupted and can go on.
+    CutShort {
+        err: String,
+        partial: Option<String>,
+        paused: bool,
+    },
+}
+
+struct PromptTurn {
+    text: String,
+    duration_ms: u64,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+/// One turn-set in a subagent session. Free of `Lua` so a listening session can
+/// drive it from a task of its own; `prompt` is the Lua-shaped wrapper.
+async fn run_prompt(s: &mut SessionState, message: String) -> Result<PromptOutcome, String> {
+    let Some(steer) = s.steer.clone() else {
+        return Err(SESSION_CLOSED_ERR.to_owned());
+    };
+    // A killed session must fail here with a clear error instead of starting
+    // a run that dies the moment the cancel propagates down; `rearm` only
+    // forgets stops aimed at earlier runs, never one from above.
+    if s.child_cancel.is_cancelled() {
+        return Err(SESSION_CLOSED_ERR.to_owned());
     }
+    s.run_stop.rearm();
     if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
             parent_tool_use_id: s.ui_id.clone(),
@@ -946,6 +1033,8 @@ async fn prompt(
             model: Some(s.params.model.spec()),
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
+            input_tx: s.input_tx.take(),
+            run_interrupt: Some(s.run_interrupt.clone()),
         });
     }
 
@@ -961,8 +1050,9 @@ async fn prompt(
         },
     )
     .with_user_response_rx(Arc::clone(&s.answer_rx))
+    .with_interrupt_source(steer)
     .with_loaded_instructions(s.loaded_instructions.clone())
-    .with_cancel(s.child_cancel.clone())
+    .with_cancel(s.run_stop.clone())
     .with_mcp(s.mcp.clone())
     .with_local_tools(Arc::clone(&s.local_tools));
 
@@ -1012,14 +1102,11 @@ async fn prompt(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let tbl = if partial.is_empty() {
-            None
-        } else {
-            let tbl = lua.create_table()?;
-            tbl.set("text", partial)?;
-            Some(tbl)
-        };
-        return Ok((tbl, Some(err)));
+        return Ok(PromptOutcome::CutShort {
+            err,
+            partial: (!partial.is_empty()).then_some(partial),
+            paused: !s.child_cancel.is_cancelled(),
+        });
     }
     // Waiting here doubles as an ordering barrier: the relay reaches `Done` only
     // after every `TurnComplete`, so all our `ToolLive::Usage` messages sit in the
@@ -1043,12 +1130,133 @@ async fn prompt(
         });
     let text = text.map_or_else(String::new, str::to_owned);
 
-    let tbl = lua.create_table()?;
-    tbl.set("text", text)?;
-    tbl.set("duration_ms", s.start.elapsed().as_millis() as u64)?;
-    tbl.set("input_tokens", s.usage.total_input())?;
-    tbl.set("output_tokens", s.usage.output)?;
-    Ok((Some(tbl), None))
+    Ok(PromptOutcome::Finished(PromptTurn {
+        text,
+        duration_ms: s.start.elapsed().as_millis() as u64,
+        input_tokens: s.usage.total_input(),
+        output_tokens: s.usage.output,
+    }))
+}
+
+/// Send a message to the subagent and wait for its full response. The agent
+/// loop runs to completion, calling tools as needed. Conversation history is
+/// kept across calls, so you can have a multi-turn conversation.
+///
+/// The returned table has fields: `text` (string), `duration_ms` (integer),
+/// `input_tokens` (integer), `output_tokens` (integer). `text` is an empty
+/// string when the subagent produced no text block (e.g. it only called
+/// tools).
+///
+/// @param message string User message to send.
+/// @return (table?, string?) Result table on success, or `(nil, err)` on
+/// failure. A run cut short hands you both: the error and a table carrying
+/// `text` (what it streamed, when there was any) and `paused`, which is `true`
+/// when the session is only interrupted and can be prompted again.
+/// @example
+/// local r, err = sess:prompt("What files are in this project?")
+/// if err then error(err) end
+/// print(r.text)
+/// print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
+#[lua_fn]
+async fn prompt(
+    lua: Lua,
+    this: mlua::UserDataRef<LuaSession>,
+    message: String,
+) -> LuaResult<Pair<Table>> {
+    let inner = Arc::clone(&this.inner);
+    drop(this);
+    let mut guard = inner.lock().await;
+    let outcome = match run_prompt(&mut guard, message).await {
+        Ok(outcome) => outcome,
+        Err(err) => return Ok((None, Some(err))),
+    };
+    Ok(match outcome {
+        PromptOutcome::CutShort {
+            err,
+            partial,
+            paused,
+        } => {
+            let tbl = lua.create_table()?;
+            if let Some(text) = partial {
+                tbl.set("text", text)?;
+            }
+            tbl.set("paused", paused)?;
+            (Some(tbl), Some(err))
+        }
+        PromptOutcome::Finished(turn) => {
+            let tbl = lua.create_table()?;
+            tbl.set("text", turn.text)?;
+            tbl.set("duration_ms", turn.duration_ms)?;
+            tbl.set("input_tokens", turn.input_tokens)?;
+            tbl.set("output_tokens", turn.output_tokens)?;
+            (Some(tbl), None)
+        }
+    })
+}
+
+/// Keep the session answering after this call returns. Text the user sends
+/// afterwards starts the next turn, and text sent while a turn is running still
+/// steers it. The session closes itself when it is cancelled from above — the
+/// user dismissing the task, a respawn, a shutdown — not when the run that
+/// opened it ends, which is the whole point of handing it off.
+///
+/// Use it instead of `:close()` where the session still has something to say.
+/// Nothing else changes: the history reaches the parent on close either way.
+/// Calling it again is a no-op: one driver owns the session.
+///
+/// @return
+#[lua_fn]
+async fn listen(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> {
+    // Claiming the one driver slot also tells Drop that the driver, not this
+    // userdata, is the one to close the session.
+    if !claim_driver(&this.listening) {
+        return Ok(());
+    }
+    let inner = Arc::clone(&this.inner);
+    let (steer, cancel) = {
+        let guard = inner.lock().await;
+        let Some(steer) = guard.steer.clone() else {
+            return Ok(());
+        };
+        // Outlives the tool call that is about to return, so it must outlive
+        // the run that opened it too.
+        guard.parent_cancels.park(&guard.ui_id, guard.cancel_slot);
+        (steer, guard.child_cancel.clone())
+    };
+    drop(this);
+    smol::spawn(drive_session(inner, steer, cancel)).detach();
+    Ok(())
+}
+
+/// Claims the single driver slot a session allows. `false` when a driver
+/// already owns the session, so a second `listen()` spawns nothing.
+fn claim_driver(listening: &AtomicBool) -> bool {
+    !listening.swap(true, Ordering::AcqRel)
+}
+
+/// The listening half of a session: one turn-set per message the user sends,
+/// with [`SteerSource`] picking up whatever arrives mid-run instead.
+///
+/// Stops on the session's own token, which an external cancel of the id fires
+/// and which `close` ends outright. Closing releases the steering receiver, so
+/// a frontend can tell a session that is still listening from one that is gone.
+async fn drive_session(
+    inner: Arc<AsyncMutex<SessionState>>,
+    steer: Arc<SteerSource>,
+    cancel: CancelToken,
+) {
+    loop {
+        let text = match cancel.race(steer.rx.recv_async()).await {
+            Ok(Ok(text)) => text,
+            // Cancelled, or the last sender went away: either way, done.
+            _ => break,
+        };
+        let mut guard = inner.lock().await;
+        if run_prompt(&mut guard, text).await.is_err() {
+            break;
+        }
+    }
+    inner.lock().await.close();
 }
 
 /// Close the session and flush its history back to the parent agent. Calling
@@ -1078,7 +1286,7 @@ lua_class! {
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, listen, close]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
@@ -1171,9 +1379,109 @@ mod tests {
             model: None,
             opts: None,
             answer_tx: None,
+            input_tx: None,
+            run_interrupt: None,
         })
         .unwrap();
         info
+    }
+
+    const STEERED_TEXT: &str = "also check the tests";
+    const PENDING_TEXT_NOT_AN_INTERRUPT: &str = "pending text must come back as one interrupt";
+    const SECOND_STEERED_TEXT: &str = "and the docs";
+    const SESSION_DIED_WITH_RUN: &str = "a listening session died with the run that opened it";
+    const UNPARKED_SURVIVED_RUN: &str = "a session the run owned outlived it";
+    const CLAIMS_WON: &str = "exactly one listen may claim the driver slot";
+    const CLAIM_RACERS: usize = 8;
+    const KEY: &str = "task-1";
+
+    /// The run that opened a session ends the moment its tool call returns, and
+    /// ends it by firing its own token and sweeping the session map. A session
+    /// that `listen`ed has to come out the far side of both still alive, which
+    /// is why its token hangs off the registration rather than off that run.
+    #[test]
+    fn a_parked_session_outlives_the_run_that_opened_it() {
+        smol::block_on(async {
+            let (run_trigger, _parent_run) = CancelToken::new();
+            let map: CancelMap<String> = CancelMap::new();
+            let (trigger, session) = CancelToken::new();
+            let slot = map.insert(KEY.to_owned(), trigger);
+            map.park(&KEY.to_owned(), slot);
+            let (_stop_trigger, run_stop) = session.child();
+            run_stop.rearm();
+
+            drop(run_trigger);
+            map.cancel_all();
+
+            assert!(!session.is_cancelled(), "{SESSION_DIED_WITH_RUN}");
+            assert!(!run_stop.is_cancelled(), "{SESSION_DIED_WITH_RUN}");
+        });
+    }
+
+    /// A sibling session that never parked is still the run's to stop.
+    #[test]
+    fn an_unparked_session_still_dies_with_the_run() {
+        let map: CancelMap<String> = CancelMap::new();
+        let (trigger, session) = CancelToken::new();
+        map.insert(KEY.to_owned(), trigger);
+
+        map.cancel_all();
+
+        assert!(session.is_cancelled(), "{UNPARKED_SURVIVED_RUN}");
+    }
+
+    /// Two `listen()`s must not race over the same receiver: however they
+    /// interleave, exactly one claims the driver slot.
+    #[test]
+    fn only_one_listen_claims_the_driver_slot() {
+        let listening = AtomicBool::new(false);
+        let claims = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..CLAIM_RACERS)
+                .map(|_| scope.spawn(|| claim_driver(&listening)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|won| *won)
+                .count()
+        });
+        assert_eq!(claims, 1, "{CLAIMS_WON}");
+    }
+
+    fn steer_source(rx: flume::Receiver<String>) -> SteerSource {
+        SteerSource {
+            rx,
+            thinking: ThinkingConfig::default(),
+            fast: false,
+        }
+    }
+
+    /// An idle pane must read as `None`, the `InterruptSource` answer for
+    /// "nothing queued" — not as an interrupt carrying nothing.
+    #[test]
+    fn steer_source_is_silent_without_input() {
+        let (_tx, rx) = flume::unbounded();
+        assert!(steer_source(rx).poll().is_none());
+    }
+
+    /// Everything typed since the last turn goes out as one command, so one
+    /// request answers the whole burst instead of one message per turn.
+    #[test]
+    fn steer_source_drains_pending_text_into_one_interrupt() {
+        let (tx, rx) = flume::unbounded();
+        let source = steer_source(rx);
+        tx.send(STEERED_TEXT.into()).unwrap();
+        tx.send(SECOND_STEERED_TEXT.into()).unwrap();
+
+        let Some(ExtractedCommand::Interrupt(inputs)) = source.poll() else {
+            panic!("{PENDING_TEXT_NOT_AN_INTERRUPT}");
+        };
+        let queued: Vec<&str> = inputs.iter().map(|i| i.message.as_str()).collect();
+        assert_eq!(queued, [STEERED_TEXT, SECOND_STEERED_TEXT]);
+        assert!(
+            source.poll().is_none(),
+            "a poll must drain what it handed over"
+        );
     }
 
     /// Dropping the guard is what ends the relay: a Lua tool context keeps a

@@ -1,7 +1,7 @@
 //! Content-addressed side table: every elided/merged original is recoverable
 //! via `rstring expand <hash16>`.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
