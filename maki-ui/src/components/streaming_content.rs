@@ -180,17 +180,21 @@ impl StreamingContent {
 
     pub fn render_lines(&mut self, width: u16) -> &[Line<'static>] {
         self.typewriter.tick();
-        self.cache.get_or_update(
+        let repopulated = self.cache.get_or_update(
             &mut self.renderer,
             self.typewriter.visible(),
             self.paint,
             width,
             true,
         );
-        if !self
-            .wrap
-            .as_ref()
-            .is_some_and(|w| w.describes(&self.cache.lines, width))
+        // `describes` only checks width and line count, so a line that merely
+        // grew in place would keep a stale index; repopulated means the painted
+        // lines changed even when their count did not.
+        if repopulated
+            || !self
+                .wrap
+                .as_ref()
+                .is_some_and(|w| w.describes(&self.cache.lines, width))
         {
             self.wrap = Some(WrapIndex::build(&self.cache.lines, width));
         }
@@ -404,6 +408,22 @@ mod tests {
             true,
         );
         assert_eq!(cache_lines_text(&cache), full_render_lines(text, "", width));
+    }
+
+    #[test]
+    fn wrap_index_rebuilds_when_a_streamed_line_grows() {
+        let style = Style::default();
+        let mut sc = StreamingContent::new("", style, style, 0);
+        sc.push("aaaa");
+        sc.render_lines(4);
+        let before = sc.wrapped_height();
+        sc.push(&"a".repeat(40));
+        sc.render_lines(4);
+        assert!(
+            sc.wrapped_height() > before,
+            "stale wrap index: {before} -> {}",
+            sc.wrapped_height()
+        );
     }
 
     #[test]

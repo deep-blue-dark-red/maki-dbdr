@@ -1051,6 +1051,26 @@ mod tests {
     }
 
     #[test]
+    fn render_never_panics_on_arbitrary_markdown() {
+        let mut rng = fastrand::Rng::with_seed(0x5EED);
+        let toks = [
+            "|", " --- |", "|:-:|", "\n", "\r\n", " ", "a", "**", "`", "```", "#", "> ", "- ",
+            "  ", "🙂", "你",
+        ];
+        for width in [0u16, 1, 3, 10, 80] {
+            for _ in 0..500 {
+                let mut s = String::new();
+                for _ in 0..rng.usize(0..80) {
+                    s.push_str(toks[rng.usize(..toks.len())]);
+                }
+                // Tables, code fences and wide chars are the byte-offset heavy
+                // paths; arbitrary structure at any width must not panic.
+                let _ = render(&s, width);
+            }
+        }
+    }
+
+    #[test]
     fn render_table_header_row_cells_are_bold() {
         let lines = render("| Header |\n| --- |\n| Data |", TEST_WIDTH);
         let header = find_span(&lines, "Header").expect("header span");

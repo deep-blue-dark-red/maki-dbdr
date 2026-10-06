@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
@@ -18,8 +18,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use super::apply_scroll_delta;
 use super::scrollbar::render_vertical_scrollbar;
-use super::{apply_scroll_delta, visual_line_count};
 use crate::selection::LineBreaks;
 
 const CHEVRON: &str = super::CHEVRON;
@@ -223,7 +223,7 @@ impl InputBox {
             self.buffer
                 .lines()
                 .iter()
-                .map(|line| visual_line_count(line.width(), ew) as u16),
+                .map(|line| wrapped_rows(line, ew, false) as u16),
         )
     }
 
@@ -354,7 +354,7 @@ impl InputBox {
             .lines()
             .iter()
             .take(self.buffer.y())
-            .map(|line| visual_line_count(line.width(), ew) as u16)
+            .map(|line| wrapped_rows(line, ew, false) as u16)
             .sum();
 
         let wrap_row = cursor_wrap_row(&self.buffer.lines()[self.buffer.y()], ew, self.buffer.x());
@@ -826,14 +826,21 @@ fn total_visual_lines(buffer: &TextBuffer, ew: usize) -> usize {
         .lines()
         .iter()
         .enumerate()
-        .map(|(i, line)| {
-            let mut text_len = line.width();
-            if i == cursor_y {
-                text_len += 1;
-            }
-            visual_line_count(text_len, ew)
-        })
+        .map(|(i, line)| wrapped_rows(line, ew, i == cursor_y))
         .sum()
+}
+
+/// Wrapped row count for one buffer line, matching [`wrap_ranges`] exactly so
+/// the input box height agrees with what is drawn: a wide char (CJK, emoji)
+/// that does not fit at the row's end wraps to the next row instead of being
+/// charged a fraction of a row. `is_cursor_line` adds the trailing caret row
+/// when the cursor sits past a completely full last row.
+fn wrapped_rows(line: &str, ew: usize, is_cursor_line: bool) -> usize {
+    if ew == 0 {
+        return 1;
+    }
+    let widths: Vec<usize> = line.chars().map(|c| c.width().unwrap_or(1)).collect();
+    wrap_ranges(&widths, ew, is_cursor_line).len()
 }
 
 #[cfg(test)]
@@ -912,6 +919,24 @@ mod tests {
             input.buffer.add_line();
         }
         assert_eq!(input.height(TEST_WIDTH), 3 + 2);
+    }
+
+    #[test_case("ab你好", 3, 3 ; "wide_char_straddles_row")]
+    #[test_case("abc", 3, 1 ; "exact_fit")]
+    #[test_case("abcd", 3, 2 ; "ascii_overflow")]
+    #[test_case("", 3, 1 ; "empty")]
+    fn wrapped_rows_matches_rendered_rows(line: &str, ew: usize, expected: usize) {
+        assert_eq!(wrapped_rows(line, ew, false), expected);
+        let (rows, _) = wrap_line(line, ew, false, 0, true, None, false);
+        assert_eq!(rows.len(), expected, "rendered row count must agree");
+    }
+
+    #[test]
+    fn height_counts_wide_chars_like_the_renderer() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        type_text(&mut input, "ab你好");
+        // ew = width - PREFIX_WIDTH; pick width so the two wide chars wrap.
+        assert_eq!(input.height(PREFIX_WIDTH + 3), 3 + BORDER_ROWS);
     }
 
     #[test]

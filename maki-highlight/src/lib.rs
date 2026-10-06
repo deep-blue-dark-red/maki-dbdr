@@ -839,6 +839,30 @@ mod tests {
     }
 
     #[test]
+    fn code_highlighter_matches_fresh_render_after_shrink_and_regrow() {
+        warmup();
+        let less = "fn main() {\n    let x = 42;\n";
+        let more = "fn main() {\n    let x = 42;\n    println!(\"{}\", x);\n}\n";
+
+        let mut ch = CodeHighlighter::new(RUST);
+        // Grow past `more`, then shrink back (the fence-close replay path), then
+        // grow again: every step must match a fresh render of the same text.
+        ch.update(more);
+        let shrunk = ch.update(less);
+        assert_eq!(
+            lines_text(&highlight_code(RUST, less, "")),
+            lines_text(shrunk),
+            "shrink replay must match a fresh render"
+        );
+        let regrown = ch.update(more);
+        assert_eq!(
+            lines_text(&highlight_code(RUST, more, "")),
+            lines_text(regrown),
+            "regrow after shrink must match a fresh render"
+        );
+    }
+
+    #[test]
     fn normalize_text_tabs_and_newlines() {
         assert_eq!(normalize_text("\t\t"), format!("{TAB_SPACES}{TAB_SPACES}"));
         assert_eq!(normalize_text("hello\n"), "hello");

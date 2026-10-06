@@ -957,6 +957,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_never_panics_on_arbitrary_markdown() {
+        let mut rng = fastrand::Rng::with_seed(0xBADC0DE);
+        let toks = [
+            "|", " --- |", "|:-:|", "\n", "\r\n", " ", "a", "**", "`", "```", "#", "> ", "- ",
+            "  ", "🙂", "你",
+        ];
+        for _ in 0..1000 {
+            let mut s = String::new();
+            for _ in 0..rng.usize(0..80) {
+                s.push_str(toks[rng.usize(..toks.len())]);
+            }
+            // `split_normal_blocks`'s table offsets are the trickiest byte
+            // bookkeeping in the parser; arbitrary structure must not panic.
+            for b in &parse(&s) {
+                if let Block::Table { rows, header_end } = b {
+                    assert!(*header_end <= rows.len(), "header_end out of range: {s:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parse_inline_visible_text_invariant() {
         let cases = [
             "plain text",
