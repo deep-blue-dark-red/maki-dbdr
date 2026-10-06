@@ -18,6 +18,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | configurable | Next / previous task chat |
 | configurable | Search messages |
 | configurable | File picker |
+| configurable | Change working directory |
 | configurable | Toggle verbose mode |
 | configurable | Open sessions list |
 | configurable | Switch to next session |

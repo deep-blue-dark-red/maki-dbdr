@@ -170,6 +170,7 @@ pub struct ConfiguredKeybindings {
     pub delete_word: Bind,
     pub search: Bind,
     pub file_picker: Bind,
+    pub change_cwd: Bind,
     pub toggle_verbose: Bind,
     pub open_editor: Bind,
     pub edit_system_prompt: Bind,
@@ -205,6 +206,7 @@ impl Default for ConfiguredKeybindings {
             delete_word: ctrl_bind!('w', "delete_word"),
             search: ctrl_bind!('f', "search"),
             file_picker: ctrl_bind!('s', "file_picker"),
+            change_cwd: ctrl_bind!('d', "change_cwd"),
             toggle_verbose: ctrl_bind!('o', "toggle_verbose"),
             open_editor: Bind {
                 code: KeyCode::Char('p'),
@@ -297,6 +299,7 @@ pub fn get_configured_bind(name: &str) -> Option<Bind> {
         "delete_word" => Some(read.delete_word),
         "search" => Some(read.search),
         "file_picker" => Some(read.file_picker),
+        "change_cwd" => Some(read.change_cwd),
         "toggle_verbose" => Some(read.toggle_verbose),
         "open_editor" => Some(read.open_editor),
         "edit_system_prompt" => Some(read.edit_system_prompt),
@@ -445,6 +448,7 @@ pub fn update_bind(action: &str, bind_str: &str) -> bool {
                 "delete_word" => write.delete_word = bind,
                 "search" => write.search = bind,
                 "file_picker" => write.file_picker = bind,
+                "change_cwd" => write.change_cwd = bind,
                 "toggle_verbose" => write.toggle_verbose = bind,
                 "open_editor" => write.open_editor = bind,
                 "edit_system_prompt" => write.edit_system_prompt = bind,
@@ -501,6 +505,7 @@ pub mod key {
     pub const SEARCH: Bind = ctrl_bind!('f', "search");
     pub const FILE_PICKER: Bind = ctrl_bind!('s', "file_picker");
     pub const TOGGLE_VERBOSE: Bind = ctrl_bind!('o', "toggle_verbose");
+    pub const CHANGE_CWD: Bind = ctrl_bind!('d', "change_cwd");
     pub const OPEN_EDITOR: Bind = Bind {
         code: KeyCode::Char('p'),
         modifiers: KeyModifiers::ALT,
@@ -758,6 +763,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Action("file_picker"),
         description: "File picker",
+        context: KeybindContext::General,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Action("change_cwd"),
+        description: "Change working directory",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -1088,6 +1099,7 @@ mod tests {
     #[test_case("shift_session_up")]
     #[test_case("delete_current_session")]
     #[test_case("toggle_global_sessions")]
+    #[test_case("change_cwd")]
     fn update_bind_routes_session_actions(action: &str) {
         assert!(update_bind(action, "ctrl+shift+x"));
         assert_eq!(get_configured_bind(action).unwrap().name, Some(action));

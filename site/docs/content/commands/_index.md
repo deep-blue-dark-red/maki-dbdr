@@ -49,6 +49,7 @@ Type `/` in the input box to open the command palette.
 | `/plugins` | Enable or disable built-in Lua plugins |
 | `/rewind` | Show rewind menu to delete turns |
 | `/aa_scores` | Refresh the cached Artificial Analysis intelligence scores |
+| `/cd-pick` | Pick a folder and change the working directory |
 | `/memory` | View, edit, move, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |

@@ -621,6 +621,7 @@ pub enum BuiltinAction {
     PrevChat,
     NextChat,
     ModelPicker,
+    ChangeCwd,
 }
 
 pub enum UiAction {

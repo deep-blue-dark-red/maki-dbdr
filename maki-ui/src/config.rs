@@ -290,6 +290,7 @@ pub fn save_config(settings: &UserSettings) {
         "delete_word",
         "search",
         "file_picker",
+        "change_cwd",
         "toggle_verbose",
         "open_editor",
         "edit_system_prompt",

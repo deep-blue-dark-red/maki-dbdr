@@ -393,7 +393,7 @@ fn set_window_title(
 ///
 /// Valid names: `"file_picker"`, `"search"`, `"help"`,
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-/// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
+/// `"prev_chat"`, `"next_chat"`, `"model_picker"`, `"change_cwd"`.
 ///
 /// There is no action for sending the user's message. To take keys like
 /// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
