@@ -1,6 +1,7 @@
 local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
+local TextInput = require("maki.text_input")
 local Toast = require("maki.toast")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines", "ast_grep_replace", "create_plugin" }
@@ -173,6 +174,14 @@ local function cmd_delete(path, dir)
   return "deleted " .. path
 end
 
+local function cmd_move(path, new_path, dir)
+  local ok, err = helpers.move_file(dir, path, new_path)
+  if not ok then
+    return nil, err
+  end
+  return "moved " .. path .. " -> " .. new_path
+end
+
 local function with_dir(res, dir)
   local prefix = "dir: " .. dir .. "\n\n"
   if type(res) == "string" then
@@ -193,15 +202,20 @@ maki.api.register_tool({
     properties = {
       command = {
         type = "string",
-        enum = { "list", "read", "write", "delete" },
-        description = "Action name only: list, read, write, or delete. Pass arguments in separate fields. "
+        enum = { "list", "read", "write", "delete", "move" },
+        description = "Action name only: list, read, write, delete, or move. Pass arguments in separate fields. "
           .. "list: optional tags, returns index. read: path or tags, returns bodies. "
-          .. "write: path and content, optional tags, creates or overwrites. delete: path.",
+          .. "write: path and content, optional tags, creates or overwrites. delete: path. "
+          .. "move: path and new_path, renames a note; never overwrites.",
         required = true,
       },
       path = {
         type = "string",
         description = "Relative path, e.g. 'architecture.md'.",
+      },
+      new_path = {
+        type = "string",
+        description = "Target file name for move (notes are flat; must not exist).",
       },
       content = { type = "string", description = "Body for write (frontmatter added automatically)." },
       tags = {
@@ -218,6 +232,9 @@ maki.api.register_tool({
       parts[#parts + 1] = input.path
     elseif input.tags then
       parts[#parts + 1] = table.concat(input.tags, ",")
+    end
+    if input.new_path then
+      parts[#parts + 1] = "-> " .. input.new_path
     end
     return table.concat(parts, " ")
   end,
@@ -254,6 +271,8 @@ maki.api.register_tool({
       result, err = cmd_write(input.path, input.content, input.tags, dir, ctx)
     elseif cmd == "delete" then
       result, err = cmd_delete(input.path, dir)
+    elseif cmd == "move" then
+      result, err = cmd_move(input.path, input.new_path, dir)
     end
     if err then
       return { llm_output = "error: " .. err, is_error = true }
@@ -328,9 +347,50 @@ local function save_view(view)
   end
 end
 
+-- One-line prompt in a small focused float, prefilled so a move is an edit of
+-- the current name. Returns the trimmed text, or nil when dismissed.
+local function prompt_name(title, initial)
+  local input = TextInput.new()
+  input:insert_text(initial)
+  local buf = maki.ui.buf()
+  local win = maki.ui.open_win(buf, {
+    title = title,
+    width = math.max(#title + 16, 44),
+    height = 3,
+    footer = { { "Enter", "move" }, { "Esc", "cancel" } },
+  })
+
+  local function draw(width)
+    local r = input:render("> ", nil, width)
+    buf:set_lines(r.lines)
+  end
+  draw(win.width)
+
+  while true do
+    local ev = win:recv()
+    if not ev or ev.type == "close" then
+      return nil
+    end
+    if ev.type == "resize" then
+      draw(ev.width)
+    elseif ev.type == "key" then
+      if ev.key == "<Esc>" or ev.key == "<C-c>" then
+        win:close()
+        return nil
+      elseif ev.key == "<CR>" then
+        local name = input:value():match("^%s*(.-)%s*$")
+        win:close()
+        return name ~= "" and name or nil
+      elseif input:handle_key(ev.key) ~= "ignored" then
+        draw(win.width)
+      end
+    end
+  end
+end
+
 maki.api.register_command({
   name = "/memory",
-  description = "View, edit, and delete memory files",
+  description = "View, edit, move, and delete memory files",
   handler = function()
     local dir = resolve_dir(true)
     if not dir then
@@ -363,6 +423,7 @@ maki.api.register_command({
           return item.label
         end,
         submit_keys = { "<C-o>" },
+        action_keys = { "<C-m>" },
         live_keys = {
           ["<Tab>"] = function()
             view = view % #VIEWS + 1
@@ -373,6 +434,7 @@ maki.api.register_command({
         footer = {
           { "Enter", "open" },
           { "Ctrl+O", "edit" },
+          { "Ctrl+M", "move" },
           { "Ctrl+D", "delete" },
           { "Tab", "switch view" },
         },
@@ -399,6 +461,18 @@ maki.api.register_command({
         else
           notify("Delete failed: " .. tostring(err))
         end
+      elseif event.type == "key" and event.key == "<C-m>" then
+        local label = event.item and event.item.label
+        local new_name = label and prompt_name(" Move " .. label .. " to ", label)
+        if new_name and new_name ~= label then
+          local ok, err = helpers.move_file(dir, label, new_name)
+          if ok then
+            notify("Moved " .. label .. " -> " .. new_name)
+          else
+            notify("Move failed: " .. tostring(err))
+          end
+        end
+        items = build()
       else
         break
       end
