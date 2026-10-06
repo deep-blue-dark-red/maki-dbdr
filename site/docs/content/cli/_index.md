@@ -29,7 +29,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | no | no | yes |
-| `--session-id`, `--fork-session` | yes | yes | yes |
+| `--session-id`, `--session-name`, `--fork-session` | yes | yes | yes |
 | `--max-turns` | no | no | yes |
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
@@ -55,6 +55,7 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
+| `--session-name <NAME>` | Alias for this directory's readable session links. Defaults to the folder's own name. See [Sessions](/docs/headless/#sessions) |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |

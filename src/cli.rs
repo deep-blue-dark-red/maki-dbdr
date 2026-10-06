@@ -116,6 +116,11 @@ pub struct Cli {
     #[arg(long)]
     pub session_id: Option<String>,
 
+    /// Alias for this directory's readable session links; defaults to the
+    /// folder's own name
+    #[arg(long, visible_alias = "sessionName")]
+    pub session_name: Option<String>,
+
     /// Fork the loaded session under a new ID
     #[arg(long, requires = "loaded")]
     pub fork_session: bool,

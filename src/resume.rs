@@ -9,13 +9,17 @@ use color_eyre::eyre::eyre;
 use maki_agent::session::{Resumed, StoredSession};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
-use maki_storage::sessions::{SessionClaim, SessionError};
+use maki_storage::sessions::{SessionClaim, SessionError, set_cwd_alias};
 use maki_ui::OpenSession;
 
 use crate::cli::Cli;
 
 const NO_PREVIOUS_SESSION: &str = "no previous session found for this directory, starting new";
 const LATEST_UNREADABLE: &str = "failed to load latest session, starting new";
+const EMPTY_SESSION_NAME: &str = "--session-name needs a non-empty name";
+/// The alias only labels the directory's readable links, so a state dir that
+/// cannot record it costs the run nothing but the named links.
+const ALIAS_UNWRITABLE: &str = "failed to record session name; links will use the folder name";
 const ID_IN_USE: &str = "--session-id names a session that already exists";
 const ID_IN_USE_HINT: &str = "pass -r/--resume to continue it, or --fork-session to copy it";
 /// For a run that already passed `--fork-session`. Suggesting the flag they
@@ -152,6 +156,7 @@ impl Source {
 /// A run claims only the id it writes. The source of a copy is read without a
 /// claim, so another run holding it open does not stop the copy.
 pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
+    seed_alias(cli, cwd, storage)?;
     let source = Source::from_flags(cli, cwd, storage)?;
     // `--fork-session` promises to leave the original alone, so its transcript
     // is never a candidate to write over, however the id lands.
@@ -195,6 +200,25 @@ pub fn resolve(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<Resolved> {
         claim,
         session,
     })
+}
+
+/// Records `--session-name` as the directory's link alias before the run can
+/// save anything under it.
+fn seed_alias(cli: &Cli, cwd: &str, storage: &StateDir) -> Result<()> {
+    let Some(name) = cli.session_name.as_deref() else {
+        return Ok(());
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(eyre!("{EMPTY_SESSION_NAME}"));
+    }
+    match set_cwd_alias(storage, cwd, name) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, cwd, "{ALIAS_UNWRITABLE}");
+            Ok(())
+        }
+    }
 }
 
 /// `--session-id` when given, else the session continued in place, else a
@@ -652,5 +676,49 @@ mod tests {
         let as_run = resolve(&cli, &cwd, &storage).expect("resolves");
         let reported = as_run.id.id();
         assert_eq!(as_run.into_resumed().0.id.id(), reported);
+    }
+
+    /// Readable links are the one thing a name buys, so the assertion walks
+    /// the view for a link the alias names and checks it points at the run.
+    #[test]
+    fn session_name_names_the_directorys_links() {
+        const ALIAS: &str = "maki";
+        const BY_PATH: &str = "by-path";
+        let (_dir, storage, cwd) = empty_storage();
+        resolve(
+            &Cli::parse_from(["maki", "--session-name", ALIAS]),
+            &cwd,
+            &storage,
+        )
+        .expect("resolves");
+        let stored = save_session(&storage, &cwd, STORED_SPEC, STORED_MESSAGE);
+
+        let view = storage.path().join(SESSIONS_DIR).join(BY_PATH);
+        let mut named = None;
+        for folder in fs::read_dir(&view).unwrap().flatten() {
+            for link in fs::read_dir(folder.path()).unwrap().flatten() {
+                let name = link.file_name().to_string_lossy().into_owned();
+                if name.ends_with(&format!("-{ALIAS}.jsonl")) {
+                    named = Some(fs::read_link(link.path()).unwrap());
+                }
+            }
+        }
+        assert_eq!(
+            named.expect("the run's link"),
+            std::path::Path::new(&format!("../../{stored}.jsonl"))
+        );
+    }
+
+    #[test]
+    fn an_empty_session_name_is_refused() {
+        let (_dir, storage, cwd) = empty_storage();
+        let Err(error) = resolve(
+            &Cli::parse_from(["maki", "--session-name", "   "]),
+            &cwd,
+            &storage,
+        ) else {
+            panic!("an empty name is refused");
+        };
+        assert!(error.to_string().contains(EMPTY_SESSION_NAME));
     }
 }

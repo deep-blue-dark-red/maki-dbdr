@@ -36,6 +36,13 @@ const TURN_STATS_DIR: &str = "turnstats";
 const MLOGS_DIR: &str = "mlogs";
 const CWD_INDEX_FILE: &str = "cwd_latest.json";
 const CWD_INDEX_STEM: &str = "cwd_latest";
+/// Readable links to session logs, filed as `by-path/<folder>/<ts>-<alias>.jsonl`.
+const BY_PATH_DIR: &str = "by-path";
+/// How a session's creation time shows up in its link name, always UTC.
+const LINK_TIME_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
+/// Alias for a cwd [`Path::file_name`] cannot name, and for names that
+/// sanitize down to nothing.
+const ALIAS_FALLBACK: &str = "root";
 const SCAN_CACHE_FILE: &str = "scan_cache.json";
 const SCAN_CACHE_STEM: &str = "scan_cache";
 const NON_SESSION_STEMS: [&str; 2] = [CWD_INDEX_STEM, SCAN_CACHE_STEM];
@@ -904,7 +911,7 @@ impl SessionLog {
     {
         claim.allows(session.id)?;
         let log = Self::write_canonical(dir, session)?;
-        update_cwd_index(dir, &session.cwd, session.id)?;
+        update_cwd_index(dir, &session.cwd, session.id, session.created_at)?;
         Ok(log)
     }
 
@@ -1016,8 +1023,12 @@ impl SessionLog {
         {
             // A failed write can leave partial bytes; roll back to the last
             // record boundary so the file matches the unadvanced cursors and
-            // a retry appends cleanly instead of duplicating records.
-            let _ = self.file.set_len(self.saved_len);
+            // a retry appends cleanly instead of duplicating records. Sync the
+            // truncation too, or a crash here leaves the torn bytes on disk.
+            let _ = self
+                .file
+                .set_len(self.saved_len)
+                .and_then(|()| self.file.sync_data());
             return Err(StorageError::from(e).into());
         }
 
@@ -1317,11 +1328,59 @@ where
 
 // -- CWD index --
 
-fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
+/// One directory's row in [`CWD_INDEX_FILE`]: the newest session there and
+/// the alias its readable links are named with. Files written before the
+/// alias existed store bare id strings.
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct CwdIndexEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawCwdEntry {
+    Entry(CwdIndexEntry),
+    LegacyId(String),
+}
+
+fn load_cwd_index(dir: &Path) -> HashMap<String, CwdIndexEntry> {
     fs::read(dir.join(CWD_INDEX_FILE))
         .ok()
-        .and_then(|data| serde_json::from_slice(&data).ok())
+        .and_then(|data| serde_json::from_slice::<HashMap<String, RawCwdEntry>>(&data).ok())
+        .map(|raw| {
+            raw.into_iter()
+                .map(|(cwd, entry)| {
+                    let entry = match entry {
+                        RawCwdEntry::Entry(entry) => entry,
+                        RawCwdEntry::LegacyId(id) => CwdIndexEntry {
+                            latest: Some(id),
+                            name: None,
+                        },
+                    };
+                    (cwd, entry)
+                })
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Names the alias a directory's session links are filed under, ahead of the
+/// first save that would default it to the folder's own name.
+pub fn set_cwd_alias(dir: &StateDir, cwd: &str, name: &str) -> Result<(), StorageError> {
+    let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
+    let mut index = load_cwd_index(&sessions_dir);
+    let entry = index.entry(cwd.to_string()).or_default();
+    if entry.name.as_deref() == Some(name) {
+        return Ok(());
+    }
+    entry.name = Some(name.to_owned());
+    atomic_write(
+        &sessions_dir.join(CWD_INDEX_FILE),
+        &serde_json::to_vec(&index)?,
+    )
 }
 
 /// The directories sessions were recorded in, most recently used first and at
@@ -1341,7 +1400,7 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, String> {
 pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
     let mut entries: Vec<(Option<(u64, u32)>, String)> = load_cwd_index(sessions_dir)
         .into_iter()
-        .map(|(cwd, session_id)| (session_time(&session_id), cwd))
+        .filter_map(|(cwd, entry)| entry.latest.map(|id| (session_time(&id), cwd)))
         .collect();
     entries.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     entries.truncate(limit);
@@ -1356,6 +1415,7 @@ pub(crate) fn recorded_cwds(sessions_dir: &Path, limit: usize) -> Vec<String> {
 fn latest_id_in(cwd: &str, dir: &Path) -> Result<Option<MakiId>, SessionError> {
     let cached = load_cwd_index(dir)
         .remove(cwd)
+        .and_then(|entry| entry.latest)
         .and_then(|s| match s.parse::<MakiId>() {
             Ok(id) => Some(id),
             Err(e) => {
@@ -1381,15 +1441,173 @@ fn session_time(session_id: &str) -> Option<(u64, u32)> {
     Some(Uuid::from_bytes(*id.as_bytes()).get_timestamp()?.to_unix())
 }
 
-fn update_cwd_index(dir: &Path, cwd: &str, session_id: MakiId) -> Result<(), StorageError> {
+/// Claims `session` as `cwd`'s newest and files its log into the readable
+/// link view under the directory's alias. The alias defaults to the folder's
+/// own name and only [`set_cwd_alias`] moves it.
+fn update_cwd_index(
+    dir: &Path,
+    cwd: &str,
+    session_id: MakiId,
+    created_at: u64,
+) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
+    let entry = index.entry(cwd.to_string()).or_default();
     let id_str = session_id.to_string();
-    if index.get(cwd).is_some_and(|v| *v == id_str) {
-        return Ok(());
+    let mut changed = entry.latest.as_deref() != Some(id_str.as_str());
+    entry.latest = Some(id_str);
+    let alias = match &entry.name {
+        Some(name) => name.clone(),
+        None => {
+            let alias = default_alias(cwd);
+            entry.name = Some(alias.clone());
+            changed = true;
+            alias
+        }
+    };
+    if changed {
+        atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)?;
     }
-    index.insert(cwd.to_string(), id_str);
-    atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)
+    link_session_log(dir, cwd, &alias, created_at, session_id)
 }
+
+/// The links name the directory itself when nothing named an alias.
+fn default_alias(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(ALIAS_FALLBACK)
+        .to_owned()
+}
+
+fn link_stamp(created_at: u64) -> Option<String> {
+    let seconds = i64::try_from(created_at).ok()?;
+    jiff::Timestamp::from_second(seconds)
+        .ok()
+        .map(|t| t.strftime(LINK_TIME_FORMAT).to_string())
+}
+
+/// One path component of a link name: anything a shell or a filesystem would
+/// trip on becomes `-`.
+fn link_component(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// The folder one cwd's links live under, readable over reversible: `/`
+/// becomes `--` and odd characters become `-`. Two paths can in principle
+/// collapse into one folder; the index holds the real mapping and this is
+/// only a view over it.
+fn view_dir_name(cwd: &str) -> String {
+    let folder: String = cwd
+        .trim_start_matches('/')
+        .split('/')
+        .map(link_component)
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join("--");
+    if folder.is_empty() {
+        ALIAS_FALLBACK.to_owned()
+    } else {
+        folder
+    }
+}
+
+/// Files a link to the session's log, as
+/// `by-path/<folder>/<yyyy-mm-dd-hh-mm-ss>-<alias>.jsonl`. A link never
+/// renames once written: its name is how a previous session stays findable.
+#[cfg(unix)]
+fn link_session_log(
+    dir: &Path,
+    cwd: &str,
+    alias: &str,
+    created_at: u64,
+    session_id: MakiId,
+) -> Result<(), StorageError> {
+    use std::os::unix::fs::symlink;
+
+    let Some(stamp) = link_stamp(created_at) else {
+        return Ok(());
+    };
+    let alias = link_component(alias);
+    let alias = if alias.is_empty() {
+        ALIAS_FALLBACK
+    } else {
+        &alias
+    };
+    let folder = dir.join(BY_PATH_DIR).join(view_dir_name(cwd));
+    fs::create_dir_all(&folder)?;
+    let target = format!("../../{session_id}.jsonl");
+    // Two sessions created in the same second share a stamp, so the id
+    // disambiguates whatever the plain name missed.
+    let short_id: String = session_id.to_string().chars().take(6).collect();
+    for name in [
+        format!("{stamp}-{alias}.jsonl"),
+        format!("{stamp}-{alias}-{short_id}.jsonl"),
+    ] {
+        let link = folder.join(name);
+        match fs::read_link(&link) {
+            Ok(existing) if existing == Path::new(&target) => return Ok(()),
+            Ok(_) => continue,
+            Err(_) => {
+                symlink(&target, &link)?;
+                return Ok(());
+            }
+        }
+    }
+    warn!(session_id = %session_id, "session link names already taken");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_session_log(
+    _dir: &Path,
+    _cwd: &str,
+    _alias: &str,
+    _created_at: u64,
+    _session_id: MakiId,
+) -> Result<(), StorageError> {
+    Ok(())
+}
+
+/// Drops a deleted session's links. The index only ever named the latest
+/// session, so the view is walked for links pointing at the log.
+#[cfg(unix)]
+fn remove_session_links(dir: &Path, session_id: MakiId) {
+    let log_name = format!("{session_id}.jsonl");
+    let Ok(folders) = fs::read_dir(dir.join(BY_PATH_DIR)) else {
+        return;
+    };
+    for folder in folders.flatten() {
+        let Ok(links) = fs::read_dir(folder.path()) else {
+            continue;
+        };
+        for link in links.flatten() {
+            let points_here = fs::read_link(link.path())
+                .is_ok_and(|target| target.file_name().is_some_and(|n| n == log_name.as_str()));
+            if points_here && let Err(e) = fs::remove_file(link.path()) {
+                warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    "session link remains after delete"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_session_links(_dir: &Path, _session_id: MakiId) {}
 
 /// The per-session turn-stats log, `<state>/sessions/turnstats/<id>.jsonl`,
 /// one JSON record per completed turn. Written by the UI in batches; read
@@ -1465,9 +1683,22 @@ fn try_remove(path: &Path) -> Result<bool, StorageError> {
 
 fn remove_from_cwd_index(dir: &Path, session_id: MakiId) -> Result<(), StorageError> {
     let mut index = load_cwd_index(dir);
+    let mut changed = false;
+    // The alias survives the session: it names the directory, so the next
+    // session there keeps filing links under it.
+    for entry in index.values_mut() {
+        if entry
+            .latest
+            .as_deref()
+            .is_some_and(|id| id.parse::<MakiId>() == Ok(session_id))
+        {
+            entry.latest = None;
+            changed = true;
+        }
+    }
     let before = index.len();
-    index.retain(|_, v| v.parse::<MakiId>() != Ok(session_id));
-    if index.len() != before {
+    index.retain(|_, entry| entry.latest.is_some() || entry.name.is_some());
+    if changed || index.len() != before {
         atomic_write(&dir.join(CWD_INDEX_FILE), &serde_json::to_vec(&index)?)?;
     }
     Ok(())
@@ -1665,10 +1896,13 @@ fn session_entries(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
         .collect())
 }
 
+/// A log is a regular file at the top of the sessions dir; the `by-path`
+/// link view, directories and symlinks never count, whatever their name says.
 fn is_session_file(p: &Path) -> bool {
-    p.file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|s| !NON_SESSION_STEMS.contains(&s))
+    p.symlink_metadata().is_ok_and(|m| m.is_file())
+        && p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| !NON_SESSION_STEMS.contains(&s))
         && p.extension().is_some_and(|e| e == "json" || e == "jsonl")
 }
 
@@ -2170,6 +2404,7 @@ where
         {
             warn!(error = %e, session_id = %id, "session archives remain after delete");
         }
+        remove_session_links(dir, id);
         if !removed {
             return Err(StorageError::NotFound(id.to_string()).into());
         }
@@ -2186,10 +2421,11 @@ mod tests {
     #[cfg(unix)]
     use super::canonical_key;
     use super::{
-        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, CWD_INDEX_FILE, DEFAULT_TITLE, LOG_BLOATED,
-        MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR, StoredSubagent,
-        TAIL_BUF, generate_title, json_path, jsonl_path, load_cwd_index, lock_path, locks_dir,
-        next_epoch, update_cwd_index, write_full_session,
+        ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, BY_PATH_DIR, CWD_INDEX_FILE, DEFAULT_TITLE,
+        LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
+        StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path, latest_id_in, link_stamp,
+        load_cwd_index, lock_path, locks_dir, next_epoch, set_cwd_alias, update_cwd_index,
+        write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,
@@ -2665,8 +2901,10 @@ mod tests {
         assert_eq!(loaded.model, "m2");
         assert_eq!(loaded.cwd, "/new");
         assert_eq!(
-            load_cwd_index(dir).get("/new"),
-            Some(&session.id.to_string())
+            load_cwd_index(dir)
+                .get("/new")
+                .and_then(|e| e.latest.as_deref()),
+            Some(session.id.to_string().as_str())
         );
     }
 
@@ -2945,7 +3183,7 @@ mod tests {
 
         let json_path = json_path(dir, session.id);
         fs::write(&json_path, serde_json::to_vec(&session).unwrap()).unwrap();
-        update_cwd_index(dir, &session.cwd, session.id).unwrap();
+        update_cwd_index(dir, &session.cwd, session.id, session.created_at).unwrap();
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
         assert_eq!(loaded.messages().len(), 1);
@@ -3123,7 +3361,7 @@ mod tests {
     fn save_with_time(session: &mut TestSession, dir: &Path, time: u64) {
         session.updated_at = time;
         SessionLog::rewrite(dir, &claim_for(dir, session), session).unwrap();
-        update_cwd_index(dir, &session.cwd, session.id).unwrap();
+        update_cwd_index(dir, &session.cwd, session.id, session.created_at).unwrap();
     }
 
     #[test]
@@ -3195,8 +3433,148 @@ mod tests {
         TestSession::delete_from(&claim_id(dir, s1.id), dir).unwrap();
         assert!(!jsonl_path(dir, s1.id).exists());
         let index = load_cwd_index(dir);
-        assert!(!index.values().any(|v| *v == s1.id.to_string()));
-        assert_eq!(index.get("/other"), Some(&s2.id.to_string()));
+        assert!(
+            !index
+                .values()
+                .any(|e| e.latest.as_deref() == Some(s1.id.to_string().as_str()))
+        );
+        assert_eq!(
+            index.get("/other").and_then(|e| e.latest.as_deref()),
+            Some(s2.id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_files_a_readable_link_named_after_the_folder() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/home/dev/proj");
+        s.save_to(&claim_for(dir, &s), dir).unwrap();
+
+        let stamp = link_stamp(s.created_at).unwrap();
+        let link = dir
+            .join(BY_PATH_DIR)
+            .join("home--dev--proj")
+            .join(format!("{stamp}-proj.jsonl"));
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new(&format!("../../{}.jsonl", s.id))
+        );
+        assert!(link.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn alias_set_ahead_of_a_run_names_its_links() {
+        const ALIAS: &str = "maki";
+        const CWD: &str = "/home/dev/proj";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join("state"));
+        let dir = state.ensure_subdir(SESSIONS_DIR).unwrap();
+        set_cwd_alias(&state, CWD, ALIAS).unwrap();
+
+        let mut s: TestSession = Session::new("m", CWD);
+        s.save_to(&claim_for(&dir, &s), &dir).unwrap();
+
+        let stamp = link_stamp(s.created_at).unwrap();
+        assert!(
+            dir.join(BY_PATH_DIR)
+                .join("home--dev--proj")
+                .join(format!("{stamp}-{ALIAS}.jsonl"))
+                .exists()
+        );
+        assert_eq!(
+            load_cwd_index(&dir)
+                .get(CWD)
+                .and_then(|e| e.name.as_deref()),
+            Some(ALIAS)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repeated_saves_keep_one_link_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/proj");
+        s.save_to(&claim_for(dir, &s), dir).unwrap();
+        s.title = "renamed".into();
+        s.save_to(&claim_for(dir, &s), dir).unwrap();
+
+        let folder = dir.join(BY_PATH_DIR).join("proj");
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_stays_out_of_the_by_path_view() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut s: TestSession = Session::new("m", "/proj");
+        s.save_to(&claim_for(dir, &s), dir).unwrap();
+
+        let view = dir.join(BY_PATH_DIR).join("proj");
+        fs::create_dir_all(&view).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../{}.jsonl", s.id),
+            view.join("2026-01-01-00-00-00-proj.jsonl"),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.join("not-a-session.jsonl")).unwrap();
+        std::os::unix::fs::symlink(jsonl_path(dir, s.id), dir.join("dup.jsonl")).unwrap();
+
+        let list = TestSession::list_all_in(dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, s.id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn delete_removes_links_but_keeps_the_alias() {
+        const ALIAS: &str = "maki";
+        const CWD: &str = "/proj";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join("state"));
+        let dir = state.ensure_subdir(SESSIONS_DIR).unwrap();
+        set_cwd_alias(&state, CWD, ALIAS).unwrap();
+
+        let mut s: TestSession = Session::new("m", CWD);
+        s.save_to(&claim_for(&dir, &s), &dir).unwrap();
+        let stamp = link_stamp(s.created_at).unwrap();
+        let link = dir
+            .join(BY_PATH_DIR)
+            .join("proj")
+            .join(format!("{stamp}-{ALIAS}.jsonl"));
+        assert!(link.exists());
+
+        TestSession::delete_from(&claim_id(&dir, s.id), &dir).unwrap();
+        assert!(!link.exists());
+        let index = load_cwd_index(&dir);
+        assert_eq!(index.get(CWD).and_then(|e| e.name.as_deref()), Some(ALIAS));
+        assert_eq!(index.get(CWD).and_then(|e| e.latest.as_deref()), None);
+        assert_eq!(latest_id_in(CWD, &dir).unwrap(), None);
+    }
+
+    #[test]
+    fn legacy_cwd_index_still_answers_latest() {
+        const CWD: &str = "/project";
+        let legacy_id = "01965087-4c71-7f00-8000-000000000000";
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let id: MakiId = legacy_id.parse().unwrap();
+        let mut session: TestSession = Session::new("m", CWD);
+        session.id = id;
+        fs::write(json_path(dir, id), serde_json::to_vec(&session).unwrap()).unwrap();
+        let mut legacy: HashMap<String, String> = HashMap::new();
+        legacy.insert(CWD.into(), legacy_id.into());
+        fs::write(
+            dir.join(CWD_INDEX_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(latest_id_in(CWD, dir).unwrap(), Some(id));
     }
 
     /// Clones share one lock, so a snapshot still queued keeps its session
@@ -3610,6 +3988,7 @@ mod tests {
         const NEWER: &str = "/project/newer";
         const NEWEST: &str = "/project/newest";
         const FORGOTTEN: &str = "/project/forgotten";
+        const RECORDED_AT: u64 = 0;
         const SESSIONS: [(&str, &str); 4] = [
             (OLD, "017f0000-0000-7000-8000-000000000001"),
             (NEWER, "018f0000-0000-7000-8000-000000000002"),
@@ -3620,7 +3999,7 @@ mod tests {
         ];
         let tmp = TempDir::new().unwrap();
         for (cwd, id) in SESSIONS {
-            update_cwd_index(tmp.path(), cwd, id.parse().unwrap()).unwrap();
+            update_cwd_index(tmp.path(), cwd, id.parse().unwrap(), RECORDED_AT).unwrap();
         }
 
         assert_eq!(

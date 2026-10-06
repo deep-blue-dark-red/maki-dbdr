@@ -70,6 +70,19 @@ copy rather than the session it came from.
 The `session_id` in output messages is the id string you passed, so a hex uuid
 comes back as that hex uuid rather than the base58 form Maki generates.
 
+Every save also files a link into a readable view, so previous sessions stay
+findable without parsing ids:
+
+```
+<state>/sessions/by-path/home-dev-proj/2026-10-06-09-15-02-proj.jsonl -> ../../<id>.jsonl
+```
+
+The alias defaults to the folder's own name. `--session-name <NAME>` records a
+different one for the directory, and later sessions there keep using it. Links
+never rename once written, so older sessions keep the alias they were saved
+with. Deleting a session removes its links and leaves the alias for the next
+one.
+
 ### One process per session
 
 Only one Maki process can have a session open, so two runs cannot overwrite

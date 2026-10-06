@@ -15,6 +15,7 @@ etcetera = { workspace = true }
 bs58 = { workspace = true }
 fs4 = { workspace = true }
 uuid = { workspace = true }
+jiff = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
