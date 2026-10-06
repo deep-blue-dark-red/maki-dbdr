@@ -284,6 +284,25 @@ case("job_output_lines_caps_live_like_settled", function()
   end
 end)
 
+case("job_output_lines_flattens_span_live_lines", function()
+  -- Child tools stream span tables ({text, style?}); cap_tail concatenates,
+  -- so the live path must flatten before capping (was: concat error).
+  local spans = { { "err: ", "tool_error" }, { "boom" } }
+  local mixed = { spans, "plain", { { "tail", "dim" } } }
+  local lines = lib.job_output_lines(job(lib.STATUS.RUNNING), mixed, 10)
+  eq(lines[1], "    err: boom", "span line joined to one plain row")
+  eq(lines[2], "    plain", "plain line passes through")
+  eq(lines[3], "    tail", "style-only span drops its style")
+  eq(lines[1], lib.cap_tail(lib.plain_lines(mixed), 10)[1], "matches cap_tail over plain_lines")
+end)
+
+case("plain_lines_mixed_shapes", function()
+  eq(#lib.plain_lines({}), 0, "empty stays empty")
+  local out = lib.plain_lines({ "a", { { "b", "dim" }, { "c" } } })
+  eq(out[1], "a", "plain untouched")
+  eq(out[2], "bc", "spans joined by text")
+end)
+
 case("kill_job_paths", function()
   local done = job(lib.STATUS.DONE)
   contains(lib.kill_job(done), "already", "terminal job reports its status")

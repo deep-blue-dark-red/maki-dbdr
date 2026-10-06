@@ -322,18 +322,27 @@ function M.tail_lines(text, max_lines)
   return M.cap_tail(M.split_lines(text), max_lines)
 end
 
--- Live snapshot lines are span tables ({text, style?}); status text is
--- plain, so keep only the span texts.
-function M.live_text(live_buf)
+-- Live snapshot lines are span tables ({text, style?}); the tail/cap
+-- helpers concatenate, so flatten to plain text first. Plain strings pass
+-- through untouched.
+function M.plain_lines(lines)
   local out = {}
-  for i, line in ipairs(live_buf:get_lines()) do
-    local spans = {}
-    for j, span in ipairs(line) do
-      spans[j] = span[1]
+  for i, line in ipairs(lines) do
+    if type(line) == "table" then
+      local spans = {}
+      for j, span in ipairs(line) do
+        spans[j] = span[1]
+      end
+      out[i] = table.concat(spans)
+    else
+      out[i] = line
     end
-    out[i] = table.concat(spans)
   end
-  return table.concat(out, "\n")
+  return out
+end
+
+function M.live_text(live_buf)
+  return table.concat(M.plain_lines(live_buf:get_lines()), "\n")
 end
 
 function M.split_lines(text)
@@ -390,7 +399,7 @@ end
 -- so a view taken mid-run and retaken after it settles render the same.
 function M.job_output_lines(job, live, max_lines)
   if live and #live > 0 then
-    return M.cap_tail(live, max_lines)
+    return M.cap_tail(M.plain_lines(live), max_lines)
   end
   if job.output and job.output ~= "" then
     return M.tail_lines(job.output, max_lines)

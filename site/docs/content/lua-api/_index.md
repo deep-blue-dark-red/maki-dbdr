@@ -2837,6 +2837,34 @@ if err then print("atomic write failed: " .. err) end
 
 ---
 
+### `maki.fs.rename()` {#maki-fs-rename}
+
+```lua
+maki.fs.rename({from}, {to})
+```
+
+Rename the file or directory at {from} to {to}. An existing file at {to}
+is replaced; a directory never is. Both paths must sit on the same
+filesystem, which a rename cannot cross.
+
+Requires the `fs_write` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{from}` (`string`) Path to move. `~/` is expanded.
+- `{to}` (`string`) Destination path. `~/` is expanded.
+
+**Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
+
+**Example:**
+
+```lua
+local ok, err = maki.fs.rename("draft.md", "notes.md")
+if err then print("rename failed: " .. err) end
+```
+
+---
+
 ### `maki.fs.rm()` {#maki-fs-rm}
 
 ```lua
@@ -5804,7 +5832,7 @@ and call this from it.
 
 Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
-`"prev_chat"`, `"next_chat"`, `"model_picker"`.
+`"prev_chat"`, `"next_chat"`, `"model_picker"`, `"change_cwd"`.
 
 There is no action for sending the user's message. To take keys like
 `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
@@ -6713,6 +6741,31 @@ function M.list(path, ctx)
 function M.view(text, ctx)
 ```
 
+### `require("maki.dir_picker")`
+
+```lua
+-- Folder picker on top of ListPicker: browse the file system from {start}
+-- and, with Tab, switch to shortcut rows — the caller's folders plus every
+-- known maki project. Blocks until a folder is picked and returns its
+-- absolute path, or nil when dismissed.
+--
+-- Keys while open:
+--   Enter       pick the highlighted shortcut, descend into the highlighted
+--               folder, or — on ".." — pick the folder being browsed
+--   <Right>     enter the highlighted folder or shortcut without picking
+--   <Left>      climb to the parent folder
+--   <Tab>       switch between shortcuts and the file system
+--   <Esc>       dismiss
+--
+-- {opts}:
+--   title (string) float title.
+--   start (string?) folder to browse first, default ~.
+--   folders (table?) shortcut rows, `{ label?, path }` each, offered as the
+--     first mode when non-empty. Known maki projects are always appended.
+--   folder_label (string?) section header naming the shortcut rows.
+function DirPicker.open(opts)
+```
+
 ### `require("maki.fuzzy_replace")`
 
 ```lua
@@ -6724,6 +6777,18 @@ M.EMPTY_OLD_STRING = "old_string must not be empty"
 -- whitespace and indentation drift. Returns the new content, or nil plus
 -- one of the error constants above.
 function M.replace(content, old_string, new_string, replace_all)
+```
+
+### `require("maki.known_paths")`
+
+```lua
+-- The project folder paths maki knows, read from the state dir maki.env
+-- hands out. `known(state_dir)` returns `{ { id, path } }`, one row per
+-- project, path-sorted: every `projects/<id>/cwd_latest.json` maps the cwds
+-- that ran there to their latest session, and each cwd resolves back to the
+-- git root the project is keyed on. Unreadable indexes skip silently.
+M.project_id = project_id
+function M.known(state_dir)
 ```
 
 ### `require("maki.list_picker")`

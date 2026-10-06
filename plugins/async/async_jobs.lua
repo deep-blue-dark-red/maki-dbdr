@@ -155,9 +155,18 @@ local function refresh_stdout()
   local lines = lib.job_output_lines(job, live, DETAIL_MAX_LINES)
   local text = table.concat(lines, "\n")
   if text ~= st.last then
+    -- Follow the stream while the view already sits at the bottom; a user
+    -- who scrolled up keeps their place.
+    local pinned = st.cursor >= st.line_count
     st.last = text
     st.line_count = #lines
     st.buf:set_lines(lines)
+    if pinned then
+      st.cursor = st.line_count
+      st.win:set_cursor(st.cursor)
+    else
+      st.cursor = math.min(st.cursor, st.line_count)
+    end
   end
 end
 
