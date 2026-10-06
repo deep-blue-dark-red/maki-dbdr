@@ -60,12 +60,14 @@ pub struct ProviderCredentials {
 
 impl ProviderCredentials {
     pub fn masked_api_key(&self) -> String {
-        if self.api_key.len() > 8 {
-            format!(
-                "{}...{}",
-                &self.api_key[..4],
-                &self.api_key[self.api_key.len() - 4..]
-            )
+        if self.api_key.chars().count() > 8 {
+            let head: String = self.api_key.chars().take(4).collect();
+            let tail: String = self
+                .api_key
+                .chars()
+                .skip(self.api_key.chars().count() - 4)
+                .collect();
+            format!("{head}...{tail}")
         } else {
             "****".to_string()
         }
@@ -231,6 +233,17 @@ mod tests {
             account_id: None,
         };
         assert_eq!(tokens.is_expired(), expected);
+    }
+
+    #[test_case("short", "****" ; "short_key")]
+    #[test_case("123456789", "1234...6789" ; "long_ascii")]
+    #[test_case("abc你defghij", "abc你...ghij" ; "long_multibyte_must_not_panic")]
+    fn masked_key(key: &str, expected: &str) {
+        let creds = ProviderCredentials {
+            api_key: key.into(),
+            host: None,
+        };
+        assert_eq!(creds.masked_api_key(), expected);
     }
 
     #[test]
