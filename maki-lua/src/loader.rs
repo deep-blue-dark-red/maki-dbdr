@@ -147,6 +147,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/create_plugin"),
     },
     BundledPlugin {
+        name: "cd",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/cd"),
+    },
+    BundledPlugin {
         name: "aa_scores",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/aa_scores"),
     },

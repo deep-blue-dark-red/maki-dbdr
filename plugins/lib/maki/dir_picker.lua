@@ -1,11 +1,13 @@
 -- Folder picker on top of ListPicker: browse the file system from {start}
--- and, when the caller offers shortcut folders, switch to them with Tab.
--- Blocks until a folder is picked and returns its absolute path, or nil when
--- dismissed.
+-- and, with Tab, switch to shortcut rows — the caller's folders plus every
+-- known maki project. Blocks until a folder is picked and returns its
+-- absolute path, or nil when dismissed.
 --
 -- Keys while open:
---   Enter       descend into the highlighted folder, or take a shortcut row
---   <C-m>/<M-m> take the folder being browsed itself (browse mode only)
+--   Enter       pick the highlighted shortcut, descend into the highlighted
+--               folder, or — on ".." — pick the folder being browsed
+--   <Right>     enter the highlighted folder or shortcut without picking
+--   <Left>      climb to the parent folder
 --   <Tab>       switch between shortcuts and the file system
 --   <Esc>       dismiss
 --
@@ -13,10 +15,11 @@
 --   title (string) float title.
 --   start (string?) folder to browse first, default ~.
 --   folders (table?) shortcut rows, `{ label?, path }` each, offered as the
---     first mode when non-empty.
+--     first mode when non-empty. Known maki projects are always appended.
 --   folder_label (string?) section header naming the shortcut rows.
 
 local ListPicker = require("maki.list_picker")
+local known_paths = require("maki.known_paths")
 local shorten_path = require("maki.shorten_path")
 
 local DirPicker = {}
@@ -29,7 +32,7 @@ local function browse_items(browse_dir)
   local here = shorten_path(browse_dir)
   local parent = maki.fs.dirname(browse_dir)
   if parent and parent ~= browse_dir then
-    items[#items + 1] = { label = "..", kind = "up", section = here }
+    items[#items + 1] = { label = "..", detail = "pick this folder", kind = "up", section = here }
   end
   local entries, list_err = maki.fs.dir(browse_dir)
   local dirs = {}
@@ -69,10 +72,32 @@ local function folder_items(folders, label)
   return items
 end
 
+-- The caller's shortcut rows, with {projects} — known maki projects — that
+-- are not already offered appended, so every picker can Tab to the projects
+-- you visit.
+local function shortcut_folders(folders, projects)
+  local merged, seen = {}, {}
+  for _, f in ipairs(folders) do
+    merged[#merged + 1] = { label = f.label, path = f.path }
+    seen[f.path] = true
+  end
+  for _, p in ipairs(projects or {}) do
+    if not seen[p.path] then
+      merged[#merged + 1] = { path = p.path }
+    end
+  end
+  return merged
+end
+
 function DirPicker.open(opts)
   opts = opts or {}
-  local folders = opts.folders or {}
-  local folder_label = opts.folder_label or "folders"
+  local projects = {}
+  local state = maki.env.state_dir()
+  if state then
+    projects = known_paths.known(state)
+  end
+  local folders = shortcut_folders(opts.folders or {}, projects)
+  local folder_label = opts.folder_label or "maki projects"
   local browse = opts.start or maki.uv.os_homedir() or "/"
   -- The caller's shortcuts are the fast path, so they open first.
   local mode = #folders > 0 and "folders" or "browse"
@@ -84,11 +109,40 @@ function DirPicker.open(opts)
     return browse_items(browse)
   end
 
-  local footer = { { "Enter", "open" } }
+  local function enter_dir(item)
+    if item == nil then
+      return nil
+    end
+    if item.kind == "dir" then
+      browse = item.path
+    elseif item.kind == "folder" then
+      -- A shortcut enters the browser, so Left can climb back out of it.
+      mode = "browse"
+      browse = item.path
+    else
+      return nil
+    end
+    return items_for()
+  end
+
+  -- Enter swaps into a directory; a shortcut or ".." falls through to the
+  -- submit, which picks.
+  local function enter_or_pick(item)
+    if item and item.kind == "dir" then
+      return enter_dir(item)
+    end
+    return nil
+  end
+
+  local footer = {
+    { "Enter", "pick / enter" },
+    { "←", "parent" },
+    { "→", "enter folder" },
+  }
   if #folders > 0 then
     footer[#footer + 1] = { "Tab", "switch mode" }
   end
-  footer[#footer + 1] = { "Alt+M", "pick folder" }
+  footer[#footer + 1] = { "Esc", "close" }
 
   while true do
     local items, list_err = items_for()
@@ -100,9 +154,21 @@ function DirPicker.open(opts)
       key = function(item)
         return item.kind .. ":" .. (item.path or item.label)
       end,
-      -- C-m is Enter on terminals without the kitty keyboard protocol; M-m works everywhere.
-      action_keys = { "<C-m>", "<M-m>" },
+      submit_swaps = true,
       live_keys = {
+        ["<CR>"] = enter_or_pick,
+        ["<Right>"] = enter_dir,
+        ["<Left>"] = function()
+          if mode ~= "browse" then
+            return nil
+          end
+          local parent = maki.fs.dirname(browse)
+          if not parent or parent == browse then
+            return nil
+          end
+          browse = parent
+          return items_for()
+        end,
         ["<Tab>"] = function()
           if #folders == 0 then
             return nil
@@ -116,22 +182,14 @@ function DirPicker.open(opts)
     if event.type == "close" then
       return nil
     end
-    if event.type == "key" then
-      -- The pick key means the folder being browsed; from the shortcuts it
-      -- first jumps to the browser, so there is something to pick.
-      if mode == "browse" then
-        return browse
-      end
-      mode = "browse"
-    elseif event.item then
+    if event.item then
       local item = event.item
       if item.kind == "folder" then
         return item.path
-      elseif item.kind == "dir" then
-        browse = item.path
       elseif item.kind == "up" then
-        browse = maki.fs.dirname(browse) or browse
+        return browse
       end
+      -- A dir never arrives as a choice: Enter swaps into it instead.
     else
       return nil
     end
@@ -140,5 +198,6 @@ end
 
 DirPicker._browse_items = browse_items
 DirPicker._folder_items = folder_items
+DirPicker._shortcut_folders = shortcut_folders
 
 return DirPicker

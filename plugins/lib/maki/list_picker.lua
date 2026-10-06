@@ -548,90 +548,102 @@ function ListPicker.open(items, opts)
     move_cursor(cursor)
   end
 
-  while true do
-    local ev = win:recv(refresh_ms)
-    if ev == nil or ev.type == "close" then
-      return { type = "close" }
-    elseif ev.type == "timeout" then
-      if opts.refresh then
-        local fresh = opts.refresh()
-        if fresh then
-          swap(fresh)
-        end
-      end
-    elseif ev.type == "resize" then
-      width = ev.width
-      height = ev.height
-      move_cursor(cursor)
-    elseif ev.type == "click" then
-      -- A click on a row selects and submits it, like moving the cursor
-      -- there and pressing Enter. Clicks on chrome (query line, blank
-      -- rows, the input line) match no item row and do nothing.
-      for i, line_no in pairs(item_lines) do
-        if line_no == ev.row then
-          move_cursor(i)
-          win:close()
-          return { type = "choice", index = original_indices[cursor], item = filtered[cursor] }
-        end
-      end
-    elseif ev.type == "key" then
-      if ev.key == "<Up>" then
-        move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)
-      elseif ev.key == "<Down>" then
-        move_cursor(cursor % math.max(#filtered, 1) + 1)
-      elseif ev.key == "<PageUp>" then
-        move_cursor(cursor - page_size())
-      elseif ev.key == "<PageDown>" then
-        move_cursor(cursor + page_size())
-      elseif ev.key == "<Esc>" or ev.key == "<C-c>" then
-        win:close()
+  -- A refresh or live-key callback error must not orphan the picker: the
+  -- window would stay up and focused with nobody reading its events, so
+  -- every later key vanishes into a channel no one drains. Close first,
+  -- then let the host log the failure.
+  local loop_ok, loop_err = pcall(function()
+    while true do
+      local ev = win:recv(refresh_ms)
+      if ev == nil or ev.type == "close" then
         return { type = "close" }
-      elseif ev.key == "<C-d>" then
-        if #filtered > 0 then
-          if confirming == cursor then
-            win:close()
-            return { type = "delete", index = original_indices[cursor], item = filtered[cursor] }
-          else
-            confirming = cursor
-            maki.ui.flash("Press Ctrl+D again to delete")
+      elseif ev.type == "timeout" then
+        if opts.refresh then
+          local fresh = opts.refresh()
+          if fresh then
+            swap(fresh)
           end
         end
-      elseif submit_keys[ev.key] then
-        if #filtered > 0 then
-          local swap_handler = opts.submit_swaps and ev.key == "<CR>" and live_keys["<CR>"] or nil
-          local swapped = swap_handler and swap_handler(filtered[cursor]) or nil
-          if swapped then
-            swap(swapped)
-          else
+      elseif ev.type == "resize" then
+        width = ev.width
+        height = ev.height
+        move_cursor(cursor)
+      elseif ev.type == "click" then
+        -- A click on a row selects and submits it, like moving the cursor
+        -- there and pressing Enter. Clicks on chrome (query line, blank
+        -- rows, the input line) match no item row and do nothing.
+        for i, line_no in pairs(item_lines) do
+          if line_no == ev.row then
+            move_cursor(i)
             win:close()
             return { type = "choice", index = original_indices[cursor], item = filtered[cursor] }
           end
         end
-      elseif live_keys[ev.key] then
-        local selected = filtered[cursor]
-        local swapped = live_keys[ev.key](selected)
-        if swapped then
-          swap(swapped)
-        end
-      elseif action_keys[ev.key] then
-        win:close()
-        return {
-          type = "key",
-          key = ev.key,
-          index = #filtered > 0 and original_indices[cursor] or nil,
-          item = filtered[cursor],
-        }
-      else
-        local result = input:handle_key(ev.key)
-        if result == TextInput.Result.CHANGED then
-          filtered, original_indices = filter_items(items, input:value())
-          move_cursor(1)
-        elseif result == TextInput.Result.MOVED then
-          move_cursor(cursor)
+      elseif ev.type == "key" then
+        if ev.key == "<Up>" then
+          move_cursor((cursor - 2) % math.max(#filtered, 1) + 1)
+        elseif ev.key == "<Down>" then
+          move_cursor(cursor % math.max(#filtered, 1) + 1)
+        elseif ev.key == "<PageUp>" then
+          move_cursor(cursor - page_size())
+        elseif ev.key == "<PageDown>" then
+          move_cursor(cursor + page_size())
+        elseif ev.key == "<Esc>" or ev.key == "<C-c>" then
+          win:close()
+          return { type = "close" }
+        elseif ev.key == "<C-d>" then
+          if #filtered > 0 then
+            if confirming == cursor then
+              win:close()
+              return { type = "delete", index = original_indices[cursor], item = filtered[cursor] }
+            else
+              confirming = cursor
+              maki.ui.flash("Press Ctrl+D again to delete")
+            end
+          end
+        elseif submit_keys[ev.key] then
+          if #filtered > 0 then
+            local swap_handler = opts.submit_swaps and ev.key == "<CR>" and live_keys["<CR>"] or nil
+            local swapped = swap_handler and swap_handler(filtered[cursor]) or nil
+            if swapped then
+              swap(swapped)
+            else
+              win:close()
+              return { type = "choice", index = original_indices[cursor], item = filtered[cursor] }
+            end
+          end
+        elseif live_keys[ev.key] then
+          local selected = filtered[cursor]
+          local swapped = live_keys[ev.key](selected)
+          if swapped then
+            swap(swapped)
+          end
+        elseif action_keys[ev.key] then
+          win:close()
+          return {
+            type = "key",
+            key = ev.key,
+            index = #filtered > 0 and original_indices[cursor] or nil,
+            item = filtered[cursor],
+          }
+        else
+          local result = input:handle_key(ev.key)
+          if result == TextInput.Result.CHANGED then
+            filtered, original_indices = filter_items(items, input:value())
+            move_cursor(1)
+          elseif result == TextInput.Result.MOVED then
+            move_cursor(cursor)
+          end
         end
       end
     end
+  end)
+  if not loop_ok then
+    win:close()
+    error(loop_err, 0)
   end
+  -- The loop's returns now surface as pcall's second value.
+  return loop_err
 end
 
 ListPicker.split_words = split_words

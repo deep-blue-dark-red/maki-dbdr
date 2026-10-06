@@ -1744,6 +1744,22 @@ case("dir_picker_folder_rows_take_labels_and_default_to_short_paths", function()
   eq(items[2].label, "/opt", "a label wins over the path")
 end)
 
+case("dir_picker_shortcut_folders_append_known_projects_not_already_offered", function()
+  local home = maki.uv.os_homedir() or "/home/test"
+  local folders = DirPicker._shortcut_folders({
+    { path = "/opt", label = "/opt" },
+    { path = home .. "/git/ada" },
+  }, {
+    { id = "ada-1", path = home .. "/git/ada" },
+    { id = "b-2", path = home .. "/git/b" },
+  })
+  eq(#folders, 3, "a known project the caller offers is not repeated")
+  eq(folders[1].label, "/opt")
+  eq(folders[2].path, home .. "/git/ada", "the caller's own row stays")
+  eq(folders[3].path, home .. "/git/b", "a new known project joins the shortcuts")
+  eq(folders[3].label, nil, "a known project keeps the shortened display")
+end)
+
 -- The project-id hash pins real storage keys, so the vectors travel with it.
 case("known_paths_fnv1a_known_vectors", function()
   local vectors = {
@@ -1774,10 +1790,10 @@ case("known_paths_resolves_the_git_root_behind_every_cwd", function()
   local proj = maki.fs.joinpath(dir, "proj")
   maki.fs.mkdir(maki.fs.joinpath(proj, ".git"), { parents = true })
   local state = maki.fs.joinpath(dir, "state")
-  local pdir = maki.fs.joinpath(state, "projects", kp.project_id(proj))
-  maki.fs.mkdir(pdir, { parents = true })
+  local index = maki.fs.joinpath(state, "sessions", "cwd_latest.json")
+  maki.fs.mkdir(maki.fs.dirname(index), { parents = true })
   maki.fs.write(
-    maki.fs.joinpath(pdir, "cwd_latest.json"),
+    index,
     maki.json.encode({ [maki.fs.joinpath(proj, "sub")] = "s1", [proj] = "s2" })
   )
 
@@ -1793,24 +1809,18 @@ case("known_paths_skips_unreadable_indexes_and_sorts", function()
   local state = maki.fs.joinpath(dir, "state")
   local a = maki.fs.joinpath(dir, "a_repo")
   local b = maki.fs.joinpath(dir, "b_repo")
-  for _, root in ipairs({ a, b }) do
-    local pdir = maki.fs.joinpath(state, "projects", kp.project_id(root))
-    maki.fs.mkdir(pdir, { parents = true })
-  end
-  maki.fs.write(maki.fs.joinpath(state, "projects", kp.project_id(a), "cwd_latest.json"), "{not json")
-  maki.fs.write(
-    maki.fs.joinpath(state, "projects", kp.project_id(b), "cwd_latest.json"),
-    maki.json.encode({ [b] = "s1" })
-  )
+  local index = maki.fs.joinpath(state, "sessions", "cwd_latest.json")
+  maki.fs.mkdir(maki.fs.dirname(index), { parents = true })
+  maki.fs.write(index, "{not json")
 
+  eq(#kp.known(state), 0, "a broken index is skipped, not an error")
+
+  maki.fs.write(index, maki.json.encode({ [b] = "s1" }))
   local known = kp.known(state)
-  eq(#known, 1, "a broken index is skipped, not an error")
+  eq(#known, 1)
   eq(known[1].path, b)
 
-  maki.fs.write(
-    maki.fs.joinpath(state, "projects", kp.project_id(a), "cwd_latest.json"),
-    maki.json.encode({ [a] = "s1" })
-  )
+  maki.fs.write(index, maki.json.encode({ [b] = "s1", [a] = "s2" }))
   known = kp.known(state)
   th.rmtree(dir)
   eq(#known, 2)

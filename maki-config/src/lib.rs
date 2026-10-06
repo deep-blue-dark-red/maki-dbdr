@@ -101,6 +101,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "async",
     "bash",
     "batch",
+    "cd",
     "code_execution",
     "create_plugin",
     "edit",
