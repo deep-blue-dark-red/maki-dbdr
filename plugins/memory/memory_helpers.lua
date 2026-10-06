@@ -21,7 +21,7 @@ local UNREADABLE_PREFIX = "warning: unreadable memory files: "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
-local COMMANDS = { "list", "read", "write", "delete", "move" }
+local COMMANDS = { "list", "read", "write", "delete" }
 local VALID_COMMANDS = {}
 for _, c in ipairs(COMMANDS) do
   VALID_COMMANDS[c] = true
@@ -164,13 +164,6 @@ function M.validate_input(input)
   elseif cmd == "delete" then
     if not has_path then
       return "'path' is required for delete"
-    end
-  elseif cmd == "move" then
-    if not has_path then
-      return "'path' is required for move"
-    end
-    if not input.new_path or input.new_path == "" then
-      return "'new_path' is required for move"
     end
   end
   return nil
@@ -417,34 +410,66 @@ function M.validate_write_size(content)
   return nil
 end
 
--- Moves the note {path} to {new_path}, both relative to {dir}. Notes are flat
--- files, so both are bare names: `list` and the picker would never see a note
--- moved into a subdirectory. The move never overwrites.
-function M.move_file(dir, path, new_path)
-  for _, p in ipairs({ path, new_path }) do
-    if p:find("[/\\]") then
-      return nil, "notes are flat files: '" .. p .. "' must be a name, not a path"
-    end
+-- Moves the note {name} out of {dir} into the memories dir keyed on
+-- {target_root}, another project's folder path. Creates the target memories
+-- dir and never overwrites a note already there.
+function M.move_to_project(dir, name, target_root, state_dir)
+  if name:find("[/\\]") then
+    return nil, "'" .. name .. "' is not a memory file name"
   end
-  local from, err = M.safe_resolve(dir, path)
+  local from, err = M.safe_resolve(dir, name)
   if not from then
     return nil, err
   end
-  local to, err = M.safe_resolve(dir, new_path)
+  local target_mem = maki.fs.joinpath(state_dir, "projects", M.project_id(target_root), "memories")
+  local to, err = M.safe_resolve(target_mem, name)
   if not to then
     return nil, err
   end
   if not maki.fs.metadata(from) then
-    return nil, "'" .. path .. "' does not exist"
+    return nil, "'" .. name .. "' does not exist"
   end
   if maki.fs.metadata(to) then
-    return nil, "'" .. new_path .. "' already exists"
+    return nil, "the target project already has a '" .. name .. "'"
+  end
+  local _, mkdir_err = maki.fs.mkdir(target_mem, { parents = true })
+  if mkdir_err then
+    return nil, "mkdir error: " .. tostring(mkdir_err)
   end
   local ok, rename_err = maki.fs.rename(from, to)
   if not ok then
     return nil, "move error: " .. tostring(rename_err)
   end
   return true
+end
+
+-- Project roots maki knows: every projects/<id>/cwd_latest.json maps the cwds
+-- that ran there to their latest session, and each cwd resolves back to the
+-- git root the memories are keyed on. Unreadable indexes skip; one row per
+-- project, path-sorted.
+function M.known_projects(state_dir)
+  local projects_root = maki.fs.joinpath(state_dir, "projects")
+  local seen, out = {}, {}
+  for _, entry in ipairs(maki.fs.dir(projects_root) or {}) do
+    if entry[2] == "directory" then
+      local raw = maki.fs.read(maki.fs.joinpath(projects_root, entry[1], "cwd_latest.json"))
+      local index = raw and maki.json.decode(raw)
+      if type(index) == "table" then
+        for cwd in pairs(index) do
+          local root = maki.fs.root(cwd, ".git") or cwd
+          local id = M.project_id(root)
+          if not seen[id] then
+            seen[id] = true
+            out[#out + 1] = { id = id, path = root }
+          end
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b)
+    return a.path < b.path
+  end)
+  return out
 end
 
 function M.format_read_entry(name, size, content)

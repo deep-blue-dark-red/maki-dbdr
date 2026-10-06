@@ -15,7 +15,8 @@ local cap_read_output = h.cap_read_output
 local validate_write_tags = h.validate_write_tags
 local validate_write_size = h.validate_write_size
 local validate_input = h.validate_input
-local move_file = h.move_file
+local move_to_project = h.move_to_project
+local known_projects = h.known_projects
 
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 
@@ -584,7 +585,6 @@ case("validate_input", function()
     { command = "write", path = "a.md", content = "x" },
     { command = "write", path = "a.md", content = "x", tags = {} },
     { command = "delete", path = "a.md" },
-    { command = "move", path = "a.md", new_path = "b.md" },
   }
   for i, input in ipairs(ok_inputs) do
     eq(validate_input(input), nil, "ok input #" .. i .. " (" .. input.command .. ")")
@@ -598,8 +598,6 @@ case("validate_input", function()
     { { command = "write" }, "path" },
     { { command = "write", path = "a.md" }, "content" },
     { { command = "delete" }, "path" },
-    { { command = "move" }, "path" },
-    { { command = "move", path = "a.md" }, "new_path" },
   }
   for _, v in ipairs(bad) do
     local err = validate_input(v[1])
@@ -655,35 +653,84 @@ case("detail_parts_end_with_the_size_and_truncate_the_tags", function()
   eq(bare[2], nil)
 end)
 
-case_tmp("move_file_renames_and_keeps_content", function(dir)
-  write_mem(dir, "old.md", { "gotchas" }, "the body")
+case_tmp("move_to_project_rekeys_the_note", function(dir)
+  local state = maki.fs.joinpath(dir, "state")
+  local src_mem = maki.fs.joinpath(dir, "src_mem")
+  local target_root = maki.fs.joinpath(dir, "target_proj")
+  maki.fs.mkdir(src_mem)
+  write_mem(src_mem, "old.md", { "gotchas" }, "the body")
 
-  eq(move_file(dir, "old.md", "new.md"), true)
-  assert(not maki.fs.metadata(maki.fs.joinpath(dir, "old.md")), "source should be gone")
-  local content = maki.fs.read(maki.fs.joinpath(dir, "new.md"))
+  eq(move_to_project(src_mem, "old.md", target_root, state), true)
+  local content = maki.fs.read(maki.fs.joinpath(state, "projects", h.project_id(target_root), "memories", "old.md"))
   assert(content:find("the body"), "body should survive the move")
   assert(content:find("gotchas"), "frontmatter should survive the move")
+  assert(not maki.fs.metadata(maki.fs.joinpath(src_mem, "old.md")), "source should be gone")
 end)
 
-case_tmp("move_file_rejects_bad_moves", function(dir)
-  write_mem(dir, "a.md", { "t" }, "body")
-  write_mem(dir, "b.md", { "t" }, "other")
+case_tmp("move_to_project_rejects_bad_moves", function(dir)
+  local state = maki.fs.joinpath(dir, "state")
+  local src_mem = maki.fs.joinpath(dir, "src_mem")
+  local target_root = maki.fs.joinpath(dir, "target_proj")
+  maki.fs.mkdir(src_mem)
+  write_mem(src_mem, "a.md", { "t" }, "body")
+  write_mem(maki.fs.joinpath(src_mem), "b.md", { "t" }, "other")
+  maki.fs.mkdir(maki.fs.joinpath(state, "projects", h.project_id(target_root), "memories"), { parents = true })
+  maki.fs.write(maki.fs.joinpath(state, "projects", h.project_id(target_root), "memories", "b.md"), "already there")
 
-  local _, err = move_file(dir, "a.md", "b.md")
-  assert(err and err:find("already exists"), "target must not exist, got: " .. tostring(err))
+  local _, err = move_to_project(src_mem, "b.md", target_root, state)
+  assert(err and err:find("already has"), "clash with target note, got: " .. tostring(err))
 
-  local _, err = move_file(dir, "ghost.md", "new.md")
+  local _, err = move_to_project(src_mem, "ghost.md", target_root, state)
   assert(err and err:find("does not exist"), "missing source, got: " .. tostring(err))
 
-  for _, target in ipairs({ "sub/new.md", "../escape.md" }) do
-    local _, err = move_file(dir, "a.md", target)
-    assert(
-      err and (err:find("flat") or err:find("traversal")),
-      "target " .. target .. " should be rejected, got: " .. tostring(err)
-    )
-  end
+  local _, err = move_to_project(src_mem, "sub/a.md", target_root, state)
+  assert(err and err:find("not a memory file name"), "path target, got: " .. tostring(err))
 
-  assert(maki.fs.metadata(maki.fs.joinpath(dir, "a.md")), "a failed move keeps the source")
+  assert(maki.fs.metadata(maki.fs.joinpath(src_mem, "a.md")), "a failed move keeps the source")
+end)
+
+case_tmp("known_projects_resolves_the_git_root_behind_every_cwd", function(dir)
+  local proj = maki.fs.joinpath(dir, "proj")
+  maki.fs.mkdir(maki.fs.joinpath(proj, ".git"), { parents = true })
+  local state = maki.fs.joinpath(dir, "state")
+  local pdir = maki.fs.joinpath(state, "projects", h.project_id(proj))
+  maki.fs.mkdir(pdir, { parents = true })
+  maki.fs.write(
+    maki.fs.joinpath(pdir, "cwd_latest.json"),
+    maki.json.encode({ [maki.fs.joinpath(proj, "sub")] = "s1", [proj] = "s2" })
+  )
+
+  local known = h.known_projects(state)
+  eq(#known, 1, "two cwds of one project collapse to one row")
+  eq(known[1].path, proj)
+  eq(known[1].id, h.project_id(proj))
+end)
+
+case_tmp("known_projects_skips_unreadable_indexes_and_sorts", function(dir)
+  local state = maki.fs.joinpath(dir, "state")
+  local a = maki.fs.joinpath(dir, "a_repo")
+  local b = maki.fs.joinpath(dir, "b_repo")
+  for _, root in ipairs({ a, b }) do
+    local pdir = maki.fs.joinpath(state, "projects", h.project_id(root))
+    maki.fs.mkdir(pdir, { parents = true })
+  end
+  maki.fs.write(maki.fs.joinpath(state, "projects", h.project_id(a), "cwd_latest.json"), "{not json")
+  maki.fs.write(
+    maki.fs.joinpath(state, "projects", h.project_id(b), "cwd_latest.json"),
+    maki.json.encode({ [b] = "s1" })
+  )
+
+  local known = h.known_projects(state)
+  eq(#known, 1, "a broken index is skipped, not an error")
+  eq(known[1].path, b)
+
+  maki.fs.write(
+    maki.fs.joinpath(state, "projects", h.project_id(a), "cwd_latest.json"),
+    maki.json.encode({ [a] = "s1" })
+  )
+  known = h.known_projects(state)
+  eq(#known, 2)
+  eq(known[1].path, a, "path sorted")
 end)
 
 if #failures > 0 then
