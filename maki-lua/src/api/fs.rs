@@ -540,6 +540,25 @@ async fn rm(_lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<bool
     Ok(pair(touched(removed, result).await.map(|()| true)))
 }
 
+/// Rename the file or directory at {from} to {to}. An existing file at {to}
+/// is replaced; a directory never is. Both paths must sit on the same
+/// filesystem, which a rename cannot cross.
+///
+/// @param from string Path to move. `~/` is expanded.
+/// @param to string Destination path. `~/` is expanded.
+/// @return (true?, string?) `true` on success, or nil plus an error message.
+/// @example
+/// local ok, err = maki.fs.rename("draft.md", "notes.md")
+/// if err then print("rename failed: " .. err) end
+#[lua_fn(guard = FsWrite)]
+async fn rename(_lua: Lua, from: String, to: String) -> LuaResult<Pair<bool>> {
+    let src = make_absolute(&from)?;
+    let dst = make_absolute(&to)?;
+    let moved = dst.clone();
+    let result = smol::unblock(move || std::fs::rename(&src, &dst)).await;
+    Ok(pair(touched(moved, result).await.map(|()| true)))
+}
+
 /// Create the directory at {path}. Set `parents = true` to create
 /// intermediate directories, like `mkdir -p`.
 ///
@@ -1081,7 +1100,7 @@ lua_table! {
     "maki.fs" => pub(crate) fn create_fs_table(perms: &PluginPermissions, plugin: Arc<str>), DOCS [
         read(perms), read_bytes(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
-        dir(perms), write(perms), append(perms), atomic_write(perms), rm(perms), mkdir(perms),
+        dir(perms), write(perms), append(perms), atomic_write(perms), rename(perms), rm(perms), mkdir(perms),
         glob(perms), grep(perms), fuzzy_files(perms, plugin),
     ]
 }
@@ -1533,6 +1552,94 @@ mod tests {
 
         assert!(error.to_string().contains(FS_WRITE_PERMISSION));
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn rename_moves_file() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("old.txt");
+        let dst = tmp.path().join("new.txt");
+        std::fs::write(&src, FIRST_CONTENT).unwrap();
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = tbl.get("rename").unwrap();
+        let (ok, err): (Value, Value) =
+            smol::block_on(rename.call_async((src.to_str().unwrap(), dst.to_str().unwrap())))
+                .unwrap();
+        assert_eq!(ok, Value::Boolean(true));
+        assert_eq!(err, Value::Nil);
+        assert!(!src.exists());
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), FIRST_CONTENT);
+    }
+
+    #[test]
+    fn rename_replaces_existing_file_but_not_dir() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.txt");
+        let dst_file = tmp.path().join("dst.txt");
+        let dst_dir = tmp.path().join("dst_dir");
+        std::fs::write(&src, FIRST_CONTENT).unwrap();
+        std::fs::write(&dst_file, REPLACEMENT_CONTENT).unwrap();
+        std::fs::create_dir(&dst_dir).unwrap();
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = tbl.get("rename").unwrap();
+
+        let (ok, err): (Value, Value) =
+            smol::block_on(rename.call_async((src.to_str().unwrap(), dst_file.to_str().unwrap())))
+                .unwrap();
+        assert_eq!(ok, Value::Boolean(true));
+        assert_eq!(err, Value::Nil);
+        assert_eq!(std::fs::read_to_string(&dst_file).unwrap(), FIRST_CONTENT);
+
+        std::fs::write(&src, FIRST_CONTENT).unwrap();
+        let (ok, err): (Value, Value) =
+            smol::block_on(rename.call_async((src.to_str().unwrap(), dst_dir.to_str().unwrap())))
+                .unwrap();
+        assert!(matches!(ok, Value::Nil), "a directory is never replaced");
+        assert!(matches!(err, Value::String(_)));
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn rename_missing_source_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("ghost.txt");
+        let dst = tmp.path().join("new.txt");
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = tbl.get("rename").unwrap();
+        let (ok, err): (Value, Value) =
+            smol::block_on(rename.call_async((src.to_str().unwrap(), dst.to_str().unwrap())))
+                .unwrap();
+        assert!(matches!(ok, Value::Nil));
+        assert!(matches!(err, Value::String(_)));
+    }
+
+    #[test]
+    fn rename_requires_fs_write_permission() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("a.txt");
+        let dst = tmp.path().join("b.txt");
+        std::fs::write(&src, FIRST_CONTENT).unwrap();
+
+        let lua = Lua::new();
+        let tbl =
+            create_fs_table(&lua, &PluginPermissions::denied(), Arc::from(TEST_PLUGIN)).unwrap();
+        let rename: mlua::Function = tbl.get("rename").unwrap();
+        let error = smol::block_on(
+            rename.call_async::<(Value, Value)>((src.to_str().unwrap(), dst.to_str().unwrap())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(FS_WRITE_PERMISSION));
+        assert!(src.exists());
+        assert!(!dst.exists());
     }
 
     #[test]
