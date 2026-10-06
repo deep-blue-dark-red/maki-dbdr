@@ -246,9 +246,8 @@ Save and retrieve concise project facts across sessions. Reuse relevant tags fro
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | Action name only: list, read, write, delete, or move. Pass arguments in separate fields. list: optional tags, returns index. read: path or tags, returns bodies. write: path and content, optional tags, creates or overwrites. delete: path. move: path and new_path, renames a note; never overwrites. |
+| `command` | string | yes | Action name only: list, read, write, or delete. Pass arguments in separate fields. list: optional tags, returns index. read: path or tags, returns bodies. write: path and content, optional tags, creates or overwrites. delete: path. |
 | `content` | string | no | Body for write (frontmatter added automatically). |
-| `new_path` | string | no | Target file name for move (notes are flat; must not exist). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
 
