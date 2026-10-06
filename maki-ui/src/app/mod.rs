@@ -117,6 +117,10 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+/// The lua command the change_cwd action and a bare `/cd` both open. The `cd`
+/// plugin owns the folder picker; the builtin `/cd` keeps the bookkeeping.
+const CD_PICK_COMMAND: &str = "/cd-pick";
+const FLASH_CD_PICKER_MISSING: &str = "The cd plugin is disabled, so there is no folder picker";
 const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
 const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
 const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";
@@ -1162,6 +1166,9 @@ impl App {
             self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
+        if key::CHANGE_CWD.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::ChangeCwd));
+        }
         if key::TOGGLE_VERBOSE.matches(key) {
             self.verbose = !self.verbose;
             return Some(vec![]);
@@ -1668,6 +1675,17 @@ impl App {
             BuiltinAction::ModelPicker => {
                 self.model_picker.open(&self.state.model.spec());
                 return vec![Action::RefreshModels];
+            }
+            BuiltinAction::ChangeCwd => {
+                if self
+                    .command_palette
+                    .find_lua_command(CD_PICK_COMMAND)
+                    .is_some()
+                {
+                    self.run_lua_command(CD_PICK_COMMAND, String::new(), 0);
+                } else {
+                    self.flash(FLASH_CD_PICKER_MISSING.into());
+                }
             }
         }
         vec![]
@@ -2880,7 +2898,9 @@ impl App {
 
     fn cmd_cd(&mut self, args: &str) -> Vec<Action> {
         let path = if args.is_empty() {
-            maki_storage::paths::home().unwrap_or_default()
+            // A bare `/cd` is where the folder picker lives: the picker hands
+            // the chosen folder back through `/cd <path>`.
+            return self.run_builtin(BuiltinAction::ChangeCwd);
         } else {
             match args.strip_prefix('~') {
                 Some(rest) => {
