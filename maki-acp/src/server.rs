@@ -38,7 +38,6 @@ use maki_storage::sessions::{SessionClaim, SessionError};
 use serde::Serialize;
 use serde_json::Value;
 use smol::Task;
-use smol::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
 
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
@@ -170,19 +169,66 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Lives in its own task because `read_line` is not cancel safe: the main loop
-/// waits on discovery too, and a dropped read would eat half a line.
+/// Largest single NDJSON frame accepted, so a newline-less flood cannot grow
+/// the reader's buffer without bound.
+const MAX_FRAME_BYTES: usize = 8 << 20;
+
+/// Reads one newline-terminated frame, capped at [`MAX_FRAME_BYTES`]. `Ok(None)`
+/// means clean EOF with no partial frame; over-long frames are a hard error so
+/// the stream does not silently desync.
+async fn next_frame<R: smol::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    use smol::io::AsyncBufReadExt;
+
+    line.clear();
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                line.extend_from_slice(&buf[..=i]);
+                reader.consume(i + 1);
+                break;
+            }
+            None => {
+                line.extend_from_slice(buf);
+                let len = buf.len();
+                reader.consume(len);
+                if line.len() > MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ACP frame exceeds maximum length",
+                    ));
+                }
+            }
+        }
+    }
+    String::from_utf8(line.split_off(0)).map(Some).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ACP frame is not valid UTF-8",
+        )
+    })
+}
+
+/// Lives in its own task because the frame reader is not cancel safe: the main
+/// loop waits on discovery too, and a dropped read would eat half a line.
 async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
     let mut reader = smol::io::BufReader::new(smol::Unblock::new(std::io::stdin()));
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
-            return Ok(());
-        }
-        if tx.send_async(Incoming::Line(line)).await.is_err() {
+    let mut line = Vec::new();
+    while let Some(text) = next_frame(&mut reader, &mut line).await? {
+        if tx.send_async(Incoming::Line(text)).await.is_err() {
             return Ok(());
         }
     }
+    Ok(())
 }
 
 /// Static manifests miss providers that only list their models over the wire
@@ -1086,8 +1132,13 @@ fn finish_turn(pending: &PendingState) -> Option<RequestId> {
 }
 
 fn send(out_tx: &Sender<Value>, msg: impl Serialize) {
-    if let Ok(json) = serde_json::to_value(JsonRpcMessage::wrap(msg)) {
-        let _ = out_tx.send(json);
+    match serde_json::to_value(JsonRpcMessage::wrap(msg)) {
+        Ok(json) => {
+            let _ = out_tx.send(json);
+        }
+        // Dropping silently would leave the client waiting on a response id
+        // that never comes, so at least make it observable.
+        Err(e) => warn!(error = %e, "dropping unserializable ACP message"),
     }
 }
 
@@ -1161,6 +1212,58 @@ mod tests {
     const NEXT_TURN_SCOPE: &str = "rm -rf /";
     const NEXT_TURN_TOOL_USE_ID: &str = "toolu_next_turn";
     const STALE_ALLOW: &str = "a stale answer must never allow the next turn's tool";
+
+    #[test]
+    fn next_frame_splits_on_newline_and_reports_eof() {
+        smol::block_on(async {
+            let data: &[u8] = b"{\"a\":1}\nsecond\n";
+            let mut reader = smol::io::BufReader::new(data);
+            let mut line = Vec::new();
+            assert_eq!(
+                next_frame(&mut reader, &mut line).await.unwrap().as_deref(),
+                Some("{\"a\":1}\n")
+            );
+            assert_eq!(
+                next_frame(&mut reader, &mut line).await.unwrap().as_deref(),
+                Some("second\n")
+            );
+            assert!(next_frame(&mut reader, &mut line).await.unwrap().is_none());
+        })
+    }
+
+    #[test]
+    fn next_frame_returns_a_final_unterminated_line() {
+        smol::block_on(async {
+            let mut reader = smol::io::BufReader::new(&b"no-newline"[..]);
+            let mut line = Vec::new();
+            assert_eq!(
+                next_frame(&mut reader, &mut line).await.unwrap().as_deref(),
+                Some("no-newline")
+            );
+            assert!(next_frame(&mut reader, &mut line).await.unwrap().is_none());
+        })
+    }
+
+    #[test]
+    fn next_frame_rejects_an_overlong_frame() {
+        smol::block_on(async {
+            let data = vec![b'a'; MAX_FRAME_BYTES + 1];
+            let mut reader = smol::io::BufReader::new(&data[..]);
+            let mut line = Vec::new();
+            let err = next_frame(&mut reader, &mut line).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        })
+    }
+
+    #[test]
+    fn next_frame_rejects_invalid_utf8() {
+        smol::block_on(async {
+            let mut reader = smol::io::BufReader::new(&[0xff, 0xfe, b'\n'][..]);
+            let mut line = Vec::new();
+            let err = next_frame(&mut reader, &mut line).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        })
+    }
 
     /// Where fixture servers claim their placeholder session. One dir is enough,
     /// since fresh ids never collide and nothing is written under them.
