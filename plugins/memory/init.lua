@@ -1,6 +1,8 @@
 local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
+local DirPicker = require("maki.dir_picker")
 local ListPicker = require("maki.list_picker")
+local shorten_path = require("maki.shorten_path")
 local Toast = require("maki.toast")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines", "ast_grep_replace", "create_plugin" }
@@ -328,108 +330,19 @@ local function save_view(view)
   end
 end
 
-local function abbrev_home(path)
-  local home = maki.uv.os_homedir()
-  if home and path:sub(1, #home + 1) == home .. "/" then
-    return "~" .. path:sub(#home + 1)
-  end
-  return path
-end
-
--- One browse step: the project roots maki remembers, then every folder of
--- {browse_dir}. The section header names where you are, and ".." keeps the
--- list never empty so the filter always has something to sit under.
-local function move_items(browse_dir, known)
-  local items = {}
-  for _, k in ipairs(known) do
-    items[#items + 1] = {
-      label = abbrev_home(k.path),
-      kind = "project",
-      path = k.path,
-      section = "maki projects",
-    }
-  end
-  local here = abbrev_home(browse_dir)
-  local parent = maki.fs.dirname(browse_dir)
-  if parent and parent ~= browse_dir then
-    items[#items + 1] = { label = "..", kind = "up", section = here }
-  end
-  local entries, list_err = maki.fs.dir(browse_dir)
-  local dirs = {}
-  for _, e in ipairs(entries or {}) do
-    if e[2] == "directory" then
-      dirs[#dirs + 1] = e[1]
-    end
-  end
-  table.sort(dirs, function(a, b)
-    local hidden_a, hidden_b = a:sub(1, 1) == ".", b:sub(1, 1) == "."
-    if hidden_a ~= hidden_b then
-      return hidden_b
-    end
-    return a:lower() < b:lower()
-  end)
-  for _, name in ipairs(dirs) do
-    items[#items + 1] = {
-      label = name .. "/",
-      kind = "dir",
-      path = maki.fs.joinpath(browse_dir, name),
-      section = here,
-    }
-  end
-  return items, list_err
-end
-
--- Blocks until a target project folder is chosen or dismissed. Enter on a
--- maki project takes it, Enter on a folder descends, and the move key takes
--- the folder being browsed itself.
-local function pick_move_target(label, origin_id)
-  local known = {}
+-- The folders the move picker offers first: the project roots maki
+-- remembers, minus the one being moved from.
+local function known_folders(origin_id)
+  local folders = {}
   local state = maki.env.state_dir()
   if state then
     for _, k in ipairs(helpers.known_projects(state)) do
       if k.id ~= origin_id then
-        known[#known + 1] = k
+        folders[#folders + 1] = { path = k.path }
       end
     end
   end
-  local browse = maki.uv.os_homedir() or "/"
-  while true do
-    local items, list_err = move_items(browse, known)
-    if list_err then
-      maki.ui.flash("Cannot list " .. abbrev_home(browse) .. ": " .. tostring(list_err))
-    end
-    local event = ListPicker.open(items, {
-      title = " Move " .. label .. " to project ",
-      key = function(item)
-        return item.kind .. ":" .. (item.path or item.label)
-      end,
-      -- C-m is Enter on terminals without the kitty keyboard protocol; M-m works everywhere.
-      action_keys = { "<C-m>", "<M-m>" },
-      footer = {
-        { "Enter", "open" },
-        { "Alt+M", "move here" },
-      },
-    })
-    if event.type == "close" then
-      return nil
-    end
-    if event.type == "key" then
-      return browse
-    end
-    local item = event.item
-    if not item then
-      return nil
-    end
-    if item.kind == "project" then
-      return item.path
-    elseif item.kind == "dir" then
-      browse = item.path
-    elseif item.kind == "up" then
-      browse = maki.fs.dirname(browse) or browse
-    else
-      return nil
-    end
-  end
+  return folders
 end
 
 maki.api.register_command({
@@ -510,11 +423,15 @@ maki.api.register_command({
         local label = event.item and event.item.label
         if label then
           local origin_id = maki.fs.basename(maki.fs.dirname(dir))
-          local target = pick_move_target(label, origin_id)
+          local target = DirPicker.open({
+            title = " Move " .. label .. " to project ",
+            folders = known_folders(origin_id),
+            folder_label = "maki projects",
+          })
           if target then
             local ok, err = helpers.move_to_project(dir, label, target, maki.env.state_dir())
             if ok then
-              notify("Moved " .. label .. " -> " .. abbrev_home(target))
+              notify("Moved " .. label .. " -> " .. shorten_path(target))
             else
               notify("Move failed: " .. tostring(err))
             end

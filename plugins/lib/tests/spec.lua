@@ -1,6 +1,7 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+local DirPicker = require("maki.dir_picker")
 local kp = require("maki.known_paths")
 local th = require("maki.test_helpers")
 
@@ -1703,6 +1704,44 @@ case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
   eq(set["<CR>"], true, "<Enter> matches a <CR> press")
   eq(set["R"], true, "a plain char is itself")
   eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
+end)
+
+-- The folder picker browses one directory per step, so the rows it feeds the
+-- list picker are pure and tested here: folders only, ".." to climb, dot
+-- folders sunk, and the header naming where you are.
+case("dir_picker_browse_lists_folders_only_with_dot_folders_last", function()
+  local dir = th.mktmpdir("dirpicker")
+  maki.fs.mkdir(dir .. "/zeta")
+  maki.fs.mkdir(dir .. "/.hidden")
+  maki.fs.mkdir(dir .. "/alpha")
+  maki.fs.write(dir .. "/file.md", "x")
+
+  local items, err = DirPicker._browse_items(dir)
+  th.rmtree(dir)
+  eq(err, nil)
+  eq(#items, 4, "files are not folders")
+  eq(items[1].label, "..", "the parent row comes first")
+  eq(items[1].kind, "up")
+  eq(items[2].label, "alpha/")
+  eq(items[3].label, "zeta/")
+  eq(items[4].label, ".hidden/", "dot folders sink")
+  for _, it in ipairs(items) do
+    eq(it.section, dir, "the header names where you are")
+  end
+end)
+
+case("dir_picker_folder_rows_take_labels_and_default_to_short_paths", function()
+  local home = maki.uv.os_homedir() or "/home/test"
+  local items = DirPicker._folder_items({
+    { path = home .. "/git/ada" },
+    { path = "/opt", label = "/opt" },
+  }, "maki projects")
+  eq(#items, 2)
+  eq(items[1].label, "~/git/ada", "a bare path is shortened for display")
+  eq(items[1].path, home .. "/git/ada", "the row keeps the absolute path")
+  eq(items[1].kind, "folder")
+  eq(items[1].section, "maki projects")
+  eq(items[2].label, "/opt", "a label wins over the path")
 end)
 
 -- The project-id hash pins real storage keys, so the vectors travel with it.
