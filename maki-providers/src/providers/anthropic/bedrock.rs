@@ -410,6 +410,14 @@ fn decode_eventstream_frame(buf: &[u8]) -> Result<(usize, Option<Vec<u8>>), Agen
 
     let prelude_size = 12; // total_len(4) + headers_len(4) + prelude_crc(4)
     let message_crc_size = 4;
+    if total_len < prelude_size + message_crc_size
+        || prelude_size + headers_len > total_len - message_crc_size
+    {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidData,
+            "inconsistent eventstream frame lengths",
+        ));
+    }
     let headers_end = prelude_size + headers_len;
     let payload_end = total_len - message_crc_size;
 
@@ -883,6 +891,19 @@ mod tests {
         let (consumed, data) = decode_eventstream_frame(&frame).unwrap();
         assert_eq!(consumed, frame.len());
         assert!(data.is_none());
+    }
+
+    #[test_case(12, 0 ; "total_len_below_minimum")]
+    #[test_case(16, 5 ; "headers_len_overflows_payload")]
+    #[test_case(100, 200 ; "headers_len_exceeds_total")]
+    fn decode_eventstream_malformed_frame_errors(total_len: u32, headers_len: u32) {
+        let mut buf = vec![0u8; (total_len as usize).max(MIN_EVENTSTREAM_FRAME)];
+        buf[..4].copy_from_slice(&total_len.to_be_bytes());
+        buf[4..8].copy_from_slice(&headers_len.to_be_bytes());
+        assert!(matches!(
+            decode_eventstream_frame(&buf),
+            Err(AgentError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     #[test_case("ValidationException", 400, "Access denied" ; "validation_exception")]

@@ -316,20 +316,38 @@ pub(crate) async fn parse_sse(
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
-                    if !name.is_empty() {
+                    // A parked accumulator may already exist for this index if a
+                    // delta arrived first; fill it instead of adding a second.
+                    let acc = match tool_accumulators
+                        .iter_mut()
+                        .find(|a| a.output_index == Some(output_index))
+                    {
+                        Some(acc) => acc,
+                        None => {
+                            tool_accumulators.push(ToolAccumulator {
+                                id: String::new(),
+                                name: String::new(),
+                                arguments: String::new(),
+                                output_index: Some(output_index),
+                            });
+                            tool_accumulators.last_mut().expect("just pushed")
+                        }
+                    };
+                    let should_emit_start = acc.name.is_empty() && !name.is_empty();
+                    if acc.id.is_empty() {
+                        acc.id = call_id;
+                    }
+                    if acc.name.is_empty() {
+                        acc.name = name;
+                    }
+                    if should_emit_start {
                         event_tx
                             .send_async(ProviderEvent::ToolUseStart {
-                                id: call_id.clone(),
-                                name: name.clone(),
+                                id: acc.id.clone(),
+                                name: acc.name.clone(),
                             })
                             .await?;
                     }
-                    tool_accumulators.push(ToolAccumulator {
-                        id: call_id,
-                        name,
-                        arguments: String::new(),
-                        output_index: Some(output_index),
-                    });
                 }
             }
 
@@ -346,16 +364,31 @@ pub(crate) async fn parse_sse(
                     Cow::Borrowed("")
                 };
                 if !delta.is_empty() {
-                    let acc = if let Some(idx) = parsed["output_index"].as_u64() {
-                        tool_accumulators
+                    let acc = match parsed["output_index"].as_u64() {
+                        Some(idx) => match tool_accumulators
                             .iter_mut()
                             .find(|a| a.output_index == Some(idx))
-                    } else {
-                        tool_accumulators.last_mut()
+                        {
+                            Some(acc) => acc,
+                            None => {
+                                // A delta can arrive before its output_item.added
+                                // (or that event was dropped); park a slot rather
+                                // than losing the argument bytes.
+                                tool_accumulators.push(ToolAccumulator {
+                                    id: String::new(),
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                    output_index: Some(idx),
+                                });
+                                tool_accumulators.last_mut().expect("just pushed")
+                            }
+                        },
+                        None => match tool_accumulators.last_mut() {
+                            Some(acc) => acc,
+                            None => continue,
+                        },
                     };
-                    if let Some(acc) = acc {
-                        acc.arguments.push_str(&delta);
-                    }
+                    acc.arguments.push_str(&delta);
                 }
             }
 
@@ -429,11 +462,14 @@ pub(crate) async fn parse_sse(
                                 })
                                 .await?;
                         }
+                        let output_index = parsed["output_index"]
+                            .as_u64()
+                            .unwrap_or(tool_accumulators.len() as u64);
                         tool_accumulators.push(ToolAccumulator {
                             id: call_id,
                             name,
                             arguments,
-                            output_index: Some(tool_accumulators.len() as u64),
+                            output_index: Some(output_index),
                         });
                     }
                 }
@@ -1044,6 +1080,71 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
             assert_eq!(tools[0].1, "glob");
             assert_eq!(tools[0].2["pattern"], "*.rs");
             assert_eq!(tools[0].2["path"], "src");
+        })
+    }
+
+    #[test]
+    fn parse_sse_delta_before_added_merges_into_one_call() {
+        smol::block_on(async {
+            // An argument delta can arrive before its output_item.added; the
+            // accumulator must be parked by output_index and reused, not
+            // duplicated.
+            let sse = "\
+event: response.function_call_arguments.delta\n\
+data: {\"output_index\":0,\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(
+                tools.len(),
+                1,
+                "parked accumulator must merge, not duplicate"
+            );
+            assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+            assert_eq!(tools[0].2["command"], "ls");
+        })
+    }
+
+    #[test]
+    fn parse_sse_interleaved_indexed_calls_keep_their_arguments() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c0\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"output_index\":1,\"delta\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"output_index\":0,\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 2);
+            assert_eq!(
+                (tools[0].1, tools[0].2["command"].as_str()),
+                ("bash", Some("ls"))
+            );
+            assert_eq!(
+                (tools[1].1, tools[1].2["path"].as_str()),
+                ("read", Some("/tmp"))
+            );
         })
     }
 

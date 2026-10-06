@@ -164,12 +164,16 @@ impl OpenAiCompatProvider {
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
     pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
-        if let Some(explicit) = auth.base_url.as_deref() {
-            return explicit.to_string();
-        }
-        self.resolved_base_url
-            .clone()
-            .unwrap_or_else(|| self.config.base_url.to_string())
+        let base = if let Some(explicit) = auth.base_url.as_deref() {
+            explicit
+        } else {
+            self.resolved_base_url
+                .as_deref()
+                .unwrap_or(self.config.base_url)
+        };
+        // Callers append a `/…` path, so a configured trailing slash would
+        // otherwise produce `//` and 404 on strict gateways.
+        base.trim_end_matches('/').to_string()
     }
 
     fn build_request(

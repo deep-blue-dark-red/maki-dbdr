@@ -376,7 +376,7 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
     stream_timeout: Duration,
 ) -> Result<Option<String>, AgentError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let result = futures_lite::future::or(
+    futures_lite::future::or(
         async { lines.next().await.transpose().map_err(AgentError::from) },
         async {
             smol::Timer::after(remaining).await;
@@ -385,11 +385,7 @@ pub(crate) async fn next_sse_line<R: AsyncBufRead + Unpin>(
             })
         },
     )
-    .await;
-    if let Ok(Some(_)) = &result {
-        *deadline = Instant::now() + stream_timeout;
-    }
-    result
+    .await
 }
 
 /// One framing line of an SSE stream.
@@ -425,11 +421,15 @@ async fn framing_line<R: AsyncBufRead + Unpin>(
         return Ok(None);
     };
     if let Some(rest) = line.strip_prefix(SSE_EVENT_PREFIX) {
+        *deadline = Instant::now() + stream_timeout;
         return Ok(Some(SseLine::Event(sse_value(rest, framing))));
     }
     if let Some(rest) = line.strip_prefix(SSE_DATA_PREFIX) {
+        *deadline = Instant::now() + stream_timeout;
         return Ok(Some(SseLine::Data(sse_value(rest, framing))));
     }
+    // Blank lines and `: keep-alive` comments must not extend the stream
+    // deadline, or an endless idle trickle would never time out.
     Ok(Some(SseLine::Other))
 }
 
