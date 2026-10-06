@@ -16,3 +16,7 @@ bench/results/
 # Root-level scratch output (err*.txt, out.txt). Scoped to the root so the
 # word lists under maki-storage/src/words/ stay addable.
 /*.txt
+
+# Local code-search index dirs
+/.rose/
+/idx-p4/
