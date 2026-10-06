@@ -21,7 +21,7 @@ local UNREADABLE_PREFIX = "warning: unreadable memory files: "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
-local COMMANDS = { "list", "read", "write", "delete" }
+local COMMANDS = { "list", "read", "write", "delete", "move" }
 local VALID_COMMANDS = {}
 for _, c in ipairs(COMMANDS) do
   VALID_COMMANDS[c] = true
@@ -164,6 +164,13 @@ function M.validate_input(input)
   elseif cmd == "delete" then
     if not has_path then
       return "'path' is required for delete"
+    end
+  elseif cmd == "move" then
+    if not has_path then
+      return "'path' is required for move"
+    end
+    if not input.new_path or input.new_path == "" then
+      return "'new_path' is required for move"
     end
   end
   return nil
@@ -408,6 +415,36 @@ function M.validate_write_size(content)
       .. "); split the memory or trim to stay under the cap"
   end
   return nil
+end
+
+-- Moves the note {path} to {new_path}, both relative to {dir}. Notes are flat
+-- files, so both are bare names: `list` and the picker would never see a note
+-- moved into a subdirectory. The move never overwrites.
+function M.move_file(dir, path, new_path)
+  for _, p in ipairs({ path, new_path }) do
+    if p:find("[/\\]") then
+      return nil, "notes are flat files: '" .. p .. "' must be a name, not a path"
+    end
+  end
+  local from, err = M.safe_resolve(dir, path)
+  if not from then
+    return nil, err
+  end
+  local to, err = M.safe_resolve(dir, new_path)
+  if not to then
+    return nil, err
+  end
+  if not maki.fs.metadata(from) then
+    return nil, "'" .. path .. "' does not exist"
+  end
+  if maki.fs.metadata(to) then
+    return nil, "'" .. new_path .. "' already exists"
+  end
+  local ok, rename_err = maki.fs.rename(from, to)
+  if not ok then
+    return nil, "move error: " .. tostring(rename_err)
+  end
+  return true
 end
 
 function M.format_read_entry(name, size, content)

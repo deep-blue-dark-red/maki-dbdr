@@ -15,6 +15,7 @@ local cap_read_output = h.cap_read_output
 local validate_write_tags = h.validate_write_tags
 local validate_write_size = h.validate_write_size
 local validate_input = h.validate_input
+local move_file = h.move_file
 
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 
@@ -583,6 +584,7 @@ case("validate_input", function()
     { command = "write", path = "a.md", content = "x" },
     { command = "write", path = "a.md", content = "x", tags = {} },
     { command = "delete", path = "a.md" },
+    { command = "move", path = "a.md", new_path = "b.md" },
   }
   for i, input in ipairs(ok_inputs) do
     eq(validate_input(input), nil, "ok input #" .. i .. " (" .. input.command .. ")")
@@ -596,6 +598,8 @@ case("validate_input", function()
     { { command = "write" }, "path" },
     { { command = "write", path = "a.md" }, "content" },
     { { command = "delete" }, "path" },
+    { { command = "move" }, "path" },
+    { { command = "move", path = "a.md" }, "new_path" },
   }
   for _, v in ipairs(bad) do
     local err = validate_input(v[1])
@@ -649,6 +653,37 @@ case("detail_parts_end_with_the_size_and_truncate_the_tags", function()
   local bare = h.detail_parts(12, {})
   eq(bare[1][1], "12B", "no separator without tags")
   eq(bare[2], nil)
+end)
+
+case_tmp("move_file_renames_and_keeps_content", function(dir)
+  write_mem(dir, "old.md", { "gotchas" }, "the body")
+
+  eq(move_file(dir, "old.md", "new.md"), true)
+  assert(not maki.fs.metadata(maki.fs.joinpath(dir, "old.md")), "source should be gone")
+  local content = maki.fs.read(maki.fs.joinpath(dir, "new.md"))
+  assert(content:find("the body"), "body should survive the move")
+  assert(content:find("gotchas"), "frontmatter should survive the move")
+end)
+
+case_tmp("move_file_rejects_bad_moves", function(dir)
+  write_mem(dir, "a.md", { "t" }, "body")
+  write_mem(dir, "b.md", { "t" }, "other")
+
+  local _, err = move_file(dir, "a.md", "b.md")
+  assert(err and err:find("already exists"), "target must not exist, got: " .. tostring(err))
+
+  local _, err = move_file(dir, "ghost.md", "new.md")
+  assert(err and err:find("does not exist"), "missing source, got: " .. tostring(err))
+
+  for _, target in ipairs({ "sub/new.md", "../escape.md" }) do
+    local _, err = move_file(dir, "a.md", target)
+    assert(
+      err and (err:find("flat") or err:find("traversal")),
+      "target " .. target .. " should be rejected, got: " .. tostring(err)
+    )
+  end
+
+  assert(maki.fs.metadata(maki.fs.joinpath(dir, "a.md")), "a failed move keeps the source")
 end)
 
 if #failures > 0 then
