@@ -174,23 +174,38 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
     Ok(attrs)
 }
 
-fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
-    match ty_name {
+fn config_value_expr(
+    ty_name: &str,
+    default: &Option<Expr>,
+    span: proc_macro2::Span,
+) -> syn::Result<TokenStream2> {
+    let required = || {
+        syn::Error::new(
+            span,
+            format!("`{ty_name}` field requires a `default` value"),
+        )
+    };
+    Ok(match ty_name {
         "bool" => {
-            let val = default.as_ref().expect("bool field requires default");
+            let val = default.as_ref().ok_or_else(required)?;
             quote! { ConfigValue::Bool(#val) }
         }
         "u32" | "u64" | "usize" => {
-            let val = default.as_ref().expect("numeric field requires default");
+            let val = default.as_ref().ok_or_else(required)?;
             quote! { ConfigValue::U64(#val as u64) }
         }
         "f64" => {
-            let val = default.as_ref().expect("numeric field requires default");
+            let val = default.as_ref().ok_or_else(required)?;
             quote! { ConfigValue::F64(#val as f64) }
         }
         "String" => quote! { ConfigValue::Str("none") },
-        other => panic!("unsupported config type: {other}"),
-    }
+        other => {
+            return Err(syn::Error::new(
+                span,
+                format!("unsupported config type: {other}"),
+            ));
+        }
+    })
 }
 
 fn type_to_name(ty: &Type) -> String {
@@ -243,7 +258,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
         let desc = attrs.desc.as_deref().unwrap_or("");
         let default_expr = match &attrs.default_doc {
             Some(doc) => quote! { ConfigValue::Str(#doc) },
-            None => config_value_expr(ty_name, &attrs.default),
+            None => config_value_expr(ty_name, &attrs.default, ident.span())?,
         };
         let min_expr = match &attrs.min {
             Some(m) => quote! { Some(#m as u64) },
@@ -304,9 +319,12 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
     } else {
         let mut default_fields = Vec::new();
         for (ident, attrs, _ty) in &field_data {
-            let default = attrs.default.as_ref().unwrap_or_else(|| {
-                panic!("field `{}` requires a default value in full mode", ident)
-            });
+            let Some(default) = attrs.default.as_ref() else {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    format!("field `{ident}` requires a default value in full mode"),
+                ));
+            };
             default_fields.push(quote! { #ident: #default });
         }
 
@@ -324,5 +342,30 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 #validate_fn
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_type_is_a_spanned_error() {
+        let err =
+            config_value_expr("Vec<String>", &None, proc_macro2::Span::call_site()).unwrap_err();
+        assert!(err.to_string().contains("unsupported config type"));
+    }
+
+    #[test]
+    fn missing_default_is_an_error_not_a_panic() {
+        let err = config_value_expr("u32", &None, proc_macro2::Span::call_site()).unwrap_err();
+        assert!(err.to_string().contains("requires a `default`"));
+    }
+
+    #[test]
+    fn scalar_default_renders() {
+        let default: Option<Expr> = Some(syn::parse_quote!(7));
+        let ts = config_value_expr("u32", &default, proc_macro2::Span::call_site()).unwrap();
+        assert!(ts.to_string().contains("ConfigValue :: U64"));
     }
 }
