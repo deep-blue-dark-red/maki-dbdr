@@ -1,7 +1,6 @@
 local ToolView = require("maki.tool_view")
 local helpers = require("memory_helpers")
 local ListPicker = require("maki.list_picker")
-local TextInput = require("maki.text_input")
 local Toast = require("maki.toast")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines", "ast_grep_replace", "create_plugin" }
@@ -174,14 +173,6 @@ local function cmd_delete(path, dir)
   return "deleted " .. path
 end
 
-local function cmd_move(path, new_path, dir)
-  local ok, err = helpers.move_file(dir, path, new_path)
-  if not ok then
-    return nil, err
-  end
-  return "moved " .. path .. " -> " .. new_path
-end
-
 local function with_dir(res, dir)
   local prefix = "dir: " .. dir .. "\n\n"
   if type(res) == "string" then
@@ -202,20 +193,15 @@ maki.api.register_tool({
     properties = {
       command = {
         type = "string",
-        enum = { "list", "read", "write", "delete", "move" },
-        description = "Action name only: list, read, write, delete, or move. Pass arguments in separate fields. "
+        enum = { "list", "read", "write", "delete" },
+        description = "Action name only: list, read, write, or delete. Pass arguments in separate fields. "
           .. "list: optional tags, returns index. read: path or tags, returns bodies. "
-          .. "write: path and content, optional tags, creates or overwrites. delete: path. "
-          .. "move: path and new_path, renames a note; never overwrites.",
+          .. "write: path and content, optional tags, creates or overwrites. delete: path.",
         required = true,
       },
       path = {
         type = "string",
         description = "Relative path, e.g. 'architecture.md'.",
-      },
-      new_path = {
-        type = "string",
-        description = "Target file name for move (notes are flat; must not exist).",
       },
       content = { type = "string", description = "Body for write (frontmatter added automatically)." },
       tags = {
@@ -232,9 +218,6 @@ maki.api.register_tool({
       parts[#parts + 1] = input.path
     elseif input.tags then
       parts[#parts + 1] = table.concat(input.tags, ",")
-    end
-    if input.new_path then
-      parts[#parts + 1] = "-> " .. input.new_path
     end
     return table.concat(parts, " ")
   end,
@@ -271,8 +254,6 @@ maki.api.register_tool({
       result, err = cmd_write(input.path, input.content, input.tags, dir, ctx)
     elseif cmd == "delete" then
       result, err = cmd_delete(input.path, dir)
-    elseif cmd == "move" then
-      result, err = cmd_move(input.path, input.new_path, dir)
     end
     if err then
       return { llm_output = "error: " .. err, is_error = true }
@@ -347,43 +328,106 @@ local function save_view(view)
   end
 end
 
--- One-line prompt in a small focused float, prefilled so a move is an edit of
--- the current name. Returns the trimmed text, or nil when dismissed.
-local function prompt_name(title, initial)
-  local input = TextInput.new()
-  input:insert_text(initial)
-  local buf = maki.ui.buf()
-  local win = maki.ui.open_win(buf, {
-    title = title,
-    width = math.max(#title + 16, 44),
-    height = 3,
-    footer = { { "Enter", "move" }, { "Esc", "cancel" } },
-  })
-
-  local function draw(width)
-    local r = input:render("> ", nil, width)
-    buf:set_lines(r.lines)
+local function abbrev_home(path)
+  local home = maki.uv.os_homedir()
+  if home and path:sub(1, #home + 1) == home .. "/" then
+    return "~" .. path:sub(#home + 1)
   end
-  draw(win.width)
+  return path
+end
 
+-- One browse step: the project roots maki remembers, then every folder of
+-- {browse_dir}. The section header names where you are, and ".." keeps the
+-- list never empty so the filter always has something to sit under.
+local function move_items(browse_dir, known)
+  local items = {}
+  for _, k in ipairs(known) do
+    items[#items + 1] = {
+      label = abbrev_home(k.path),
+      kind = "project",
+      path = k.path,
+      section = "maki projects",
+    }
+  end
+  local here = abbrev_home(browse_dir)
+  local parent = maki.fs.dirname(browse_dir)
+  if parent and parent ~= browse_dir then
+    items[#items + 1] = { label = "..", kind = "up", section = here }
+  end
+  local entries, list_err = maki.fs.dir(browse_dir)
+  local dirs = {}
+  for _, e in ipairs(entries or {}) do
+    if e[2] == "directory" then
+      dirs[#dirs + 1] = e[1]
+    end
+  end
+  table.sort(dirs, function(a, b)
+    local hidden_a, hidden_b = a:sub(1, 1) == ".", b:sub(1, 1) == "."
+    if hidden_a ~= hidden_b then
+      return hidden_b
+    end
+    return a:lower() < b:lower()
+  end)
+  for _, name in ipairs(dirs) do
+    items[#items + 1] = {
+      label = name .. "/",
+      kind = "dir",
+      path = maki.fs.joinpath(browse_dir, name),
+      section = here,
+    }
+  end
+  return items, list_err
+end
+
+-- Blocks until a target project folder is chosen or dismissed. Enter on a
+-- maki project takes it, Enter on a folder descends, and the move key takes
+-- the folder being browsed itself.
+local function pick_move_target(label, origin_id)
+  local known = {}
+  local state = maki.env.state_dir()
+  if state then
+    for _, k in ipairs(helpers.known_projects(state)) do
+      if k.id ~= origin_id then
+        known[#known + 1] = k
+      end
+    end
+  end
+  local browse = maki.uv.os_homedir() or "/"
   while true do
-    local ev = win:recv()
-    if not ev or ev.type == "close" then
+    local items, list_err = move_items(browse, known)
+    if list_err then
+      maki.ui.flash("Cannot list " .. abbrev_home(browse) .. ": " .. tostring(list_err))
+    end
+    local event = ListPicker.open(items, {
+      title = " Move " .. label .. " to project ",
+      key = function(item)
+        return item.kind .. ":" .. (item.path or item.label)
+      end,
+      -- C-m is Enter on terminals without the kitty keyboard protocol; M-m works everywhere.
+      action_keys = { "<C-m>", "<M-m>" },
+      footer = {
+        { "Enter", "open" },
+        { "Alt+M", "move here" },
+      },
+    })
+    if event.type == "close" then
       return nil
     end
-    if ev.type == "resize" then
-      draw(ev.width)
-    elseif ev.type == "key" then
-      if ev.key == "<Esc>" or ev.key == "<C-c>" then
-        win:close()
-        return nil
-      elseif ev.key == "<CR>" then
-        local name = input:value():match("^%s*(.-)%s*$")
-        win:close()
-        return name ~= "" and name or nil
-      elseif input:handle_key(ev.key) ~= "ignored" then
-        draw(win.width)
-      end
+    if event.type == "key" then
+      return browse
+    end
+    local item = event.item
+    if not item then
+      return nil
+    end
+    if item.kind == "project" then
+      return item.path
+    elseif item.kind == "dir" then
+      browse = item.path
+    elseif item.kind == "up" then
+      browse = maki.fs.dirname(browse) or browse
+    else
+      return nil
     end
   end
 end
@@ -423,7 +467,8 @@ maki.api.register_command({
           return item.label
         end,
         submit_keys = { "<C-o>" },
-        action_keys = { "<C-m>" },
+        -- C-m is Enter on terminals without the kitty keyboard protocol; M-m works everywhere.
+        action_keys = { "<C-m>", "<M-m>" },
         live_keys = {
           ["<Tab>"] = function()
             view = view % #VIEWS + 1
@@ -434,7 +479,7 @@ maki.api.register_command({
         footer = {
           { "Enter", "open" },
           { "Ctrl+O", "edit" },
-          { "Ctrl+M", "move" },
+          { "Alt+M", "move" },
           { "Ctrl+D", "delete" },
           { "Tab", "switch view" },
         },
@@ -461,15 +506,18 @@ maki.api.register_command({
         else
           notify("Delete failed: " .. tostring(err))
         end
-      elseif event.type == "key" and event.key == "<C-m>" then
+      elseif event.type == "key" and (event.key == "<C-m>" or event.key == "<M-m>") then
         local label = event.item and event.item.label
-        local new_name = label and prompt_name(" Move " .. label .. " to ", label)
-        if new_name and new_name ~= label then
-          local ok, err = helpers.move_file(dir, label, new_name)
-          if ok then
-            notify("Moved " .. label .. " -> " .. new_name)
-          else
-            notify("Move failed: " .. tostring(err))
+        if label then
+          local origin_id = maki.fs.basename(maki.fs.dirname(dir))
+          local target = pick_move_target(label, origin_id)
+          if target then
+            local ok, err = helpers.move_to_project(dir, label, target, maki.env.state_dir())
+            if ok then
+              notify("Moved " .. label .. " -> " .. abbrev_home(target))
+            else
+              notify("Move failed: " .. tostring(err))
+            end
           end
         end
         items = build()
