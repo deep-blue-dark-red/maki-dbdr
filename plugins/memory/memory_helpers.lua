@@ -2,6 +2,13 @@ local backoff = require("maki.utf8").backoff
 
 local M = {}
 
+-- The project-id hash and the known-paths enumeration live in the shared lib,
+-- so the /cd picker and these helpers can never disagree about the key a
+-- project's state is filed under.
+local known_paths = require("maki.known_paths")
+M.project_id = known_paths.project_id
+M.known_projects = known_paths.known
+
 M.MAX_TAGS = 50
 M.MAX_FILE_BYTES = 20 * 1024
 M.CAP_HINT_REWRITE = "rewrite the memory to fit under the cap"
@@ -44,11 +51,6 @@ function M.fnv1a_64(data)
     hi = new_hi
   end
   return string.format("%08x%08x", hi, lo)
-end
-
-function M.project_id(path)
-  local base = maki.fs.basename(path) or "root"
-  return base .. "-" .. M.fnv1a_64(path)
 end
 
 function M.safe_resolve(memories_dir, relative)
@@ -441,35 +443,6 @@ function M.move_to_project(dir, name, target_root, state_dir)
     return nil, "move error: " .. tostring(rename_err)
   end
   return true
-end
-
--- Project roots maki knows: every projects/<id>/cwd_latest.json maps the cwds
--- that ran there to their latest session, and each cwd resolves back to the
--- git root the memories are keyed on. Unreadable indexes skip; one row per
--- project, path-sorted.
-function M.known_projects(state_dir)
-  local projects_root = maki.fs.joinpath(state_dir, "projects")
-  local seen, out = {}, {}
-  for _, entry in ipairs(maki.fs.dir(projects_root) or {}) do
-    if entry[2] == "directory" then
-      local raw = maki.fs.read(maki.fs.joinpath(projects_root, entry[1], "cwd_latest.json"))
-      local index = raw and maki.json.decode(raw)
-      if type(index) == "table" then
-        for cwd in pairs(index) do
-          local root = maki.fs.root(cwd, ".git") or cwd
-          local id = M.project_id(root)
-          if not seen[id] then
-            seen[id] = true
-            out[#out + 1] = { id = id, path = root }
-          end
-        end
-      end
-    end
-  end
-  table.sort(out, function(a, b)
-    return a.path < b.path
-  end)
-  return out
 end
 
 function M.format_read_entry(name, size, content)

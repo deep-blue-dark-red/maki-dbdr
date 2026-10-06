@@ -1,6 +1,7 @@
 local truncate = require("maki.truncate")
 local ToolView = require("maki.tool_view")
 local output_limits = require("maki.output_limits")
+local kp = require("maki.known_paths")
 local th = require("maki.test_helpers")
 
 -- Splitting a line is a method, not a key, so the random walk names it apart
@@ -1702,6 +1703,79 @@ case("picker_keys_are_normalized_and_bad_ones_are_dropped", function()
   eq(set["<CR>"], true, "<Enter> matches a <CR> press")
   eq(set["R"], true, "a plain char is itself")
   eq(set["<nope>"], nil, "a key maki cannot name is dropped, not stored to never match")
+end)
+
+-- The project-id hash pins real storage keys, so the vectors travel with it.
+case("known_paths_fnv1a_known_vectors", function()
+  local vectors = {
+    { "", "cbf29ce484222325" },
+    { "a", "af63dc4c8601ec8c" },
+    { "/home/user/my-project", "fc6e8b528feefa1c" },
+  }
+  for _, v in ipairs(vectors) do
+    eq(kp._fnv1a_64(v[1]), v[2], "input: " .. ("%q"):format(v[1]))
+  end
+  local high = kp._fnv1a_64(string.rep("\xff", 64))
+  assert(#high == 16 and high:match("^%x+$"), "high bytes must still hash to 16 hex chars")
+end)
+
+case("known_paths_project_id_is_basename_plus_hash", function()
+  local id = kp.project_id("/home/user/my-project")
+  assert(id:match("^my%-project%-%x+$"), "should be basename-hex, got: " .. id)
+  eq(#id:match("%-(%x+)$"), 16, "hash should be 16 hex chars")
+
+  local root_id = kp.project_id("/")
+  assert(root_id:match("^root%-"), "/ should use 'root' as basename")
+
+  assert(kp.project_id("/home/alice/myapp") ~= kp.project_id("/home/bob/myapp"), "same basename, different paths")
+end)
+
+case("known_paths_resolves_the_git_root_behind_every_cwd", function()
+  local dir = th.mktmpdir("knownpaths")
+  local proj = maki.fs.joinpath(dir, "proj")
+  maki.fs.mkdir(maki.fs.joinpath(proj, ".git"), { parents = true })
+  local state = maki.fs.joinpath(dir, "state")
+  local pdir = maki.fs.joinpath(state, "projects", kp.project_id(proj))
+  maki.fs.mkdir(pdir, { parents = true })
+  maki.fs.write(
+    maki.fs.joinpath(pdir, "cwd_latest.json"),
+    maki.json.encode({ [maki.fs.joinpath(proj, "sub")] = "s1", [proj] = "s2" })
+  )
+
+  local known = kp.known(state)
+  th.rmtree(dir)
+  eq(#known, 1, "two cwds of one project collapse to one row")
+  eq(known[1].path, proj)
+  eq(known[1].id, kp.project_id(proj))
+end)
+
+case("known_paths_skips_unreadable_indexes_and_sorts", function()
+  local dir = th.mktmpdir("knownpaths")
+  local state = maki.fs.joinpath(dir, "state")
+  local a = maki.fs.joinpath(dir, "a_repo")
+  local b = maki.fs.joinpath(dir, "b_repo")
+  for _, root in ipairs({ a, b }) do
+    local pdir = maki.fs.joinpath(state, "projects", kp.project_id(root))
+    maki.fs.mkdir(pdir, { parents = true })
+  end
+  maki.fs.write(maki.fs.joinpath(state, "projects", kp.project_id(a), "cwd_latest.json"), "{not json")
+  maki.fs.write(
+    maki.fs.joinpath(state, "projects", kp.project_id(b), "cwd_latest.json"),
+    maki.json.encode({ [b] = "s1" })
+  )
+
+  local known = kp.known(state)
+  eq(#known, 1, "a broken index is skipped, not an error")
+  eq(known[1].path, b)
+
+  maki.fs.write(
+    maki.fs.joinpath(state, "projects", kp.project_id(a), "cwd_latest.json"),
+    maki.json.encode({ [a] = "s1" })
+  )
+  known = kp.known(state)
+  th.rmtree(dir)
+  eq(#known, 2)
+  eq(known[1].path, a, "path sorted")
 end)
 
 th.report()

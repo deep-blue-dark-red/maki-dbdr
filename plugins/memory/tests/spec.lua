@@ -1,6 +1,5 @@
 local h = require("memory_helpers")
 
-local fnv1a_64 = h.fnv1a_64
 local project_id = h.project_id
 local safe_resolve = h.safe_resolve
 local normalize_tag = h.normalize_tag
@@ -16,7 +15,6 @@ local validate_write_tags = h.validate_write_tags
 local validate_write_size = h.validate_write_size
 local validate_input = h.validate_input
 local move_to_project = h.move_to_project
-local known_projects = h.known_projects
 
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 
@@ -59,19 +57,6 @@ end
 local function write_mem(dir, name, tags, body)
   maki.fs.write(maki.fs.joinpath(dir, name), encode_frontmatter(tags) .. body)
 end
-
-case("fnv1a_known_vectors", function()
-  local vectors = {
-    { "", "cbf29ce484222325" },
-    { "a", "af63dc4c8601ec8c" },
-    { "/home/user/my-project", "fc6e8b528feefa1c" },
-  }
-  for _, v in ipairs(vectors) do
-    eq(fnv1a_64(v[1]), v[2], "input: " .. ("%q"):format(v[1]))
-  end
-  local high = fnv1a_64(string.rep("\xff", 64))
-  assert(#high == 16 and high:match("^%x+$"), "high bytes must still hash to 16 hex chars")
-end)
 
 case("safe_resolve_rejects_bad_paths", function()
   local bad = {
@@ -687,50 +672,6 @@ case_tmp("move_to_project_rejects_bad_moves", function(dir)
   assert(err and err:find("not a memory file name"), "path target, got: " .. tostring(err))
 
   assert(maki.fs.metadata(maki.fs.joinpath(src_mem, "a.md")), "a failed move keeps the source")
-end)
-
-case_tmp("known_projects_resolves_the_git_root_behind_every_cwd", function(dir)
-  local proj = maki.fs.joinpath(dir, "proj")
-  maki.fs.mkdir(maki.fs.joinpath(proj, ".git"), { parents = true })
-  local state = maki.fs.joinpath(dir, "state")
-  local pdir = maki.fs.joinpath(state, "projects", h.project_id(proj))
-  maki.fs.mkdir(pdir, { parents = true })
-  maki.fs.write(
-    maki.fs.joinpath(pdir, "cwd_latest.json"),
-    maki.json.encode({ [maki.fs.joinpath(proj, "sub")] = "s1", [proj] = "s2" })
-  )
-
-  local known = h.known_projects(state)
-  eq(#known, 1, "two cwds of one project collapse to one row")
-  eq(known[1].path, proj)
-  eq(known[1].id, h.project_id(proj))
-end)
-
-case_tmp("known_projects_skips_unreadable_indexes_and_sorts", function(dir)
-  local state = maki.fs.joinpath(dir, "state")
-  local a = maki.fs.joinpath(dir, "a_repo")
-  local b = maki.fs.joinpath(dir, "b_repo")
-  for _, root in ipairs({ a, b }) do
-    local pdir = maki.fs.joinpath(state, "projects", h.project_id(root))
-    maki.fs.mkdir(pdir, { parents = true })
-  end
-  maki.fs.write(maki.fs.joinpath(state, "projects", h.project_id(a), "cwd_latest.json"), "{not json")
-  maki.fs.write(
-    maki.fs.joinpath(state, "projects", h.project_id(b), "cwd_latest.json"),
-    maki.json.encode({ [b] = "s1" })
-  )
-
-  local known = h.known_projects(state)
-  eq(#known, 1, "a broken index is skipped, not an error")
-  eq(known[1].path, b)
-
-  maki.fs.write(
-    maki.fs.joinpath(state, "projects", h.project_id(a), "cwd_latest.json"),
-    maki.json.encode({ [a] = "s1" })
-  )
-  known = h.known_projects(state)
-  eq(#known, 2)
-  eq(known[1].path, a, "path sorted")
 end)
 
 if #failures > 0 then
