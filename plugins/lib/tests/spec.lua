@@ -1792,10 +1792,7 @@ case("known_paths_resolves_the_git_root_behind_every_cwd", function()
   local state = maki.fs.joinpath(dir, "state")
   local index = maki.fs.joinpath(state, "sessions", "cwd_latest.json")
   maki.fs.mkdir(maki.fs.dirname(index), { parents = true })
-  maki.fs.write(
-    index,
-    maki.json.encode({ [maki.fs.joinpath(proj, "sub")] = "s1", [proj] = "s2" })
-  )
+  maki.fs.write(index, maki.json.encode({ [maki.fs.joinpath(proj, "sub")] = "s1", [proj] = "s2" }))
 
   local known = kp.known(state)
   th.rmtree(dir)

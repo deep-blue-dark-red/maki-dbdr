@@ -6784,9 +6784,9 @@ function M.replace(content, old_string, new_string, replace_all)
 ```lua
 -- The project folder paths maki knows, read from the state dir maki.env
 -- hands out. `known(state_dir)` returns `{ { id, path } }`, one row per
--- project, path-sorted: every `projects/<id>/cwd_latest.json` maps the cwds
--- that ran there to their latest session, and each cwd resolves back to the
--- git root the project is keyed on. Unreadable indexes skip silently.
+-- project, path-sorted: `sessions/cwd_latest.json` maps every cwd that ran a
+-- session to its latest session, and each cwd resolves back to the git root
+-- the project is keyed on. Unreadable indexes skip silently.
 M.project_id = project_id
 function M.known(state_dir)
 ```
