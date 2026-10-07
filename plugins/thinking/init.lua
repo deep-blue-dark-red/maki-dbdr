@@ -16,4 +16,4 @@ maki.api.register_command({
   end,
 })
 
-maki.keymap.set("n", "<M-t>", Window.open, { desc = "Thinking effort" })
+maki.keymap.set("n", "<C-t>", Window.open, { desc = "Thinking effort" })

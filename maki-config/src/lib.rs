@@ -314,7 +314,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
+        description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget); the level last set in the session's folder outranks it",
     },
     ConfigField {
         name: "log_api",

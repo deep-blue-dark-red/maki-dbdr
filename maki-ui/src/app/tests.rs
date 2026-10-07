@@ -31,7 +31,7 @@ use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TokenUsage,
 };
 use maki_storage::id::MakiId;
-use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
+use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking, cwd_thinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -6226,6 +6226,21 @@ fn thinking_explicit_args() {
 
     app.set_thinking("high").unwrap();
     assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+}
+
+#[test]
+fn set_thinking_records_the_folder_level_for_the_next_session() {
+    let tmp = TempDir::new().unwrap();
+    let dir = StateDir::from_path(tmp.path().to_path_buf());
+    let mut app = build_app(dir.clone(), Arc::new(test_writer(dir.clone())));
+
+    app.set_thinking("high").unwrap();
+    assert_eq!(
+        cwd_thinking(&dir, TEST_CWD),
+        Some(StoredThinking::Effort {
+            level: Effort::High
+        })
+    );
 }
 
 #[test]

@@ -66,7 +66,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `always_yolo` | bool | `false` | - | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | - | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
 | `always_workflow` | bool | `false` | - | Start every session with workflow mode (task callable inside code_execution) |
-| `always_thinking` | bool \| string | `false` | - | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `always_thinking` | bool \| string | `false` | - | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget); the level last set in the session's folder outranks it |
 | `log_api` | bool | `false` | `MAKI_LOG_API` | Append every LLM request and response to a compressed `.mlog` wire log under the sessions directory (view with `mlog`) |
 
 ### `ui`

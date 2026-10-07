@@ -15,6 +15,7 @@ use maki_config::{Config, ProjectConfig, load_env_files, load_permissions};
 use maki_lua::{InitFiles, Interaction, PackPlan, PackReport, PluginHost};
 use maki_providers::model::Model;
 use maki_storage::StateDir;
+use maki_storage::sessions::cwd_thinking;
 use maki_ui::{OpenSession, RunOutcome};
 
 use crate::cli::{Cli, normalize_tool_name};
@@ -466,6 +467,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
         for OpenSession { session, .. } in &mut tabs {
             if session.messages().is_empty() {
                 stack.config.session_defaults.seed(&mut session.meta);
+                // The level last set in this folder outranks the config knob:
+                // it is the user's most recent word on the folder.
+                if let Some(thinking) = cwd_thinking(&storage, &cwd_str) {
+                    session.meta.thinking = Some(thinking);
+                }
             }
         }
 

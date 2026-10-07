@@ -90,6 +90,7 @@ use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, a
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::input_history::InputHistory;
+use maki_storage::sessions::set_cwd_thinking;
 
 /// Number of completed turns buffered in memory before a batched append to
 /// the per-session turn-stats log. Keeps disk writes off the hot
@@ -728,6 +729,8 @@ impl App {
     ///
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
+    /// The folder's index gets the same value, seeding the next fresh session
+    /// there; a failed write must not undo the live change, so it only logs.
     pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
@@ -738,6 +741,9 @@ impl App {
             .clamped(&self.state.model);
         self.state.thinking = thinking;
         self.cache_miss_forced |= thinking != previous;
+        if let Err(e) = set_cwd_thinking(&self.storage, &self.state.session.cwd, thinking.into()) {
+            tracing::warn!(error = %e, cwd = %self.state.session.cwd, "failed to record the folder's last thinking level");
+        }
         Ok(thinking)
     }
 

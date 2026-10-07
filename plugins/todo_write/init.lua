@@ -3,7 +3,7 @@ local MAIN_TASK = "main"
 -- `todos[session_id][task_id]`: a subagent shares its session id with the
 -- parent, only the task id tells them apart.
 local todos = {}
--- Sessions where Ctrl+T hid the panel; forgotten when the turn ends.
+-- Sessions where Alt+T hid the panel; forgotten when the turn ends.
 local hidden = {}
 -- Sessions that ran a turn since they were loaded. Restores of their
 -- transcript are still in flight while the turn runs, so they are stale.
@@ -40,7 +40,7 @@ end
 local function update_hint(items)
   maki.ui.set_status_hint({
     { string.format(" %d/%d ", count_done(items), #items), "foreground" },
-    { "Ctrl+T", "keybind_key" },
+    { "Alt+T", "keybind_key" },
     { " ", "" },
   })
 end
@@ -59,7 +59,7 @@ local function ensure_win()
     focus = false,
     visible = false,
     footer = {
-      { "Ctrl+T", "to hide" },
+      { "Alt+T", "to hide" },
     },
   })
 end
@@ -181,7 +181,7 @@ local function toggle()
   sync_panel()
 end
 
-maki.keymap.set("n", "<C-t>", toggle, { desc = "Toggle todo panel" })
+maki.keymap.set("n", "<M-t>", toggle, { desc = "Toggle todo panel" })
 
 maki.api.create_autocmd("TurnStart", {
   callback = function(ev)

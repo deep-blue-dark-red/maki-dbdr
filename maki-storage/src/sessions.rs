@@ -1328,15 +1328,17 @@ where
 
 // -- CWD index --
 
-/// One directory's row in [`CWD_INDEX_FILE`]: the newest session there and
-/// the alias its readable links are named with. Files written before the
-/// alias existed store bare id strings.
+/// One directory's row in [`CWD_INDEX_FILE`]: the newest session there, the
+/// alias its readable links are named with, and the last thinking level set
+/// in it. Files written before the alias or the level existed omit them.
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct CwdIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     latest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<StoredThinking>,
 }
 
 #[derive(Deserialize)]
@@ -1357,7 +1359,7 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, CwdIndexEntry> {
                         RawCwdEntry::Entry(entry) => entry,
                         RawCwdEntry::LegacyId(id) => CwdIndexEntry {
                             latest: Some(id),
-                            name: None,
+                            ..CwdIndexEntry::default()
                         },
                     };
                     (cwd, entry)
@@ -1367,20 +1369,59 @@ fn load_cwd_index(dir: &Path) -> HashMap<String, CwdIndexEntry> {
         .unwrap_or_default()
 }
 
-/// Names the alias a directory's session links are filed under, ahead of the
-/// first save that would default it to the folder's own name.
-pub fn set_cwd_alias(dir: &StateDir, cwd: &str, name: &str) -> Result<(), StorageError> {
+/// Rewrites the directory's index row through `f`, which answers whether it
+/// changed anything. Shared by the setters so each one is a two-liner.
+fn mutate_cwd_entry(
+    dir: &StateDir,
+    cwd: &str,
+    f: impl FnOnce(&mut CwdIndexEntry) -> bool,
+) -> Result<(), StorageError> {
     let sessions_dir = dir.ensure_subdir(SESSIONS_DIR)?;
     let mut index = load_cwd_index(&sessions_dir);
     let entry = index.entry(cwd.to_string()).or_default();
-    if entry.name.as_deref() == Some(name) {
+    if !f(entry) {
         return Ok(());
     }
-    entry.name = Some(name.to_owned());
     atomic_write(
         &sessions_dir.join(CWD_INDEX_FILE),
         &serde_json::to_vec(&index)?,
     )
+}
+
+/// Names the alias a directory's session links are filed under, ahead of the
+/// first save that would default it to the folder's own name.
+pub fn set_cwd_alias(dir: &StateDir, cwd: &str, name: &str) -> Result<(), StorageError> {
+    mutate_cwd_entry(dir, cwd, |entry| {
+        if entry.name.as_deref() == Some(name) {
+            return false;
+        }
+        entry.name = Some(name.to_owned());
+        true
+    })
+}
+
+/// The last thinking level [`set_cwd_thinking`] recorded for `cwd`, the seed
+/// a fresh session there starts on. Reads never create anything.
+pub fn cwd_thinking(dir: &StateDir, cwd: &str) -> Option<StoredThinking> {
+    load_cwd_index(&dir.path().join(SESSIONS_DIR))
+        .remove(cwd)
+        .and_then(|entry| entry.thinking)
+}
+
+/// Records the thinking level the user last set in `cwd`, so the next fresh
+/// session there starts on it.
+pub fn set_cwd_thinking(
+    dir: &StateDir,
+    cwd: &str,
+    thinking: StoredThinking,
+) -> Result<(), StorageError> {
+    mutate_cwd_entry(dir, cwd, |entry| {
+        if entry.thinking == Some(thinking) {
+            return false;
+        }
+        entry.thinking = Some(thinking);
+        true
+    })
 }
 
 /// The directories sessions were recorded in, most recently used first and at
@@ -2423,9 +2464,9 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, BY_PATH_DIR, CWD_INDEX_FILE, DEFAULT_TITLE,
         LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
-        StoredSubagent, TAIL_BUF, generate_title, json_path, jsonl_path, latest_id_in, link_stamp,
-        load_cwd_index, lock_path, locks_dir, next_epoch, set_cwd_alias, update_cwd_index,
-        write_full_session,
+        StoredSubagent, TAIL_BUF, cwd_thinking, generate_title, json_path, jsonl_path,
+        latest_id_in, link_stamp, load_cwd_index, lock_path, locks_dir, next_epoch, set_cwd_alias,
+        set_cwd_thinking, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,
@@ -3490,6 +3531,41 @@ mod tests {
                 .and_then(|e| e.name.as_deref()),
             Some(ALIAS)
         );
+    }
+
+    #[test]
+    fn cwd_thinking_round_trips_and_ignores_other_folders() {
+        const CWD: &str = "/home/dev/proj";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join("state"));
+
+        assert_eq!(cwd_thinking(&state, CWD), None);
+
+        let level = StoredThinking::Effort {
+            level: Effort::High,
+        };
+        set_cwd_thinking(&state, CWD, level).unwrap();
+        assert_eq!(cwd_thinking(&state, CWD), Some(level));
+        assert_eq!(cwd_thinking(&state, "/elsewhere"), None);
+
+        let off = StoredThinking::Off;
+        set_cwd_thinking(&state, CWD, off).unwrap();
+        assert_eq!(cwd_thinking(&state, CWD), Some(off));
+    }
+
+    #[test]
+    fn cwd_index_rows_without_thinking_read_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join(CWD_INDEX_FILE),
+            r#"{"\/proj":{"latest":"01900000-0000-7000-8000-000000000000","name":"proj"}}"#,
+        )
+        .unwrap();
+
+        let index = load_cwd_index(dir);
+        assert_eq!(index["/proj"].thinking, None);
     }
 
     #[test]
