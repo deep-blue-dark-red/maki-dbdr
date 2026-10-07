@@ -3161,6 +3161,7 @@ name = "maki-rstring"
 version = "0.5.7"
 dependencies = [
  "criterion",
+ "jiff",
  "serde_json",
  "sha2",
  "tiktoken-rs",

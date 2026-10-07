@@ -13,6 +13,7 @@
 //! `<r:hash>` stub — `rstring expand <hash>` recovers the original.
 
 pub mod cluster;
+pub mod export_md;
 pub mod jsonl;
 pub mod mask;
 pub mod repeat;

@@ -24,12 +24,16 @@ fn main() {
             }
         }
         Some("compress") => compress(&args[1..]),
+        Some("export-md") => export_md_cmd(&args[1..]),
         Some("bench") => bench(&args[1..]),
         Some("tokens") => tokens_cmd(&args[1..]),
         Some("thin-table") => thin_table(&args[1..]),
         _ => {
             eprintln!(
                 "usage: rstring compress [--mode auto|stream|session|session-md|session-json] [--side P] [--keep-thinking] [--no-surp] [--thin RATE] [--evict-last N] < in > out"
+            );
+            eprintln!(
+                "       rstring export-md [--no-thinking] [--no-tools] [--name S] [--path P] [--index N] [--date SECS] [--model S] [file] < session > markdown"
             );
             eprintln!("       rstring expand <hash16> [side-path]");
             eprintln!("       rstring bench <files...>   # end-to-end scoreboard");
@@ -45,6 +49,88 @@ fn main() {
 
 fn default_side_path() -> String {
     ".rstring-side.json".into()
+}
+
+/// /export as a filter: transcript jsonl or export JSON in, markdown out.
+fn export_md_cmd(args: &[String]) {
+    let mut o = rs::export_md::Opts::default();
+    let mut file: Option<&String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        match flag {
+            "--name" => {
+                o.name = Some(flag_value(args, i, flag));
+                i += 2;
+            }
+            "--path" => {
+                o.path = Some(flag_value(args, i, flag));
+                i += 2;
+            }
+            "--index" => {
+                o.index = Some(args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("--index wants an integer");
+                    std::process::exit(2);
+                }));
+                i += 2;
+            }
+            "--date" => {
+                o.date = Some(args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("--date wants unix seconds");
+                    std::process::exit(2);
+                }));
+                i += 2;
+            }
+            "--model" => {
+                o.model = Some(flag_value(args, i, flag));
+                i += 2;
+            }
+            "--no-thinking" => {
+                o.thinking = false;
+                i += 1;
+            }
+            "--no-tools" => {
+                o.tools = false;
+                i += 1;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                std::process::exit(2);
+            }
+            _ => {
+                file = args.get(i);
+                i += 1;
+            }
+        }
+    }
+
+    let input = match file {
+        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("read {p}: {e}");
+            std::process::exit(1);
+        }),
+        None => {
+            let mut s = String::new();
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .expect("stdin utf-8");
+            s
+        }
+    };
+    match rs::export_md::run(&input, &o) {
+        Ok(out) => print!("{out}"),
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn flag_value(args: &[String], i: usize, flag: &str) -> String {
+    args.get(i + 1).cloned().unwrap_or_else(|| {
+        eprintln!("{flag} wants a value");
+        std::process::exit(2);
+    })
 }
 
 fn compress(args: &[String]) {
