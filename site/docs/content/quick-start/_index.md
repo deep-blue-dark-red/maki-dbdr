@@ -30,6 +30,8 @@ curl -fsSL https://maki.sh/install.sh | sh
 
 Installs to `~/.local/bin`. Override with `MAKI_INSTALL_DIR`.
 
+When `cargo` is available, the installer also installs `jlf`, a JSON log formatter that `/logs` pipes the log through. Without it, `/logs` falls back to plain `less`, or set `log_command` in `user.config` to something like `tail -n 30 alog | less -R` (`alog` expands to the log path; the settings picker's log-command entry opens the file).
+
 ### Windows (PowerShell)
 
 ```powershell
@@ -54,6 +56,8 @@ curl -fsSL https://maki.sh/install.sh | sh
 ```
 
 Both install to `%LOCALAPPDATA%\maki` and add it to your user PATH. Override with `MAKI_INSTALL_DIR` / `$env:MAKI_INSTALL_DIR`.
+
+Like the shell script, the installer installs `jlf` via cargo when cargo is available. Without it, `/logs` falls back to plain `less`.
 
 ### Living on the edge (main branch)
 
