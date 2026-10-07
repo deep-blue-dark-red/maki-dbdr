@@ -394,15 +394,15 @@ function M.build_items(jobs)
   return items
 end
 
--- Full stdout for the detail view. `live` is a running job's published buf
--- lines; a settled job reads its captured output. Both paths cap to a tail
--- so a view taken mid-run and retaken after it settles render the same.
-function M.job_output_lines(job, live, max_lines)
+-- Full console lines for the stdout split: a running job's live snapshot
+-- (span tables flattened), otherwise its captured output. Uncapped: the
+-- split renders the complete log, appending live lines as they stream.
+function M.console_lines(job, live)
   if live and #live > 0 then
-    return M.cap_tail(M.plain_lines(live), max_lines)
+    return M.plain_lines(live)
   end
   if job.output and job.output ~= "" then
-    return M.tail_lines(job.output, max_lines)
+    return M.split_lines(job.output)
   end
   return { M.NO_OUTPUT }
 end

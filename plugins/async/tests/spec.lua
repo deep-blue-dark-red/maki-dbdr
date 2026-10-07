@@ -180,16 +180,12 @@ case("last_output_line", function()
   eq(lib.last_output_line(done):sub(-3), "\xE2\x80\xA6", "cap ends with ellipsis")
 end)
 
-case("job_output_lines", function()
-  eq(
-    lib.job_output_lines(job(lib.STATUS.RUNNING), { "live line" }, 10)[1],
-    "    live line",
-    "live lines render as an indented tail"
-  )
+case("console_lines", function()
+  eq(lib.console_lines(job(lib.STATUS.RUNNING), { "live line" })[1], "live line", "live lines pass through plain")
   local done = job(lib.STATUS.DONE)
-  done.output = "a\nb"
-  contains(table.concat(lib.job_output_lines(done, nil, 10), "\n"), "b", "settled job renders its output tail")
-  eq(lib.job_output_lines(job(lib.STATUS.DONE), nil, 10)[1], lib.NO_OUTPUT, "empty output uses the sentinel")
+  done.output = "a\nb\nc"
+  eq(#lib.console_lines(done, nil), 3, "settled job renders its full output")
+  eq(lib.console_lines(job(lib.STATUS.DONE), nil)[1], lib.NO_OUTPUT, "empty output uses the sentinel")
 end)
 
 case("render_status_lists_jobs_and_results", function()
@@ -262,38 +258,16 @@ case("validate_batch_rejects_whole_batch_before_registration", function()
   eq(specs[1].name, "ok-job", "spec name kept")
 end)
 
-case("job_output_lines_caps_live_like_settled", function()
-  local many = {}
-  for i = 1, 12 do
-    many[i] = "line" .. i
-  end
-  local j = { status = lib.STATUS.RUNNING, output = "" }
-  local live = lib.job_output_lines(j, many, 5)
-  -- Same shape as the settled tail of the same output: dropped-line counter,
-  -- indented rows, last line intact.
-  local settled = lib.job_output_lines({
-    status = lib.STATUS.DONE,
-    output = table.concat(many, "\n"),
-  }, nil, 5)
-  eq(#live, 6, "live capped to max_lines plus counter")
-  contains(live[1], "7 earlier lines omitted", "live dropped-line counter")
-  eq(live[#live], "    line12", "live keeps last line indented")
-  eq(#settled, #live, "settled view same height as live view")
-  for i = 1, #live do
-    eq(settled[i], live[i], "settled row matches live row " .. i)
-  end
-end)
-
-case("job_output_lines_flattens_span_live_lines", function()
-  -- Child tools stream span tables ({text, style?}); cap_tail concatenates,
-  -- so the live path must flatten before capping (was: concat error).
+case("console_lines_flattens_span_live_lines", function()
+  -- Child tools stream span tables ({text, style?}); the log is plain text,
+  -- so live snapshots flatten (was: concat error in cap_tail).
   local spans = { { "err: ", "tool_error" }, { "boom" } }
   local mixed = { spans, "plain", { { "tail", "dim" } } }
-  local lines = lib.job_output_lines(job(lib.STATUS.RUNNING), mixed, 10)
-  eq(lines[1], "    err: boom", "span line joined to one plain row")
-  eq(lines[2], "    plain", "plain line passes through")
-  eq(lines[3], "    tail", "style-only span drops its style")
-  eq(lines[1], lib.cap_tail(lib.plain_lines(mixed), 10)[1], "matches cap_tail over plain_lines")
+  local lines = lib.console_lines(job(lib.STATUS.RUNNING), mixed)
+  eq(lines[1], "err: boom", "span line joined to one plain row")
+  eq(lines[2], "plain", "plain line passes through")
+  eq(lines[3], "tail", "style-only span drops its style")
+  eq(#lib.plain_lines({}), 0, "empty snapshot stays empty")
 end)
 
 case("plain_lines_mixed_shapes", function()

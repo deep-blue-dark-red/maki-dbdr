@@ -7,9 +7,6 @@ local ListPicker = require("maki.list_picker")
 
 local TICK_MS = 500
 local DETAIL_TICK_MS = 250
--- The stdout panel shows essentially the whole output; the cap only exists
--- so a runaway job cannot balloon the buf without bound.
-local DETAIL_MAX_LINES = 5000
 local PAGE_LINES = 15
 local PANEL_TITLE = " Jobs "
 local DEFAULT_TOGGLE_KEY = "<C-g>"
@@ -140,9 +137,11 @@ local function fresh_items()
   return items
 end
 
--- The stdout split. It stays open across picker focus switches; the picker
--- owns focus while open, and Tab hands it over either way.
-local stdout -- { win, buf, job, last, cursor, line_count }
+-- The stdout split shows a job's full console log: live lines append as
+-- the child streams, and the settled capture replaces the view wholesale.
+-- It stays open across picker focus switches; the picker owns focus while
+-- open, and Tab hands it over either way.
+local stdout -- { win, buf, job, cursor, line_count, acc, consumed, settled, dirty }
 
 local function refresh_stdout()
   local st = stdout
@@ -150,17 +149,34 @@ local function refresh_stdout()
     return
   end
   local job = st.job
-  local running = not lib.TERMINAL[job.status]
-  local live = running and job.live_buf and job.live_buf:get_lines() or nil
-  local lines = lib.job_output_lines(job, live, DETAIL_MAX_LINES)
-  local text = table.concat(lines, "\n")
-  if text ~= st.last then
+  if lib.TERMINAL[job.status] then
+    if not st.settled then
+      st.settled = true
+      st.acc = lib.console_lines(job, nil)
+      st.consumed = #st.acc
+      st.dirty = true
+    end
+  elseif job.live_buf then
+    local fresh = lib.plain_lines(job.live_buf:get_lines())
+    -- Live snapshots only grow; consume by count, not content.
+    if #fresh > st.consumed then
+      if st.consumed == 0 then
+        st.acc = {}
+      end
+      for i = st.consumed + 1, #fresh do
+        st.acc[#st.acc + 1] = fresh[i]
+      end
+      st.consumed = #fresh
+      st.dirty = true
+    end
+  end
+  if st.dirty then
+    st.dirty = false
     -- Follow the stream while the view already sits at the bottom; a user
     -- who scrolled up keeps their place.
     local pinned = st.cursor >= st.line_count
-    st.last = text
-    st.line_count = #lines
-    st.buf:set_lines(lines)
+    st.line_count = #st.acc
+    st.buf:set_lines(st.acc)
     if pinned then
       st.cursor = st.line_count
       st.win:set_cursor(st.cursor)
@@ -188,7 +204,17 @@ local function open_stdout(job)
     focus = false,
     footer = { { "Tab", "jobs" }, { "Esc", "close" }, { "↑↓", "line" }, { "PgUp/PgDn", "page" } },
   })
-  stdout = { win = w, buf = b, job = job, last = nil, cursor = 1, line_count = 0 }
+  stdout = {
+    win = w,
+    buf = b,
+    job = job,
+    cursor = 1,
+    line_count = 1,
+    acc = { lib.NO_OUTPUT },
+    consumed = 0,
+    settled = false,
+    dirty = false,
+  }
   refresh_stdout()
 end
 
