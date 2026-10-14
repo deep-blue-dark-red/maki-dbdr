@@ -267,6 +267,14 @@ Test a skill using its SKILL.md tests frontmatter. Runs one headless maki subpro
 |-----------|------|----------|-------------|
 | `skill` | string | yes | Skill name to test |
 
+### `tool_help` {#tool_help}
+
+Show a tool's full description and argument schema.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Tool name to look up |
+
 ## Web
 
 ### `webfetch` {#webfetch}
@@ -287,13 +295,3 @@ Search the web for current information or external documentation using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
-
-## Additional tools
-
-### `tool_help` {#tool_help}
-
-Show a tool's full description and argument schema.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `name` | string | yes | Tool name to look up |
