@@ -3,11 +3,17 @@
 -- known maki project. Blocks until a folder is picked and returns its
 -- absolute path, or nil when dismissed.
 --
+-- The mode rides in the title — "{title} | {folder_label}" while the
+-- shortcut rows are up, the plain title over the file system — and the
+-- shortcut rows wear the accent palette in bold, so the two modes read
+-- apart at a glance.
+--
 -- Keys while open:
 --   Enter       pick the highlighted shortcut, descend into the highlighted
 --               folder, or — on ".." — pick the folder being browsed
 --   <Right>     enter the highlighted folder or shortcut without picking
 --   <Left>      climb to the parent folder
+--   <BS>/<Del>  climb to the parent folder too, unadvertised
 --   <Tab>       switch between shortcuts and the file system
 --   <Esc>       dismiss
 --
@@ -59,7 +65,7 @@ local function browse_items(browse_dir)
   return items, list_err
 end
 
-local function folder_items(folders, label)
+local function folder_items(folders, label, style)
   local items = {}
   for _, f in ipairs(folders) do
     items[#items + 1] = {
@@ -67,6 +73,7 @@ local function folder_items(folders, label)
       kind = "folder",
       path = f.path,
       section = label,
+      style = style,
     }
   end
   return items
@@ -89,6 +96,15 @@ local function shortcut_folders(folders, projects)
   return merged
 end
 
+-- The window title names the mode: the label rides next to the caller's
+-- title while the shortcuts are up, the plain title over the file system.
+local function mode_title(base, label, mode)
+  if mode == "folders" then
+    return (" %s | %s "):format(base, label)
+  end
+  return " " .. base .. " "
+end
+
 function DirPicker.open(opts)
   opts = opts or {}
   local projects = {}
@@ -98,13 +114,29 @@ function DirPicker.open(opts)
   end
   local folders = shortcut_folders(opts.folders or {}, projects)
   local folder_label = opts.folder_label or "maki projects"
+  local base_title = (opts.title or "Pick a folder"):match("^%s*(.-)%s*$")
   local browse = opts.start or maki.uv.os_homedir() or "/"
   -- The caller's shortcuts are the fast path, so they open first.
   local mode = #folders > 0 and "folders" or "browse"
+  local win
+
+  local function set_mode(new_mode)
+    mode = new_mode
+    if win then
+      win:set_config({ title = mode_title(base_title, folder_label, mode) })
+    end
+  end
+
+  -- Resolved once per open, like the picker's own styles: a theme cannot
+  -- change while the float holds focus.
+  local function project_style()
+    local accent = maki.ui.theme_style("accent") or {}
+    return { fg = accent.fg, bold = true }
+  end
 
   local function items_for()
     if mode == "folders" then
-      return folder_items(folders, folder_label)
+      return folder_items(folders, folder_label, project_style())
     end
     return browse_items(browse)
   end
@@ -117,7 +149,7 @@ function DirPicker.open(opts)
       browse = item.path
     elseif item.kind == "folder" then
       -- A shortcut enters the browser, so Left can climb back out of it.
-      mode = "browse"
+      set_mode("browse")
       browse = item.path
     else
       return nil
@@ -144,36 +176,44 @@ function DirPicker.open(opts)
   end
   footer[#footer + 1] = { "Esc", "close" }
 
+  -- Climb is the Left arrow's job; Backspace and Delete shadow it quietly.
+  local function climb()
+    if mode ~= "browse" then
+      return nil
+    end
+    local parent = maki.fs.dirname(browse)
+    if not parent or parent == browse then
+      return nil
+    end
+    browse = parent
+    return items_for()
+  end
+
   while true do
     local items, list_err = items_for()
     if list_err then
       maki.ui.flash("Cannot list " .. shorten_path(browse) .. ": " .. tostring(list_err))
     end
     local event = ListPicker.open(items, {
-      title = opts.title,
+      title = mode_title(base_title, folder_label, mode),
       key = function(item)
         return item.kind .. ":" .. (item.path or item.label)
       end,
       submit_swaps = true,
+      on_open = function(handle)
+        win = handle
+      end,
       live_keys = {
         ["<CR>"] = enter_or_pick,
         ["<Right>"] = enter_dir,
-        ["<Left>"] = function()
-          if mode ~= "browse" then
-            return nil
-          end
-          local parent = maki.fs.dirname(browse)
-          if not parent or parent == browse then
-            return nil
-          end
-          browse = parent
-          return items_for()
-        end,
+        ["<Left>"] = climb,
+        ["<BS>"] = climb,
+        ["<Del>"] = climb,
         ["<Tab>"] = function()
           if #folders == 0 then
             return nil
           end
-          mode = mode == "folders" and "browse" or "folders"
+          set_mode(mode == "folders" and "browse" or "folders")
           return items_for()
         end,
       },
@@ -199,5 +239,6 @@ end
 DirPicker._browse_items = browse_items
 DirPicker._folder_items = folder_items
 DirPicker._shortcut_folders = shortcut_folders
+DirPicker._mode_title = mode_title
 
 return DirPicker

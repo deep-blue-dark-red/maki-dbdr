@@ -113,6 +113,10 @@ local function item_section(item)
   return type(item) == "table" and item.section or nil
 end
 
+local function item_style(item)
+  return type(item) == "table" and item.style or nil
+end
+
 local function next_section(item, prev)
   local s = item_section(item)
   if s and s ~= prev then
@@ -310,7 +314,7 @@ local function render_lines(items, selected, width, query, peer, soft_selected)
     local section = next_section(item, prev_section)
     local is_sel = (i == selected)
     local is_peer = not is_sel and sel_key ~= nil and peer.key(item) == sel_key
-    local style = is_sel and sel_style or (is_peer and peer_style or "item")
+    local style = is_sel and sel_style or (is_peer and peer_style or item_style(item) or "item")
     local match_style = is_sel and "match_selected" or (is_peer and peer_match or "match")
 
     if section then
@@ -428,10 +432,11 @@ end
 -- decides.
 --
 -- {items} is a list of strings or of
--- { label, detail?, section?, section_detail? } tables. A detail is a string, or
--- a list of { text, style } parts when the right of a row needs more than one
--- color. Mark one part `elastic = true` and that is the part a narrow row cuts,
--- leaving the parts after it whole.
+-- { label, detail?, section?, section_detail?, style? } tables. A detail is a
+-- string, or a list of { text, style } parts when the right of a row needs more
+-- than one color. Mark one part `elastic = true` and that is the part a narrow
+-- row cuts, leaving the parts after it whole. A {style} (a span style name or
+-- table) repaints the row instead of "item".
 --
 -- {opts}:
 --   title, footer, cursor (initial index)
@@ -455,6 +460,8 @@ end
 --     while the picker is open so rows track a changing source. Returning nil
 --     skips the swap, so callers re-build rows only when something changed
 --   refresh_ms: poll interval for {refresh}
+--   on_open: function(win), called with the window handle once the float is
+--     up, so the caller can re-title or re-shape it while the picker runs
 --
 -- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
 -- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
@@ -508,6 +515,9 @@ function ListPicker.open(items, opts)
     height = content_height(items) + BORDER_CHROME,
     reserved_bottom = 1,
   })
+  if opts.on_open then
+    opts.on_open(win)
+  end
 
   width = win.width
   local height = win.height

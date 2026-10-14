@@ -1405,6 +1405,14 @@ case("render_lines_match_at_start_keeps_indent", function()
   eq(lines[1][2][2], "match_selected")
 end)
 
+case("render_lines_item_style_repaints_plain_rows_only", function()
+  local item = { label = "ada", style = "accent" }
+  local plain = render_lines({ item }, 2, 40)
+  eq(plain[1][1][2], "accent", "a styled row wears its own style, not item")
+  local picked = render_lines({ item }, 1, 40)
+  eq(picked[1][1][2], "selected", "the selection still wins over the row's style")
+end)
+
 case("render_lines_sections_headers_and_item_lines", function()
   local items = {
     { label = "a", section = "auth", section_detail = "(2)" },
@@ -1735,13 +1743,20 @@ case("dir_picker_folder_rows_take_labels_and_default_to_short_paths", function()
   local items = DirPicker._folder_items({
     { path = home .. "/git/ada" },
     { path = "/opt", label = "/opt" },
-  }, "maki projects")
+  }, "maki projects", { fg = "#ff9e3b", bold = true })
   eq(#items, 2)
   eq(items[1].label, "~/git/ada", "a bare path is shortened for display")
   eq(items[1].path, home .. "/git/ada", "the row keeps the absolute path")
   eq(items[1].kind, "folder")
   eq(items[1].section, "maki projects")
+  eq(items[1].style.fg, "#ff9e3b", "the caller's palette rides on every row")
   eq(items[2].label, "/opt", "a label wins over the path")
+end)
+
+case("dir_picker_mode_title_inlines_the_label_over_the_projects", function()
+  local title = DirPicker._mode_title
+  eq(title("Change directory", "maki projects", "folders"), " Change directory | maki projects ")
+  eq(title("Change directory", "maki projects", "browse"), " Change directory ", "the file system drops the label")
 end)
 
 case("dir_picker_shortcut_folders_append_known_projects_not_already_offered", function()
