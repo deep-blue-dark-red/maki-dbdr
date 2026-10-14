@@ -6229,7 +6229,7 @@ fn ast_grep_tools_search_then_rewrite() {
     );
 
     // The CLI exits 1 the way grep does when nothing matched; that is a plain
-    // "No matches" reply, not an error.
+    // "No matches" reply plus the structural-failure hint, not an error.
     let empty = exec_tool(
         &reg,
         "ast_grep",
@@ -6237,6 +6237,7 @@ fn ast_grep_tools_search_then_rewrite() {
     )
     .unwrap();
     assert!(empty.contains("No matches"), "got: {empty}");
+    assert!(empty.contains("complete node"), "got: {empty}");
 
     // A pattern ast-grep cannot parse matches nothing and only warns on
     // stderr; answering as an error gets the pattern fixed instead of read

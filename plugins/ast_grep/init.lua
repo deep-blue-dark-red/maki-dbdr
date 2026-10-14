@@ -203,13 +203,19 @@ end
 
 --- A pattern ast-grep could not fully parse matches nothing and says so on
 --- stderr; answer as an error so the pattern gets fixed, not read as an
---- honest empty search.
-local function no_match_output(result)
+--- honest empty search. Other structurally doomed patterns (a truncated
+--- node, a multi-node sequence, a bogus kind) match nothing with no warning
+--- at all, so a pattern-based empty search rides the hint.
+local function no_match_output(result, input)
   local stderr = result.stderr or ""
   if stderr:find(ERROR_NODE_NOTE, 1, true) then
     return error_output(trim(stderr))
   end
-  return { llm_output = with_stderr(core.NO_MATCHES, stderr) }
+  local text = with_stderr(core.NO_MATCHES, stderr)
+  if input.pattern then
+    text = text .. "\n" .. core.EMPTY_PATTERN_HINT
+  end
+  return { llm_output = text }
 end
 
 --- Parses the run's matches, or the (nil, nil, why) an error response needs.
@@ -223,24 +229,24 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **ast_grep** tool for structural search by code pattern (metavariables like `$F`), and **ast_grep_replace** to rewrite those matches. Prefer **grep** for plain text/regex search. ast_grep takes exactly one of pattern/kind; a pattern is one node, sequences go inside `{ $$$ }`.",
+  content = "- Use the **ast_grep** tool for structural search by code pattern (metavariables like `$F`), and **ast_grep_replace** to rewrite those matches. Prefer **grep** for plain text/regex search. ast_grep takes exactly one of pattern/kind; a pattern is one complete node (a truncated node matches nothing), sequences go inside `{ $$$ }`.",
 })
 
 maki.api.register_tool({
   name = "ast_grep",
   kind = "search",
-  description = [[Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one node per call (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens must exist in the source (`0..$N`, not `(0..$N)`). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.]],
+  description = [[Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.]],
 
   schema = {
     type = "object",
     properties = {
       pattern = {
         type = "string",
-        description = "AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written.",
+        description = "AST snippet: exactly one complete node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`; a truncated node (e.g. Python `def $F($$$ARGS):` with no body) matches nothing. Metavariables `$NAME`/`$$$NAME` only; must match source text as written.",
       },
       kind = {
         type = "string",
-        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both.",
+        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both.",
       },
       lang = {
         type = "string",
@@ -295,7 +301,7 @@ maki.api.register_tool({
       return error_output(invalid_run)
     end
     if #entries == 0 then
-      return no_match_output(result)
+      return no_match_output(result, input)
     end
 
     for _, entry in ipairs(entries) do
@@ -335,11 +341,11 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
     properties = {
       pattern = {
         type = "string",
-        description = "AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written.",
+        description = "AST snippet: exactly one complete node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`; a truncated node (e.g. Python `def $F($$$ARGS):` with no body) matches nothing. Metavariables `$NAME`/`$$$NAME` only; must match source text as written.",
       },
       kind = {
         type = "string",
-        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both.",
+        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both.",
       },
       rewrite = {
         type = "string",
@@ -404,7 +410,7 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
       return error_output(invalid_run)
     end
     if #entries == 0 then
-      return no_match_output(preview)
+      return no_match_output(preview, input)
     end
 
     local applied_run, apply_err = run_ast_grep(core.apply_argv(input), timeout_ms)

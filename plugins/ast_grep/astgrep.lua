@@ -15,6 +15,8 @@ local M = {}
 M.BIN = "ast-grep"
 M.NOT_FOUND = "ast-grep is not on PATH. Install it (https://ast-grep.github.io) or disable the ast_grep plugin."
 M.NO_MATCHES = "No matches"
+M.EMPTY_PATTERN_HINT =
+  "note: a pattern that is not one complete node (e.g. Python `def $F($$$ARGS):` without a body) or spans multiple nodes also matches nothing"
 M.SEARCH_REQUIRED =
   "error: pattern or kind is required (pattern: an AST snippet like `fn $F() { $BODY }`; kind: a node kind like `function_item`)"
 M.REWRITE_REQUIRED = "error: rewrite is required (the replacement snippet, free to reuse the pattern's metavariables)"
