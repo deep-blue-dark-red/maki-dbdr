@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -121,16 +121,16 @@ Pass the regex without shell quotes; use normal JSON escaping (a literal [ is "\
 
 ### `ast_grep` {#ast_grep}
 
-Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one node per call (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens must exist in the source (`0..$N`, not `(0..$N)`). Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.
+Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both. |
+| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to return |
 | `path` | string | no | cwd | Directory or file to search in |
-| `pattern` | string | no |  | AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
+| `pattern` | string | no |  | AST snippet: exactly one complete node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`; a truncated node (e.g. Python `def $F($$$ARGS):` with no body) matches nothing. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
 | `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
 | `timeout` | integer | no | 60 | Timeout in seconds |
 
@@ -142,11 +142,11 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. Plain words like `pointer` are rejected. Supply this or pattern, never both. |
+| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to show |
 | `path` | string | yes |  | Absolute path to the file or directory to rewrite |
-| `pattern` | string | no |  | AST snippet: exactly one node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
+| `pattern` | string | no |  | AST snippet: exactly one complete node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`; a truncated node (e.g. Python `def $F($$$ARGS):` with no body) matches nothing. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
 | `rewrite` | string | yes |  | Replacement snippet, may use the pattern's metavariables |
 | `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
 | `timeout` | integer | no | 60 | Timeout in seconds |
@@ -287,3 +287,13 @@ Search the web for current information or external documentation using Exa AI.
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## Additional tools
+
+### `tool_help` {#tool_help}
+
+Show a tool's full description and argument schema.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Tool name to look up |

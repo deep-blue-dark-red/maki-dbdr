@@ -734,7 +734,9 @@ maki.api.get_tool({name})
 ```
 
 Look up a single tool by name. Returns its metadata table or nil if the
-tool does not exist. For Lua-registered tools the returned table also
+tool does not exist. The entry carries the tool's full description
+(describe callbacks are honored, with a fallback to the static
+description). For Lua-registered tools the returned table also
 includes `header` and `restore` handle functions (wrapped so they never
 throw).
 
@@ -742,7 +744,7 @@ throw).
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, description, schema, audiences, kind?, header?, restore? }, or nil if not found.
 
 **Example:**
 
@@ -6749,11 +6751,17 @@ function M.view(text, ctx)
 -- known maki project. Blocks until a folder is picked and returns its
 -- absolute path, or nil when dismissed.
 --
+-- The mode rides in the title — "{title} | {folder_label}" while the
+-- shortcut rows are up, the plain title over the file system — and the
+-- shortcut rows wear the accent palette in bold, so the two modes read
+-- apart at a glance.
+--
 -- Keys while open:
 --   Enter       pick the highlighted shortcut, descend into the highlighted
 --               folder, or — on ".." — pick the folder being browsed
 --   <Right>     enter the highlighted folder or shortcut without picking
 --   <Left>      climb to the parent folder
+--   <BS>/<Del>  climb to the parent folder too, unadvertised
 --   <Tab>       switch between shortcuts and the file system
 --   <Esc>       dismiss
 --
@@ -6805,10 +6813,11 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 -- decides.
 --
 -- {items} is a list of strings or of
--- { label, detail?, section?, section_detail? } tables. A detail is a string, or
--- a list of { text, style } parts when the right of a row needs more than one
--- color. Mark one part `elastic = true` and that is the part a narrow row cuts,
--- leaving the parts after it whole.
+-- { label, detail?, section?, section_detail?, style? } tables. A detail is a
+-- string, or a list of { text, style } parts when the right of a row needs more
+-- than one color. Mark one part `elastic = true` and that is the part a narrow
+-- row cuts, leaving the parts after it whole. A {style} (a span style name or
+-- table) repaints the row instead of "item".
 --
 -- {opts}:
 --   title, footer, cursor (initial index)
@@ -6832,6 +6841,8 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 --     while the picker is open so rows track a changing source. Returning nil
 --     skips the swap, so callers re-build rows only when something changed
 --   refresh_ms: poll interval for {refresh}
+--   on_open: function(win), called with the window handle once the float is
+--     up, so the caller can re-title or re-shape it while the picker runs
 --
 -- Keys you pass go through `maki.keymap.normalize`, so `"<Enter>"` and
 -- `"<CR>"` are the same binding. An invalid key is dropped with a warning.
