@@ -582,21 +582,24 @@ impl RegistrySnapshot {
     }
 }
 
-fn format_examples_as_text(examples: &Value) -> Option<String> {
-    let arr = examples.as_array()?;
-    if arr.is_empty() {
-        return None;
-    }
-    let mut text = String::from("Examples:");
-    for ex in arr {
-        if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
-            text.push_str("\n```\n");
-            text.push_str(code);
-            text.push_str("\n```");
+    /// Text fallback for providers without native `input_examples`: `code`
+    /// examples render as plain blocks, input-shaped ones as compact JSON, so
+    /// every example carries information instead of a dangling header.
+    pub fn format_examples_as_text(examples: &Value) -> Option<String> {
+        let mut text = String::new();
+        for ex in examples.as_array()?.iter().filter(|ex| !ex.is_null()) {
+            if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
+                text.push_str("\n```\n");
+                text.push_str(code);
+                text.push_str("\n```");
+            } else if let Ok(json) = serde_json::to_string(ex) {
+                text.push_str("\n```json\n");
+                text.push_str(&json);
+                text.push_str("\n```");
+            }
         }
+        (!text.is_empty()).then(|| format!("Examples:{text}"))
     }
-    Some(text)
-}
 
 #[cfg(test)]
 mod tests {
@@ -604,11 +607,26 @@ mod tests {
     use crate::template::Vars;
     use test_case::test_case;
 
-    use crate::tools::test_support::{mock_tool, mock_tool_with_schema};
+    use crate::tools::test_support::{mock_tool, mock_tool_with_examples, mock_tool_with_schema};
 
     const ANY_TOOL_NAME: &str = "schemaless";
     const EMPTY_SCHEMA_REJECTED: &str =
         "strict providers reject a function whose parameters is empty";
+
+    fn wait_example() -> Value {
+        json!([{"action": "wait"}])
+    }
+
+    fn desc_ctx() -> DescriptionContext<'static> {
+        static ALL: LazyLock<crate::tools::ToolFilter> =
+            LazyLock::new(|| crate::tools::ToolFilter::All);
+        DescriptionContext {
+            filter: &ALL,
+            audience: ToolAudience::MAIN,
+            workflow: false,
+            mcp: false,
+        }
+    }
 
     #[test]
     fn plain_tool_args_renders_scalar_args_without_the_name() {
@@ -660,13 +678,60 @@ mod tests {
             plugin: plugin.into(),
         }
     }
-
     #[test]
     fn name_conflict_is_rejected() {
         let reg = ToolRegistry::new();
         reg.register(mock("dupe"), lua_source("p")).unwrap();
         let err = reg.register(mock("dupe"), lua_source("p")).unwrap_err();
         assert!(matches!(err, RegistryError::NameConflict { .. }));
+    }
+
+    #[test]
+    fn definitions_keep_examples_native_when_supported() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_tool_with_examples("exampled", ToolAudience::all(), wait_example()),
+            lua_source("p"),
+        )
+        .unwrap();
+
+        let defs = reg.definitions(&Vars::new(), &desc_ctx(), true);
+        assert_eq!(defs[0]["input_examples"], wait_example());
+        assert_eq!(defs[0]["description"].as_str(), Some("mock tool"));
+    }
+
+    #[test]
+    fn definitions_merge_examples_into_description_when_unsupported() {
+        let reg = ToolRegistry::new();
+        reg.register(
+            mock_tool_with_examples("exampled", ToolAudience::all(), wait_example()),
+            lua_source("p"),
+        )
+        .unwrap();
+
+        let defs = reg.definitions(&Vars::new(), &desc_ctx(), false);
+        assert!(defs[0].get("input_examples").is_none());
+        assert_eq!(
+            defs[0]["description"].as_str(),
+            Some("mock tool\n\nExamples:\n```json\n{\"action\":\"wait\"}\n```")
+        );
+    }
+
+    #[test]
+    fn format_examples_as_text_renders_code_examples_as_plain_blocks() {
+        let examples = json!([{"code": "print(1)"}, {"code": "print(2)"}]);
+        assert_eq!(
+            format_examples_as_text(&examples),
+            Some("Examples:\n```\nprint(1)\n```\n```\nprint(2)\n```".to_owned())
+        );
+    }
+
+    #[test_case(json!(null) ; "null")]
+    #[test_case(json!([]) ; "empty_array")]
+    #[test_case(json!("nope") ; "not_an_array")]
+    #[test_case(json!([null]) ; "null_entry_only")]
+    fn format_examples_as_text_without_renderable_content_is_none(examples: Value) {
+        assert_eq!(format_examples_as_text(&examples), None);
     }
 
     #[test]

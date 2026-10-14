@@ -17,7 +17,7 @@ pub use hook::{Authority, HookCall, HookStage, ToolHook, Verdict};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
     RegisteredTool, RegistryError, Tool, ToolAudience, ToolExecResult, ToolInvocation,
-    ToolRegistry, ToolSource,
+    ToolRegistry, ToolSource, format_examples_as_text,
 };
 
 use std::collections::HashMap;
@@ -656,6 +656,20 @@ pub mod test_support {
             name: name.to_owned(),
             audience,
             schema,
+            examples: None,
+        })
+    }
+
+    pub fn mock_tool_with_examples(
+        name: &str,
+        audience: ToolAudience,
+        examples: Value,
+    ) -> Arc<dyn registry::Tool> {
+        Arc::new(MockTool {
+            name: name.to_owned(),
+            audience,
+            schema: serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            examples: Some(examples),
         })
     }
 
@@ -663,6 +677,7 @@ pub mod test_support {
         name: String,
         audience: ToolAudience,
         schema: Value,
+        examples: Option<Value>,
     }
 
     struct MockInvocation;
@@ -685,6 +700,9 @@ pub mod test_support {
         }
         fn schema(&self) -> Value {
             self.schema.clone()
+        }
+        fn examples(&self) -> Option<Value> {
+            self.examples.clone()
         }
         fn audience(&self) -> ToolAudience {
             self.audience

@@ -11,7 +11,9 @@ use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::template;
 use maki_agent::template::Vars;
-use maki_agent::tools::{FileAccess, RequestTools, ToolAudience, ToolRegistry};
+use maki_agent::tools::{
+    FileAccess, RequestTools, ToolAudience, ToolRegistry, format_examples_as_text,
+};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
@@ -51,8 +53,8 @@ fn base_tools(
 }
 
 /// `/tool_prompt` body: one `## name` section per tool the model is offered,
-/// with its instruction text, in request order. MCP tools are already merged
-/// into `tools` by [`agent::request_tools`].
+/// with its instruction text and examples, in request order. MCP tools are
+/// already merged into `tools` by [`agent::request_tools`].
 fn render_tool_prompt(tools: &Value) -> String {
     let defs = tools.as_array();
     let count = defs.map_or(0, |defs| defs.len());
@@ -70,6 +72,13 @@ fn render_tool_prompt(tools: &Value) -> String {
                 out.push('\n');
             }
             _ => out.push_str("(no description)\n"),
+        }
+        // Native `input_examples` ride outside the description, so surface
+        // them here or supporting models would look example-less.
+        if let Some(text) = format_examples_as_text(&def["input_examples"]) {
+            out.push('\n');
+            out.push_str(&text);
+            out.push('\n');
         }
     }
     out
@@ -726,6 +735,20 @@ mod tests {
         }
         let out = render_tool_prompt(&json!([def]));
         assert!(out.contains(needle), "{out}");
+    }
+
+    #[test]
+    fn native_input_examples_render_after_description() {
+        let def = json!({
+            "name": ALPHA,
+            "description": ALPHA_INSTR,
+            "input_examples": [{"code": "print('hi')"}],
+        });
+        let out = render_tool_prompt(&json!([def]));
+        let desc_at = out.find(ALPHA_INSTR).expect("description");
+        let examples_at = out.find("Examples:").expect("examples section");
+        assert!(desc_at < examples_at, "{out}");
+        assert!(out.contains("print('hi')"), "{out}");
     }
 
     #[test]
