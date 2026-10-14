@@ -3,28 +3,23 @@ local lib = require("cron_lib")
 local CRONTAB_WAIT_MS = 10000
 local ACTIONS = { "add", "edit", "delete", "list" }
 
-local DESCRIPTION = [[Schedule recurring maki runs with the cronjob tool. Each job fires
-`maki -p` (headless build mode) in a fixed directory with a pinned model and
-optional skill, and appends output to a log file.
+local DESCRIPTION = [[Schedule recurring `maki -p` runs: fixed directory, pinned
+model, optional skill, output appended to a log.
 
 Actions:
 - add:    create a job (name, schedule, and prompt or skill required).
-- edit:   change fields of an existing job by name; omitted fields keep their value.
+- edit:   change fields by name; omitted fields keep their value.
 - delete: remove a job by name.
 - list:   show all maki-managed jobs.
 
 Notes:
-- schedule is a standard 5-field cron expression ("30 7 * * 1-5") or an alias (@daily, @hourly, ...).
-- model is a spec like "anthropic/claude-sonnet-4-6"; omit to use the default.
-- Jobs run unattended: yolo defaults to true (deny rules still apply), and gate with allowed_tools for a narrower allow list.
-- continue = true resumes the most recent session in cwd each fire instead of
-  starting fresh. Context (and token cost) then grows with every run, and the
-  session resumed is simply the last one in that directory, which may be one of
-  yours. Default off: every fire is a cold start.
-- cron provides almost no environment: pass env_file (sourced before the run) when the job needs API keys or PATH entries.
-- The job log defaults to <state dir>/cron/logs/<name>.log.
+- schedule: 5-field cron expression ("30 7 * * 1-5") or alias (@daily, ...).
+- Jobs run unattended (yolo defaults true; deny rules still apply); narrow with allowed_tools.
+- continue=true resumes the last session in cwd each fire, so context grows;
+  default off (cold start every fire).
+- Log defaults to <state dir>/cron/logs/<name>.log.
 
-Use list first, then add/edit/delete.]]
+Use list first.]]
 
 local VALID_ACTION = {}
 for _, action in ipairs(ACTIONS) do
