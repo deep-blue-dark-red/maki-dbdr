@@ -6761,7 +6761,6 @@ function M.view(text, ctx)
 --               folder, or — on ".." — pick the folder being browsed
 --   <Right>     enter the highlighted folder or shortcut without picking
 --   <Left>      climb to the parent folder
---   <BS>/<Del>  climb to the parent folder too, unadvertised
 --   <Tab>       switch between shortcuts and the file system
 --   <Esc>       dismiss
 --

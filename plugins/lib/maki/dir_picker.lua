@@ -13,7 +13,6 @@
 --               folder, or — on ".." — pick the folder being browsed
 --   <Right>     enter the highlighted folder or shortcut without picking
 --   <Left>      climb to the parent folder
---   <BS>/<Del>  climb to the parent folder too, unadvertised
 --   <Tab>       switch between shortcuts and the file system
 --   <Esc>       dismiss
 --
@@ -65,14 +64,13 @@ local function browse_items(browse_dir)
   return items, list_err
 end
 
-local function folder_items(folders, label, style)
+local function folder_items(folders, style)
   local items = {}
   for _, f in ipairs(folders) do
     items[#items + 1] = {
       label = f.label or shorten_path(f.path),
       kind = "folder",
       path = f.path,
-      section = label,
       style = style,
     }
   end
@@ -136,7 +134,7 @@ function DirPicker.open(opts)
 
   local function items_for()
     if mode == "folders" then
-      return folder_items(folders, folder_label, project_style())
+      return folder_items(folders, project_style())
     end
     return browse_items(browse)
   end
@@ -176,7 +174,6 @@ function DirPicker.open(opts)
   end
   footer[#footer + 1] = { "Esc", "close" }
 
-  -- Climb is the Left arrow's job; Backspace and Delete shadow it quietly.
   local function climb()
     if mode ~= "browse" then
       return nil
@@ -207,8 +204,6 @@ function DirPicker.open(opts)
         ["<CR>"] = enter_or_pick,
         ["<Right>"] = enter_dir,
         ["<Left>"] = climb,
-        ["<BS>"] = climb,
-        ["<Del>"] = climb,
         ["<Tab>"] = function()
           if #folders == 0 then
             return nil

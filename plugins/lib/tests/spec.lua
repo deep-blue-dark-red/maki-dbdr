@@ -1743,12 +1743,12 @@ case("dir_picker_folder_rows_take_labels_and_default_to_short_paths", function()
   local items = DirPicker._folder_items({
     { path = home .. "/git/ada" },
     { path = "/opt", label = "/opt" },
-  }, "maki projects", { fg = "#ff9e3b", bold = true })
+  }, { fg = "#ff9e3b", bold = true })
   eq(#items, 2)
   eq(items[1].label, "~/git/ada", "a bare path is shortened for display")
   eq(items[1].path, home .. "/git/ada", "the row keeps the absolute path")
   eq(items[1].kind, "folder")
-  eq(items[1].section, "maki projects")
+  eq(items[1].section, nil, "the title names the mode, no section header")
   eq(items[1].style.fg, "#ff9e3b", "the caller's palette rides on every row")
   eq(items[2].label, "/opt", "a label wins over the path")
 end)
