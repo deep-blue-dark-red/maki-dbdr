@@ -80,6 +80,8 @@ const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const JLF: &str = "jlf";
+const LOG_VIEWER_FALLBACK: &str = "less +G {}";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -1868,10 +1870,7 @@ impl<'t> EventLoop<'t> {
                     .unwrap_or_else(|_| self.sessions[idx].app.storage.path().to_path_buf())
                     .join("maki.log");
                 let log_path_str = log_path.to_string_lossy();
-                let cmd_string = match &settings.log_command {
-                    Some(cmd) if !cmd.trim().is_empty() => cmd.clone(),
-                    _ => "less +G {}".to_string(),
-                };
+                let cmd_string = logs_command(settings.log_command.as_deref(), binary_on_path(JLF));
                 let cmd_string = cmd_string
                     .replace("<path>", &log_path_str)
                     .replace("alog", &log_path_str)
@@ -2069,6 +2068,28 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
     }
 }
 
+/// Soft PATH lookup for an optional helper binary; `/logs` uses it to detect
+/// a configured formatter (e.g. `jlf`) that was never installed.
+fn binary_on_path(binary: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    std::env::split_paths(&paths).any(|dir| dir.join(format!("{binary}{suffix}")).is_file())
+}
+
+/// Resolves the `/logs` shell command: honors the user's `log_command`, but
+/// falls back to the plain pager when it references a formatter that is not
+/// on PATH, so a missing `jlf` cannot break log viewing.
+fn logs_command(configured: Option<&str>, formatter_on_path: bool) -> String {
+    match configured {
+        Some(cmd) if !cmd.trim().is_empty() && (!cmd.contains(JLF) || formatter_on_path) => {
+            cmd.to_string()
+        }
+        _ => LOG_VIEWER_FALLBACK.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2078,8 +2099,7 @@ mod tests {
     use maki_providers::TokenUsage;
     use test_case::test_case;
 
-    const OBSERVATION: &str = "failed";
-    const SHELL_RESULT: &str = "command finished";
+    const DEFAULT_LOG_COMMAND: &str = "tail -n 30 alog | jlf -c | less -R";
 
     /// Backgrounding must slow clock-driven repaints without silencing the
     /// motion flag: a spinner that stops reporting movement never gets the
@@ -2240,6 +2260,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn shell_results_do_not_replace_existing_preamble() {
+        const OBSERVATION: &str = "failed";
+        const SHELL_RESULT: &str = "command finished";
+
         let mut preamble = vec![Message::observation(OBSERVATION.into())];
 
         prepend_preamble(
@@ -2249,5 +2272,14 @@ mod tests {
 
         let text = preamble.iter().map(Message::user_text).collect::<Vec<_>>();
         assert_eq!(text, [Some(SHELL_RESULT), Some(OBSERVATION)]);
+    }
+
+    #[test_case(None, false => LOG_VIEWER_FALLBACK; "unset log_command uses pager fallback")]
+    #[test_case(Some("   "), false => LOG_VIEWER_FALLBACK; "blank log_command uses pager fallback")]
+    #[test_case(Some(DEFAULT_LOG_COMMAND), false => LOG_VIEWER_FALLBACK; "missing jlf falls back to pager")]
+    #[test_case(Some(DEFAULT_LOG_COMMAND), true => DEFAULT_LOG_COMMAND; "installed jlf keeps the pipeline")]
+    #[test_case(Some("tail -n 30 alog | less -R"), false => "tail -n 30 alog | less -R"; "formatter-free command is untouched")]
+    fn logs_command_resolves(configured: Option<&str>, formatter_on_path: bool) -> String {
+        logs_command(configured, formatter_on_path)
     }
 }

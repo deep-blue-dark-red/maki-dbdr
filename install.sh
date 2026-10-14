@@ -3,6 +3,7 @@ set -eu
 
 REPO="deep-blue-dark-red/maki-dbdr"
 BINARY="maki"
+JLF_VERSION="0.3.1"
 
 github_curl() {
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
@@ -94,6 +95,28 @@ Write-Host \"added \$dir to user PATH (restart terminal if maki is not found)\"
 " || true
 }
 
+install_to() {
+    src="$1"
+    dir="$2"
+    name="$(basename "${src}")"
+    dest="${dir}/${name}"
+
+    if mkdir -p "${dir}" 2>/dev/null && [ -w "${dir}" ]; then
+        mv "${src}" "${dest}"
+        chmod +x "${dest}"
+    elif command -v sudo > /dev/null 2>&1; then
+        echo "installing ${name} to ${dir} (requires sudo)..."
+        sudo sh -c '
+            set -e
+            mkdir -p "$1"
+            mv "$2" "$3"
+            chmod +x "$3"
+        ' maki-install "${dir}" "${src}" "${dest}"
+    else
+        err "cannot write to ${dir} (set MAKI_INSTALL_DIR to a writable directory)"
+    fi
+}
+
 main() {
     need_cmd curl
 
@@ -140,30 +163,25 @@ main() {
 
     [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
 
-    dest="${INSTALL_DIR}/${bin_name}"
+    install_to "${tmp}/${bin_name}" "${INSTALL_DIR}"
+    echo "${BINARY} ${tag} installed to ${INSTALL_DIR}/${bin_name}"
 
-    if mkdir -p "${INSTALL_DIR}" 2>/dev/null && [ -w "${INSTALL_DIR}" ]; then
-        mv "${tmp}/${bin_name}" "${dest}"
-        chmod +x "${dest}"
-    elif command -v sudo > /dev/null 2>&1; then
-        echo "installing to ${INSTALL_DIR} (requires sudo)..."
-        sudo sh -c '
-            set -e
-            mkdir -p "$1"
-            mv "$2" "$3"
-            chmod +x "$3"
-        ' maki-install "${INSTALL_DIR}" "${tmp}/${bin_name}" "${dest}"
+    if ! command -v cargo > /dev/null 2>&1; then
+        echo "note: cargo not found; skipping jlf (/logs falls back to plain less without it)"
     else
-        err "cannot write to ${INSTALL_DIR} (set MAKI_INSTALL_DIR to a writable directory)"
+        echo "installing jlf via cargo (may take a minute)..."
+        if cargo install jlf --version "${JLF_VERSION}" --locked; then
+            echo "jlf installed (formats /logs output)"
+        else
+            echo "note: jlf install failed; /logs falls back to plain less without it"
+        fi
     fi
-
-    echo "${BINARY} ${tag} installed to ${dest}"
 
     if is_windows; then
         add_windows_user_path "${INSTALL_DIR}"
     else
         warn_path "${INSTALL_DIR}"
-        warn_shadowed "${dest}"
+        warn_shadowed "${INSTALL_DIR}/${bin_name}"
     fi
     echo ""
 }

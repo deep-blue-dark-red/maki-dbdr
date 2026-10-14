@@ -5,6 +5,7 @@ $ProgressPreference = "SilentlyContinue"
 
 $Repo = "deep-blue-dark-red/maki-dbdr"
 $Binary = "maki"
+$JlfVersion = "0.3.1"
 $InstallDir = if ($env:MAKI_INSTALL_DIR) {
     $env:MAKI_INSTALL_DIR
 } else {
@@ -93,6 +94,14 @@ function Install-Maki([string]$Tag) {
         }
 
         Write-Host "$Binary $Tag installed to $dest"
+
+        if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            Write-Host "note: cargo not found; skipping jlf (/logs falls back to plain less without it)"
+        } else {
+            Write-Host "installing jlf via cargo (may take a minute)..."
+            cargo install jlf --version $JlfVersion --locked
+        }
+
         Add-ToUserPath -Dir $InstallDir
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
