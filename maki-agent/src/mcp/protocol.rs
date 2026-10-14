@@ -80,25 +80,85 @@ pub struct ToolsListResult {
 }
 
 #[derive(Deserialize)]
-pub struct CallToolContent {
-    #[serde(default)]
-    pub text: String,
+pub struct ListPage<T> {
+    #[serde(flatten)]
+    pub items: T,
+    #[serde(default, rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CallToolContent {
+    Text {
+        text: String,
+    },
+    Resource {
+        resource: EmbeddedResource,
+    },
+    ResourceLink {
+        uri: String,
+        name: String,
+    },
+    Image {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Audio {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(other)]
+    Unsupported,
+}
+
+#[derive(Deserialize)]
+pub struct EmbeddedResource {
+    pub uri: String,
+    pub text: Option<String>,
+}
+
+impl CallToolContent {
+    fn text(&self) -> String {
+        match self {
+            Self::Text { text } => text.clone(),
+            Self::Resource { resource } => resource
+                .text
+                .clone()
+                .unwrap_or_else(|| format!("[Unsupported MCP binary resource: {}]", resource.uri)),
+            Self::ResourceLink { uri, name } => format!("{name}: {uri}"),
+            Self::Image { mime_type } => format!("[Unsupported MCP image content: {mime_type}]"),
+            Self::Audio { mime_type } => format!("[Unsupported MCP audio content: {mime_type}]"),
+            Self::Unsupported => "[Unsupported MCP content type]".to_string(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<CallToolContent>,
+    #[serde(default, rename = "structuredContent")]
+    pub structured_content: Option<Value>,
     #[serde(default, rename = "isError")]
     pub is_error: bool,
 }
 
 impl CallToolResult {
     pub fn joined_text(&self) -> String {
-        self.content
+        let text = self
+            .content
             .iter()
-            .map(|c| c.text.as_str())
+            .map(CallToolContent::text)
+            .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if text.is_empty() {
+            self.structured_content
+                .as_ref()
+                .map_or(text, Value::to_string)
+        } else {
+            text
+        }
     }
 }
 
@@ -155,6 +215,38 @@ pub struct GetPromptResult {
 mod tests {
     use super::*;
     use serde_json::json;
+    use test_case::test_case;
+
+    const RESOURCE_TEXT: &str = "critical answer";
+    const RESOURCE_URI: &str = "file:///answer.txt";
+    const RESOURCE_LINK: &str = "answer: file:///answer.txt";
+    const BINARY_RESOURCE: &str = "[Unsupported MCP binary resource: file:///answer.txt]";
+    const IMAGE_CONTENT: &str = "[Unsupported MCP image content: image/png]";
+    const AUDIO_CONTENT: &str = "[Unsupported MCP audio content: audio/wav]";
+    const UNKNOWN_CONTENT: &str = "[Unsupported MCP content type]";
+
+    #[test_case(json!({"type": "resource", "resource": {"uri": RESOURCE_URI, "text": RESOURCE_TEXT}}), RESOURCE_TEXT; "embedded_text")]
+    #[test_case(json!({"type": "resource", "resource": {"uri": RESOURCE_URI, "blob": "YQ=="}}), BINARY_RESOURCE; "embedded_binary")]
+    #[test_case(json!({"type": "resource_link", "uri": RESOURCE_URI, "name": "answer"}), RESOURCE_LINK; "resource_link")]
+    #[test_case(json!({"type": "image", "mimeType": "image/png", "data": "YQ=="}), IMAGE_CONTENT; "image")]
+    #[test_case(json!({"type": "audio", "mimeType": "audio/wav", "data": "YQ=="}), AUDIO_CONTENT; "audio")]
+    #[test_case(json!({"type": "future_content"}), UNKNOWN_CONTENT; "unknown")]
+    fn tool_content_is_not_silently_discarded(content: Value, expected: &str) {
+        let result: CallToolResult = serde_json::from_value(json!({"content": [content]})).unwrap();
+        assert_eq!(result.joined_text(), expected);
+    }
+
+    #[test_case(json!([]), "{\"answer\":42}"; "structured_only")]
+    #[test_case(json!([{"type": "text", "text": ""}, {"type": "text", "text": ""}]), "{\"answer\":42}"; "empty_text_blocks")]
+    #[test_case(json!([{"type": "text", "text": "answer: 42"}]), "answer: 42"; "text_not_duplicated")]
+    fn structured_content_fills_empty_text(content: Value, expected: &str) {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "content": content,
+            "structuredContent": {"answer": 42}
+        }))
+        .unwrap();
+        assert_eq!(result.joined_text(), expected);
+    }
 
     #[test]
     fn request_skips_none_params() {
@@ -176,7 +268,7 @@ mod tests {
 
     #[test]
     fn call_tool_result_honours_is_error_rename() {
-        let raw = json!({"content": [{"text": "hello"}], "isError": true});
+        let raw = json!({"content": [{"type": "text", "text": "hello"}], "isError": true});
         let result: CallToolResult = serde_json::from_value(raw).unwrap();
         assert!(result.is_error);
         assert_eq!(result.joined_text(), "hello");
