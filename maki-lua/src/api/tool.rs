@@ -1233,12 +1233,14 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 }
 
 /// Look up a single tool by name. Returns its metadata table or nil if the
-/// tool does not exist. For Lua-registered tools the returned table also
+/// tool does not exist. The entry carries the tool's full description
+/// (describe callbacks are honored, with a fallback to the static
+/// description). For Lua-registered tools the returned table also
 /// includes `header` and `restore` handle functions (wrapped so they never
 /// throw).
 ///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, description, schema, audiences, kind?, header?, restore? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1254,6 +1256,13 @@ fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
         return Ok(LuaValue::Nil);
     };
     let t = tool_entry_to_lua(lua, &entry)?;
+    let dctx = DescriptionContext {
+        filter: &ToolFilter::All,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+    t.set("description", entry.tool.description(&dctx))?;
     if let Some((header, restore)) = local_tool_handles(&name) {
         if let Some(f) = header {
             t.set("header", wrap_header(lua, name.clone(), f)?)?;

@@ -186,6 +186,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "status",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/status"),
     },
+    BundledPlugin {
+        name: "tool_help",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tool_help"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
@@ -1410,6 +1414,25 @@ mod tests {
         host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
             .unwrap();
         assert!(reg.has("glob"));
+    }
+
+    #[test]
+    fn tool_help_registers_and_get_tool_returns_description() {
+        let reg = Arc::new(ToolRegistry::new());
+        let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+        assert!(reg.has("tool_help"));
+        host.load_source(
+            "tool_help_probe",
+            r#"
+            local t = maki.api.get_tool("read")
+            assert(t, "read tool registered")
+            assert(t.description and #t.description > 0, "description present")
+            assert(t.schema and t.schema.properties, "schema present")
+            "#,
+        )
+        .unwrap();
     }
 
     /// The second call sends `Shutdown` on a sender that is already
