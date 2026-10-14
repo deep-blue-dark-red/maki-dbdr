@@ -127,6 +127,7 @@ impl StatusBar {
     /// [`Self::flash`] for messages whose meaning rides on a color, such as
     /// the green cache keep-alive ping.
     pub fn flash_styled(&mut self, msg: String, style: Style) {
+        tracing::info!(msg = %msg, "status flash");
         self.flash = Some((msg, style, Instant::now()));
     }
 

@@ -628,6 +628,22 @@ fn paste_loads_every_image_path_in_the_text() {
     assert_eq!(app.input_box.buffer.value(), "");
 }
 
+#[test]
+fn paste_loads_every_image_path_space_separated_on_one_line() {
+    let mut app = test_app();
+    app.update(Msg::Paste("/tmp/one.jpeg /tmp/two\\ photo.png".into()));
+    assert_eq!(app.image_paste_rx.len(), 2);
+    assert_eq!(app.input_box.buffer.value(), "");
+}
+
+#[test]
+fn paste_of_prose_mentioning_a_path_stays_text() {
+    let mut app = test_app();
+    app.update(Msg::Paste("look at /tmp/one.png first".into()));
+    assert!(app.image_paste_rx.is_empty());
+    assert_eq!(app.input_box.buffer.value(), "look at /tmp/one.png first");
+}
+
 #[test_case(Some(PRIMARY_TEXT), PRIMARY_TEXT ; "selection_inserted")]
 #[test_case(None,               ""           ; "empty_selection_ignored")]
 fn primary_selection_read_lands_on_tick(selection: Option<&str>, expected: &str) {

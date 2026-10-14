@@ -87,7 +87,7 @@ impl App {
         let mut any_image = false;
         if self.is_main_chat() {
             for line in text.lines() {
-                if let Some((path, media_type)) = image::try_parse_image_path(line) {
+                for (path, media_type) in image::try_parse_image_paths(line) {
                     self.start_file_image_paste(path, media_type);
                     any_image = true;
                 }

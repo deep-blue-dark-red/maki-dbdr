@@ -6,6 +6,7 @@ use std::sync::Arc;
 use base64::Engine;
 use image::{ImageBuffer, RgbaImage};
 use maki_agent::{ImageMediaType, ImageSource};
+use shell_words::split;
 
 pub(crate) const MAX_IMAGE_PIXELS: usize = 8_000_000;
 pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -46,6 +47,22 @@ pub(crate) fn try_parse_image_path(text: &str) -> Option<(PathBuf, ImageMediaTyp
     let path = maki_storage::paths::expand_tilde(Path::new(&path_str));
     let media_type = media_type_for(&path)?;
     Some((path, media_type))
+}
+
+/// A dropped batch of files arrives as one line of shell-escaped paths
+/// (`/a\ b.jpeg /c.jpeg` — Ghostty, Terminal.app, iTerm2 on macOS), which is
+/// not itself a path. Parse each word; only when every word resolves to an
+/// image do we call it a drop, so prose that happens to mention a path still
+/// pastes as text.
+pub(crate) fn try_parse_image_paths(text: &str) -> Vec<(PathBuf, ImageMediaType)> {
+    match split(text) {
+        Ok(words) if !words.is_empty() => words
+            .iter()
+            .map(|word| try_parse_image_path(word))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
+        _ => try_parse_image_path(text).into_iter().collect(),
+    }
 }
 
 pub fn load_file_image(path: &Path, media_type: ImageMediaType) -> Result<ImageSource, String> {
@@ -124,6 +141,42 @@ mod tests {
     #[test_case("look at /home/user/photo.png" ; "embedded_path")]
     fn try_parse_image_path_none(input: &str) {
         assert!(try_parse_image_path(input).is_none());
+    }
+
+    #[test]
+    fn try_parse_image_paths_splits_a_ghostty_drop_of_two() {
+        let drop_line = "/Users/me/a\\ b.jpeg /Users/me/c\\ \\(1\\).png";
+        let paths = try_parse_image_paths(drop_line);
+        let rendered: Vec<&str> = paths.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(rendered, ["/Users/me/a b.jpeg", "/Users/me/c (1).png"]);
+        assert_eq!(
+            paths.iter().map(|(_, mt)| *mt).collect::<Vec<_>>(),
+            [ImageMediaType::Jpeg, ImageMediaType::Png]
+        );
+    }
+
+    #[test]
+    fn try_parse_image_paths_unescapes_a_single_file_with_parens() {
+        let paths = try_parse_image_paths("/Users/me/holiday\\ \\(1\\).jpeg");
+        assert_eq!(
+            paths.iter().map(|(p, _)| p.to_str().unwrap()).collect::<Vec<_>>(),
+            ["/Users/me/holiday (1).jpeg"]
+        );
+    }
+
+    #[test]
+    fn try_parse_image_paths_newline_and_uri_batches_still_parse() {
+        let newline_batch = try_parse_image_paths("file:///tmp/one.png");
+        assert_eq!(
+            newline_batch.iter().map(|(p, _)| p.to_str().unwrap()).collect::<Vec<_>>(),
+            ["/tmp/one.png"]
+        );
+    }
+
+    #[test]
+    fn try_parse_image_paths_prose_is_not_a_drop() {
+        assert!(try_parse_image_paths("look at /home/user/photo.png").is_empty());
+        assert!(try_parse_image_paths("read /tmp/a.png and /tmp/b.png first").is_empty());
     }
 
     #[test]

@@ -31,7 +31,39 @@ const SAVE_RECOVERED: &str = "Session save recovered";
 #[cfg(test)]
 pub(crate) const STORAGE_THREAD_MSG: &str = "spawn storage writer thread";
 
-type Pending = Arc<Mutex<HashMap<MakiId, Entry>>>;
+type Pending = Arc<Mutex<PendingWrites>>;
+
+#[derive(Default)]
+struct PendingWrites {
+    entries: HashMap<MakiId, Entry>,
+    in_flight: HashSet<MakiId>,
+}
+
+impl PendingWrites {
+    fn take_batch(&mut self) -> HashMap<MakiId, Entry> {
+        let batch = mem::take(&mut self.entries);
+        self.in_flight.extend(
+            batch
+                .iter()
+                .filter_map(|(id, entry)| matches!(entry, Entry::Save(..)).then_some(*id)),
+        );
+        batch
+    }
+
+    fn outstanding(&self) -> Vec<MakiId> {
+        self.in_flight
+            .iter()
+            .copied()
+            .chain(
+                self.entries
+                    .iter()
+                    .filter_map(|(id, entry)| matches!(entry, Entry::Save(..)).then_some(*id)),
+            )
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
 
 type DeleteCallback = Box<dyn FnOnce(Result<(), SessionError>) + Send>;
 
@@ -102,11 +134,15 @@ impl StorageWriter {
     }
 
     fn enqueue(&self, id: MakiId, entry: Entry) {
-        lock(&self.pending).insert(id, entry);
-        if self.wake.send(()).is_err()
-            && let Some(Entry::Delete(_, done)) = lock(&self.pending).remove(&id)
-        {
-            done(Err(writer_gone()));
+        lock(&self.pending).entries.insert(id, entry);
+        if self.wake.send(()).is_err() {
+            let mut pending = lock(&self.pending);
+            if matches!(pending.entries.get(&id), Some(Entry::Delete(..)))
+                && let Some(Entry::Delete(_, done)) = pending.entries.remove(&id)
+            {
+                drop(pending);
+                done(Err(writer_gone()));
+            }
         }
     }
 
@@ -117,12 +153,12 @@ impl StorageWriter {
         drop(self.wake);
         self.done_rx.recv_timeout(timeout).unwrap_or_else(|_| {
             warn!("storage writer did not drain within {timeout:?}");
-            Vec::new()
+            lock(&self.pending).outstanding()
         })
     }
 }
 
-fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, HashMap<MakiId, Entry>> {
+fn lock(pending: &Pending) -> std::sync::MutexGuard<'_, PendingWrites> {
     pending.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -143,23 +179,25 @@ struct Writer {
 
 impl Writer {
     fn flush(&mut self, pending: &Pending) {
-        // Bound first: a `for` head temporary lives for the whole loop, so
-        // iterating the guard directly would deadlock the re-insert below.
-        let batch = mem::take(&mut *lock(pending));
+        let batch = lock(pending).take_batch();
         for (id, entry) in batch {
             match entry {
                 Entry::Save(session, claim) => {
                     let result = claim.persist(&*session);
+                    let mut pending = lock(pending);
+                    pending.in_flight.remove(&id);
                     if result.is_err() {
                         // `checkpoint` never resends an unchanged revision, so
                         // a dropped snapshot would miss disk for good.
                         // `or_insert` lets a newer op win; the shutdown flush
                         // is the last retry. The claim stays queued with it, so
                         // the session stays locked while a write is owed.
-                        lock(pending)
+                        pending
+                            .entries
                             .entry(id)
                             .or_insert(Entry::Save(session, claim));
                     }
+                    drop(pending);
                     self.report(id, result);
                 }
                 Entry::Delete(claim, done) => {
@@ -204,6 +242,7 @@ mod tests {
 
     use maki_storage::sessions::SESSIONS_DIR;
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::OpenSession;
@@ -220,6 +259,66 @@ mod tests {
     const LANDED_RELEASES: &str = "a session let go is free once its last snapshot landed";
     const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
     const REPORTED_UNSAVED: &str = "a transcript that never landed must be named on the way out";
+
+    #[test]
+    fn a_snapshot_sent_after_the_writer_stops_is_named_at_shutdown() {
+        let (_tmp, dir) = state_dir();
+        let (session, claim) = fresh(&dir);
+        let id = session.id;
+        let (wake, wake_rx) = flume::unbounded();
+        let (done_tx, done_rx) = flume::bounded(1);
+        drop(wake_rx);
+        drop(done_tx);
+        let writer = StorageWriter {
+            pending: Arc::default(),
+            wake,
+            done_rx,
+        };
+        writer.send(Arc::new(session), claim);
+        assert_eq!(
+            writer.shutdown(Duration::ZERO),
+            vec![id],
+            "{REPORTED_UNSAVED}"
+        );
+    }
+
+    #[test_case(false, false, false; "queued_timeout")]
+    #[test_case(true, false, false; "in_flight_timeout")]
+    #[test_case(true, true, false; "newer_snapshot_timeout")]
+    #[test_case(false, false, true; "queued_disconnected")]
+    #[test_case(true, false, true; "in_flight_disconnected")]
+    fn unfinished_writes_are_named_when_shutdown_cannot_drain(
+        in_flight: bool,
+        newer_snapshot: bool,
+        disconnected: bool,
+    ) {
+        let (_tmp, dir) = state_dir();
+        let (session, claim) = fresh(&dir);
+        let id = session.id;
+        let pending: Pending = Arc::default();
+        lock(&pending)
+            .entries
+            .insert(id, Entry::Save(Arc::new(session.clone()), claim.clone()));
+        let _batch = in_flight.then(|| lock(&pending).take_batch());
+        if newer_snapshot {
+            lock(&pending)
+                .entries
+                .insert(id, Entry::Save(Arc::new(session), claim));
+        }
+        let (wake, _wake_rx) = flume::unbounded();
+        let (done_tx, done_rx) = flume::bounded(1);
+        let _done_tx = (!disconnected).then_some(done_tx);
+        let writer = StorageWriter {
+            pending,
+            wake,
+            done_rx,
+        };
+        assert_eq!(
+            writer.shutdown(Duration::ZERO),
+            vec![id],
+            "{REPORTED_UNSAVED}"
+        );
+    }
 
     fn state_dir() -> (TempDir, StateDir) {
         let tmp = TempDir::new().unwrap();
