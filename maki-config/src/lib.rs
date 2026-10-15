@@ -127,6 +127,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "skill",
     "status",
     "subtask",
+    "terminal_progress",
     "thinking",
     "todo_write",
     "tool_help",

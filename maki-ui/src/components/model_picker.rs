@@ -4,7 +4,9 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use maki_providers::Model;
 use maki_providers::ModelTier;
@@ -24,20 +26,25 @@ const FREE_LABEL: &str = "Free";
 const SCORE_LABEL: &str = "AA";
 const PRICE_SEPARATOR: &str = " · ";
 const PRICE_WIDTH: usize = 7;
+/// Fits `AA ~100.0`, the widest score a row can quote.
+const SCORE_COL_WIDTH: usize = 8;
+/// Rank 0 of each fade: best-scoring model, priciest model.
+const SCORE_HIGH: Color = Color::Rgb(0x58, 0xa6, 0xff);
+const COST_HIGH: Color = Color::Rgb(0xff, 0x51, 0x51);
+/// Fade target when the theme's description colour is not an RGB blend.
+const RANK_GREY: Color = Color::Rgb(0x6e, 0x6e, 0x6e);
 
 fn footer_line() -> Line<'static> {
     let t = theme::current();
     Line::from(vec![
         Span::styled("  Enter", t.keybind_key),
         Span::styled(" select", t.tool_dim),
-        Span::styled("  !", t.keybind_key),
-        Span::styled(" strong", t.tool_dim),
-        Span::styled("  @", t.keybind_key),
-        Span::styled(" medium", t.tool_dim),
-        Span::styled("  #", t.keybind_key),
-        Span::styled(" weak", t.tool_dim),
-        Span::styled("  $", t.keybind_key),
-        Span::styled(" compaction", t.tool_dim),
+        Span::styled("  C", t.keybind_key),
+        Span::styled(" cheap default", t.tool_dim),
+        Span::styled("  S", t.keybind_key),
+        Span::styled(" strong default", t.tool_dim),
+        Span::styled("  T", t.keybind_key),
+        Span::styled(" thinking (cycle)", t.tool_dim),
     ])
 }
 
@@ -60,12 +67,31 @@ fn tier_for_shortcut(key: KeyEvent) -> Option<ModelTier> {
     }
 }
 
+/// `S` and `C` set the strong and cheap defaults the footer advertises;
+/// the shifted digits keep their legacy tier shortcuts.
+fn tier_shortcut(key: KeyEvent) -> Option<ModelTier> {
+    match key.code {
+        KeyCode::Char('S') => Some(ModelTier::Strong),
+        KeyCode::Char('C') => Some(ModelTier::Weak),
+        _ => tier_for_shortcut(key),
+    }
+}
+
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
+    CycleThinking,
     Close,
+}
+
+/// One quoted number in the detail row: its text, the value behind its rank,
+/// and the rank itself (0.0 = brightest end of the fade).
+struct Cell {
+    value: f64,
+    text: String,
+    rank: f32,
 }
 
 struct ModelEntry {
@@ -73,7 +99,11 @@ struct ModelEntry {
     id: String,
     provider_display: String,
     suffix: Option<String>,
-    detail: String,
+    score: Option<Cell>,
+    price: Option<Cell>,
+    /// Width the widest price in the list pads into, so every score sits in
+    /// the same column however long the neighbouring prices are.
+    price_col: usize,
     override_tiers: Vec<ModelTier>,
     free: bool,
 }
@@ -87,8 +117,33 @@ impl PickerItem for ModelEntry {
         self.suffix.as_deref()
     }
 
-    fn detail(&self) -> Option<&str> {
-        Some(&self.detail)
+    fn detail_spans(&self) -> Option<Vec<Span<'_>>> {
+        if self.score.is_none() && self.price.is_none() {
+            return None;
+        }
+        let t = theme::current();
+        let mut spans = Vec::with_capacity(3);
+        match &self.score {
+            // No price means the price column stays empty, so the score is
+            // padded out to where the priced rows begin instead of sliding
+            // into it.
+            Some(score) => spans.push(Span::styled(
+                &score.text,
+                rank_style(SCORE_HIGH, score.rank),
+            )),
+            None => spans.push(Span::raw(" ".repeat(SCORE_COL_WIDTH))),
+        }
+        match &self.price {
+            Some(price) => {
+                spans.push(Span::styled(PRICE_SEPARATOR, t.item_desc));
+                spans.push(Span::styled(&price.text, rank_style(COST_HIGH, price.rank)));
+            }
+            None => {
+                let gap = PRICE_SEPARATOR.width() + self.price_col;
+                spans.push(Span::raw(" ".repeat(gap)));
+            }
+        }
+        Some(spans)
     }
 
     fn section(&self) -> Option<&str> {
@@ -137,6 +192,17 @@ impl ModelPicker {
         let entries = self.load_entries();
         self.picker.open(entries, TITLE);
         self.preselect_current_model();
+    }
+
+    /// Ranks every quoted number against the whole list: rank 0 is the
+    /// brightest end of each fade (best score, priciest model), the last
+    /// rank lands on grey.
+    fn rank_cells(cells: &mut [&mut Cell]) {
+        cells.sort_by(|a, b| b.value.total_cmp(&a.value));
+        let last = cells.len().saturating_sub(1);
+        for (pos, cell) in cells.iter_mut().enumerate() {
+            cell.rank = pos as f32 / last.max(1) as f32;
+        }
     }
 
     /// Providers fetch their model lists in the background and drop them into
@@ -188,6 +254,26 @@ impl ModelPicker {
                 .then_with(|| a.id.cmp(&b.id))
         });
         entries.extend(full);
+        let mut scored: Vec<&mut Cell> = entries
+            .iter_mut()
+            .filter_map(|e| e.score.as_mut())
+            .collect();
+        Self::rank_cells(&mut scored);
+        let mut priced: Vec<&mut Cell> = entries
+            .iter_mut()
+            .filter_map(|e| e.price.as_mut())
+            .collect();
+        Self::rank_cells(&mut priced);
+        let price_col = priced.iter().map(|c| c.text.width()).max().unwrap_or(0);
+        for e in &mut entries {
+            e.price_col = price_col;
+            if let Some(score) = &mut e.score {
+                score.text = format!("{:<SCORE_COL_WIDTH$}", score.text);
+            }
+            if let Some(price) = &mut e.price {
+                price.text = format!("{:>price_col$}", price.text);
+            }
+        }
         entries
     }
 
@@ -239,7 +325,7 @@ impl ModelPicker {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> ModelPickerAction {
-        if let Some(tier) = tier_for_shortcut(key)
+        if let Some(tier) = tier_shortcut(key)
             && let Some(entry) = self.picker.selected_item()
         {
             let spec = entry.spec.clone();
@@ -249,6 +335,8 @@ impl ModelPicker {
             } else {
                 ModelPickerAction::AssignTier(spec, tier)
             }
+        } else if key.code == KeyCode::Char('T') {
+            ModelPickerAction::CycleThinking
         } else {
             match self.picker.handle_key(key) {
                 PickerAction::Consumed => ModelPickerAction::Consumed,
@@ -289,6 +377,30 @@ fn format_pricing(model: &Model) -> Option<String> {
     })
 }
 
+/// The grey end of both fades: the theme's own description colour when it can
+/// blend, a fixed grey otherwise.
+fn rank_grey(t: &crate::theme::Theme) -> Color {
+    match t.item_desc.fg {
+        Some(c @ Color::Rgb(..)) => c,
+        _ => RANK_GREY,
+    }
+}
+
+fn blend(from: Color, to: Color, t: f32) -> Color {
+    match (from, to) {
+        (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) => Color::Rgb(
+            theme::lerp_u8(fr, tr, t),
+            theme::lerp_u8(fg, tg, t),
+            theme::lerp_u8(fb, tb, t),
+        ),
+        _ => from,
+    }
+}
+
+fn rank_style(top: Color, rank: f32) -> Style {
+    Style::default().fg(blend(top, rank_grey(&theme::current()), rank))
+}
+
 fn parse_model_entry(spec: &str, scores: &AaScores) -> Option<ModelEntry> {
     let (provider_str, model_id) = spec.split_once('/')?;
 
@@ -311,33 +423,45 @@ fn parse_model_entry(spec: &str, scores: &AaScores) -> Option<ModelEntry> {
 
     let override_tiers = model_registry::override_tiers(spec);
     let (free, price) = match Model::from_spec(spec) {
-        Ok(m) => (m.is_free(), format_pricing(&m)),
+        Ok(m) => {
+            let free = m.is_free();
+            let price = match format_pricing(&m) {
+                Some(text) => Some(Cell {
+                    value: m.pricing.input + m.pricing.output,
+                    text,
+                    rank: 0.0,
+                }),
+                None if free => Some(Cell {
+                    value: 0.0,
+                    text: FREE_LABEL.to_string(),
+                    rank: 0.0,
+                }),
+                None => None,
+            };
+            (free, price)
+        }
         Err(_) => (false, None),
     };
     // The row quotes the intelligence index first, then what it costs to run:
     // a tier word told the reader nothing the tier shortcuts did not already.
-    let mut parts = Vec::new();
-    if let Some((score, estimated)) = scores.score(model_id) {
-        parts.push(if estimated {
-            format!("{SCORE_LABEL} ~{score:.1}")
+    let score = scores.score(model_id).map(|(value, estimated)| Cell {
+        value,
+        text: if estimated {
+            format!("{SCORE_LABEL} ~{value:.1}")
         } else {
-            format!("{SCORE_LABEL} {score:.1}")
-        });
-    }
-    if free {
-        parts.push(FREE_LABEL.to_string());
-    }
-    if let Some(price) = price {
-        parts.push(price);
-    }
-    let detail = parts.join(PRICE_SEPARATOR);
+            format!("{SCORE_LABEL} {value:.1}")
+        },
+        rank: 0.0,
+    });
     let id = model_id.to_string();
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
         provider_display,
         suffix: None,
-        detail,
+        score,
+        price,
+        price_col: 0,
         override_tiers,
         free,
     })
@@ -439,17 +563,14 @@ mod tests {
             parse_model_entry("anthropic/claude-sonnet-4-20250514", &AaScores::default()).unwrap();
         assert_eq!(entry.id, "claude-sonnet-4-20250514");
         assert_eq!(entry.provider_display, "Anthropic");
-        assert!(!entry.detail.is_empty());
+        assert!(entry.price.is_some());
     }
 
     #[test]
     fn parse_model_entry_paid_model_not_marked_free() {
         let entry =
             parse_model_entry("anthropic/claude-sonnet-4-20250514", &AaScores::default()).unwrap();
-        assert!(
-            !entry.detail.contains(FREE_LABEL),
-            "paid anthropic model must not be marked free"
-        );
+        assert!(!entry.free, "paid anthropic model must not be marked free");
     }
 
     #[test]
@@ -686,7 +807,7 @@ mod tests {
         register_openrouter_models();
         let entry = parse_model_entry(OX_SPEC, &AaScores::default()).unwrap();
         assert!(
-            entry.free && entry.detail == FREE_LABEL,
+            entry.free && entry.price.as_ref().map(|p| p.text.as_str()) == Some(FREE_LABEL),
             "zero-priced discovery must mark the entry free"
         );
     }
@@ -696,12 +817,10 @@ mod tests {
         register_openrouter_models();
         let entry =
             parse_model_entry(&format!("openrouter/{PAID_ID}"), &AaScores::default()).unwrap();
-        assert!(
-            !entry.detail.contains(FREE_LABEL),
-            "paid discovery must not mark the entry free"
-        );
+        assert!(!entry.free, "paid discovery must not mark the entry free");
         assert_eq!(
-            entry.detail, PAID_PRICE_LABEL,
+            entry.price.as_ref().map(|p| p.text.as_str()),
+            Some(PAID_PRICE_LABEL),
             "paid discovery must show its price"
         );
     }
@@ -716,13 +835,157 @@ mod tests {
 
         let paid = parse_model_entry(&format!("openrouter/{PAID_ID}"), &scores).unwrap();
         assert_eq!(
-            paid.detail,
-            format!("AA 44.8{PRICE_SEPARATOR}{PAID_PRICE_LABEL}"),
+            paid.score.as_ref().map(|s| s.text.as_str()),
+            Some("AA 44.8"),
             "a measured score leads the row, tier words are gone"
         );
 
         let free = parse_model_entry(OX_SPEC, &scores).unwrap();
-        assert_eq!(free.detail, "AA ~27.9 · Free");
+        assert_eq!(
+            free.score.as_ref().map(|s| s.text.as_str()),
+            Some("AA ~27.9")
+        );
+        assert_eq!(
+            free.price.as_ref().map(|p| p.text.as_str()),
+            Some(FREE_LABEL)
+        );
+    }
+
+    fn plain_entry(score: Option<Cell>, price: Option<Cell>, price_col: usize) -> ModelEntry {
+        ModelEntry {
+            spec: String::new(),
+            id: String::new(),
+            provider_display: String::new(),
+            suffix: None,
+            score,
+            price,
+            price_col,
+            override_tiers: Vec::new(),
+            free: false,
+        }
+    }
+
+    fn spans_width(e: &ModelEntry) -> usize {
+        e.detail_spans()
+            .map_or(0, |spans| spans.iter().map(|s| s.content.width()).sum())
+    }
+
+    /// Every row with any detail quotes into the same total width, so the
+    /// render's right alignment lands scores and prices in fixed columns.
+    #[test]
+    fn detail_columns_align_across_priced_and_scoreless_rows() {
+        const PRICE_COL: usize = 12;
+        let cell = |text: &str| Cell {
+            value: 1.0,
+            text: text.to_string(),
+            rank: 0.0,
+        };
+        let score_text = format!("{:<SCORE_COL_WIDTH$}", format!("{SCORE_LABEL} 40.0"));
+        let price_text = format!("{:>PRICE_COL$}", "$3.00/$15.00");
+        let both = plain_entry(Some(cell(&score_text)), Some(cell(&price_text)), PRICE_COL);
+        let score_only = plain_entry(Some(cell(&score_text)), None, PRICE_COL);
+        let price_only = plain_entry(None, Some(cell(&price_text)), PRICE_COL);
+
+        let width = spans_width(&both);
+        assert_eq!(spans_width(&score_only), width);
+        assert_eq!(spans_width(&price_only), width);
+
+        // A scoreless row leaves the price column blank instead of sliding
+        // its score into it.
+        let score_only_spans = score_only.detail_spans().unwrap();
+        let tail: String = score_only_spans
+            .iter()
+            .skip(1)
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(tail.chars().all(char::is_whitespace));
+
+        assert!(plain_entry(None, None, PRICE_COL).detail_spans().is_none());
+    }
+
+    /// Rank 0 is the brightest end of a fade, the last rank lands on grey.
+    #[test]
+    fn ranks_fade_from_bright_to_grey() {
+        let mut best = Cell {
+            value: 50.0,
+            text: String::new(),
+            rank: 1.0,
+        };
+        let mut worst = Cell {
+            value: 10.0,
+            text: String::new(),
+            rank: 0.0,
+        };
+        ModelPicker::rank_cells(&mut [&mut best, &mut worst]);
+        assert_eq!(best.rank, 0.0, "highest value ranks first");
+        assert_eq!(worst.rank, 1.0);
+        // Costs rank the same way, priciest first.
+        let mut cheap = Cell {
+            value: 0.0,
+            text: String::new(),
+            rank: 1.0,
+        };
+        ModelPicker::rank_cells(&mut [&mut cheap, &mut best, &mut worst]);
+        assert_eq!(best.rank, 0.0, "value 50 is the priciest");
+        assert_eq!(worst.rank, 0.5);
+        assert_eq!(cheap.rank, 1.0, "free fades to grey");
+    }
+
+    #[test]
+    fn load_entries_pads_prices_into_a_shared_column() {
+        register_openrouter_models();
+        let models = Arc::new(ArcSwapOption::empty());
+        models.store(Some(Arc::new(vec![
+            format!("openrouter/{PAID_ID}"),
+            OX_SPEC.into(),
+        ])));
+        let mut p = ModelPicker::new(models);
+        p.open("");
+        let entries = p.load_entries();
+        let paid = entries.iter().find(|e| e.id == PAID_ID).unwrap();
+        let free = entries.iter().find(|e| e.id == "stealth/ox-alpha").unwrap();
+        assert_eq!(paid.price_col, PAID_PRICE_LABEL.width());
+        assert_eq!(paid.price.as_ref().unwrap().text, PAID_PRICE_LABEL);
+        assert_eq!(
+            paid.price.as_ref().unwrap().rank,
+            0.0,
+            "priciest is reddest"
+        );
+        assert_eq!(free.price.as_ref().unwrap().rank, 1.0, "free fades to grey");
+    }
+
+    #[test_case(key(KeyCode::Char('C')), ModelTier::Weak     ; "c_sets_cheap_default")]
+    #[test_case(key(KeyCode::Char('S')), ModelTier::Strong   ; "s_sets_strong_default")]
+    fn default_shortcut_assigns_and_keeps_picker_open(k: KeyEvent, want: ModelTier) {
+        let mut p = ModelPicker::new(test_models());
+        p.open("anthropic/claude-sonnet-4-20250514");
+        let action = p.handle_key(k);
+        assert!(matches!(&action, ModelPickerAction::AssignTier(s, t)
+                if s == "anthropic/claude-sonnet-4-20250514" && *t == want),);
+        assert!(p.is_open());
+    }
+
+    #[test]
+    fn t_cycles_thinking_without_closing() {
+        let mut p = ModelPicker::new(test_models());
+        p.open("anthropic/claude-sonnet-4-20250514");
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('T'))),
+            ModelPickerAction::CycleThinking
+        ));
+        assert!(p.is_open());
+    }
+
+    #[test]
+    fn lowercase_shortcut_letters_still_search() {
+        let mut p = ModelPicker::new(test_models());
+        p.open("");
+        p.handle_key(key(KeyCode::Char('c')));
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s.contains("claude")),
+            "lowercase c filters instead of triggering the cheap default"
+        );
     }
 
     #[test]

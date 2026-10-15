@@ -258,8 +258,7 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
 const FULL_MODEL_SPEC: &str = "openrouter/glm-5.3";
 const DEFAULT_SUBAGENT_SPEC: &str = "moonshot/kimi-k3";
 const DEFAULT_SUBAGENT_THINKING: &str = "low";
-const DEFAULT_SUBAGENT_ERR: &str =
-    "expected model (string) or thinking (string|number)";
+const DEFAULT_SUBAGENT_ERR: &str = "expected model (string) or thinking (string|number)";
 
 /// Advertised to the model, so the wording lives in the docs, not here: what
 /// matters is that the property exists and that whatever the model writes
@@ -331,7 +330,11 @@ fn default_subagent_fills_what_caller_omits(
         json!({ "model": DEFAULT_SUBAGENT_SPEC, "thinking": DEFAULT_SUBAGENT_THINKING }),
     );
     let (reg, _host) = load_task_host_with_opts(opts);
-    let schema = reg.get(SUBTASK_TOOL).expect("subtask tool missing").tool.schema();
+    let schema = reg
+        .get(SUBTASK_TOOL)
+        .expect("subtask tool missing")
+        .tool
+        .schema();
     assert!(
         schema["properties"].get("model_tier").is_none(),
         "model_tier should be hidden when a default model is configured"
@@ -347,7 +350,10 @@ fn default_subagent_fills_what_caller_omits(
 
     let snap = probe(&reg);
     assert_eq!(snap["resolve_opts"]["spec"], json!(expected_spec));
-    assert_eq!(snap.get("thinking"), expected_thinking.map(|t| json!(t)).as_ref());
+    assert_eq!(
+        snap.get("thinking"),
+        expected_thinking.map(|t| json!(t)).as_ref()
+    );
     assert_eq!(snap["cap_thinking"], json!(false));
 }
 

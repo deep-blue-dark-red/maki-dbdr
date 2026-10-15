@@ -2827,6 +2827,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "flume 0.11.1",
+ "futures-lite",
  "isahc",
  "libc",
  "maki-acp",
@@ -2835,6 +2836,7 @@ dependencies = [
  "maki-lua",
  "maki-otel",
  "maki-providers",
+ "maki-shmem",
  "maki-storage",
  "maki-ui",
  "open",
@@ -3187,6 +3189,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "maki-shmem"
+version = "0.5.7"
+dependencies = [
+ "hmac",
+ "libc",
+ "sha2",
+ "thiserror 2.0.18",
+ "zstd",
+]
+
+[[package]]
 name = "maki-storage"
 version = "0.5.7"
 dependencies = [
@@ -3230,6 +3243,7 @@ dependencies = [
  "maki-markdown",
  "maki-otel",
  "maki-providers",
+ "maki-shmem",
  "maki-storage",
  "notify",
  "nucleo",

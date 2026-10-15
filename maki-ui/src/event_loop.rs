@@ -38,7 +38,10 @@ use maki_lua::{
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
-use maki_providers::{Message, Model};
+use maki_providers::{EMPTY_RESPONSE_MARKER, Message, Model, ThinkingConfig};
+use maki_shmem::Speaker;
+use maki_shmem::broadcast::{Broadcaster, PendingCommand};
+use maki_shmem::control::{AckResult, Command};
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
@@ -46,6 +49,7 @@ use maki_storage::sessions::normalize_title;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use serde_json::json;
+use std::str::FromStr;
 use tracing::{info, warn};
 
 use crate::agent::{
@@ -355,6 +359,9 @@ struct SessionRuntime {
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
+    /// The session this runtime last published to the shmem feed, so a
+    /// session swap (`/new`, goto, reload) retires the id it stopped owning.
+    broadcast_id: Option<MakiId>,
     /// This session's model and provider, one cell per runtime and never
     /// shared. The agent loop reads it at the start of every turn, and a
     /// background tab must not get dragged onto the model another tab just
@@ -408,6 +415,9 @@ struct SpawnCtx {
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust_question: Option<TrustQuestion>,
+    /// This process's session ring; `None` when its file could not be
+    /// created, in which case maki runs fine without the shmem feed.
+    broadcaster: Option<Arc<Broadcaster>>,
 }
 
 impl SpawnCtx {
@@ -467,6 +477,7 @@ impl SpawnCtx {
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
+            broadcast_id: None,
             slot: cell,
         }
     }
@@ -683,6 +694,7 @@ impl<'t> EventLoop<'t> {
             storage_writer,
             model_policy,
             trust_question,
+            broadcaster: Broadcaster::start().ok().map(Arc::new),
         };
 
         let mut runtimes: Vec<SessionRuntime> = sessions
@@ -789,6 +801,8 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
+            self.broadcast_sessions();
+            self.apply_maki_commands();
             if dirty.take()
                 && let Err(e) = self.paint()
             {
@@ -907,6 +921,65 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Applies control commands haunt sent over the command rings and
+    /// acks each one on the status ring. `Refresh` never reaches here: the
+    /// broadcaster thread answers it inline.
+    fn apply_maki_commands(&mut self) {
+        let pending: Vec<PendingCommand> = match &self.ctx.broadcaster {
+            Some(broadcaster) => broadcaster.drain_commands(),
+            None => return,
+        };
+        for command in pending {
+            self.apply_maki_command(command);
+        }
+    }
+
+    fn apply_maki_command(&mut self, pending: PendingCommand) {
+        let result = self.run_maki_command(&pending);
+        if let Some(broadcaster) = &self.ctx.broadcaster {
+            broadcaster.ack(&pending.session_id, pending.request_id, result);
+        }
+    }
+
+    fn run_maki_command(&mut self, pending: &PendingCommand) -> AckResult {
+        let Ok(id) = MakiId::from_str(&pending.session_id) else {
+            return AckResult::NoSession;
+        };
+        let Some(idx) = self.position(id) else {
+            return AckResult::NoSession;
+        };
+        match &pending.command {
+            Command::Cancel => {
+                self.sessions[idx].handles.cancel_all();
+                AckResult::Ok
+            }
+            Command::Prompt(text) => match self.submit_text(idx, text.clone()) {
+                Ok(_) => AckResult::Ok,
+                Err(_) => AckResult::Rejected,
+            },
+            Command::Refresh => AckResult::Ok,
+        }
+    }
+
+    /// Refreshes the shmem session feed: one ring per process carries every
+    /// open session, latest-wins per id, so haunt's table survives laps and
+    /// late attaches without the UI thread touching shared memory.
+    fn broadcast_sessions(&mut self) {
+        let Some(broadcaster) = &self.ctx.broadcaster else {
+            return;
+        };
+        for rt in &mut self.sessions {
+            let id = rt.id();
+            if rt.broadcast_id != Some(id) {
+                if let Some(old) = rt.broadcast_id {
+                    broadcaster.remove(&old.to_string());
+                }
+                rt.broadcast_id = Some(id);
+            }
+            broadcaster.update(rt.app.session_snapshot());
+        }
+    }
+
     /// Only the focused session is drawn, so only it can owe a frame; focusing
     /// another is an event, and events always repaint. The rest get
     /// [`App::tick_background`].
@@ -947,6 +1020,12 @@ impl<'t> EventLoop<'t> {
             }
             AgentEvent::TurnComplete(turn) if current => {
                 rt.notifications.on_turn_complete(&turn.message);
+                if let Some(broadcaster) = self.ctx.broadcaster.as_ref()
+                    && let Some(text) = turn.message.first_text_content()
+                    && text != EMPTY_RESPONSE_MARKER
+                {
+                    broadcaster.chat(&rt.id().to_string(), Speaker::Assistant, text);
+                }
             }
             event if current => rt.notifications.on_done(event),
             _ => {}
@@ -1028,6 +1107,11 @@ impl<'t> EventLoop<'t> {
             UiAction::SetWindowTitle(title) => {
                 if let Err(error) = terminal::set_window_title(&title) {
                     warn!(%error, "failed to set window title");
+                }
+            }
+            UiAction::SetProgress { state, percent } => {
+                if let Err(error) = terminal::set_progress(state, percent) {
+                    warn!(%error, "failed to set terminal progress");
                 }
             }
             UiAction::Input { req, reply_tx } => {
@@ -1273,6 +1357,9 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                     let rt = self.remove_runtime(i);
+                    if let Some(broadcaster) = &self.ctx.broadcaster {
+                        broadcaster.remove(&rt.id().to_string());
+                    }
                     self.ctx
                         .lua_event_handle
                         .end_session(rt.id(), SessionEndReason::Delete);
@@ -1484,6 +1571,9 @@ impl<'t> EventLoop<'t> {
     }
 
     fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
+        if let Some(broadcaster) = &self.ctx.broadcaster {
+            broadcaster.chat(&self.sessions[idx].id().to_string(), Speaker::User, &text);
+        }
         let msg = QueuedMessage {
             text,
             images: Vec::new(),
@@ -1745,6 +1835,17 @@ impl<'t> EventLoop<'t> {
             }
             Action::UnassignTier(spec, tier) => {
                 maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
+            }
+            Action::CycleThinking => {
+                let app = self.focused_app();
+                let next = match app.state.thinking {
+                    ThinkingConfig::Off => "adaptive",
+                    ThinkingConfig::Adaptive => "high",
+                    _ => "off",
+                };
+                if let Err(e) = app.set_thinking(next) {
+                    app.flash(e);
+                }
             }
             Action::Compact(instructions) => {
                 let rt = &mut self.sessions[idx];

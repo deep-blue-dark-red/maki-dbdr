@@ -386,6 +386,45 @@ fn set_window_title(
     Ok(())
 }
 
+/// Sets the terminal's progress indicator (OSC 9;4): the spinner or bar that
+/// Ghostty, Windows Terminal, iTerm2 and others draw on the tab or taskbar.
+/// Terminals that do not know the sequence ignore it. It passes through tmux
+/// and screen like the title does, and maki clears it on exit and suspend.
+///
+/// @param state string `"off"` clears it, `"indeterminate"` spins,
+///   `"normal"` shows `percent`, `"error"` shows it in the error colour, and
+///   `"paused"` shows it as waiting.
+/// @param percent integer? 0 to 100, used by every state but `"off"` and
+///   `"indeterminate"`. Default 0.
+/// @return
+/// @example
+/// maki.ui.set_progress("indeterminate")
+/// maki.ui.set_progress("normal", 40)
+/// maki.ui.set_progress("off")
+#[lua_fn]
+fn set_progress(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    state: String,
+    percent: Option<u8>,
+) -> LuaResult<()> {
+    let state = match state.as_str() {
+        "off" => 0,
+        "normal" => 1,
+        "error" => 2,
+        "indeterminate" => 3,
+        "paused" => 4,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "set_progress: unknown state '{other}', expected off, normal, error, indeterminate or paused"
+            )));
+        }
+    };
+    let percent = percent.unwrap_or(0).min(100);
+    let _ = tx.try_send(UiAction::SetProgress { state, percent });
+    Ok(())
+}
+
 /// Runs a built-in UI action by name, exactly as its default keybinding
 /// would. Handy when a default key never reaches maki because tmux or
 /// your terminal grabs it first: bind a new key with `maki.keymap.set`
@@ -734,7 +773,7 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual input, manual input_edit,
+        manual set_window_title, manual set_progress, manual input, manual input_edit,
     ]
 }
 
@@ -749,6 +788,7 @@ pub(crate) fn create_ui_table(
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
         set_window_title__register(&t, lua, tx.clone())?;
+        set_progress__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         input__register(&t, lua, tx.clone())?;

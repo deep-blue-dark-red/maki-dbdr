@@ -6025,6 +6025,41 @@ maki.ui.set_window_title("")
 
 ---
 
+### `maki.ui.set_progress()` {#maki-ui-set_progress}
+
+```lua
+maki.ui.set_progress({state}, {percent?})
+```
+
+Sets the terminal's progress indicator (OSC 9;4): the spinner or bar that
+Ghostty, Windows Terminal, iTerm2 and others draw on the tab or taskbar.
+Terminals that do not know the sequence ignore it. It passes through tmux
+and screen like the title does, and maki clears it on exit and suspend.
+
+**Parameters:**
+
+- `{state}` (`string`) `"off"` clears it, `"indeterminate"` spins,
+
+  `"normal"` shows `percent`, `"error"` shows it in the error colour, and
+
+
+  `"paused"` shows it as waiting.
+
+- `{percent?}` (`integer?`) 0 to 100, used by every state but `"off"` and
+
+  `"indeterminate"`. Default 0.
+
+
+**Example:**
+
+```lua
+maki.ui.set_progress("indeterminate")
+maki.ui.set_progress("normal", 40)
+maki.ui.set_progress("off")
+```
+
+---
+
 ### `maki.ui.input()` {#maki-ui-input}
 
 ```lua

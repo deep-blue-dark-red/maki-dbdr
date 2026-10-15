@@ -187,6 +187,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/status"),
     },
     BundledPlugin {
+        name: "terminal_progress",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/terminal_progress"),
+    },
+    BundledPlugin {
         name: "tool_help",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tool_help"),
     },

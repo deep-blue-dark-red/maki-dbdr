@@ -87,6 +87,7 @@ use maki_lua::{
     PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, TokenUsage, add_cost};
+use maki_shmem::broadcast::{SessionSnapshot as ShmemSnapshot, SessionState as ShmemState};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::input_history::InputHistory;
@@ -464,6 +465,9 @@ pub struct App {
     last_seen_output_tokens: u32,
     /// When the last turn completed; used to detect stale-cache risk on idle.
     last_turn_at: Option<Instant>,
+    /// Name of the most recently started tool, republished in the session
+    /// broadcast (`session_snapshot`).
+    last_tool: Arc<str>,
 
     pub(crate) storage: StateDir,
     /// The folder trust question this run was started with, `None` when the
@@ -628,6 +632,7 @@ impl App {
             round_start: None,
             last_seen_output_tokens: 0,
             last_turn_at: None,
+            last_tool: Arc::from(""),
             storage,
             trust_question: None,
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -1094,6 +1099,27 @@ impl App {
         }
     }
 
+    /// The session's state for the shmem feed haunt attaches to; the event
+    /// loop republishes it every iteration, latest-wins per session id.
+    pub(crate) fn session_snapshot(&self) -> ShmemSnapshot {
+        let state = if self.permission_prompt.is_open() || self.plan_form.is_visible() {
+            ShmemState::Waiting
+        } else if matches!(self.status, Status::Streaming) {
+            ShmemState::Working
+        } else {
+            ShmemState::Idle
+        };
+        ShmemSnapshot {
+            state,
+            context_used: self.state.context_size,
+            context_limit: self.state.model.context_window,
+            cost_usd: self.state.cost.unwrap_or_default(),
+            session_id: self.state.session.id.to_string(),
+            title: self.state.session.title.clone(),
+            last_tool: self.last_tool.to_string(),
+        }
+    }
+
     fn send_answer(&self, answer: String) {
         if let Some(tx) = &self.answer_tx {
             let _ = tx.try_send(answer);
@@ -1542,6 +1568,7 @@ impl App {
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
                 }
+                ModelPickerAction::CycleThinking => vec![Action::CycleThinking],
                 ModelPickerAction::Close => vec![],
             });
         }
@@ -2307,13 +2334,16 @@ impl App {
         }
 
         match &envelope.event {
-            AgentEvent::ToolStart(event) => self.fire_session_autocmd(
-                "ToolStart",
-                serde_json::json!({
-                    "tool_id": event.id,
-                    "tool": event.tool,
-                }),
-            ),
+            AgentEvent::ToolStart(event) => {
+                self.last_tool = Arc::clone(&event.tool);
+                self.fire_session_autocmd(
+                    "ToolStart",
+                    serde_json::json!({
+                        "tool_id": event.id,
+                        "tool": event.tool,
+                    }),
+                )
+            }
             AgentEvent::ToolDone(event) => self.fire_session_autocmd(
                 "ToolDone",
                 serde_json::json!({

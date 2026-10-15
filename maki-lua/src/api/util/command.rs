@@ -634,6 +634,12 @@ pub enum UiAction {
     },
     Flash(String),
     SetWindowTitle(String),
+    /// OSC 9;4 taskbar/tab progress: `state` is 0 clear, 1 normal, 2 error,
+    /// 3 indeterminate, 4 paused; `percent` is 0..=100.
+    SetProgress {
+        state: u8,
+        percent: u8,
+    },
     OpenEditor {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,

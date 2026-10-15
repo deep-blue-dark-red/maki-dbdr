@@ -10,11 +10,12 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
+use futures_lite::future::or;
 use maki_agent::headless::{self, HeadlessHandle, HeadlessParams};
 use maki_agent::permissions::PluginRuleStore;
 use maki_agent::session::Resumed;
@@ -26,7 +27,12 @@ use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::model::Model;
-use maki_providers::{TokenUsage, add_cost};
+use maki_providers::{EMPTY_RESPONSE_MARKER, TokenUsage, add_cost};
+use maki_shmem::Speaker;
+use maki_shmem::broadcast::{
+    Broadcaster, SessionSnapshot as ShmemSnapshot, SessionState as ShmemState,
+};
+use maki_shmem::control::{AckResult, Command};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
@@ -34,6 +40,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 const SESSION_LINE_PREFIX: &str = "session: ";
+
+/// How often a quiet run still polls haunt's commands, so a `Cancel` is not
+/// stuck behind a tool that emits nothing.
+const COMMAND_POLL: Duration = Duration::from_millis(250);
 
 // Fails fast: silently dropping an image the caller explicitly attached
 // would be worse than erroring.
@@ -207,6 +217,18 @@ pub fn run(params: PrintParams) -> Result<()> {
         eprintln!("MCP config error: {mcp_config_errors}");
     }
 
+    // Read before `resumed` moves into the spawn: haunt's table shows the
+    // stored title for `-r`, the prompt's first line for a fresh run.
+    let broadcast_title = resumed
+        .session
+        .as_ref()
+        .map(|s| s.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| prompt.lines().next().unwrap_or("maki -p").to_owned());
+    // The prompt is moved into the spawn; haunt's chat feed quotes it.
+    let broadcast_prompt = prompt.clone();
+    let initial_context = resumed.context_size;
+
     let (handle, mut events) = maki_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
         config,
@@ -234,6 +256,24 @@ pub fn run(params: PrintParams) -> Result<()> {
         task,
     } = handle;
     let start = Instant::now();
+
+    // Same per-process feed the TUI writes: latest-wins snapshots on a ring
+    // haunt attaches to, parked and unlinked when this handle drops. A headless
+    // run is always `Working` until it ends, when the session is removed.
+    let broadcaster = Broadcaster::start().ok();
+    let broadcast_status = |last_tool: &str, context_used: u32, cost_usd: f64| {
+        if let Some(b) = &broadcaster {
+            b.update(ShmemSnapshot {
+                state: ShmemState::Working,
+                context_used,
+                context_limit: model.context_window,
+                cost_usd,
+                session_id: session_id.to_string(),
+                title: broadcast_title.clone(),
+                last_tool: last_tool.to_owned(),
+            });
+        }
+    };
 
     let mut verbose_out = match format {
         OutputFormat::StreamJson => Some(VerboseOutput::StreamJson),
@@ -277,7 +317,35 @@ pub fn run(params: PrintParams) -> Result<()> {
         || MODE_BUILD,
     );
 
-    while let Some(envelope) = smol::block_on(events.next()) {
+    let mut cancelled = false;
+    let mut last_tool = String::new();
+    let mut context_used = initial_context;
+    broadcast_status(&last_tool, context_used, 0.0);
+    let broadcast_chat = |speaker: Speaker, text: &str| {
+        if let Some(b) = &broadcaster {
+            b.chat(&session_id.to_string(), speaker, text);
+        }
+    };
+    broadcast_chat(Speaker::User, &broadcast_prompt);
+    loop {
+        // Ticks keep the command path live while a single long tool emits
+        // nothing; the stream end and a tick are told apart by the wrapper.
+        let next = smol::block_on(or(async { Some(events.next().await) }, async {
+            smol::Timer::after(COMMAND_POLL).await;
+            None
+        }));
+        let envelope = match next {
+            Some(Some(envelope)) => envelope,
+            // The run's event stream has ended.
+            Some(None) => break,
+            None => {
+                cancelled |= apply_headless_commands(broadcaster.as_ref(), &session_id);
+                if cancelled {
+                    break;
+                }
+                continue;
+            }
+        };
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
@@ -301,8 +369,11 @@ pub fn run(params: PrintParams) -> Result<()> {
                 }
             }
             AgentEvent::ThinkingDelta { .. } => {}
+            AgentEvent::ToolStart(ts) => {
+                last_tool = ts.tool.to_string();
+                broadcast_status(&last_tool, context_used, cost.unwrap_or_default());
+            }
             AgentEvent::ToolPending { .. }
-            | AgentEvent::ToolStart(_)
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolDone(_)
             | AgentEvent::QueueItemConsumed { .. }
@@ -346,6 +417,16 @@ pub fn run(params: PrintParams) -> Result<()> {
             }
             AgentEvent::TurnComplete(tc) => {
                 add_cost(&mut cost, tc.cost);
+                if let Some(ctx) = tc.context_size {
+                    context_used = ctx;
+                }
+                broadcast_status(&last_tool, context_used, cost.unwrap_or_default());
+                if parent_tool_use_id.is_none()
+                    && let Some(text) = tc.message.first_text_content()
+                    && text != EMPTY_RESPONSE_MARKER
+                {
+                    broadcast_chat(Speaker::Assistant, text);
+                }
                 if let Some(out) = &mut verbose_out {
                     let content_value = serde_json::to_value(&tc.message.content)?;
                     out.emit(&AssistantEvent {
@@ -396,8 +477,20 @@ pub fn run(params: PrintParams) -> Result<()> {
                 break;
             }
         }
+        cancelled |= apply_headless_commands(broadcaster.as_ref(), &session_id);
+        if cancelled {
+            break;
+        }
     }
-    smol::block_on(headless::await_shutdown(task));
+    if let Some(b) = &broadcaster {
+        b.remove(&session_id.to_string());
+    }
+    if cancelled {
+        stop_reason = Some(DoneReason::Cancelled);
+        smol::block_on(task.cancel());
+    } else {
+        smol::block_on(headless::await_shutdown(task));
+    }
     lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
 
     let duration_ms = start.elapsed().as_millis();
@@ -432,6 +525,33 @@ pub fn run(params: PrintParams) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Applies commands haunt sent this run: `Cancel` stops it, `Prompt` is
+/// refused (a headless run takes no new input), `Refresh` never reaches here —
+/// the broadcaster thread answers it inline. Returns whether the run was
+/// cancelled.
+fn apply_headless_commands(broadcaster: Option<&Broadcaster>, session_id: &SessionRef) -> bool {
+    let Some(broadcaster) = broadcaster else {
+        return false;
+    };
+    let mut cancelled = false;
+    for pending in broadcaster.drain_commands() {
+        let result = if pending.session_id != session_id.to_string() {
+            AckResult::NoSession
+        } else {
+            match pending.command {
+                Command::Cancel => {
+                    cancelled = true;
+                    AckResult::Ok
+                }
+                Command::Prompt(_) => AckResult::Rejected,
+                Command::Refresh => AckResult::Ok,
+            }
+        };
+        broadcaster.ack(&pending.session_id, pending.request_id, result);
+    }
+    cancelled
 }
 
 /// Nothing reached the model, so the reason is the only answer there is. A

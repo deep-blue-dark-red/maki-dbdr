@@ -218,6 +218,21 @@ pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
     write_sequence(&window_title_sequence(TerminalMux::detect(), title))
 }
 
+/// OSC 9;4 progress: `state` 0 clear, 1 normal, 2 error, 3 indeterminate,
+/// 4 paused. Clear and indeterminate carry no percentage.
+fn progress_sequence(mux: TerminalMux, state: u8, percent: u8) -> String {
+    let body = match state {
+        0 => "0".to_owned(),
+        3 => "3".to_owned(),
+        s => format!("{};{}", s.min(4), percent.min(100)),
+    };
+    mux.wrap_for_mux(format!("\u{1b}]9;4;{body}\u{7}"))
+}
+
+pub(crate) fn set_progress(state: u8, percent: u8) -> std::io::Result<()> {
+    write_sequence(&progress_sequence(TerminalMux::detect(), state, percent))
+}
+
 fn write_mux_sequence(sequence: &str) {
     let _ = write_sequence(&TerminalMux::detect().wrap_for_mux(sequence.into()));
 }
@@ -312,6 +327,8 @@ fn teardown() {
 }
 
 fn pop_terminal_modes() {
+    // A spinner left on the tab would outlive maki.
+    let _ = set_progress(0, 0);
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     stdout().execute(crossterm::cursor::Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
@@ -617,6 +634,18 @@ mod tests {
     #[test_case("\0\t\u{7f}\u{85}\n\u{2003}", FALLBACK_NOTIFICATION_MESSAGE ; "all_control_input_falls_back")]
     fn sanitize_notification_message_cases(message: &str, expected: &str) {
         assert_eq!(sanitize_notification_message(message), expected);
+    }
+
+    #[test_case(0, 50, "\u{1b}]9;4;0\u{7}" ; "clear_drops_percent")]
+    #[test_case(3, 50, "\u{1b}]9;4;3\u{7}" ; "indeterminate_drops_percent")]
+    #[test_case(1, 40, "\u{1b}]9;4;1;40\u{7}" ; "normal_carries_percent")]
+    #[test_case(2, 250, "\u{1b}]9;4;2;100\u{7}" ; "percent_is_capped")]
+    #[test_case(4, 0, "\u{1b}]9;4;4;0\u{7}" ; "paused")]
+    fn progress_sequence_cases(state: u8, percent: u8, expected: &str) {
+        assert_eq!(
+            progress_sequence(TerminalMux::None, state, percent),
+            expected
+        );
     }
 
     #[test]

@@ -8737,3 +8737,27 @@ fn focused_bottom_panel_renders_through_app_view() {
         "bottom panel must paint through the app view, got: {text}"
     );
 }
+
+#[test]
+fn session_snapshot_maps_status_and_prompts() {
+    use maki_shmem::broadcast::SessionState as ShmemState;
+
+    let mut app = test_app();
+    let snapshot = app.session_snapshot();
+    assert_eq!(snapshot.state, ShmemState::Idle);
+    assert_eq!(snapshot.session_id, app.state.session.id.to_string());
+    assert_eq!(snapshot.title, app.state.session.title);
+
+    app.status = Status::Streaming;
+    assert_eq!(app.session_snapshot().state, ShmemState::Working);
+
+    app.permission_prompt.push(
+        "perm-snapshot".into(),
+        ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        true,
+        None,
+    );
+    assert_eq!(app.session_snapshot().state, ShmemState::Waiting);
+}

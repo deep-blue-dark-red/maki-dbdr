@@ -38,6 +38,10 @@ pub trait PickerItem {
     fn detail(&self) -> Option<&str> {
         None
     }
+    /// Styled replacement for [`Self::detail`]; wins when both are present.
+    fn detail_spans(&self) -> Option<Vec<Span<'_>>> {
+        None
+    }
     fn section(&self) -> Option<&str> {
         None
     }
@@ -765,54 +769,55 @@ fn render_list<T: PickerItem>(
         let label = format!("  {}", item.label());
         let suffix = item.suffix();
         let spin_elapsed = animation_elapsed_ms();
-        let detail: Option<&str> = if item.is_spinning() {
-            Some(active_spinner_str(spin_elapsed))
+        let (detail_spans, detail_w): (Vec<Span>, usize) = if item.is_spinning() {
+            let s = active_spinner_str(spin_elapsed);
+            let style = animation::active_spinner_style(spin_elapsed, detail_style, t.tool_success);
+            (vec![Span::styled(s.to_owned(), style)], s.width())
+        } else if let Some(spans) = item.detail_spans() {
+            let w = spans.iter().map(|s| s.content.width()).sum();
+            (spans, w)
         } else {
-            item.detail()
-        };
-        let detail_style = if item.is_spinning() {
-            animation::active_spinner_style(spin_elapsed, detail_style, t.tool_success)
-        } else {
-            detail_style
+            match item.detail() {
+                Some(d) => (vec![Span::styled(d.to_owned(), detail_style)], d.width()),
+                None => (Vec::new(), 0),
+            }
         };
         let suffix_gap = 2usize;
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
         let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
-        let line = match detail {
-            Some(detail) => {
-                let max_label = area.width.saturating_sub(
-                    detail.width() as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD,
-                ) as usize;
-                let label = truncate_label(&label, max_label);
-                let pad = (area.width as usize).saturating_sub(
-                    label.width() + trailing_gap + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
-                );
-                let mut spans = Vec::with_capacity(7);
-                if let Some(cb) = checkbox {
-                    spans.push(cb);
-                }
-                spans.push(Span::styled(label, style));
-                if let Some(s) = suffix {
-                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
-                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
-                }
-                spans.push(Span::styled(" ".repeat(pad), style));
-                spans.push(Span::styled(detail.to_string(), detail_style));
-                spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
-                Line::from(spans)
+        let line = if detail_w > 0 {
+            let max_label = area
+                .width
+                .saturating_sub(detail_w as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD)
+                as usize;
+            let label = truncate_label(&label, max_label);
+            let pad = (area.width as usize).saturating_sub(
+                label.width() + trailing_gap + detail_w + DETAIL_RIGHT_PAD as usize + 1,
+            );
+            let mut spans = Vec::with_capacity(4 + detail_spans.len());
+            if let Some(cb) = checkbox {
+                spans.push(cb);
             }
-            None => {
-                let mut spans: Vec<Span> = Vec::with_capacity(4);
-                if let Some(cb) = checkbox {
-                    spans.push(cb);
-                }
-                spans.push(Span::styled(label, style));
-                if let Some(s) = suffix {
-                    spans.push(Span::styled(" ".repeat(suffix_gap), style));
-                    spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
-                }
-                Line::from(spans)
+            spans.push(Span::styled(label, style));
+            if let Some(s) = suffix {
+                spans.push(Span::styled(" ".repeat(suffix_gap), style));
+                spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
             }
+            spans.push(Span::styled(" ".repeat(pad), style));
+            spans.extend(detail_spans);
+            spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
+            Line::from(spans)
+        } else {
+            let mut spans: Vec<Span> = Vec::with_capacity(4);
+            if let Some(cb) = checkbox {
+                spans.push(cb);
+            }
+            spans.push(Span::styled(label, style));
+            if let Some(s) = suffix {
+                spans.push(Span::styled(" ".repeat(suffix_gap), style));
+                spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
+            }
+            Line::from(spans)
         };
         lines.push(line);
         i += 1;

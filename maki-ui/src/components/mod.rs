@@ -234,6 +234,7 @@ pub enum Action {
     },
     AssignTier(String, ModelTier),
     UnassignTier(String, ModelTier),
+    CycleThinking,
     RefreshModels,
     RefreshUsage,
     Compact(Option<String>),
