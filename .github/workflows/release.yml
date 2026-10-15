@@ -63,12 +63,17 @@ jobs:
             '
           sudo chown -R $(id -u):$(id -g) target/
 
+      - name: Fetch rose-native (optional)
+        run: .github/scripts/fetch-rose-native.sh "$GITHUB_REF_NAME" "${{ matrix.target }}"
+
       - name: Package
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
+          files=("${BINARY_NAME}")
+          [ -d lib ] && files+=(lib)
+          tar czf "${archive}" "${files[@]}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
@@ -102,13 +107,19 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Fetch rose-native (optional)
+        shell: bash
+        run: .github/scripts/fetch-rose-native.sh "$GITHUB_REF_NAME" "${{ matrix.target }}"
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.tar.gz"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "${BINARY_NAME}"
-          tar czf "${archive}" "${BINARY_NAME}"
+          files=("${BINARY_NAME}")
+          [ -d lib ] && files+=(lib)
+          tar czf "${archive}" "${files[@]}"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Package (Windows)
@@ -118,7 +129,10 @@ jobs:
           tag="$GITHUB_REF_NAME"
           archive="${BINARY_NAME}-${tag}-${{ matrix.target }}.zip"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}.exe" "${BINARY_NAME}.exe"
-          7z a "${archive}" "${BINARY_NAME}.exe"
+          files=("${BINARY_NAME}.exe")
+          [ -d lib ] && files+=(lib)
+          7z a "${archive}" "${files[@]}" > /dev/null
+          echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
           echo "ARCHIVE=${archive}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
