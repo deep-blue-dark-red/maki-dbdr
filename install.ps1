@@ -95,6 +95,21 @@ function Install-Maki([string]$Tag) {
 
         Write-Host "$Binary $Tag installed to $dest"
 
+        # The rose engine library, when the archive carried one (lib/ beside the
+        # executable). Optional by design: an archive built without it still yields a
+        # working maki — see .github/scripts/fetch-rose-native.sh.
+        $libSrc = Join-Path $tmp "lib"
+        if (Test-Path -LiteralPath $libSrc) {
+            $libDir = Join-Path $InstallDir "lib"
+            try {
+                New-Item -ItemType Directory -Path $libDir -Force | Out-Null
+                Copy-Item -Path (Join-Path $libSrc "*") -Destination $libDir -Recurse -Force
+                Write-Host "rose engine library installed to $libDir"
+            } catch {
+                Write-Host "note: could not install the rose engine library to $libDir: $_"
+            }
+        }
+
         if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
             Write-Host "note: cargo not found; skipping jlf (/logs falls back to plain less without it)"
         } else {

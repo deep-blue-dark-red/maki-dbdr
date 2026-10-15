@@ -117,6 +117,25 @@ install_to() {
     fi
 }
 
+install_lib() {
+    src="$1"
+    dir="$2"
+    # Optional by design: an archive built without the prebuilt rose-native asset (see
+    # .github/scripts/fetch-rose-native.sh) installs a working maki and no library.
+    [ -d "${src}" ] || return 0
+
+    if mkdir -p "${dir}" 2>/dev/null && [ -w "${dir}" ]; then
+        cp -Rf "${src}/." "${dir}/"
+    elif command -v sudo > /dev/null 2>&1; then
+        echo "installing the rose engine library to ${dir} (requires sudo)..."
+        sudo sh -c 'mkdir -p "$1" && cp -Rf "$2/." "$1/"' maki-install "${dir}" "${src}"
+    else
+        echo "note: cannot write to ${dir}; the rose engine library was not installed"
+        return 0
+    fi
+    echo "rose engine library installed to ${dir}"
+}
+
 main() {
     need_cmd curl
 
@@ -153,18 +172,29 @@ main() {
     tmp="$(mktemp -d)"
     trap 'rm -rf "${tmp}"' EXIT
 
-    echo "downloading ${BINARY} ${tag} for ${target}..."
-    if [ "${archive_ext}" = "zip" ]; then
-        github_curl "${url}" -o "${tmp}/maki.zip"
-        unzip -qo "${tmp}/maki.zip" -d "${tmp}"
+    # MAKI_ARCHIVE installs from a local file instead of the release: for air-gapped
+    # machines, and for testing this script against an archive that was just built
+    # (including the optional lib/ the release legs attach to it).
+    archive="${tmp}/maki.${archive_ext}"
+    if [ -n "${MAKI_ARCHIVE:-}" ]; then
+        echo "using local archive ${MAKI_ARCHIVE}"
+        cp "${MAKI_ARCHIVE}" "${archive}"
     else
-        github_curl "${url}" | tar xz -C "${tmp}"
+        echo "downloading ${BINARY} ${tag} for ${target}..."
+        github_curl "${url}" -o "${archive}"
+    fi
+
+    if [ "${archive_ext}" = "zip" ]; then
+        unzip -qo "${archive}" -d "${tmp}"
+    else
+        tar xzf "${archive}" -C "${tmp}"
     fi
 
     [ -f "${tmp}/${bin_name}" ] || err "archive did not contain ${bin_name}"
 
     install_to "${tmp}/${bin_name}" "${INSTALL_DIR}"
     echo "${BINARY} ${tag} installed to ${INSTALL_DIR}/${bin_name}"
+    install_lib "${tmp}/lib" "${INSTALL_DIR}/lib"
 
     if ! command -v cargo > /dev/null 2>&1; then
         echo "note: cargo not found; skipping jlf (/logs falls back to plain less without it)"
