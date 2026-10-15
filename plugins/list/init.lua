@@ -3,7 +3,7 @@ local list_helpers = require("list_helpers")
 local shorten_path = require("maki.shorten_path")
 
 local DESCRIPTION =
-  [[List one directory: alphabetically sorted names, directories first with a trailing /. Hides AGENTS.md, CLAUDE.md, and COPILOT.md. Use glob for recursive filename searches.]]
+  [[List one directory: names sorted alphabetically, directories first with a trailing /. Hides AGENTS.md, CLAUDE.md, and COPILOT.md.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",

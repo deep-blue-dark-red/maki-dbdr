@@ -7,8 +7,7 @@ local truncate_bytes = helpers.truncate_bytes
 local split_lines = helpers.split_lines
 
 local DESCRIPTION =
-  [[Read a file range with 1-based line numbers. Supply path, offset (first line), and limit (line count). limit=0 reads to EOF, capped at 2000 lines by default. Absolute, relative, and ~/ paths are accepted.
-Use outline first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.]]
+  [[Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted. Follow truncation hints to continue.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
@@ -135,8 +134,7 @@ end
 maki.api.register_prompt_hint({
   slot = "tool_usage",
   content = [[
-- When using the **read** tool, only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable **read** tool limit.]],
+- When using the **read** tool, only read the sections you actually need.]],
 })
 
 maki.api.register_tool({

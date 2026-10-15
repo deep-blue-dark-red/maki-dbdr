@@ -12,18 +12,16 @@ local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr
 local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
 
 local EDIT_LINES_DESCRIPTION =
-  [[Replace the inclusive 1-based range start..end with new_string; an empty string deletes it. Use only with current line numbers from read output; earlier edits can shift them. Prefer edit for exact-text changes. Do not call through batch.]]
+  [[Replace the inclusive 1-based range start..end with new_string; an empty string deletes it. Line numbers must be current: earlier edits shift them. Prefer edit for exact-text changes. Do not call through batch.]]
 
 local INSERT_LINES_DESCRIPTION =
   [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
 
 local EDIT_DESCRIPTION =
-  [[Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace and enough context to match once. replace_all=true replaces every occurrence in this file. new_string may be empty to delete text.
-For several changes in one file, use multiedit. If matching fails, re-read the target range and retry once with corrected text; do not switch to write.]]
+  [[Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once.]]
 
 local MULTIEDIT_DESCRIPTION =
-  [[Apply several exact-text edits to one file atomically. Read the target ranges first; copy old_string without line numbers, preserving whitespace. Each must match once unless replace_all=true.
-Edits run in order against the previous edit's result. If any fails, nothing is written. On failure, re-read the target range and retry once with corrected text; do not switch to write.]]
+  [[Apply several exact-text edits to one file atomically: they run in order, each against the previous result, and if any fails nothing is written. Copy each old_string from read output without line numbers, preserving whitespace; each must match once unless replace_all=true. On failure, re-read the target range and retry once.]]
 
 local function edit_header(input)
   local buf = maki.ui.buf()

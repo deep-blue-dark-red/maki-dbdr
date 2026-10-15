@@ -2,7 +2,7 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
 local DESCRIPTION =
-  [[Create a necessary new file with content; creates parent directories. Use edit or multiedit for existing files, including after an edit failure. This tool overwrites existing content by default; append=true adds to the end. Create documentation only when the user requests it.]]
+  [[Create a new file with content; creates parent directories. Overwrites an existing file unless append=true.]]
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()

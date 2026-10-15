@@ -21,7 +21,7 @@ local STATUS_MARKERS = {
 }
 
 local DESCRIPTION =
-  [[Track work with 3+ steps. Create the list before starting and update after each completed step. Every call replaces the entire list: include all items and their current statuses. Before finishing, mark each completed or cancelled. Skip for trivial tasks.]]
+  [[Track work of 3+ steps. Every call replaces the whole list, so include every item with its current status. Create the list before starting, update it after each completed step, and mark every item completed or cancelled before finishing.]]
 
 local function items_of(sid, task)
   return todos[sid] and todos[sid][task] or {}

@@ -252,16 +252,14 @@ local function collect_commands(node, source)
   return out
 end
 
-local description = [[Execute a bash command.
-Commands run in ]] .. cwd .. [[ by default.
-
-Use for git, builds, tests, rg, and shell operations such as mv/cp/rm. Use dedicated tools to read or edit file contents. Set workdir instead of cd; provide a 3-5 word description. Join dependent commands with &&; batch independent calls.
-Commands must be non-interactive. Use tail=N instead of piping to tail to preserve live output. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.
-Output above 398B is rstring-compressed before it reaches you: `line [xN]` means N lines differed only in volatile values (timestamps, uuids, epoch runs, temp paths), a run of uniform JSON objects becomes one `<rec cols>` header followed by TSV rows, and random-looking byte runs of 48+ chars anywhere (base64/hex tokens, PEM bodies, digests) are replaced inline by `[masked r=<hash> n=<len>]`, and spans repeated across lines (a shared path or log prefix) factor into a lead legend with `<n>` refs. Load-bearing text (paths, versions, error codes, short numbers) and code-looking lines (indented, or ending `;`/`{`/`}`) are always verbatim.]]
+local description = [[Execute a non-interactive bash command. Runs in ]]
+  .. cwd
+  .. [[ by default; set workdir instead of cd. Join dependent commands with &&. Use tail=N instead of piping to tail, so live output is kept. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.
+Output above 398B is compressed before it reaches you: `line [xN]` stands for N lines that differed only in volatile values (timestamps, uuids, epoch runs, temp paths); a run of uniform JSON objects becomes a `<rec cols>` header and TSV rows; a random-looking run of 48+ chars (base64/hex tokens, PEM bodies, digests) becomes `[masked r=<hash> n=<len>]`; spans repeated across lines (a shared path or log prefix) move into a lead legend referenced as `<n>`. Paths, versions, error codes, short numbers and code-looking lines (indented, or ending `;`/`{`/`}`) stay verbatim.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
+  content = "- Use bash for file operations when one command costs less than several tool calls: a mechanical replacement across files (`perl -pi -e`), moves and copies, a quick look with `head` or `sed -n`. **edit** rejects a file changed since its last **read**, so re-read a file before editing it if bash changed it after you read it.",
 })
 
 local opts = maki.api.register_options(output_limits.extend({

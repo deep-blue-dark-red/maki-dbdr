@@ -33,14 +33,14 @@ local OUT_OF_ORDER_NOTE =
   "Results arrive out of order as workers free up - always reference jobs by id or name, never by position."
 
 local description = table.concat({
-  "Queue independent tool calls in the background; spawn returns job ids immediately. Use batch when you want to wait for all calls, task for an autonomous subagent.",
+  "Run tool calls as background jobs; spawn returns job ids at once.",
   "",
-  "- spawn (default): supply jobs as {tool, parameters, name?, timeout_seconds?}. Optional workers limits concurrency for this spawn.",
-  "- status: inspect jobs; settled jobs show output tails, running jobs a live output tail.",
-  "- wait: retrieve results for job_ids (ids or names; default all unfinished). Waits up to timeout_seconds (default 300; 0 returns immediately). A wait timeout does not stop jobs; wait again if needed.",
-  "- cancel: cancel job_ids (default all unfinished). Queued jobs never start; running jobs are aborted, child processes killed, results discarded. Cancellation does not undo side effects.",
+  "- spawn (default): jobs as {tool, parameters, name?, timeout_seconds?}; workers caps concurrency for this spawn.",
+  "- status: running jobs show a live output tail, settled jobs their output tail.",
+  "- wait: block up to timeout_seconds (default 300; 0 returns at once) for job_ids (ids or names; default all unfinished). A wait timeout does not stop jobs.",
+  "- cancel: job_ids (default all unfinished). Queued jobs never start; running jobs are killed with their child processes and their results discarded. Side effects remain.",
   "",
-  "Match results by name (ids remain accepted), never position. Use returned names to collect needed results before finishing; jobs end with the session. Do not call async inside a job.",
+  "Match results by name, not position, and collect the ones you need before finishing: jobs end with the session. Do not call async inside a job.",
 }, "\n")
 
 local opts = maki.api.register_options({

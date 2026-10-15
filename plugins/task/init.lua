@@ -35,8 +35,7 @@ local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
 
 local description =
-  [[Delegate a self-contained subgoal to a new agent. Use research (default) for read-only exploration or general for implementation. Include the objective, relevant context, file scope, and expected result in prompt; each call starts fresh.
-Use batch for independent subgoals; give implementation agents separate file ownership. Request a concise result with file:line references. The user does not see the result directly; summarize relevant findings. Use async for background tool calls.]]
+  [[Delegate a self-contained subgoal to a new agent that starts with no context: put the objective, relevant context, file scope, and expected result in prompt. research (default) is read-only; general can implement. Run independent subgoals in one batch, giving implementation agents separate files. Ask for a concise result with file:line references; the user does not see it, so summarize what matters.]]
 
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },

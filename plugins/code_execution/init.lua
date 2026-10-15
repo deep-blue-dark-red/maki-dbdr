@@ -122,14 +122,13 @@ local function build_body(ctx, code)
   return buf, view, highlight
 end
 
-local description = "Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. "
-  .. "Runs on monty, a restricted interpreter — not full CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. "
-  .. "Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. "
-  .. "Tools return strings; parse as needed and print only useful results. "
-  .. "For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. "
-  .. "Bundled stdlib only: re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata — anything else fails to import; no direct network access. "
-  .. "open() supports text files; follow the same read/edit/write rules as direct calls. "
-  .. "Default execution budget: 30s, excluding time waiting for tools."
+local description = "Run restricted Python that calls maki tools; only printed output reaches the conversation. "
+  .. "The interpreter is monty, not CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. "
+  .. "Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings. "
+  .. "For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; check each result for errors. "
+  .. "Stdlib is limited to re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata; no network access. "
+  .. "open() reads and writes text files under the same rules as the read and write tools. "
+  .. "Budget: 30s by default, not counting tool waits."
 
 local schema = {
   type = "object",

@@ -13,8 +13,8 @@ Maki ships with 27 built-in tools in this reference (26 on by default, 1 opt-in 
 
 ### `bash` {#bash}
 
-Execute a bash command.
-Commands run in <cwd> by default.
+Execute a non-interactive bash command. Runs in <cwd> by default; set workdir instead of cd. Join dependent commands with &&. Use tail=N instead of piping to tail, so live output is kept. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.
+Output above 398B is compressed before it reaches you: `line [xN]` stands for N lines that differed only in volatile values (timestamps, uuids, epoch runs, temp paths); a run of uniform JSON objects becomes a `<rec cols>` header and TSV rows; a random-looking run of 48+ chars (base64/hex tokens, PEM bodies, digests) becomes `[masked r=<hash> n=<len>]`; spans repeated across lines (a shared path or log prefix) move into a lead legend referenced as `<n>`. Paths, versions, error codes, short numbers and code-looking lines (indented, or ending `;`/`{`/`}`) stay verbatim.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -26,7 +26,7 @@ Commands run in <cwd> by default.
 
 ### `list` {#list}
 
-List one directory: alphabetically sorted names, directories first with a trailing /. Hides AGENTS.md, CLAUDE.md, and COPILOT.md. Use glob for recursive filename searches.
+List one directory: names sorted alphabetically, directories first with a trailing /. Hides AGENTS.md, CLAUDE.md, and COPILOT.md.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -34,8 +34,7 @@ List one directory: alphabetically sorted names, directories first with a traili
 
 ### `read` {#read}
 
-Read a file range with 1-based line numbers. Supply path, offset (first line), and limit (line count). limit=0 reads to EOF, capped at 2000 lines by default. Absolute, relative, and ~/ paths are accepted.
-Use outline first for unread code, then choose one adequate range. Follow truncation hints to continue. Re-read a target range after a failed edit; otherwise reuse content already shown.
+Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted. Follow truncation hints to continue.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -45,7 +44,7 @@ Use outline first for unread code, then choose one adequate range. Follow trunca
 
 ### `write` {#write}
 
-Create a necessary new file with content; creates parent directories. Use edit or multiedit for existing files, including after an edit failure. This tool overwrites existing content by default; append=true adds to the end. Create documentation only when the user requests it.
+Create a new file with content; creates parent directories. Overwrites an existing file unless append=true.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -55,8 +54,7 @@ Create a necessary new file with content; creates parent directories. Use edit o
 
 ### `edit` {#edit}
 
-Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace and enough context to match once. replace_all=true replaces every occurrence in this file. new_string may be empty to delete text.
-For several changes in one file, use multiedit. If matching fails, re-read the target range and retry once with corrected text; do not switch to write.
+Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -67,8 +65,7 @@ For several changes in one file, use multiedit. If matching fails, re-read the t
 
 ### `multiedit` {#multiedit}
 
-Apply several exact-text edits to one file atomically. Read the target ranges first; copy old_string without line numbers, preserving whitespace. Each must match once unless replace_all=true.
-Edits run in order against the previous edit's result. If any fails, nothing is written. On failure, re-read the target range and retry once with corrected text; do not switch to write.
+Apply several exact-text edits to one file atomically: they run in order, each against the previous result, and if any fails nothing is written. Copy each old_string from read output without line numbers, preserving whitespace; each must match once unless replace_all=true. On failure, re-read the target range and retry once.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -77,7 +74,7 @@ Edits run in order against the previous edit's result. If any fails, nothing is 
 
 ### `edit_lines` {#edit_lines}
 
-Replace the inclusive 1-based range start..end with new_string; an empty string deletes it. Use only with current line numbers from read output; earlier edits can shift them. Prefer edit for exact-text changes. Do not call through batch.
+Replace the inclusive 1-based range start..end with new_string; an empty string deletes it. Line numbers must be current: earlier edits shift them. Prefer edit for exact-text changes. Do not call through batch.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -98,7 +95,7 @@ Insert `new_string` after line `line`, or at the top with 0. Only include new li
 
 ### `glob` {#glob}
 
-Find files when you know a filename or path pattern, e.g. **/*.rs. Respects .gitignore; returns paths newest first. Use grep to search contents.
+Find files by name or path pattern, e.g. **/*.rs. Respects .gitignore; returns paths newest first.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -107,8 +104,7 @@ Find files when you know a filename or path pattern, e.g. **/*.rs. Respects .git
 
 ### `grep` {#grep}
 
-Search file contents for a known symbol or regex. Returns line-numbered matches grouped by file, newest files first; respects .gitignore. Narrow with path/include and bound output with limit/context_before/context_after.
-Pass the regex without shell quotes; use normal JSON escaping (a literal [ is "\\[" in JSON). Multiline matching activates for \n, (?s), or (?m). Use bash with rg for counts, file-only results, or type filters.
+Search file contents by regex. Returns line-numbered matches grouped by file, newest files first; respects .gitignore. Pass the regex without shell quotes, with normal JSON escaping (a literal [ is "\\[" in JSON). Multiline matching activates for \n, (?s), or (?m).
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -121,7 +117,7 @@ Pass the regex without shell quotes; use normal JSON escaping (a literal [ is "\
 
 ### `ast_grep` {#ast_grep}
 
-Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Use grep for text or regex. Requires ast-grep on PATH.
+Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -136,8 +132,7 @@ Search code by syntax structure. Supply exactly one of `pattern` (a single compl
 
 ### `ast_grep_replace` {#ast_grep_replace}
 
-Rewrite all AST matches in the absolute file or directory path. Search first with ast_grep using the same scope and pattern/kind (exactly one of them, never both — pattern wins if both are given). Supply rewrite; it may reuse pattern metavariables such as $X.
-Every match is changed: limit caps displayed matches, not edits. Returns replacements and the applied count. Requires ast-grep on PATH.
+Rewrite every AST match under an absolute file or directory path. Takes exactly one of pattern/kind, as ast_grep does (pattern wins if both are given), and a rewrite that may reuse metavariables such as $X. Run the same scope and pattern with ast_grep first: every match is changed, and limit caps only the matches displayed. Returns the replacements and the applied count. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -153,7 +148,7 @@ Every match is changed: limit caps displayed matches, not edits. Returns replace
 
 ### `outline` {#outline}
 
-Return a file outline: imports, types, and function signatures with [line numbers]. Call once before reading an unread code file, then use read for the needed range. Supports source code and Markdown; if the language is unsupported, use read.
+Return a file outline: imports, types, and function signatures with [line numbers]. Supports source code and Markdown; for other files use read.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -161,7 +156,7 @@ Return a file outline: imports, types, and function signatures with [line number
 
 ### `view_image` {#view_image}
 
-View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
+View an image file (png, jpeg, gif, webp) as vision input; read cannot show images. Accepts absolute, relative, and ~/ paths. Oversized images are downscaled; animated gif/webp keep only the first frame.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -181,7 +176,7 @@ Scaffold a personal plugin in the maki config directory. Creates lua/<name>.lua 
 
 ### `async` {#async}
 
-Queue independent tool calls in the background; spawn returns job ids immediately. Use batch when you want to wait for all calls, task for an autonomous subagent.
+Run tool calls as background jobs; spawn returns job ids at once.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -193,7 +188,7 @@ Queue independent tool calls in the background; spawn returns job ids immediatel
 
 ### `batch` {#batch}
 
-Run 1-25 independent tool calls in parallel and wait for all results. Each item: {tool: name, parameters: arguments}. Calls must not depend on each other's results or modify the same file. Use code_execution for dependencies or output filtering, async to keep working while tools run. Do not nest batch.
+Run 1-25 independent tool calls in parallel and wait for all results. Each item: {tool: name, parameters: arguments}. Calls must not depend on each other's results or modify the same file. Do not nest batch.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -201,7 +196,7 @@ Run 1-25 independent tool calls in parallel and wait for all results. Each item:
 
 ### `code_execution` {#code_execution}
 
-Run sandboxed Python to chain tool calls or filter output before it reaches the conversation. Runs on monty, a restricted interpreter — not full CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings; parse as needed and print only useful results. For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; inspect each result for errors. Bundled stdlib only: re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata — anything else fails to import; no direct network access. open() supports text files; follow the same read/edit/write rules as direct calls. Default execution budget: 30s, excluding time waiting for tools.
+Run restricted Python that calls maki tools; only printed output reaches the conversation. The interpreter is monty, not CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings. For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; check each result for errors. Stdlib is limited to re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata; no network access. open() reads and writes text files under the same rules as the read and write tools. Budget: 30s by default, not counting tool waits.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -210,7 +205,7 @@ Run sandboxed Python to chain tool calls or filter output before it reaches the 
 
 ### `question` {#question}
 
-Ask the user for missing requirements or a decision needed to proceed. Group related questions in one call. Put the recommended option first, with "(Recommended)" in its label. Free-text answers are available by default; omit catch-all options. Set multiSelect=true only for multiple choices. Returns selected labels per question.
+Ask the user for missing requirements or a decision needed to proceed. Group related questions in one call. Put the recommended option first, labelled "(Recommended)". Free-text answers are always available, so omit catch-all options. Set multiSelect=true only when several choices can apply. Returns the selected labels per question.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -220,8 +215,7 @@ Ask the user for missing requirements or a decision needed to proceed. Group rel
 
 ### `task` {#task}
 
-Delegate a self-contained subgoal to a new agent. Use research (default) for read-only exploration or general for implementation. Include the objective, relevant context, file scope, and expected result in prompt; each call starts fresh.
-Use batch for independent subgoals; give implementation agents separate file ownership. Request a concise result with file:line references. The user does not see the result directly; summarize relevant findings. Use async for background tool calls.
+Delegate a self-contained subgoal to a new agent that starts with no context: put the objective, relevant context, file scope, and expected result in prompt. research (default) is read-only; general can implement. Run independent subgoals in one batch, giving implementation agents separate files. Ask for a concise result with file:line references; the user does not see it, so summarize what matters.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -234,7 +228,7 @@ Use batch for independent subgoals; give implementation agents separate file own
 
 ### `todo_write` {#todo_write}
 
-Track work with 3+ steps. Create the list before starting and update after each completed step. Every call replaces the entire list: include all items and their current statuses. Before finishing, mark each completed or cancelled. Skip for trivial tasks.
+Track work of 3+ steps. Every call replaces the whole list, so include every item with its current status. Create the list before starting, update it after each completed step, and mark every item completed or cancelled before finishing.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -242,7 +236,7 @@ Track work with 3+ steps. Create the list before starting and update after each 
 
 ### `memory` {#memory}
 
-Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Keep notes current; update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates.
+Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -269,7 +263,7 @@ Test a skill using its SKILL.md tests frontmatter. Runs one headless maki subpro
 
 ### `tool_help` {#tool_help}
 
-Show a tool's full description and argument schema.
+Show a tool's full description and argument schema. An unknown name returns the list of available tools.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -279,7 +273,7 @@ Show a tool's full description and argument schema.
 
 ### `webfetch` {#webfetch}
 
-Fetch a known URL as markdown (default), text, html, or json. HTTP is upgraded to HTTPS. Maximum response: 5MB; timeout up to 120s (default 30s). For large pages, call from code_execution and print only relevant sections. Use websearch to find URLs.
+Fetch a URL as markdown (default), text, html, or json. HTTP is upgraded to HTTPS. Maximum response 5MB; timeout up to 120s (default 30s). For large pages, call it from code_execution and print only the relevant sections.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -289,7 +283,7 @@ Fetch a known URL as markdown (default), text, html, or json. HTTP is upgraded t
 
 ### `websearch` {#websearch}
 
-Search the web for current information or external documentation using Exa AI.
+Search the web using Exa AI. Today's date is YYYY-MM-DD. Returns titles, URLs, and snippets.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

@@ -135,7 +135,7 @@ end
 maki.api.register_tool({
   name = "webfetch",
   kind = "fetch",
-  description = [[Fetch a known URL as markdown (default), text, html, or json. HTTP is upgraded to HTTPS. Maximum response: 5MB; timeout up to 120s (default 30s). For large pages, call from code_execution and print only relevant sections. Use websearch to find URLs.]],
+  description = [[Fetch a URL as markdown (default), text, html, or json. HTTP is upgraded to HTTPS. Maximum response 5MB; timeout up to 120s (default 30s). For large pages, call it from code_execution and print only the relevant sections.]],
 
   schema = {
     type = "object",

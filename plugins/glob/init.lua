@@ -17,7 +17,7 @@ end
 maki.api.register_tool({
   name = "glob",
   kind = "search",
-  description = [[Find files when you know a filename or path pattern, e.g. **/*.rs. Respects .gitignore; returns paths newest first. Use grep to search contents.]],
+  description = [[Find files by name or path pattern, e.g. **/*.rs. Respects .gitignore; returns paths newest first.]],
 
   schema = {
     type = "object",

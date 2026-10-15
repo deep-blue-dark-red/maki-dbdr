@@ -154,7 +154,7 @@ maki.api.register_prompt_hint({
 maki.api.register_tool({
   name = "outline",
   kind = "read",
-  description = [[Return a file outline: imports, types, and function signatures with [line numbers]. Call once before reading an unread code file, then use read for the needed range. Supports source code and Markdown; if the language is unsupported, use read.]],
+  description = [[Return a file outline: imports, types, and function signatures with [line numbers]. Supports source code and Markdown; for other files use read.]],
 
   schema = {
     type = "object",

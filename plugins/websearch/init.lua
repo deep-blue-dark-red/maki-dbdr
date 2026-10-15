@@ -40,13 +40,11 @@ end
 maki.api.register_tool({
   name = "websearch",
   kind = "fetch",
-  description = "Search the web for current information or external documentation using "
+  description = "Search the web using "
     .. provider.label
-    .. ".\n\n"
-    .. "Today's date is "
+    .. ". Today's date is "
     .. os.date("%Y-%m-%d")
-    .. ".\n\n"
-    .. "Use a specific query. Returns titles, URLs, and snippets; use webfetch for a page's contents.",
+    .. ". Returns titles, URLs, and snippets.",
 
   schema = {
     type = "object",

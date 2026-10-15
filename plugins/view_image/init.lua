@@ -1,10 +1,7 @@
 local shorten_path = require("maki.shorten_path")
 
 local DESCRIPTION =
-  [[View an image file (png, jpeg, gif, webp) so you can actually see it; it is returned as vision input alongside the tool result. Use instead of `read` for images.
-
-- Paths: absolute, relative, or ~/.
-- Oversized images are downscaled automatically (animated gif/webp keep only the first frame).]]
+  [[View an image file (png, jpeg, gif, webp) as vision input; read cannot show images. Accepts absolute, relative, and ~/ paths. Oversized images are downscaled; animated gif/webp keep only the first frame.]]
 
 -- Anthropic rejects images over 5MB base64; 3MB raw is ~4MB encoded,
 -- which leaves headroom.

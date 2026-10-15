@@ -3,7 +3,7 @@ local QuestionHelpers = require("question_helpers")
 local ToolView = require("maki.tool_view")
 
 local DESCRIPTION =
-  [[Ask the user for missing requirements or a decision needed to proceed. Group related questions in one call. Put the recommended option first, with "(Recommended)" in its label. Free-text answers are available by default; omit catch-all options. Set multiSelect=true only for multiple choices. Returns selected labels per question.]]
+  [[Ask the user for missing requirements or a decision needed to proceed. Group related questions in one call. Put the recommended option first, labelled "(Recommended)". Free-text answers are always available, so omit catch-all options. Set multiSelect=true only when several choices can apply. Returns the selected labels per question.]]
 
 local function normalize(questions)
   questions = questions or {}

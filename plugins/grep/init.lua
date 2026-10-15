@@ -189,14 +189,13 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **grep** tool when searching for specific content across files.",
+  content = "- Use the **grep** tool to search file contents; use rg via bash for counts, file-only results, or type filters.",
 })
 
 maki.api.register_tool({
   name = "grep",
   kind = "search",
-  description = [[Search file contents for a known symbol or regex. Returns line-numbered matches grouped by file, newest files first; respects .gitignore. Narrow with path/include and bound output with limit/context_before/context_after.
-Pass the regex without shell quotes; use normal JSON escaping (a literal [ is "\\[" in JSON). Multiline matching activates for \n, (?s), or (?m). Use bash with rg for counts, file-only results, or type filters.]],
+  description = [[Search file contents by regex. Returns line-numbered matches grouped by file, newest files first; respects .gitignore. Pass the regex without shell quotes, with normal JSON escaping (a literal [ is "\\[" in JSON). Multiline matching activates for \n, (?s), or (?m).]],
 
   schema = {
     type = "object",

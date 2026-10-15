@@ -187,7 +187,7 @@ end
 maki.api.register_tool({
   name = "memory",
   description = "Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. "
-    .. "Keep notes current; update or delete stale facts. list/read return the notes directory; "
+    .. "Update or delete stale facts. list/read return the notes directory; "
     .. "use edit on <dir>/<path> for targeted updates.",
 
   schema = {

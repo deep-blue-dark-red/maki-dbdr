@@ -1,9 +1,7 @@
 local help = require("tool_help")
 
-local DESCRIPTION = [[Show a tool's full description and argument schema.
-
-Args:
-- name: exact tool name. Unknown names return the list of available tools.]]
+local DESCRIPTION =
+  [[Show a tool's full description and argument schema. An unknown name returns the list of available tools.]]
 
 maki.api.register_tool({
   name = "tool_help",
