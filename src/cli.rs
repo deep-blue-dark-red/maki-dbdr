@@ -219,6 +219,11 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Watch a session live in a read-only TUI; the process that owns it keeps running
+    Attach {
+        /// Session id to watch
+        session: String,
+    },
     /// Manage API authentication
     Auth {
         #[command(subcommand)]

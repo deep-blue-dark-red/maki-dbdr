@@ -2503,6 +2503,12 @@ where
         load_session_at(&path)
     }
 
+    /// The file [`Session::read_only`] would load, for a watcher that polls it
+    /// for changes instead of claiming the session.
+    pub fn log_path(id: MakiId, dir: &StateDir) -> Option<PathBuf> {
+        locate_session_file(&dir.path().join(SESSIONS_DIR), id)
+    }
+
     /// Runs every turn: a session still on the default title or on a
     /// generated one is retitled from its messages, so a first message with
     /// nothing usable in it does not pin the title for good. A title set by

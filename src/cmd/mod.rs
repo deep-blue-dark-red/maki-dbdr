@@ -1,4 +1,5 @@
 mod acp;
+mod attach;
 mod migrate;
 mod session;
 mod subcmd;
@@ -220,6 +221,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
                 AuthAction::Status => subcmd::auth_status(&storage)?,
             }
+        }
+        Some(Command::Attach { session }) => {
+            attach::run(&session, cli.no_plugins, cli.no_jit, trust_mode)?;
         }
         Some(Command::Outline { path }) => {
             subcmd::outline(&path, cli.no_plugins, cli.no_jit, trust_mode)?;

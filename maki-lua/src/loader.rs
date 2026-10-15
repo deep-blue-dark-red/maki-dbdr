@@ -1073,6 +1073,12 @@ impl EventHandle {
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
+        Self::disconnected()
+    }
+
+    /// A handle no runtime answers: UI-only consumers (the attach viewer) use
+    /// it so autocmds and restore requests no-op instead of queueing.
+    pub fn disconnected() -> Self {
         Self::from_tx(flume::unbounded().0)
     }
 

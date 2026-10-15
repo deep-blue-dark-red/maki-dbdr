@@ -5,6 +5,7 @@
 
 pub mod animation;
 pub mod app;
+pub mod attach;
 pub mod chat;
 mod clipboard;
 mod clock;

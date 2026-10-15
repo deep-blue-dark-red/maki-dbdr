@@ -103,6 +103,14 @@ maki models --refresh    # refetch the models.dev catalog
 
 One spec per line, warnings on stderr. Built-in and script providers are listed live, catalog-backed providers from the models.dev cache, which expires after 24 hours and supplies model pricing and context windows. `--refresh` refetches it. When the refetch fails, the cached catalog stays in place, the list still prints, and the command exits non-zero.
 
+### `maki attach`
+
+```bash
+maki attach <id>    # watch a session live, read-only
+```
+
+Opens a session in a viewer TUI without claiming it, so the process that owns the session, interactive or headless, keeps running. The transcript follows the session log as turns land, and while an owner is live the header shows its state, the running tool, context use, and cost from the shared-memory feed. `q` quits the viewer, `c` sends a cancel to the owner through the same control rings an external monitor uses, and the footer confirms when the owner acks it. An id from `maki session list` works here too.
+
 ### `maki session`
 
 ```bash
