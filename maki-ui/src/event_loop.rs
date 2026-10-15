@@ -622,16 +622,19 @@ impl<'t> EventLoop<'t> {
         // so every loop has to claim the UI back for itself.
         ui_attachment.attach();
 
-        // Apply the config theme before the warmup thread spawns, or warmup
-        // could bake the syntax palette from the old theme. Only the
-        // in-memory name is set, so the user's saved pick survives.
-        if let Some(ref name) = ui_config.theme {
+        // Apply the theme before the warmup thread spawns, or warmup could
+        // bake the syntax palette from the old one. The theme last picked in
+        // this folder outranks the config knob; only the in-memory name is
+        // set, so the user's saved picks survive.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let folder_theme = maki_storage::sessions::cwd_theme(&storage, &cwd.to_string_lossy());
+        if let Some(name) = folder_theme.as_ref().or(ui_config.theme.as_ref()) {
             match crate::theme::load_by_name(name) {
                 Ok(theme) => {
                     crate::theme::set_current_name(name);
                     crate::theme::set(theme);
                 }
-                Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
+                Err(e) => startup_warnings.push(format!("theme {name}: {e}")),
             }
         }
 
@@ -641,7 +644,6 @@ impl<'t> EventLoop<'t> {
             crate::update::spawn_check();
         });
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let (mcp_handle, mcp_config_errors) = smol::block_on(mcp::start(&cwd, project_config));
 
         let provider: Arc<dyn Provider> = if needs_login {

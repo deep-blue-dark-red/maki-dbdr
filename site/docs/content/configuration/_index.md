@@ -91,7 +91,7 @@ All fields are optional. Typos in field names cause an error right away.
 
 ### `ui.theme`
 
-Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
+Name of the color theme to load at startup, overriding the theme you last picked interactively. A theme you pick is remembered per folder, and the folder's pick outranks this setting. If neither is set, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
 
 Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dark_daltonized_v2`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_maki`, `kanagawa_maki_ink`, `kanagawa_maki_lotus`, `kanagawa_maki_slate`, `kanagawa_maki_storm`, `kanagawa_maki_wave`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_maki`, `rose_pine_maki_bloom`, `rose_pine_maki_dusk`, `rose_pine_maki_haze`, `rose_pine_maki_midnight`, `rose_pine_maki_slate`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 

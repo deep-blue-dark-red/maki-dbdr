@@ -464,6 +464,11 @@ pub fn persist_theme(name: &str) {
     set_current_name(name);
     if let Ok(dir) = StateDir::resolve() {
         maki_storage::theme::persist_theme_name(&dir, name);
+        if let Ok(cwd) = std::env::current_dir()
+            && let Err(e) = maki_storage::sessions::set_cwd_theme(&dir, &cwd.to_string_lossy(), name)
+        {
+            tracing::warn!(error = %e, "failed to record the folder's theme");
+        }
     }
 }
 

@@ -6,8 +6,7 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 ## New files (pure additions — never conflict)
 
 ### Providers
-- `maki-providers/src/wire_log.rs` — network wire logger
-- `maki-providers/src/bin/mlog.rs` — `mlog` binary for reading wire logs
+- `maki-providers/src/wire_log.rs` — network wire logger (owns the `.mlog` format; the old `bin/mlog.rs` viewer binary is gone, `e4a42ed8`)
 - `maki-providers/src/providers/tensorx.rs` — tensorx provider
 
 ### UI components
@@ -15,7 +14,30 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 - `maki-ui/src/components/export_picker.rs` — `/export` transcript picker
 - `maki-ui/src/components/goto_picker.rs` — `/goto` turn navigation
 - `maki-ui/src/components/skills_modal.rs` — `/skills` TUI skills manager
+- `maki-ui/src/components/plugins_modal.rs` — `/plugins` enable/disable + per-plugin tool info
+- `maki-ui/src/components/stats_modal.rs` — `/stats` token/cost readout (o200k counts)
+- `maki-ui/src/components/system_prompt_modal.rs` — `/system_prompt` resolved-prompt viewer
+- `maki-ui/src/components/tool_prompt_modal.rs` — `/tool_prompt` per-plugin tool toggles
+- `maki-ui/src/components/prompt_view.rs` — resolved-prompt rendering shared by the prompt modals
+- `maki-ui/src/components/cache_miss_prompt.rs` — cache-miss warm-ping warning
+- `maki-ui/src/components/list_picker.rs` — generic list picker (sessions, rewind, menus)
 - `maki-ui/src/config.rs` — flat Ghostty-style config loader (`user.config`)
+
+### Agent / runtime
+- `maki-ui/src/agent/keepwarm.rs` — idle provider prompt-cache warmer (zone 15)
+- `maki-agent/src/prompts/checkpoint_user.md`, `session_name.md` — `/checkpoint` and auto session-naming templates
+- `maki-lua/src/api/util/loaded.rs` — shared "is plugin loaded" helper
+- `maki-storage/src/aa_scores.rs` — Artificial Analysis intelligence-score cache for the model picker
+
+### rstring crate
+- `maki-rstring/` — output compression + the `rstring` CLI: tiered collapsing of lines that differ only in volatile values (`line [xN]`), uniform JSONL → one TSV header row, entropy-run masking, o200k token counting, semantic thinning, `export-md` transcript rendering. Wired at two boundaries (zone 16).
+
+### Plugins (fork-only)
+- `plugins/outline/` — upstream's `plugins/index`, renamed; do not restore `index`
+- `plugins/cd/` — `/cd-pick`, the folder picker over `maki.dir_picker`
+- `plugins/status/` — NDJSON status feed for external programs
+- `plugins/async/` — background job queue + jobs panel
+- `plugins/ast_grep/`, `plugins/tool_help/`, `plugins/create_plugin/`, `plugins/aa_scores/`, `plugins/cronjob/`, `plugins/compilerbrain/` (tool views for the foreign `compilerbrain.*` tools)
 
 ### Removed on purpose (do not restore on merge)
 - `maki-tool-macro/` and `maki-ui/src/components/render_hints.rs` — deleted in
@@ -24,6 +46,8 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 - `plugins/hackernews/` — deleted in `efaefdb8`.
 - `maki-ui/src/components/session_picker.rs` — the session list is now the Lua
   `plugins/sessions/init.lua` plugin. See conflict zone 6.
+- `plugins/index/` — upstream's plugin, renamed to `plugins/outline` on the
+  fork (`b0242269`); restoring it double-registers the outline tool.
 
 ### Themes
 - `maki-ui/src/themes/kanagawa_maki.toml` + 5 variants (ink, lotus, slate, storm, wave)
@@ -31,9 +55,11 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 - `maki-ui/src/themes/dark_daltonized.toml` + `dark_daltonized_v2.toml`
 
 ### Bench / tooling
-- `skill-benchmarking/` — Python benchmarking suite (runner, mutator, reporter)
-- `scripts/agent-test.sh`
-- `tests/agent/skill-test-*.sh`
+- `skill-benchmarking/` — Python benchmarking suite (runner, mutator, reporter,
+  `tasks/` fixtures, `variants/` baselines)
+- `scripts/agent-test.sh`, `scripts/merge-audit.sh`
+- `tests/agent/skill-test-*.sh` (incl. `skill-test-create-plugin.sh`,
+  `skill-test-ssh.sh`)
 
 ---
 
@@ -55,13 +81,21 @@ render_if_open!(self.settings_picker);
 render_if_open!(self.export_picker);
 ```
 
-**Required in `render_top_modals`:**
+**Required in `render_top_modals`** (fork modals; `usage_modal` between them
+is upstream's):
 ```rust
+let r = self.system_prompt_modal.view(frame, full);
+if r.width > 0 { overlay_rect = r; }
+let r = self.tool_prompt_modal.view(frame, full);
+if r.width > 0 { overlay_rect = r; }
 let r = self.plugins_modal.view(frame, full);
 if r.width > 0 { overlay_rect = r; }
 let r = self.skills_modal.view(frame, full);
 if r.width > 0 { overlay_rect = r; }
 ```
+
+`stats_modal` renders further down on `is_open()`, and `cache_miss_prompt`
+reserves bottom layout height and renders there — both must survive too.
 
 ---
 
@@ -75,6 +109,9 @@ Fork commands that must be in `BUILTIN_COMMANDS`:
 - `/rewind` — delete turns menu
 - `/config` — alias of `/settings`
 - `/resume` — alias of `/sessions` (dispatches to the sessions Lua plugin)
+- `/stats` — token/cost stats modal
+- `/system_prompt` — resolved-prompt viewer + editor seeding (zone 12)
+- `/tool_prompt` — per-plugin tool toggle modal
 
 `/rename` is deliberately NOT a builtin any more: upstream's
 `plugins/sessions/init.lua` registers `/rename <title>`, so the fork's AI-naming
@@ -87,6 +124,10 @@ with the `@` printed only if the picker closes without a pick
 (`mention_pending`), so a selected path reaches the message bare. Keeping
 upstream's plugin would put two popups on the same `@`.
 
+`/cd` exists upstream, but the fork reworked it: a bare `/cd` opens the dir
+picker, the `change_cwd` action is bound to Ctrl+L, and `plugins/cd` adds
+`/cd-pick` on top.
+
 ---
 
 ### 3. `maki-ui/src/app/mod.rs`
@@ -98,6 +139,10 @@ pub(super) export_picker: ExportPicker,
 pub(super) plugins_modal: PluginsModal,
 pub(super) skills_modal: SkillsModal,
 pub(super) goto_picker: GotoPicker,
+pub(super) system_prompt_modal: SystemPromptModal,
+pub(super) tool_prompt_modal: ToolPromptModal,
+pub(super) stats_modal: StatsModal,
+pub(super) cache_warm: Option<CacheWarmPing>,
 pub show_token_stats: bool,
 ```
 
@@ -107,6 +152,9 @@ pub show_token_stats: bool,
 "/export"   => { self.export_picker.open(...); vec![] }
 "/plugins"  => { self.plugins_modal.open(...); vec![] }
 "/skills"   => { self.skills_modal.open(...); vec![] }
+"/stats"       => { self.stats_modal.toggle(); vec![] }
+"/cd"          => self.cmd_cd(&cmd.args),
+"/tool_prompt" => { ... }
 "/checkpoint" => { ... }
 "/rewind"   => { ... }
 ```
@@ -115,7 +163,9 @@ pub show_token_stats: bool,
 `New session` still goes through `start_rename`.)
 
 #### `overlays()` / `overlays_mut()` arrays
-All five fork components must be present.
+All fork overlays must be present: the five components above plus
+`system_prompt_modal`, `tool_prompt_modal` and `stats_modal` (the arrays claim
+23 entries).
 
 ---
 
@@ -183,6 +233,16 @@ pub struct SessionSummary {
 
 `ScanRecord::Meta` must include `#[serde(default)] context_size: u32`.
 `read_last_meta()` must return `(String, u64, u32)` not `(String, u64)`.
+
+Two more fork-only behaviors live in this file now:
+
+- **Per-folder thinking level** (`d2e68bfa`): `set_cwd_thinking` records the
+  level last set via `/thinking` in a folder's meta; a fresh session there
+  starts on it instead of the default.
+- **By-path session links** (`9dffeaef`): sessions are linked as
+  `by-path/<folder>/<ts>-<alias>.jsonl` beside the canonical id-named logs;
+  `--session-name` names a directory's links, and the cwd index keeps the
+  newest session per directory plus its alias.
 
 ---
 
@@ -295,6 +355,44 @@ cargo test -p maki-lua --test spec skill_plugin_spec
 
 ---
 
+### 15. Idle cache warming (`maki-ui/src/agent/keepwarm.rs`)
+
+While the UI sits idle, `keepwarm` sends bounded warm pings (`WARM_MAX_PINGS`)
+so the provider prompt cache stays hot; `app/mod.rs` owns the `cache_warm:
+Option<CacheWarmPing>` field and posts the `kv-cache-warm ping sent (n/N)`
+status. A ping that misses the cache warns (`⚠ cache warm miss`) through
+`cache_miss_prompt.rs`, which also reserves bottom layout height in `view.rs`.
+Upstream has neither file — a merge reworking the idle path must re-wire the
+pump, not drop it.
+
+---
+
+### 16. rstring compression (two boundaries)
+
+`maki-rstring` compresses exactly two edges, both gated by the `rstring`
+config knob:
+
+- tool output at the lua→agent edge — `maki-lua/src/api/tool.rs` (bash output
+  above `maki_rstring::MIN_BYTES` collapses; errors pass through)
+- user messages after input hooks — `maki-agent/src/agent/run.rs`
+  (`compress_if_useful` above `MIN_BYTES`; tests pin the disabled path)
+
+`plugins/bash/init.lua` documents the resulting format for the model. A merge
+that rewrites either call site silently re-inflates every big tool result.
+
+---
+
+### 17. `plugins/memory/init.lua` — fork extensions on an upstream plugin
+
+`memory` is upstream's plugin; the fork added `/memory move`, the Ctrl+M
+project picker and `move_to_project` (notes re-keyed onto another project).
+They depend on fork-only Lua API: `maki.fs.rename`, `maki.dir_picker` and
+`maki.known_paths` (which owns the project-id hash and the known-roots scan).
+An upstream rewrite of the plugin silently drops the move UI; the API surface
+itself is pure addition and safe.
+
+---
+
 ## Upstream v0.5.5 merge notes (2026-09-17)
 
 Resolved on `merge/upstream-v0.5.5` (upstream `5da1b2a2`, v0.5.5; 49 conflicted
@@ -386,13 +484,47 @@ sensitive), `maki-pack`'s `deletion_preflight_..._one_revision_is_live` lock,
 `markdown::the_code_memo_follows_the_theme...`, and
 `child_env::child_sees_only_keys_set_after_strip`.
 
+## Fork development since v0.5.6 (2026-09-29 → 2026-10-14)
+
+No upstream merge in this window — main advanced on its own (69 commits).
+Decisions and features a future merge must not trample:
+
+- **Agent loop** (`9a2eef65`): stop-vs-end cancel semantics — a stop with no
+  run in flight goes stale instead of killing the next run; the Lua agent api
+  gained interrupt sources and an input channel (a session's registration,
+  not its opening run, ends it), so listening sessions can be paused, fed
+  text and continued. The task plugin surfaces `paused` results.
+- **Default system prompt rewritten** (`0296256b`); zone 12's user
+  `system.md` still overrides it wholesale.
+- **Z.AI plan-gated 429s** are retried inside the rate-limit budget
+  (`bd998fcc`), not surfaced as failures.
+- **Hardening to keep**: MCP tool content decoding — content types,
+  structured content, list pagination (`f1061ab8`); ACP bounded, cancel-safe
+  stdin framing (`709cd601`); bedrock framing, SSE deadlines, openai tool
+  accumulation (`b7303e2b`); API keys masked on char boundaries (`5eeaf07d`);
+  config-macro errors are spanned, not panics (`4e6607f9`).
+- **Tool surface**: `tool_help` plugin and `get_tool` returning the tool
+  description (`4b4b0349`); input examples rendered for providers without
+  native support (`b359d48b`); argument values in tool headers (`62cf50fd`);
+  `register_tool_view` renders tools a plugin does not own (`1ca156c6`).
+- **Keybindings**: the thinking picker sits on `plan_toggle` (Ctrl+T), the
+  todo panel took Alt+T (`d2e68bfa`).
+- **`/logs`** falls back to `less` when `jlf` is not on PATH (`6b54ac37`).
+- **`create_plugin`** scaffolds personal plugins into the config dir
+  (`2d25721b`), with an agent-level test
+  (`tests/agent/skill-test-create-plugin.sh`).
+- The **upstream v0.6.3 merge** is being resolved on branch
+  `merge/upstream-v0.6.3`; its decisions (Rust providers → Lua declarations,
+  `openrouter_pins.rs`, `tensorx` as a Lua plugin, `RowWalk` re-homed into
+  `messages/segment.rs`) are recorded in that branch's FORK.md and land with
+  the merge.
+
 ## Known gaps (not regressions, but broken)
 
-- **`Ctrl+Shift+D` (delete current session) has no handler.** The bind is
-  declared in `keybindings.rs`, is user-configurable via `config.rs`, and is
-  advertised — but nothing matches `key::DELETE_CURRENT_SESSION`. The handler
-  lived on the deleted Rust `session_picker` (`remove_entry`) and was not
-  reimplemented when the session list moved to Lua. Pressing it does nothing.
+- ~~`Ctrl+Shift+D` (delete current session) has no handler.~~ Fixed on the
+  `merge/upstream-v0.6.3` branch (`26bebc6b`): the bind dispatches the
+  sessions plugin's `/delete_session`. Still a no-op on `main` until that
+  merge lands.
 
 ## Merge checklist
 

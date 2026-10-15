@@ -1329,8 +1329,8 @@ where
 // -- CWD index --
 
 /// One directory's row in [`CWD_INDEX_FILE`]: the newest session there, the
-/// alias its readable links are named with, and the last thinking level set
-/// in it. Files written before the alias or the level existed omit them.
+/// alias its readable links are named with, the last thinking level and theme
+/// set in it. Files written before a field existed omit it.
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct CwdIndexEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1339,6 +1339,8 @@ struct CwdIndexEntry {
     name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<StoredThinking>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1420,6 +1422,26 @@ pub fn set_cwd_thinking(
             return false;
         }
         entry.thinking = Some(thinking);
+        true
+    })
+}
+
+/// The theme last picked in `cwd` ([`set_cwd_theme`]), the one a maki opened
+/// there starts on. Reads never create anything.
+pub fn cwd_theme(dir: &StateDir, cwd: &str) -> Option<String> {
+    load_cwd_index(&dir.path().join(SESSIONS_DIR))
+        .remove(cwd)
+        .and_then(|entry| entry.theme)
+}
+
+/// Records the theme the user last picked in `cwd`, so the next maki opened
+/// there starts on it.
+pub fn set_cwd_theme(dir: &StateDir, cwd: &str, theme: &str) -> Result<(), StorageError> {
+    mutate_cwd_entry(dir, cwd, |entry| {
+        if entry.theme.as_deref() == Some(theme) {
+            return false;
+        }
+        entry.theme = Some(theme.to_owned());
         true
     })
 }
@@ -2464,9 +2486,9 @@ mod tests {
     use super::{
         ARCHIVE_DIR, ARCHIVE_KEEP, ARCHIVE_MAX_BYTES, BY_PATH_DIR, CWD_INDEX_FILE, DEFAULT_TITLE,
         LOG_BLOATED, MAX_APPENDS, MAX_TITLE_LEN, MSG_PREFIX, SESSION_VERSION, SESSIONS_DIR,
-        StoredSubagent, TAIL_BUF, cwd_thinking, generate_title, json_path, jsonl_path,
+        StoredSubagent, TAIL_BUF, cwd_theme, cwd_thinking, generate_title, json_path, jsonl_path,
         latest_id_in, link_stamp, load_cwd_index, lock_path, locks_dir, next_epoch, set_cwd_alias,
-        set_cwd_thinking, update_cwd_index, write_full_session,
+        set_cwd_theme, set_cwd_thinking, update_cwd_index, write_full_session,
     };
     use super::{
         HistorySnapshot, SCAN_CACHE_FILE, Session, SessionClaim, SessionError, SessionLog,
@@ -3566,6 +3588,23 @@ mod tests {
 
         let index = load_cwd_index(dir);
         assert_eq!(index["/proj"].thinking, None);
+        assert_eq!(index["/proj"].theme, None);
+    }
+
+    #[test]
+    fn cwd_theme_round_trips_and_ignores_other_folders() {
+        const CWD: &str = "/home/dev/proj";
+        let tmp = TempDir::new().unwrap();
+        let state = StateDir::from_path(tmp.path().join("state"));
+
+        assert_eq!(cwd_theme(&state, CWD), None);
+
+        set_cwd_theme(&state, CWD, "gruvbox").unwrap();
+        assert_eq!(cwd_theme(&state, CWD).as_deref(), Some("gruvbox"));
+        assert_eq!(cwd_theme(&state, "/elsewhere"), None);
+
+        set_cwd_theme(&state, CWD, "nord").unwrap();
+        assert_eq!(cwd_theme(&state, CWD).as_deref(), Some("nord"));
     }
 
     #[test]

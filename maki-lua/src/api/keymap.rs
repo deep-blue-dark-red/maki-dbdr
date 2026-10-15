@@ -54,6 +54,9 @@ impl KeybindTicket {
         if !bind.live.load(Ordering::Acquire) {
             return None;
         }
+        // fetch_update is deprecated from std 1.99; its rename try_update
+        // needs 1.93, and the workspace MSRV is 1.88.
+        #[allow(deprecated)]
         bind.in_flight
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_IN_FLIGHT).then_some(n + 1)

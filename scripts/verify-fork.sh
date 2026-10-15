@@ -61,7 +61,7 @@ check_not() {
 # ── New files ────────────────────────────────────────────────────────────────
 
 file_exists "wire logger"      maki-providers/src/wire_log.rs
-file_exists "mlog binary"      maki-providers/src/bin/mlog.rs
+file_absent "mlog binary gone" maki-providers/src/bin/mlog.rs
 file_exists "tensorx provider" maki-providers/src/providers/tensorx.rs
 # Deleted on purpose — must not come back: d952f8aa moved the last native tool
 # to Lua; efaefdb8 dropped hackernews; the Rust session_picker gave way to the

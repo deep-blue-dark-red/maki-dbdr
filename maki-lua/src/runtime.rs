@@ -2590,22 +2590,22 @@ impl LuaRuntime {
             &permissions,
             Arc::clone(&opts),
         )
-        .map_err(&map_err)?;
+        .map_err(map_err)?;
 
         if let Some(config) = config {
             let setup_fn =
                 crate::api::util::setup::create_setup_fn(&self.lua, Arc::clone(config.store))
-                    .map_err(&map_err)?;
-            maki.set("setup", setup_fn).map_err(&map_err)?;
+                    .map_err(map_err)?;
+            maki.set("setup", setup_fn).map_err(map_err)?;
 
             let pack = match config.scope {
                 ConfigScope::Global => crate::api::pack::create_pack_table(&self.lua),
                 _ => crate::api::pack::create_pack_read_table(&self.lua),
             }
-            .map_err(&map_err)?;
-            maki.set("pack", pack).map_err(&map_err)?;
+            .map_err(map_err)?;
+            maki.set("pack", pack).map_err(map_err)?;
         }
-        let env = self.build_env(maki, require_root).map_err(&map_err)?;
+        let env = self.build_env(maki, require_root).map_err(map_err)?;
 
         drop(self.drop_plugin_keys(&name));
         // The one place a name `clear_plugin` tombstoned comes back live, so
@@ -2646,7 +2646,7 @@ impl LuaRuntime {
                 result
             }
             PluginLoad::Function { function, argument } => {
-                function.set_environment(env).map_err(&map_err)?;
+                function.set_environment(env).map_err(map_err)?;
                 queue_codegen(&self.codegen_queue, &function);
                 function.call_async::<()>(argument).await
             }

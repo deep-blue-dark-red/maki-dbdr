@@ -398,6 +398,9 @@ struct Shared {
 struct WalkPermit;
 
 impl WalkPermit {
+    // fetch_update is deprecated from std 1.99; its rename try_update needs
+    // 1.93, and the workspace MSRV is 1.88.
+    #[allow(deprecated)]
     fn take() -> Option<Self> {
         WALKS
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |walking| {

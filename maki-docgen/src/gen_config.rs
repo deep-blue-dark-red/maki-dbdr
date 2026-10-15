@@ -106,9 +106,10 @@ fn write_theme_section(out: &mut String) {
     writeln!(
         out,
         "Name of the color theme to load at startup, overriding the theme you \
-         last picked interactively. If unset, Maki keeps your last selection \
-         (the built-in default on first run). An unknown name is ignored with \
-         a warning.\n"
+         last picked interactively. A theme you pick is remembered per folder, \
+         and the folder's pick outranks this setting. If neither is set, Maki \
+         keeps your last selection (the built-in default on first run). An \
+         unknown name is ignored with a warning.\n"
     )
     .unwrap();
     let names = maki_ui::BUNDLED_THEMES
