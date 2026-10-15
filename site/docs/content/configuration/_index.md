@@ -143,6 +143,9 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `supervisor_batch_turns` | u32 | `6` | 1 | Worker turns per supervisor review |
 | `supervisor_batch_tokens` | u32 | `8000` | 500 | New transcript tokens that trigger a supervisor review before `supervisor_batch_turns` is reached |
 | `supervisor_max_notes` | u32 | `3` | - | Corrective notes the supervisor may give per run; past it only a stop gets through |
+| `supervisor_exit_wait_secs` | u64 | `30` | - | Seconds an ending run waits for the supervisor's last review; 0 never waits, and a late answer reaches the next run |
+| `supervisor_policy` | string[] | `["actions", "report"]` | - | What the supervisor reads: `transcript` (compact transcript batches), `actions` (every action carries a one-line `why`), `report` (closing claim, actions, diff and checks at the end of a run) |
+| `supervisor_checks` | string[] | `[]` | - | Shell commands the harness runs at the end of a supervised run; their exit codes and output tails go into the report |
 
 ### `provider`
 

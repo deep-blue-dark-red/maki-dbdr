@@ -48,6 +48,12 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 40_000;
 pub const DEFAULT_SUPERVISOR_BATCH_TURNS: u32 = 6;
 pub const DEFAULT_SUPERVISOR_BATCH_TOKENS: u32 = 8_000;
 pub const DEFAULT_SUPERVISOR_MAX_NOTES: u32 = 3;
+pub const DEFAULT_SUPERVISOR_EXIT_WAIT_SECS: u64 = 30;
+/// Supervisor policy parts: what the supervisor reads of a worker.
+pub const SUPERVISOR_POLICY_TRANSCRIPT: &str = "transcript";
+pub const SUPERVISOR_POLICY_ACTIONS: &str = "actions";
+pub const SUPERVISOR_POLICY_REPORT: &str = "report";
+const DEFAULT_SUPERVISOR_POLICY: &[&str] = &[SUPERVISOR_POLICY_ACTIONS, SUPERVISOR_POLICY_REPORT];
 /// What one turn asks to generate. A number of maki's own choosing rather than
 /// "whatever the window can spare", because the latter ties the output cap to a
 /// prompt estimate, and an estimate that reads low buys a rejection from every
@@ -770,6 +776,9 @@ pub struct AgentFileConfig {
     pub supervisor_batch_turns: Option<u32>,
     pub supervisor_batch_tokens: Option<u32>,
     pub supervisor_max_notes: Option<u32>,
+    pub supervisor_exit_wait_secs: Option<u64>,
+    pub supervisor_policy: Option<Vec<String>>,
+    pub supervisor_checks: Option<Vec<String>>,
 }
 
 impl AgentFileConfig {
@@ -794,7 +803,10 @@ impl AgentFileConfig {
             supervisor_model,
             supervisor_batch_turns,
             supervisor_batch_tokens,
-            supervisor_max_notes
+            supervisor_max_notes,
+            supervisor_exit_wait_secs,
+            supervisor_policy,
+            supervisor_checks
         );
     }
 }
@@ -1541,6 +1553,25 @@ pub struct AgentConfig {
     #[config(default = DEFAULT_SUPERVISOR_MAX_NOTES, desc = "Corrective notes the supervisor may give per run; past it only a stop gets through")]
     pub supervisor_max_notes: u32,
 
+    #[config(default = DEFAULT_SUPERVISOR_EXIT_WAIT_SECS, desc = "Seconds an ending run waits for the supervisor's last review; 0 never waits, and a late answer reaches the next run")]
+    pub supervisor_exit_wait_secs: u64,
+
+    #[config(
+        ty = "string[]",
+        default = "default_supervisor_policy()",
+        default_doc = "[\"actions\", \"report\"]",
+        desc = "What the supervisor reads: `transcript` (compact transcript batches), `actions` (every action carries a one-line `why`), `report` (closing claim, actions, diff and checks at the end of a run)"
+    )]
+    pub supervisor_policy: Vec<String>,
+
+    #[config(
+        ty = "string[]",
+        default = "Vec::new()",
+        default_doc = "[]",
+        desc = "Shell commands the harness runs at the end of a supervised run; their exit codes and output tails go into the report"
+    )]
+    pub supervisor_checks: Vec<String>,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1551,6 +1582,13 @@ pub struct AgentConfig {
     /// registers its tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
+}
+
+fn default_supervisor_policy() -> Vec<String> {
+    DEFAULT_SUPERVISOR_POLICY
+        .iter()
+        .map(|part| (*part).to_owned())
+        .collect()
 }
 
 impl AgentConfig {
@@ -1586,6 +1624,13 @@ impl AgentConfig {
             supervisor_max_notes: file
                 .supervisor_max_notes
                 .unwrap_or(DEFAULT_SUPERVISOR_MAX_NOTES),
+            supervisor_exit_wait_secs: file
+                .supervisor_exit_wait_secs
+                .unwrap_or(DEFAULT_SUPERVISOR_EXIT_WAIT_SECS),
+            supervisor_policy: file
+                .supervisor_policy
+                .unwrap_or_else(default_supervisor_policy),
+            supervisor_checks: file.supervisor_checks.unwrap_or_default(),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
