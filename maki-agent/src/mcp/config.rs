@@ -146,6 +146,9 @@ pub struct RawServerConfig {
     pub timeout: u64,
     #[serde(default)]
     pub always_load: bool,
+    /// Replaces the instructions the server sends on `initialize`; `""` drops them.
+    #[serde(default)]
+    pub instructions: Option<String>,
     #[serde(flatten)]
     pub transport: RawTransport,
 }
@@ -157,6 +160,7 @@ impl RawServerConfig {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
+            instructions: None,
             transport,
         }
     }
@@ -195,6 +199,8 @@ pub struct ServerConfig {
     /// Skip deferral: every tool from this server enters the context upfront
     /// instead of being discoverable through `tool_search`.
     pub always_load: bool,
+    /// `Some` overrides what the server sends; `Some("")` suppresses it.
+    pub instructions: Option<String>,
     pub transport: Transport,
 }
 
@@ -360,6 +366,7 @@ pub fn parse_server(
         name,
         timeout: Duration::from_millis(server.timeout),
         always_load: server.always_load,
+        instructions: server.instructions,
         transport,
     })
 }
@@ -498,6 +505,7 @@ mod tests {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
+            instructions: None,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -514,6 +522,7 @@ mod tests {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
+            instructions: None,
             transport: RawTransport::Http(RawHttpFields {
                 url: url.to_string(),
                 headers: HashMap::new(),
@@ -555,6 +564,30 @@ headers = { Authorization = "Bearer ${MAKI_TEST_MCP_UNSET_84421}" }
         let msg = err.to_string();
         assert!(msg.contains("MAKI_TEST_MCP_UNSET_84421"), "got: {msg}");
         assert!(msg.contains("Authorization"), "got: {msg}");
+    }
+
+    #[test]
+    fn instructions_key_reaches_the_server_config() {
+        let config: McpConfig = toml::from_str(
+            r#"
+[mcp.rose]
+command = ["rose-mcp", "mcp"]
+instructions = """
+Search by meaning with rose__Search.
+"""
+
+[mcp.plain]
+command = ["plain"]
+"#,
+        )
+        .unwrap();
+        let rose = parse("rose", config.mcp["rose"].clone()).unwrap();
+        assert_eq!(
+            rose.instructions.as_deref(),
+            Some("Search by meaning with rose__Search.\n")
+        );
+        let plain = parse("plain", config.mcp["plain"].clone()).unwrap();
+        assert_eq!(plain.instructions, None);
     }
 
     #[test]

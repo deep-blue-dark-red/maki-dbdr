@@ -80,6 +80,7 @@ On macOS, Maki uses its own OpenSSL, which does not read the keychain. The bundl
 | `timeout` | u64 | 30000 | Milliseconds (1-300000) |
 | `enabled` | bool | true | |
 | `always_load` | bool | false | Skip tool search, load all tools upfront |
+| `instructions` | string | | Replaces the instructions the server sends; `""` drops them. See [Server instructions](#server-instructions) |
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
@@ -88,6 +89,23 @@ One option lives at the top level of `mcp.toml`, outside any server:
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
+
+## Server instructions
+
+A server can send `instructions` in its `initialize` result: how it wants its tools used. Maki appends them to the system prompt under `# MCP server instructions`, one `## <server>` section each, for servers that are connected. A server that connects late is included from the next request on, and one that disconnects drops out.
+
+Set `instructions` on a server to write your own. It replaces what the server sends, supplies text for a server that sends none, and `instructions = ""` drops the server's text:
+
+```toml
+[mcp.rose]
+command = ["rose-mcp", "mcp"]
+instructions = """
+Know what the code does but not its name: search with rose__Search,
+then read at the returned location.
+"""
+```
+
+`/system_prompt` shows the result.
 
 ## Tool search
 

@@ -336,7 +336,7 @@ impl<'h> Agent<'h> {
 
         self.gauge.seed_if_empty(
             self.history.as_slice(),
-            &self.system,
+            &request_system(&self.system, self.mcp.as_ref()),
             request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
         );
 
@@ -443,11 +443,11 @@ impl<'h> Agent<'h> {
         // for the request below; a borrowed `Cow` tied to `&self` would
         // conflict with those mutations.
         let tools = request_tools(&self.tools, self.mcp.as_ref()).into_owned();
-        let estimated_tokens =
-            estimate_prompt_tokens(self.history.as_slice(), &self.system, &tools);
+        let system = request_system(&self.system, self.mcp.as_ref()).into_owned();
+        let estimated_tokens = estimate_prompt_tokens(self.history.as_slice(), &system, &tools);
         let turn_idx = (self.num_turns + 1) as usize;
         if self.num_turns == 0 {
-            let turn_0_est = estimate_prompt_tokens(&[], &self.system, &tools);
+            let turn_0_est = estimate_prompt_tokens(&[], &system, &tools);
             let turn_1_est = estimated_tokens.saturating_sub(turn_0_est);
             self.turn_state.record_estimate(0, turn_0_est);
             self.turn_state.record_estimate(1, turn_1_est);
@@ -1011,7 +1011,7 @@ impl<'h> Agent<'h> {
         // just summarized away, so what is left is all it may count.
         self.gauge.reset(
             self.history.as_slice(),
-            &self.system,
+            &request_system(&self.system, self.mcp.as_ref()),
             request_tools(&self.tools, self.mcp.as_ref()).as_ref(),
         );
         let context_size_after = self.gauge.size();
@@ -1134,6 +1134,17 @@ pub fn request_tools<'t>(tools: &'t RequestTools, mcp: Option<&McpSession>) -> C
             Cow::Owned(tools)
         }
         None => Cow::Borrowed(tools.definitions()),
+    }
+}
+
+/// `system` with connected MCP servers' instructions appended. Recomputed per
+/// request for the same reason as [`request_tools`].
+pub fn request_system<'s>(system: &'s str, mcp: Option<&McpSession>) -> Cow<'s, str> {
+    let block = mcp.map(|mcp| mcp.instructions()).unwrap_or_default();
+    if block.is_empty() {
+        Cow::Borrowed(system)
+    } else {
+        Cow::Owned(format!("{system}\n\n{block}"))
     }
 }
 

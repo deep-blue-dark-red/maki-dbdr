@@ -48,6 +48,9 @@ fn invalid_response(name: &Arc<str>, e: impl std::fmt::Display) -> McpError {
 pub struct ServerCapabilities {
     pub tools: bool,
     pub prompts: bool,
+    /// The optional `instructions` field of the initialize result: how the
+    /// server wants its tools used. Blank counts as absent.
+    pub instructions: Option<String>,
 }
 
 impl ServerCapabilities {
@@ -55,6 +58,11 @@ impl ServerCapabilities {
         Self {
             tools: result["capabilities"]["tools"].is_object(),
             prompts: result["capabilities"]["prompts"].is_object(),
+            instructions: result["instructions"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
         }
     }
 }
@@ -297,5 +305,14 @@ mod tests {
     fn parses_capabilities(result: Value, tools: bool, prompts: bool) {
         let caps = ServerCapabilities::parse(&result);
         assert_eq!((caps.tools, caps.prompts), (tools, prompts));
+    }
+
+    #[test_case(json!({"instructions": "Use search first.\n"}), Some("Use search first.") ; "trimmed")]
+    #[test_case(json!({"instructions": "  \n"}), None ; "blank")]
+    #[test_case(json!({"instructions": 3}), None ; "not_a_string")]
+    #[test_case(json!({}), None ; "absent")]
+    fn parses_instructions(result: Value, expected: Option<&str>) {
+        let caps = ServerCapabilities::parse(&result);
+        assert_eq!(caps.instructions.as_deref(), expected);
     }
 }

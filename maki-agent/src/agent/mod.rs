@@ -19,7 +19,7 @@ pub use instructions::{
 
 pub mod turn_state;
 pub use run::{
-    Agent, AgentParams, AgentRunParams, ModelSlot, RunContext, RunContextBuilder, request_tools,
-    resolve_compaction_model,
+    Agent, AgentParams, AgentRunParams, ModelSlot, RunContext, RunContextBuilder, request_system,
+    request_tools, resolve_compaction_model,
 };
 pub use turn_state::{ToolCallRecord, Turn, TurnState};

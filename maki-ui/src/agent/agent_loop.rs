@@ -622,15 +622,17 @@ impl AgentLoop {
 
     /// Always pins `Build` mode and no workflow: btw runs neither, so Plan-mode
     /// constraints would only confuse the model and a gauge sizing this only
-    /// cares about the length. Everything else matches the live prompt.
+    /// cares about the length. Everything else matches the live prompt,
+    /// connected MCP servers' instructions included.
     fn system_prompt(&self, prompt_slots: &maki_agent::prompt::ResolvedSlots) -> String {
-        agent::build_system_prompt(
+        let system = agent::build_system_prompt(
             &self.vars,
             &maki_agent::AgentMode::Build,
             &self.instructions.text,
             prompt_slots,
             &self.model_slot.load().model,
-        )
+        );
+        agent::request_system(&system, self.mcp.as_ref()).into_owned()
     }
 
     /// What `/tool_prompt` shows: every tool definition a run would send, with

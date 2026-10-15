@@ -137,6 +137,8 @@ struct ServerEntry {
     transport: Option<Arc<dyn McpTransport>>,
     tools: Vec<McpToolDef>,
     prompts: Vec<McpPromptDef>,
+    /// What the server sent on `initialize`, before any config override.
+    instructions: Option<String>,
 }
 
 impl ServerEntry {
@@ -149,6 +151,15 @@ impl ServerEntry {
         }
         self.tools.clear();
         self.prompts.clear();
+        self.instructions = None;
+    }
+
+    /// The config's `instructions` wins over the server's; a blank one drops both.
+    fn effective_instructions(&self) -> Option<&str> {
+        match self.config.as_ref().and_then(|c| c.instructions.as_deref()) {
+            Some(own) => Some(own.trim()).filter(|s| !s.is_empty()),
+            None => self.instructions.as_deref(),
+        }
     }
 
     fn populate(&mut self, result: StartResult) {
@@ -156,7 +167,9 @@ impl ServerEntry {
             transport,
             tool_infos,
             prompt_infos,
+            instructions,
         } = result;
+        self.instructions = instructions;
         self.tools = tool_infos
             .into_iter()
             .filter(|info| {
@@ -203,6 +216,8 @@ struct ToolIndex {
     tools: HashMap<Arc<str>, ToolRef>,
     prompts: HashMap<String, PromptRef>,
     descriptors: Arc<[ToolDescriptor]>,
+    /// The system-prompt block for connected servers' instructions; empty when none.
+    instructions: String,
 }
 
 /// One published MCP tool. Wire name and search text are derived from
@@ -531,6 +546,13 @@ impl McpHandle {
 
     pub fn reader(&self) -> McpSnapshotReader {
         McpSnapshotReader(Arc::clone(&self.snapshot))
+    }
+
+    /// The system-prompt block of connected servers' instructions, empty when
+    /// none sent any. Read per request, like the tool array, so a server that
+    /// connects late is described from the next request on.
+    pub fn instructions(&self) -> String {
+        self.index.load().instructions.clone()
     }
 
     /// Where wire names (`server__tool`, what providers send) and internal names
@@ -886,6 +908,7 @@ struct StartResult {
     transport: Arc<dyn McpTransport>,
     tool_infos: Vec<protocol::ToolInfo>,
     prompt_infos: Vec<protocol::PromptInfo>,
+    instructions: Option<String>,
 }
 
 async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
@@ -943,6 +966,7 @@ async fn start_server(config: &ServerConfig) -> Result<StartResult, McpError> {
         transport,
         tool_infos,
         prompt_infos,
+        instructions: capabilities.instructions,
     })
 }
 
@@ -971,6 +995,7 @@ fn parse_entries(config: McpConfig) -> McpManagerInner {
             transport: None,
             tools: Vec::new(),
             prompts: Vec::new(),
+            instructions: None,
         });
     }
 
@@ -1025,6 +1050,21 @@ fn apply_start_result(
     }
 }
 
+/// One `##` section per server, in entry order, so the block stays
+/// byte-identical across requests (prompt cache).
+fn render_instructions(sections: &[(&str, &str)]) -> String {
+    if sections.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "# MCP server instructions\n\nConnected MCP servers sent these instructions for their tools.",
+    );
+    for (server, text) in sections {
+        out.push_str(&format!("\n\n## {server}\n{text}"));
+    }
+    out
+}
+
 /// The only place read-side state is updated. Every mutation in the command loop ends here.
 fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSwap<McpSnapshot>) {
     let mut tools = HashMap::new();
@@ -1033,6 +1073,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
     let mut server_infos = Vec::with_capacity(inner.entries.len());
     let mut prompt_infos = Vec::new();
     let mut pids = Vec::new();
+    let mut instructions = Vec::new();
 
     for entry in &inner.entries {
         let (url, oauth, ca_file) = match entry.config.as_ref().map(|c| &c.transport) {
@@ -1078,6 +1119,9 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
                 );
                 prompt_infos.push(p.to_info(&entry.name));
             }
+            if let Some(text) = entry.effective_instructions() {
+                instructions.push((entry.name.as_str(), text));
+            }
             pids.extend(transport.child_pids());
         }
 
@@ -1098,6 +1142,7 @@ fn publish(inner: &McpManagerInner, index: &ArcSwap<ToolIndex>, snapshot: &ArcSw
         tools,
         prompts,
         descriptors: descriptors.into(),
+        instructions: render_instructions(&instructions),
     }));
     snapshot.store(Arc::new(McpSnapshot {
         infos: server_infos,
@@ -1147,6 +1192,7 @@ pub mod test_support {
                 })
                 .collect(),
             prompts: Vec::new(),
+            instructions: None,
         };
         let inner = McpManagerInner {
             entries: vec![entry],
@@ -1327,6 +1373,7 @@ mod tests {
             enabled: true,
             timeout: DEFAULT_TIMEOUT_MS,
             always_load: false,
+            instructions: None,
             transport: RawTransport::Stdio(RawStdioFields {
                 command: cmd.iter().map(|s| s.to_string()).collect(),
                 environment: HashMap::new(),
@@ -1430,6 +1477,7 @@ mod tests {
                 input_schema: json!({}),
             }],
             prompts: Vec::new(),
+            instructions: None,
         }
     }
 
@@ -1438,6 +1486,7 @@ mod tests {
             name: name.into(),
             timeout: Duration::from_secs(1),
             always_load: false,
+            instructions: None,
             transport: Transport::Stdio {
                 program: MISSING_PROGRAM.into(),
                 args: vec![],
@@ -1616,6 +1665,73 @@ mod tests {
         handle.extend_tools(&mut tools);
         // Loaded cap plus the search tool for the remaining deferred ones.
         assert_eq!(tools.as_array().unwrap().len(), MAX_SEARCH_LOADS + 1);
+    }
+
+    fn instructed_entry(name: &str, sent: Option<&str>, configured: Option<&str>) -> ServerEntry {
+        let mut raw = stdio_raw(&["echo"]);
+        raw.instructions = configured.map(str::to_owned);
+        let mut entry = fake_entry(name, FakeTransport::new());
+        entry.config = Some(parse_server(name.into(), raw, Path::new("")).unwrap());
+        entry.instructions = sent.map(str::to_owned);
+        entry
+    }
+
+    #[test]
+    fn instructions_cover_connected_servers_in_entry_order() {
+        let mut gone = instructed_entry("gone", Some("Unreachable."), None);
+        gone.transport = None;
+        let mut off = instructed_entry("off", Some("Switched off."), None);
+        off.status = McpServerStatus::Disabled;
+        let (_inner, session) = setup(vec![
+            instructed_entry("alpha", Some("Use alpha first."), None),
+            gone,
+            off,
+            instructed_entry("beta", Some("Then beta."), None),
+            instructed_entry("quiet", None, None),
+        ]);
+        assert_eq!(
+            session.instructions(),
+            "# MCP server instructions\n\nConnected MCP servers sent these instructions for their tools.\
+             \n\n## alpha\nUse alpha first.\n\n## beta\nThen beta."
+        );
+    }
+
+    #[test_case(Some("Theirs."), None, Some("Theirs.") ; "server_only")]
+    #[test_case(Some("Theirs."), Some(" Mine.\n"), Some("Mine.") ; "config_replaces")]
+    #[test_case(None, Some("Mine."), Some("Mine.") ; "config_supplies")]
+    #[test_case(Some("Theirs."), Some(""), None ; "blank_config_drops")]
+    #[test_case(None, None, None ; "neither")]
+    fn config_instructions_override_the_server(
+        sent: Option<&str>,
+        configured: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let entry = instructed_entry("srv", sent, configured);
+        assert_eq!(entry.effective_instructions(), expected);
+    }
+
+    #[test]
+    fn request_system_appends_only_when_a_server_sent_instructions() {
+        let (_inner, silent) = setup(vec![instructed_entry("srv", None, None)]);
+        assert!(matches!(
+            crate::agent::request_system("base", Some(&silent)),
+            std::borrow::Cow::Borrowed("base")
+        ));
+        assert!(matches!(
+            crate::agent::request_system("base", None),
+            std::borrow::Cow::Borrowed("base")
+        ));
+        let (_inner, chatty) = setup(vec![instructed_entry("srv", Some("Do X."), None)]);
+        let system = crate::agent::request_system("base", Some(&chatty));
+        assert!(system.starts_with("base\n\n# MCP server instructions"));
+        assert!(system.ends_with("## srv\nDo X."));
+    }
+
+    #[test]
+    fn clear_connection_forgets_sent_instructions() {
+        let mut entry = instructed_entry("srv", Some("Do X."), None);
+        smol::block_on(entry.clear_connection());
+        assert_eq!(entry.effective_instructions(), None);
     }
 
     fn entry_with_tools(name: &str, tools: Vec<McpToolDef>) -> ServerEntry {
