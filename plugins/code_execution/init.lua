@@ -62,7 +62,7 @@ local CALLABLE_TOOLS_ERR = "cannot list callable tools: "
 -- a leading digit. Binding it would raise a SyntaxError the model cannot act on.
 local PY_IDENTIFIER = "^[%a_][%w_]*$"
 local WORKFLOW_TOOLS_NOTE =
-  "\nWorkflow mode: orchestrate subagents from this script. Await every `task(...)` call and use `gather(task(...), task(...))` for parallel fan-out. Pass `output_schema` to task for machine-readable results (a JSON string, parse with `json.loads`).\n"
+  "\nWorkflow mode: orchestrate subagents from this script. Await every `subtask(...)` call and use `gather(subtask(...), subtask(...))` for parallel fan-out. Pass `output_schema` to subtask for machine-readable results (a JSON string, parse with `json.loads`).\n"
 local PY_TYPES = { string = "str", integer = "int", boolean = "bool", array = "list" }
 
 local opts = maki.api.register_options(output_limits.extend({
@@ -125,7 +125,7 @@ end
 local description = "Run restricted Python that calls maki tools; only printed output reaches the conversation. "
   .. "The interpreter is monty, not CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. "
   .. "Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings. "
-  .. "For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; check each result for errors. "
+  .. "For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; check each result for errors: a failed call raises RuntimeError, and `gather` turns it into an `[ERROR] ...` string. "
   .. "Stdlib is limited to re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata; no network access. "
   .. "open() reads and writes text files under the same rules as the read and write tools. "
   .. "Budget: 30s by default, not counting tool waits."

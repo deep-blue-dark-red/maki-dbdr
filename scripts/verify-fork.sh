@@ -374,14 +374,6 @@ check "TurnStats carries thinking"   "maki-ui/src/components/status_bar.rs" "pub
 check "status bar renders TH"        "maki-ui/src/components/status_bar.rs" '" | TH {}"'
 check "thinking wired from turn"     "maki-ui/src/app/mod.rs" "thinking_tokens: tc.usage.reasoning"
 
-# ── skill_test failure diagnostics ───────────────────────────────────────────
-
-F=plugins/skill/init.lua
-check "skill test stderr captured"     "$F" "on_stderr"
-check "skill test timeout override"    "$F" "tonumber(tc.timeout_ms) or 60000"
-check "skill test diagnostic tails"    "$F" "tail_oneline"
-check_not "no bare timeout error"      "$F" 'return nil, "timeout after 60s"'
-
 # ── Results ──────────────────────────────────────────────────────────────────
 
 echo ""

@@ -2,11 +2,17 @@
 //! the UI event loop, which owns live runtimes and storage. `notify` posts
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
+use std::fs;
+
 use maki_agent::SessionMailbox;
 use maki_agent::agent::live_history;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
+use maki_sessionlog::effects::{DiffView, EffectsOpts};
+use maki_sessionlog::effects_log;
+use maki_storage::StateDir;
 use maki_storage::id::MakiId;
+use maki_storage::sessions::SESSIONS_DIR;
 use mlua::{Lua, Result as LuaResult, Table, Value};
 use serde_json::json;
 
@@ -26,6 +32,9 @@ const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
 const NOT_LIVE_ERR: &str = "session not live";
 const NO_FOCUSED_ERR: &str = "no focused session";
+const NO_TOOL_CALLS_ERR: &str = "session made no tool calls";
+const DEFAULT_SUMMARY_EXAMPLES: usize = 5;
+const DEFAULT_SUMMARY_CONTEXT: usize = 2;
 
 async fn roundtrip(
     lua: Lua,
@@ -257,6 +266,60 @@ async fn messages(
     Ok((Some(out), None))
 }
 
+/// Condenses a stored session's tool calls into a compact report: files
+/// changed with net line counts, commands run, network and state effects,
+/// failed calls with their reasons, and the net git diff of every changed
+/// file. Works on any stored session, live or finished, without loading it.
+///
+/// @param id string Session id, as returned by `list()` or `live()`.
+/// @param opts table? Options:
+///   `diff` (boolean?) include the git diff section (default true).
+///   `context` (integer?) unchanged lines around each change (default 2).
+///   `diff_lines` (integer?) cap each file's diff at this many lines.
+///   `limit` (integer?) distinct examples per command, target or failure (default 5).
+///   `transcript` (boolean?) replace the commands list with the model's replies
+///   interleaved with every command, thinking excluded (default false).
+/// @return (string|nil, string|nil) The report, or nil and an error.
+/// @example
+/// local report, err = maki.session.summary(id, { diff_lines = 40 })
+#[lua_fn]
+fn summary(_lua: &Lua, id: String, opts: Option<Table>) -> LuaResult<Pair<String>> {
+    let id: MakiId = try_pair!(id.parse());
+    let (diff, context, diff_lines, limit, transcript) = match &opts {
+        Some(opts) => (
+            opts.get::<Option<bool>>("diff")?.unwrap_or(true),
+            opts.get::<Option<usize>>("context")?
+                .unwrap_or(DEFAULT_SUMMARY_CONTEXT),
+            opts.get::<Option<usize>>("diff_lines")?,
+            opts.get::<Option<usize>>("limit")?
+                .unwrap_or(DEFAULT_SUMMARY_EXAMPLES),
+            opts.get::<Option<bool>>("transcript")?.unwrap_or(false),
+        ),
+        None => (
+            true,
+            DEFAULT_SUMMARY_CONTEXT,
+            None,
+            DEFAULT_SUMMARY_EXAMPLES,
+            false,
+        ),
+    };
+    let state = try_pair!(StateDir::resolve());
+    let path = state.path().join(SESSIONS_DIR).join(format!("{id}.jsonl"));
+    let text = try_pair!(fs::read_to_string(&path));
+    let opts = EffectsOpts {
+        limit,
+        diff: diff.then_some(DiffView {
+            context,
+            max_lines: diff_lines,
+        }),
+        transcript,
+    };
+    match try_pair!(effects_log(&text, opts)) {
+        Some(report) => Ok((Some(report), None)),
+        None => Ok(err_pair(NO_TOOL_CALLS_ERR)),
+    }
+}
+
 /// Returns the id of the currently focused session.
 ///
 /// @return (string|nil, string|nil) Session id, or nil and an error.
@@ -429,7 +492,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), summary(), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
 
 #[cfg(test)]
@@ -461,6 +524,17 @@ mod tests {
         let t = create_session_table(&lua, tx).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
+    }
+
+    #[test]
+    fn summary_rejects_an_id_that_is_not_a_session_id() {
+        let lua = lua_with_session(None);
+        let (val, err): (Value, Option<String>) = lua
+            .load("return session.summary('../../etc/passwd')")
+            .eval()
+            .unwrap();
+        assert!(val.is_nil());
+        assert!(err.is_some());
     }
 
     #[test]

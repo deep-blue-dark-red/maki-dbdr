@@ -647,7 +647,7 @@ fail the load too. The specs also feed the generated configuration docs.
 
 - `{spec}` (`table`) Map of option name to a spec table:
   - `default` (`boolean|number|string`) Optional. Used when the user sets nothing. Its Lua type becomes the option type.
-  - `type` (`string`) Required when there is no default: "boolean", "integer", "number", or "string".
+  - `type` (`string`) Required when there is no default: "boolean", "integer", "number", "string", or "table". A table has no default and its fields are the plugin's to check.
   - `min` (`number`) Optional. Minimum accepted value, numeric options only.
   - `desc` (`string`) Required. One line shown in the configuration docs.
 
@@ -1496,6 +1496,8 @@ and tool set.
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits the parent
     setting if omitted, and is capped at it otherwise.
+  - `cap_thinking` (`boolean?`) cap an explicit `thinking` at the parent
+    setting. `false` leaves only the model's own limits. Default: `true`.
   - `fast` (`boolean?`) use fast mode. Inherits parent setting if omitted.
 
 **Returns:** ([`Session?`](#maki-agent-Session), `string?`) Session handle, or `(nil, err)` on failure.
@@ -4019,6 +4021,40 @@ end
 
 ---
 
+### `maki.session.summary()` {#maki-session-summary}
+
+```lua
+maki.session.summary({id}, {opts?})
+```
+
+Condenses a stored session's tool calls into a compact report: files
+changed with net line counts, commands run, network and state effects,
+failed calls with their reasons, and the net git diff of every changed
+file. Works on any stored session, live or finished, without loading it.
+
+**Parameters:**
+
+- `{id}` (`string`) Session id, as returned by `list()` or `live()`.
+- `{opts?}` (`table?`) Options:
+  - `diff` (`boolean?`) include the git diff section (default true).
+  - `context` (`integer?`) unchanged lines around each change (default 2).
+  - `diff_lines` (`integer?`) cap each file's diff at this many lines.
+  - `limit` (`integer?`) distinct examples per command, target or failure (default 5).
+  - `transcript` (`boolean?`) replace the commands list with the model's replies
+
+  interleaved with every command, thinking excluded (default false).
+
+
+**Returns:** (`string|nil`, `string|nil`) The report, or nil and an error.
+
+**Example:**
+
+```lua
+local report, err = maki.session.summary(id, { diff_lines = 40 })
+```
+
+---
+
 ### `maki.session.focus()` {#maki-session-focus}
 
 ```lua
@@ -4222,7 +4258,7 @@ h:stop()
 ## maki.task {#maki-task}
 
 The subagents of the focused session and their transcripts. Tasks are
-spawned by the `task` tool and addressed by an id that survives a reload.
+spawned by the `subtask` tool and addressed by an id that survives a reload.
 Without an interactive UI every function returns
 `nil, "no interactive UI attached"`.
 

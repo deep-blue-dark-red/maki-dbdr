@@ -53,7 +53,7 @@ async fn focus(
 
 lua_table! {
     /// The subagents of the focused session and their transcripts. Tasks are
-    /// spawned by the `task` tool and addressed by an id that survives a reload.
+    /// spawned by the `subtask` tool and addressed by an id that survives a reload.
     /// Without an interactive UI every function returns
     /// `nil, "no interactive UI attached"`.
     "maki.task" => pub(crate) fn create_task_table(tx: Option<flume::Sender<UiAction>>),
@@ -141,7 +141,7 @@ mod tests {
         host.join().unwrap();
     }
 
-    /// `plugins/task/picker_rows.lua` spots the main chat with `if not task.status`,
+    /// `plugins/subtask/picker_rows.lua` spots the main chat with `if not task.status`,
     /// so a missing key has to stay missing on the Lua side.
     #[test]
     fn list_passes_host_array_through_unchanged() {

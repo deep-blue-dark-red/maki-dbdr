@@ -1,0 +1,27 @@
+[package]
+name = "maki-sessionlog"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Extract, filter and thin maki session logs into token-efficient text"
+
+[dependencies]
+clap = { workspace = true }
+color-eyre = { workspace = true }
+jiff = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+test-case = { workspace = true }
+
+[[bin]]
+name = "sessionlog"
+path = "src/main.rs"

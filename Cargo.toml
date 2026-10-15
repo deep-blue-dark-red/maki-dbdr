@@ -59,6 +59,7 @@ members = [
   "maki-pack",
   "maki-providers",
   "maki-rstring",
+  "maki-sessionlog",
   "maki-storage",
   "maki-config-macro",
   "maki-lua-macro",
@@ -81,6 +82,7 @@ maki-config = { path = "maki-config" }
 maki-interpreter = { path = "maki-interpreter" }
 maki-providers = { path = "maki-providers" }
 maki-rstring = { path = "maki-rstring" }
+maki-sessionlog = { path = "maki-sessionlog" }
 maki-storage = { path = "maki-storage" }
 maki-ui = { path = "maki-ui" }
 maki-lua = { path = "maki-lua" }

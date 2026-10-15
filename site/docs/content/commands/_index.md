@@ -65,7 +65,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
 - **`/thinking`**: extended thinking. Bare, or `Ctrl+T`, it opens a picker of the effort levels with what each one costs in tokens; `Enter` applies the selected level and `Esc` closes without changing anything. With an argument it sets the level directly: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. A level set here is remembered per folder and seeds the next fresh session in it. Config: `always_thinking`.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
-- **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
+- **`/workflow`**: let `code_execution` call the `subtask` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.

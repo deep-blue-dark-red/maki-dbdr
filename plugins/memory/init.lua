@@ -197,7 +197,7 @@ maki.api.register_tool({
         type = "string",
         enum = { "list", "read", "write", "delete" },
         description = "Action name only: list, read, write, or delete. Pass arguments in separate fields. "
-          .. "list: optional tags, returns index. read: path or tags, returns bodies. "
+          .. "list: optional tags, returns index. read: tags (all matching bodies) or path (one file); tags win. "
           .. "write: path and content, optional tags, creates or overwrites. delete: path.",
         required = true,
       },

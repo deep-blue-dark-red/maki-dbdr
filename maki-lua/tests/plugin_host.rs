@@ -38,7 +38,7 @@ const MALFORMED_FLOOR: &str = "min_maki_version = 12\n";
 const SHADOWED_TOOL: &str = "skill";
 const REPLACEMENT_PLUGIN: &str = "my_skill";
 const REPLACEMENT_DESC: &str = "took the builtin name over";
-const PERMISSION_KEYED_TOOL: &str = "task";
+const PERMISSION_KEYED_TOOL: &str = "subtask";
 const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
 const PLAIN_TOOL: &str = "plain_helper";
 const FILE_WRITE_TOOLS_DRIFT: &str = "fs_write tool declarations drifted from FILE_WRITE_TOOLS, update the const or the \
@@ -3556,6 +3556,7 @@ const OPTS_PROBE_PLUGIN: &str = r#"
 local opts = maki.api.register_options({
     timeout_secs = { default = 120, min = 5, desc = "Timeout." },
     label = { type = "string", desc = "Label." },
+    limits = { type = "table", desc = "Limits." },
 })
 maki.api.register_tool({
     name = "opts_probe",
@@ -3566,15 +3567,17 @@ maki.api.register_tool({
         return (maki.json.encode({
             timeout_secs = opts.timeout_secs,
             label = opts.label,
+            limits = opts.limits,
         }))
     end
 })
 "#;
 
 const UNKNOWN_OPTION_ERR: &str =
-    "unknown option \"typo\" for plugins.opts_plugin (valid options: label, timeout_secs)";
+    "unknown option \"typo\" for plugins.opts_plugin (valid options: label, limits, timeout_secs)";
 const OPTION_TYPE_ERR: &str =
     "invalid value for plugins.opts_plugin.timeout_secs: expected integer";
+const OPTION_TABLE_ERR: &str = "invalid value for plugins.opts_plugin.limits: expected table";
 const OPTION_MIN_ERR: &str =
     "invalid value for plugins.opts_plugin.timeout_secs: 1 is below minimum (5)";
 const OPTION_DESC_ERR: &str = "option \"timeout_secs\": desc is required";
@@ -3604,7 +3607,7 @@ fn json_obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> 
     ; "defaults_without_user_opts"
 )]
 #[test_case::test_case(
-    serde_json::json!({ "timeout_secs": 30, "label": "x" }),
+    serde_json::json!({ "timeout_secs": 30, "label": "x", "limits": { "depth": 2 } }),
     serde_json::json!(30), serde_json::json!("x")
     ; "user_opts_win"
 )]
@@ -3613,6 +3616,7 @@ fn register_options_merges(
     timeout_secs: serde_json::Value,
     label: serde_json::Value,
 ) {
+    let limits = opts.get("limits").cloned().unwrap_or_default();
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source_with_opts("opts_plugin", OPTS_PROBE_PLUGIN, json_obj(opts))
@@ -3621,12 +3625,14 @@ fn register_options_merges(
     let snap = probe_opts(&reg);
     assert_eq!(snap["timeout_secs"], timeout_secs);
     assert_eq!(snap["label"], label);
+    assert_eq!(snap["limits"], limits);
 }
 
 #[test_case::test_case(serde_json::json!({ "typo": 1 }), UNKNOWN_OPTION_ERR ; "unknown_key")]
 #[test_case::test_case(serde_json::json!({ "timeout_secs": "abc" }), OPTION_TYPE_ERR ; "wrong_type")]
 #[test_case::test_case(serde_json::json!({ "timeout_secs": 12.5 }), OPTION_TYPE_ERR ; "float_for_integer")]
 #[test_case::test_case(serde_json::json!({ "timeout_secs": 1 }), OPTION_MIN_ERR ; "below_min")]
+#[test_case::test_case(serde_json::json!({ "limits": "deep" }), OPTION_TABLE_ERR ; "string_for_table")]
 fn register_options_rejects_bad_user_opts(opts: serde_json::Value, expected: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

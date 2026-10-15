@@ -56,7 +56,7 @@ impl FileAccess {
     ///
     /// A tool that declares `mutable_path` and also dispatches a child tool
     /// onto that same path would wait on itself. None does, since `batch`,
-    /// `task` and `code_execution` declare no mutable path, and nothing
+    /// `subtask` and `code_execution` declare no mutable path, and nothing
     /// enforces it statically. Hence the log line when a wait starts: it is
     /// the only trace such a hang would leave.
     ///

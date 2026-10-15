@@ -126,7 +126,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "sessions",
     "skill",
     "status",
-    "task",
+    "subtask",
     "thinking",
     "todo_write",
     "tool_help",
@@ -318,7 +318,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with workflow mode (task callable inside code_execution)",
+        description: "Start every session with workflow mode (subtask callable inside code_execution)",
     },
     ConfigField {
         name: "always_thinking",
@@ -660,7 +660,8 @@ pub enum NotificationMethod {
 pub struct ToolOutputLinesFile {
     pub bash: Option<usize>,
     pub code_execution: Option<usize>,
-    pub task: Option<usize>,
+    #[serde(alias = "task")]
+    pub subtask: Option<usize>,
     pub outline: Option<usize>,
     pub grep: Option<usize>,
     pub read: Option<usize>,
@@ -676,7 +677,7 @@ impl ToolOutputLinesFile {
             overlay,
             bash,
             code_execution,
-            task,
+            subtask,
             outline,
             grep,
             read,
@@ -1371,7 +1372,7 @@ impl UiConfig {
 pub struct ToolOutputLines {
     pub bash: usize,
     pub code_execution: usize,
-    pub task: usize,
+    pub subtask: usize,
     pub outline: usize,
     pub grep: usize,
     pub read: usize,
@@ -1384,7 +1385,7 @@ impl ToolOutputLines {
     pub const DEFAULT: Self = Self {
         bash: 5,
         code_execution: 5,
-        task: 5,
+        subtask: 5,
         outline: 3,
         grep: 3,
         read: 3,
@@ -1396,7 +1397,7 @@ impl ToolOutputLines {
     pub const FIELD_DEFAULTS: &[(&'static str, usize)] = &[
         ("bash", Self::DEFAULT.bash),
         ("code_execution", Self::DEFAULT.code_execution),
-        ("task", Self::DEFAULT.task),
+        ("subtask", Self::DEFAULT.subtask),
         ("outline", Self::DEFAULT.outline),
         ("grep", Self::DEFAULT.grep),
         ("read", Self::DEFAULT.read),
@@ -1411,7 +1412,7 @@ impl ToolOutputLines {
         Self {
             bash: f.bash.unwrap_or(d.bash),
             code_execution: f.code_execution.unwrap_or(d.code_execution),
-            task: f.task.unwrap_or(d.task),
+            subtask: f.subtask.unwrap_or(d.subtask),
             outline: f.outline.unwrap_or(d.outline),
             grep: f.grep.unwrap_or(d.grep),
             read: f.read.unwrap_or(d.read),
@@ -1425,7 +1426,7 @@ impl ToolOutputLines {
         [
             ("bash", self.bash),
             ("code_execution", self.code_execution),
-            ("task", self.task),
+            ("subtask", self.subtask),
             ("outline", self.outline),
             ("grep", self.grep),
             ("read", self.read),
@@ -1451,7 +1452,7 @@ impl ToolOutputLines {
         match name {
             "bash" => self.bash,
             "code_execution" => self.code_execution,
-            "task" => self.task,
+            "subtask" => self.subtask,
             "outline" => self.outline,
             "grep" | "glob" | "ast_grep" => self.grep,
             "read" => self.read,
@@ -1510,7 +1511,7 @@ pub struct AgentConfig {
     )]
     pub stale_read_check: bool,
 
-    #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (task tool)")]
+    #[config(default = DEFAULT_TASK_MAX_CONCURRENT, min = MIN_TASK_MAX_CONCURRENT, desc = "Max concurrently running subagents (subtask tool)")]
     pub task_max_concurrent: usize,
 
     #[config(

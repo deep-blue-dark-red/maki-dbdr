@@ -60,7 +60,7 @@ File-write tools are pre-allowed inside the project working directory (cwd at se
 | `edit_lines` | `<cwd>/**` | Outside cwd requires permission |
 | `insert_lines` | `<cwd>/**` | Same, when the opt-in tool is enabled |
 | `ast_grep_replace` | `<cwd>/**` | Same |
-| `task` | `*` | Subagent spawning always allowed |
+| `subtask` | `*` | Subagent spawning always allowed |
 
 The memory plugin uses a plugin rule to pre-allow the file-write tools inside its notes directory (under maki's state dir), so the agent can edit memory notes directly without a prompt.
 

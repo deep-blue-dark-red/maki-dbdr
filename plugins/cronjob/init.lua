@@ -276,12 +276,18 @@ maki.api.register_tool({
     required = { "action" },
     properties = {
       action = { type = "string", enum = ACTIONS, description = "add, edit, delete, or list" },
-      name = { type = "string", description = "Unique job id (required for add/edit/delete)" },
+      name = {
+        type = "string",
+        description = "Unique job id: letter first, then letters/digits/-/_ (required for add/edit/delete)",
+      },
       schedule = { type = "string", description = "5-field cron expression or @alias (add requires it)" },
       cwd = { type = "string", description = "Working directory the job runs in (add default: current cwd)" },
       model = { type = "string", description = "Model spec provider/model-id (add/edit; empty clears)" },
-      skill = { type = "string", description = "Skill name the run should load (add/edit)" },
-      prompt = { type = "string", description = "Prompt text for the run (add requires prompt or skill)" },
+      skill = { type = "string", description = "Skill the run is told to use; with prompt it is prepended (add/edit)" },
+      prompt = {
+        type = "string",
+        description = "Prompt text for the run (with skill it is appended; add requires prompt or skill)",
+      },
       yolo = { type = "boolean", description = "Run with --yolo (default true)" },
       continue = {
         type = "boolean",

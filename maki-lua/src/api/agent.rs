@@ -512,6 +512,8 @@ lua_class! {
 ///     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
 ///     `"max"`), or a budget integer (token count). Inherits the parent
 ///     setting if omitted, and is capped at it otherwise.
+///   `cap_thinking` (boolean?) - cap an explicit `thinking` at the parent
+///     setting. `false` leaves only the model's own limits. Default: `true`.
 ///   `fast` (boolean?) - use fast mode. Inherits parent setting if omitted.
 /// @return (Session?, string?) Session handle, or `(nil, err)` on failure.
 /// @example
@@ -541,6 +543,7 @@ async fn session(
     let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
     let name: Option<String> = opts.get("name")?;
     let thinking_val: Option<LuaValue> = opts.get("thinking")?;
+    let cap_thinking: bool = opts.get::<Option<bool>>("cap_thinking")?.unwrap_or(true);
     let audience = match opts.get::<Option<String>>("audience")? {
         Some(s) => {
             try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
@@ -637,11 +640,14 @@ async fn session(
         }
     };
     // Omitting inherits the parent as-is; an explicit level is capped at it
-    // first, then reconciled once with the model so the status badge,
-    // `AgentInput` and the request itself all report what this session runs.
-    let thinking = requested_thinking.map_or(agent_ctx.opts.thinking, |t| {
-        t.clamp_to(agent_ctx.opts.thinking)
-    });
+    // unless the caller opts out, then reconciled once with the model so the
+    // status badge, `AgentInput` and the request itself all report what this
+    // session runs.
+    let thinking = match requested_thinking {
+        None => agent_ctx.opts.thinking,
+        Some(t) if cap_thinking => t.clamp_to(agent_ctx.opts.thinking),
+        Some(t) => t,
+    };
     let opts = RequestOptions { thinking, fast }.clamped(&model);
 
     let (stream_guard, sub_events) = event_stream();

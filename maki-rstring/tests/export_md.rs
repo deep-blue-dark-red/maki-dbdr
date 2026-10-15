@@ -19,7 +19,10 @@ const JSONL: &str = concat!(
 
 fn tmp_jsonl(name: &str, body: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("rstring-export-md-{name}-{}.jsonl", std::process::id()));
+    p.push(format!(
+        "rstring-export-md-{name}-{}.jsonl",
+        std::process::id()
+    ));
     std::fs::write(&p, body).unwrap();
     p
 }
@@ -34,7 +37,9 @@ fn export_md_renders_header_and_tool_pairing() {
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.starts_with("---\n---\n# hi\n- /p/x.jsonl\n- Index 1\n- Date 1970-01-01_00-00-00\n- Model m\n"));
+    assert!(text.starts_with(
+        "---\n---\n# hi\n- /p/x.jsonl\n- Index 1\n- Date 1970-01-01_00-00-00\n- Model m\n"
+    ));
     assert!(text.contains("## User 0"));
     assert!(text.contains("**Tool Call:** `read`"));
     assert!(text.contains("**Output:**\n```\nout\n```"));
@@ -58,7 +63,11 @@ fn export_md_no_tools_drops_calls_and_outputs() {
 #[test]
 fn export_md_garbage_exits_nonzero() {
     let path = tmp_jsonl("garbage", "not a session at all\n");
-    let out = Command::new(EXE).arg("export-md").arg(&path).output().unwrap();
+    let out = Command::new(EXE)
+        .arg("export-md")
+        .arg(&path)
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(1));
     std::fs::remove_file(&path).ok();
 }

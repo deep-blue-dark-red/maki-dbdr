@@ -622,7 +622,7 @@ mod tests {
         }
     }
 
-    /// Shape of workflow mode: a script awaits `task`, and the subagent it
+    /// Shape of workflow mode: a script awaits `subtask`, and the subagent it
     /// waits on runs a script of its own. Scopes that serialized would sit
     /// on each other forever.
     #[test]
@@ -635,8 +635,8 @@ mod tests {
                 });
                 Ok(inner.join().unwrap().output.unwrap())
             });
-            let tools = HashMap::from([("task".to_owned(), subagent)]);
-            let _ = tx.send(run_code("task()", &tools, None, default_limits()));
+            let tools = HashMap::from([("subtask".to_owned(), subagent)]);
+            let _ = tx.send(run_code("subtask()", &tools, None, default_limits()));
         });
         let result = rx.recv_timeout(NESTED_TIMEOUT).expect(NESTED_DEADLOCK);
         assert_eq!(result.unwrap().output, Some(json!(5)));

@@ -1,5 +1,9 @@
 local M = {}
 
+M.NOT_BUILT_IN =
+  "'%s' is %s: tool_help covers built-in tools only. Its definition in your tool list is complete; load a deferred MCP tool with tool_search."
+local SOURCE_LABELS = { mcp = "an MCP tool", ["local"] = "a host tool" }
+
 local function sorted_keys(t)
   local keys = {}
   for k in pairs(t) do
@@ -7,6 +11,15 @@ local function sorted_keys(t)
   end
   table.sort(keys)
   return keys
+end
+
+function M.list_tools(callable)
+  local names = {}
+  for _, t in ipairs(callable) do
+    names[#names + 1] = t.name
+  end
+  table.sort(names)
+  return "Tools: " .. table.concat(names, ", ")
 end
 
 local function arg_type(p)
@@ -62,24 +75,35 @@ function M.format_help(entry)
   return table.concat(parts, "\n\n")
 end
 
-function M.known_tool_names()
-  local names = {}
-  for _, t in ipairs(maki.api.get_tools()) do
-    names[#names + 1] = t.name
+function M.unknown(name, callable)
+  for _, t in ipairs(callable) do
+    if t.name == name then
+      return string.format(M.NOT_BUILT_IN, name, SOURCE_LABELS[t.source] or t.source)
+    end
   end
-  table.sort(names)
-  return table.concat(names, ", ")
+  return {
+    llm_output = "error: no tool named '" .. name .. "'. " .. M.list_tools(callable),
+    is_error = true,
+  }
 end
 
-function M.handler(input)
-  local entry = maki.api.get_tool(input.name)
-  if not entry then
-    return {
-      llm_output = "error: no tool named '" .. input.name .. "'. Tools: " .. M.known_tool_names(),
-      is_error = true,
-    }
+function M.handler(input, ctx)
+  if not input.name or input.name == "" then
+    local callable, err = maki.agent.callable_tools(ctx)
+    if err then
+      return { llm_output = "error: " .. err, is_error = true }
+    end
+    return M.list_tools(callable)
   end
-  return M.format_help(entry)
+  local entry = maki.api.get_tool(input.name)
+  if entry then
+    return M.format_help(entry)
+  end
+  local callable, err = maki.agent.callable_tools(ctx)
+  if err then
+    return { llm_output = "error: " .. err, is_error = true }
+  end
+  return M.unknown(input.name, callable)
 end
 
 return M

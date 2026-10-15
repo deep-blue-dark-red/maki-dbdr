@@ -582,24 +582,24 @@ impl RegistrySnapshot {
     }
 }
 
-    /// Text fallback for providers without native `input_examples`: `code`
-    /// examples render as plain blocks, input-shaped ones as compact JSON, so
-    /// every example carries information instead of a dangling header.
-    pub fn format_examples_as_text(examples: &Value) -> Option<String> {
-        let mut text = String::new();
-        for ex in examples.as_array()?.iter().filter(|ex| !ex.is_null()) {
-            if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
-                text.push_str("\n```\n");
-                text.push_str(code);
-                text.push_str("\n```");
-            } else if let Ok(json) = serde_json::to_string(ex) {
-                text.push_str("\n```json\n");
-                text.push_str(&json);
-                text.push_str("\n```");
-            }
+/// Text fallback for providers without native `input_examples`: `code`
+/// examples render as plain blocks, input-shaped ones as compact JSON, so
+/// every example carries information instead of a dangling header.
+pub fn format_examples_as_text(examples: &Value) -> Option<String> {
+    let mut text = String::new();
+    for ex in examples.as_array()?.iter().filter(|ex| !ex.is_null()) {
+        if let Some(code) = ex.get("code").and_then(|c| c.as_str()) {
+            text.push_str("\n```\n");
+            text.push_str(code);
+            text.push_str("\n```");
+        } else if let Ok(json) = serde_json::to_string(ex) {
+            text.push_str("\n```json\n");
+            text.push_str(&json);
+            text.push_str("\n```");
         }
-        (!text.is_empty()).then(|| format!("Examples:{text}"))
     }
+    (!text.is_empty()).then(|| format!("Examples:{text}"))
+}
 
 #[cfg(test)]
 mod tests {

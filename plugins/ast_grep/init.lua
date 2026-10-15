@@ -229,13 +229,13 @@ end
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Use the **ast_grep** tool for structural search by code pattern (metavariables like `$F`), and **ast_grep_replace** to rewrite those matches. Prefer **grep** for plain text/regex search. ast_grep takes exactly one of pattern/kind; a pattern is one complete node (a truncated node matches nothing), sequences go inside `{ $$$ }`.",
+  content = "- Use the **ast_grep** tool for structural search by code pattern (metavariables like `$F`), and **ast_grep_replace** to rewrite those matches. Prefer **grep** for plain text/regex search. ast_grep takes a pattern or a kind; a pattern is one complete node (a truncated node matches nothing), sequences go inside `{ $$$ }`.",
 })
 
 maki.api.register_tool({
   name = "ast_grep",
   kind = "search",
-  description = [[Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Requires ast-grep on PATH.]],
+  description = [[Search code by syntax structure. Supply one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`); if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Requires ast-grep on PATH.]],
 
   schema = {
     type = "object",
@@ -246,7 +246,7 @@ maki.api.register_tool({
       },
       kind = {
         type = "string",
-        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both.",
+        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Ignored when pattern is set.",
       },
       lang = {
         type = "string",
@@ -260,7 +260,7 @@ maki.api.register_tool({
       },
       strictness = {
         type = "string",
-        description = "Pattern strictness: " .. table.concat(core.STRICTNESS, " | "),
+        description = "Pattern strictness: " .. core.STRICTNESS_HELP,
       },
       limit = { type = "integer", description = "Max matches to return" },
       timeout = { type = "integer", description = "Timeout in seconds (default 60)" },
@@ -333,7 +333,7 @@ maki.api.register_tool({
   mutable_path = "path",
   permission_scopes = "path",
   audiences = { "main", "general_sub", "interpreter" },
-  description = [[Rewrite every AST match under an absolute file or directory path. Takes exactly one of pattern/kind, as ast_grep does (pattern wins if both are given), and a rewrite that may reuse metavariables such as $X. Run the same scope and pattern with ast_grep first: every match is changed, and limit caps only the matches displayed. Returns the replacements and the applied count. Requires ast-grep on PATH.]],
+  description = [[Rewrite every AST match under an absolute file or directory path. Takes one of pattern/kind, as ast_grep does (pattern wins if both are given), and a rewrite that may reuse metavariables such as $X. Run the same scope and pattern with ast_grep first: every match is changed, and limit caps only the matches displayed. Returns the replacements and the applied count. Requires ast-grep on PATH.]],
 
   schema = {
     type = "object",
@@ -344,7 +344,7 @@ maki.api.register_tool({
       },
       kind = {
         type = "string",
-        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both.",
+        description = "Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Ignored when pattern is set.",
       },
       rewrite = {
         type = "string",
@@ -367,9 +367,9 @@ maki.api.register_tool({
       },
       strictness = {
         type = "string",
-        description = "Pattern strictness: " .. table.concat(core.STRICTNESS, " | "),
+        description = "Pattern strictness: " .. core.STRICTNESS_HELP,
       },
-      limit = { type = "integer", description = "Max matches to show" },
+      limit = { type = "integer", description = "Max matches to display (all matches are rewritten)" },
       timeout = { type = "integer", description = "Timeout in seconds (default 60)" },
     },
   },

@@ -159,8 +159,8 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
-        name: "task",
-        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/task"),
+        name: "subtask",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/subtask"),
     },
     BundledPlugin {
         name: "code_execution",

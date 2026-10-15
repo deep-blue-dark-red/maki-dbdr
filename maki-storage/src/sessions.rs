@@ -372,6 +372,11 @@ pub struct SessionMeta {
     /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yolo: Option<bool>,
+    /// The title came from `generate_title` rather than from a person, so a
+    /// later turn may replace it with a better one. Absent on older sessions,
+    /// whose titles are left alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub title_auto: bool,
 }
 
 /// Messages plus the token of the run they belong to. Comparing tokens tells
@@ -657,13 +662,64 @@ pub fn normalize_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
-    let first_user_text = messages.iter().find_map(|m| m.first_user_text());
+/// Fewest words a line needs to read as a sentence rather than pasted
+/// structure.
+const MIN_TITLE_WORDS: usize = 3;
 
-    let Some(text) = first_user_text.map(str::trim).filter(|t| !t.is_empty()) else {
+/// Leading markup that carries no meaning in a title: list and quote markers,
+/// headings, fences, table pipes and block-drawing glyphs.
+fn strip_line_decoration(line: &str) -> &str {
+    line.trim_start_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '#' | '>' | '-' | '*' | '+' | '|' | '`' | '=' | '~')
+            || ('\u{2500}'..='\u{259F}').contains(&c)
+    })
+}
+
+/// A line reads as prose when it has enough words and most of its characters
+/// are letters or spaces; pasted schemas, tags and code fail one of the two.
+fn is_prose(line: &str) -> bool {
+    if matches!(line.chars().next(), Some('<' | '{' | '[' | '/' | '$')) {
+        return false;
+    }
+    let words = line
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .count();
+    let plain = line
+        .chars()
+        .filter(|c| {
+            c.is_alphabetic() || c.is_whitespace() || matches!(c, ',' | '.' | ':' | '\'' | '?')
+        })
+        .count();
+    words >= MIN_TITLE_WORDS && plain * 10 >= line.chars().count() * 7
+}
+
+/// The first prose line of a user message, decoration stripped.
+fn prose_line(text: &str) -> Option<&str> {
+    text.lines()
+        .map(|l| strip_line_decoration(l).trim_end())
+        .find(|l| is_prose(l))
+}
+
+/// A title says what the user asked for. The first user message that has a
+/// prose line supplies it, so a leading paste of tags, tables or schema does
+/// not become the title; only when no message has one does the first message
+/// stand in, normalized as is.
+pub fn generate_title<M: TitleSource>(messages: &[M]) -> String {
+    let texts = || {
+        messages
+            .iter()
+            .filter_map(|m| m.first_user_text())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    };
+    let Some(first) = texts().next() else {
         return DEFAULT_TITLE.into();
     };
-    let text = normalize_title(text);
+    let text = texts()
+        .find_map(prose_line)
+        .map_or_else(|| normalize_title(first), normalize_title);
 
     if text.len() <= MAX_TITLE_LEN {
         return text;
@@ -2254,7 +2310,13 @@ where
         &mut self.usage_by_model
     }
 
+    /// A title set by hand: it is final, and no turn regenerates over it.
     pub fn set_title(&mut self, title: String) {
+        self.meta.title_auto = false;
+        self.replace_title(title);
+    }
+
+    fn replace_title(&mut self, title: String) {
         if self.title == title {
             return;
         }
@@ -2441,9 +2503,18 @@ where
         load_session_at(&path)
     }
 
+    /// Runs every turn: a session still on the default title or on a
+    /// generated one is retitled from its messages, so a first message with
+    /// nothing usable in it does not pin the title for good. A title set by
+    /// hand is never touched.
     pub fn update_title_if_default(&mut self) {
-        if self.title == DEFAULT_TITLE {
-            self.set_title(generate_title(&self.messages));
+        if self.title != DEFAULT_TITLE && !self.meta.title_auto {
+            return;
+        }
+        let title = generate_title(&self.messages);
+        if title != DEFAULT_TITLE {
+            self.meta.title_auto = true;
+            self.replace_title(title);
         }
     }
 
@@ -3475,6 +3546,18 @@ mod tests {
         ; "long_truncates_at_word"
     )]
     #[test_case("one\n\ntwo\t three", "one two three" ; "whitespace_collapses")]
+    #[test_case(
+        "<0> - path (string\n<1> - timeout (integer): Timeout in seconds\n\nwhy is this tool schema ambiguous for models",
+        "why is this tool schema ambiguous for models"
+        ; "pasted_schema_is_skipped"
+    )]
+    #[test_case(
+        "read the skill, compare with system prompt:\n\u{2590}\u{2588} block art\n| a | b |",
+        "read the skill, compare with system prompt:"
+        ; "first_prose_line_wins_over_trailing_paste"
+    )]
+    #[test_case("## fix the flaky test", "fix the flaky test" ; "heading_marker_stripped")]
+    #[test_case("{\"a\": 1}\n[1, 2]", "{\"a\": 1} [1, 2]" ; "no_prose_falls_back_to_first_message")]
     fn title_extraction(input: &str, expected: &str) {
         let messages: Vec<Value> = if input.is_empty() {
             vec![]
@@ -3482,6 +3565,28 @@ mod tests {
             vec![user_message(input)]
         };
         assert_eq!(generate_title(&messages), expected);
+    }
+
+    #[test]
+    fn generated_title_is_replaced_but_a_set_one_is_not() {
+        let mut s: TestSession = Session::new("m", "/p");
+        s.replace_messages(vec![user_message("{\"a\": 1}")]);
+        s.update_title_if_default();
+        assert_eq!(s.title, "{\"a\": 1}");
+        assert!(s.meta.title_auto);
+
+        s.replace_messages(vec![
+            user_message("{\"a\": 1}"),
+            user_message("now fix the parser bug"),
+        ]);
+        s.update_title_if_default();
+        assert_eq!(s.title, "now fix the parser bug");
+
+        s.set_title("mine".into());
+        s.replace_messages(vec![user_message("something else entirely here")]);
+        s.update_title_if_default();
+        assert_eq!(s.title, "mine");
+        assert!(!s.meta.title_auto);
     }
 
     #[test]

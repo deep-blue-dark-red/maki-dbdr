@@ -3012,6 +3012,7 @@ dependencies = [
  "maki-pack",
  "maki-providers",
  "maki-rstring",
+ "maki-sessionlog",
  "maki-storage",
  "mlua",
  "nucleo-matcher",
@@ -3167,6 +3168,22 @@ dependencies = [
  "sha2",
  "tiktoken-rs",
  "tokie",
+]
+
+[[package]]
+name = "maki-sessionlog"
+version = "0.5.7"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "jiff",
+ "regex",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "test-case",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

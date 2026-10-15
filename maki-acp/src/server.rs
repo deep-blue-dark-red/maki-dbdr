@@ -1018,7 +1018,7 @@ fn start_event_pump(
                     // security prompt is worse than naming none.
                     let raw_input = subagent.is_none().then(|| tool_inputs.get(&id)).flatten();
                     // A child's own tool call never reached the client, nor
-                    // this cache, so its permission rides on the `task` call
+                    // this cache, so its permission rides on the `subtask` call
                     // the client can see, only the child's channel may take the
                     // answer, and the title is all the dialog gets.
                     let request_id = id.clone();
@@ -1584,11 +1584,11 @@ mod tests {
     const PROMPT_TEXT: &str = "rename foo to bar";
     /// A string id no ask can ever carry, since ours are minted as numbers.
     const UNANSWERABLE_ID: &str = "not-an-id";
-    const SUBAGENT_NAME: &str = "task";
+    const SUBAGENT_NAME: &str = "subtask";
     const CHILD_TOOL_USE_IDS: [&str; 2] = ["child_write_1", "child_write_2"];
     const PERMISSION_TOOL: &str = "write";
     const MAIN_PERMISSION_TITLE: &str = "write: /project";
-    const CHILD_PERMISSION_TITLE: &str = "task: write: /project";
+    const CHILD_PERMISSION_TITLE: &str = "subtask: write: /project";
     const ESCALATION_REASON: &str = "plugin flagged this write";
     const ESCALATED_PERMISSION_TITLE: &str = "plugin flagged this write (write: /project)";
     const TURN_ERROR: &str = "provider returned 500";
@@ -1735,7 +1735,7 @@ mod tests {
             let call = &request["params"]["toolCall"];
             assert_eq!(
                 call["toolCallId"], PARENT_TOOL_USE_ID,
-                "a child permission rides on the task call the client knows"
+                "a child permission rides on the subtask call the client knows"
             );
             assert_eq!(call["title"], title);
         }

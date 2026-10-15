@@ -1,7 +1,7 @@
 local help = require("tool_help")
 
 local DESCRIPTION =
-  [[Show a tool's full description and argument schema. An unknown name returns the list of available tools.]]
+  [[Show a built-in tool's full description and argument schema. Without a name, list the callable tools. An unknown name returns the callable tools.]]
 
 maki.api.register_tool({
   name = "tool_help",
@@ -9,15 +9,14 @@ maki.api.register_tool({
   description = DESCRIPTION,
   schema = {
     type = "object",
-    required = { "name" },
     properties = {
-      name = { type = "string", description = "Tool name to look up" },
+      name = { type = "string", description = "Tool name to look up; omit to list callable tools" },
     },
   },
   header = function(input)
     return "tool_help " .. (input.name or "")
   end,
-  handler = function(input)
-    return help.handler(input)
+  handler = function(input, ctx)
+    return help.handler(input, ctx)
   end,
 })

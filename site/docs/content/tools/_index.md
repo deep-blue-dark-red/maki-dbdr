@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -111,39 +111,39 @@ Search file contents by regex. Returns line-numbered matches grouped by file, ne
 | `context_after` | integer | no |  | Context lines after match |
 | `context_before` | integer | no |  | Context lines before match |
 | `include` | string | no |  | File glob filter (e.g. *.c) |
-| `limit` | integer | no |  | Max match groups to return |
-| `path` | string | no | cwd | Directory to search in |
+| `limit` | integer | no |  | Max match groups (a match plus its context lines) to return |
+| `path` | string | no | cwd | File or directory to search |
 | `pattern` | string | yes |  | Regex pattern |
 
 ### `ast_grep` {#ast_grep}
 
-Search code by syntax structure. Supply exactly one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`) — never both; if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Requires ast-grep on PATH.
+Search code by syntax structure. Supply one of `pattern` (a single complete AST node with metavariables, e.g. `fn $F() { $BODY }`) or `kind` (a tree-sitter node kind, e.g. `function_item`); if both are given, pattern wins and kind is ignored. Pattern rules: one complete node per call — a truncated node (e.g. Python `def $F($$$ARGS):` with no body) or a multi-node sequence matches nothing without warning (put sequences in a construct, e.g. `if $C { $$$BODY }`); metavariables are `$NAME`/`$$$NAME` only, never rustc `$($A:tt)*`; no leading `.` fragments; parens match literally — `$A..$B` also matches a parenthesized `(0..n)`, while a parenthesized pattern requires source parens. Returns matched lines and metavariable bindings. Language is inferred from extensions unless lang is set; respects .gitignore. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both. |
+| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Ignored when pattern is set. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
 | `limit` | integer | no |  | Max matches to return |
 | `path` | string | no | cwd | Directory or file to search in |
 | `pattern` | string | no |  | AST snippet: exactly one complete node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`; a truncated node (e.g. Python `def $F($$$ARGS):` with no body) matches nothing. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
-| `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
+| `strictness` | string | no |  | Pattern strictness: cst (exact) \| smart (default, skips trivial syntax) \| ast (named nodes only) \| relaxed (ignores comments) \| signature (kinds only) \| template (text only) |
 | `timeout` | integer | no | 60 | Timeout in seconds |
 
 ### `ast_grep_replace` {#ast_grep_replace}
 
-Rewrite every AST match under an absolute file or directory path. Takes exactly one of pattern/kind, as ast_grep does (pattern wins if both are given), and a rewrite that may reuse metavariables such as $X. Run the same scope and pattern with ast_grep first: every match is changed, and limit caps only the matches displayed. Returns the replacements and the applied count. Requires ast-grep on PATH.
+Rewrite every AST match under an absolute file or directory path. Takes one of pattern/kind, as ast_grep does (pattern wins if both are given), and a rewrite that may reuse metavariables such as $X. Run the same scope and pattern with ast_grep first: every match is changed, and limit caps only the matches displayed. Returns the replacements and the applied count. Requires ast-grep on PATH.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `include` | string | no |  | File glob filter (e.g. *.rs) |
-| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Supply this or pattern, never both. |
+| `kind` | string | no |  | Tree-sitter node kind (snake_case, per language): rust `function_item`, `impl_item`, `match_expression`, `closure_expression`, `macro_invocation`; ts `function_declaration`, `call_expression`. A word that is not a real node kind (e.g. `pointer`) just matches nothing. Ignored when pattern is set. |
 | `lang` | string | no |  | Language name (e.g. rust, ts, tsx, python). Inferred from extensions when omitted. |
-| `limit` | integer | no |  | Max matches to show |
+| `limit` | integer | no |  | Max matches to display (all matches are rewritten) |
 | `path` | string | yes |  | Absolute path to the file or directory to rewrite |
 | `pattern` | string | no |  | AST snippet: exactly one complete node — `fn $F() { $BODY }`, `$X.lock()`, `if $C { $$$BODY }`; a truncated node (e.g. Python `def $F($$$ARGS):` with no body) matches nothing. Metavariables `$NAME`/`$$$NAME` only; must match source text as written. |
 | `rewrite` | string | yes |  | Replacement snippet, may use the pattern's metavariables |
-| `strictness` | string | no |  | Pattern strictness: cst \| smart \| ast \| relaxed \| signature \| template |
+| `strictness` | string | no |  | Pattern strictness: cst (exact) \| smart (default, skips trivial syntax) \| ast (named nodes only) \| relaxed (ignores comments) \| signature (kinds only) \| template (text only) |
 | `timeout` | integer | no | 60 | Timeout in seconds |
 
 ### `outline` {#outline}
@@ -184,7 +184,7 @@ Run tool calls as background jobs; spawn returns job ids at once.
 | `job_ids` | array | no | all unfinished jobs | wait/cancel: job ids or names |
 | `jobs` | array | no |  | spawn: jobs to queue, each { tool, parameters, name?, timeout_seconds? } or flat { tool, ...params } |
 | `timeout_seconds` | integer | no | 300; 0 returns immediately | wait: seconds to block before returning current statuses |
-| `workers` | integer | no |  | spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option |
+| `workers` | integer | no |  | spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option; extra jobs queue |
 
 ### `batch` {#batch}
 
@@ -196,7 +196,7 @@ Run 1-25 independent tool calls in parallel and wait for all results. Each item:
 
 ### `code_execution` {#code_execution}
 
-Run restricted Python that calls maki tools; only printed output reaches the conversation. The interpreter is monty, not CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings. For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; check each result for errors. Stdlib is limited to re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata; no network access. open() reads and writes text files under the same rules as the read and write tools. Budget: 30s by default, not counting tool waits.
+Run restricted Python that calls maki tools; only printed output reaches the conversation. The interpreter is monty, not CPython: f-strings are the only string formatting (no `%` operator, no str.format()); generator expressions materialize to lists. Await every call with keyword arguments, e.g. `r = await read(path='/project/file.py', offset=10, limit=40)`. Tools return strings. For concurrency, use `await gather(outline(path='/project/a.py'), grep(pattern='TODO'))` with direct tool calls, not async def wrappers; check each result for errors: a failed call raises RuntimeError, and `gather` turns it into an `[ERROR] ...` string. Stdlib is limited to re, asyncio, sys, os, json, collections, math, itertools, datetime, pathlib, typing, dataclasses, unicodedata; no network access. open() reads and writes text files under the same rules as the read and write tools. Budget: 30s by default, not counting tool waits.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -213,18 +213,19 @@ Ask the user for missing requirements or a decision needed to proceed. Group rel
 
 ## Agent & Knowledge
 
-### `task` {#task}
+### `subtask` {#subtask}
 
 Delegate a self-contained subgoal to a new agent that starts with no context: put the objective, relevant context, file scope, and expected result in prompt. research (default) is read-only; general can implement. Run independent subgoals in one batch, giving implementation agents separate files. Ask for a concise result with file:line references; the user does not see it, so summarize what matters.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
+| `model` | string | no | Exact model spec, e.g. "openrouter/glm-5.3". Overrides model_tier; set thinking for its reasoning level. |
 | `model_tier` | string | no | Model tier: strong for complex reasoning, medium for implementation, weak for simple search or edits. Omit to inherit; capped at the current tier. |
 | `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
 | `prompt` | string | yes | Detailed task prompt for the agent |
 | `subagent_type` | string | no | Subagent type: "research" (read-only, default) or "general" (can modify files) |
-| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent. |
+| `thinking` | string | no | Thinking: off\|adaptive\|minimal\|low\|medium\|high\|xhigh\|max\|int budget. Omit to inherit parent; capped at parent unless model is set. |
 
 ### `todo_write` {#todo_write}
 
@@ -240,7 +241,7 @@ Save and retrieve concise project facts across sessions. Reuse relevant tags fro
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `command` | string | yes | Action name only: list, read, write, or delete. Pass arguments in separate fields. list: optional tags, returns index. read: path or tags, returns bodies. write: path and content, optional tags, creates or overwrites. delete: path. |
+| `command` | string | yes | Action name only: list, read, write, or delete. Pass arguments in separate fields. list: optional tags, returns index. read: tags (all matching bodies) or path (one file); tags win. write: path and content, optional tags, creates or overwrites. delete: path. |
 | `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
@@ -253,21 +254,13 @@ Load instructions for a task-specific skill. Pass name to load it; omit name to 
 |-----------|------|----------|-------------|
 | `name` | string | no | Skill name; omit to list available skills |
 
-### `skill_test` {#skill_test}
-
-Test a skill using its SKILL.md tests frontmatter. Runs one headless maki subprocess per case and checks the response against expect_contains / expect_not_contains. Returns pass/fail details and failure output. Each case defaults to 60s; timeout_ms overrides it.
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `skill` | string | yes | Skill name to test |
-
 ### `tool_help` {#tool_help}
 
-Show a tool's full description and argument schema. An unknown name returns the list of available tools.
+Show a built-in tool's full description and argument schema. Without a name, list the callable tools. An unknown name returns the callable tools.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `name` | string | yes | Tool name to look up |
+| `name` | string | no | Tool name to look up; omit to list callable tools |
 
 ## Web
 

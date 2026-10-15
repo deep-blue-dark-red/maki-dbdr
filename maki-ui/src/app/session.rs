@@ -197,6 +197,8 @@ impl App {
             fast: state.fast_intent(),
             workflow: state.workflow,
             yolo: self.permissions.persisted_yolo(),
+            // Owned by the title code on the session, not by live UI state.
+            title_auto: state.session.meta.title_auto,
         }
     }
 
@@ -390,6 +392,7 @@ impl App {
             input_draft: None,
             queued_messages: Vec::new(),
             yolo: self.permissions.persisted_yolo(),
+            title_auto: false,
         };
         open
     }

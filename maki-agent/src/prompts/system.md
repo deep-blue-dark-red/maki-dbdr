@@ -32,9 +32,9 @@
 
 - More than two independent calls → use one **batch** (works for all tools). Do not issue them one turn at a time
 - Output of one call feeds the next, or needs filtering → use `code_execution` for sandboxed python
-- Self-contained subgoal → use **task** to spawn a subagent; inline every fact or context it needs
+- Self-contained subgoal → use **subtask** to spawn a subagent; inline every fact or context it needs
 - **bash** handles everything else: `git`, builds, tests, `rg`, `mv`/`cp`/`rm`/`rsync`, and so on
-- **async** for dispatching tool calls asynchronously into a work queue without waiting. Difference: **batch** waits for all items to be done, **async** returns items when they come. Use for long slow calls. Do not confuse `async` (asynchronous queue) with `task` (subagent)
+- **async** for dispatching tool calls asynchronously into a work queue without waiting. Difference: **batch** waits for all items to be done, **async** returns items when they come. Use for long slow calls. Do not confuse `async` (asynchronous queue) with `subtask` (subagent)
 
 # Workflow
 

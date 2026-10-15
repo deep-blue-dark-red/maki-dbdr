@@ -33,17 +33,27 @@ local INVALID_INPUT_PREFIX =
 local BODY_INDENT_COLS = 4
 local MIN_MD_WIDTH = 20
 local DEFAULT_OUTPUT_LINES = 5
+local DEFAULT_SUBAGENT_KEY = "plugins.subtask.default_subagent"
 
 local description =
   [[Delegate a self-contained subgoal to a new agent that starts with no context: put the objective, relevant context, file scope, and expected result in prompt. research (default) is read-only; general can implement. Run independent subgoals in one batch, giving implementation agents separate files. Ask for a concise result with file:line references; the user does not see it, so summarize what matters.]]
 
 local opts = maki.api.register_options({
   max_concurrent = { default = 8, min = 1, desc = "Max concurrently running subagents." },
-  allow_model = {
-    default = false,
-    desc = "Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves.",
+  default_subagent = {
+    type = "table",
+    desc = 'Model and reasoning level a subagent runs on unless the caller names a model, e.g. { model = "moonshot/kimi-k3", thinking = "low" }.',
   },
 })
+
+local default_subagent = opts.default_subagent or {}
+for key, value in pairs(default_subagent) do
+  local valid = (key == "model" and type(value) == "string")
+    or (key == "thinking" and (type(value) == "string" or type(value) == "number"))
+  if not valid then
+    error(string.format("%s.%s: expected model (string) or thinking (string|number)", DEFAULT_SUBAGENT_KEY, key), 0)
+  end
+end
 
 local schema = {
   type = "object",
@@ -66,23 +76,18 @@ local schema = {
       type = "string",
       description = "Model tier: strong for complex reasoning, medium for implementation, weak for simple search or edits. Omit to inherit; capped at the current tier.",
     },
+    model = {
+      type = "string",
+      description = 'Exact model spec, e.g. "openrouter/glm-5.3". Overrides model_tier; set thinking for its reasoning level.',
+    },
     thinking = {
-      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent.",
+      description = "Thinking: off|adaptive|minimal|low|medium|high|xhigh|max|int budget. Omit to inherit parent; capped at parent unless model is set.",
     },
     output_schema = {
       description = "JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string.",
     },
   },
 }
-
--- Only advertise `model` when the plugin opts in: it costs tokens in every
--- task schema, and an off-by-default flag keeps the common path lean.
-if opts.allow_model then
-  schema.properties.model = {
-    type = "string",
-    description = 'Exact model spec, e.g. "ollama/glm-5.2". You tell maki the model; maki will not guess. Overrides model_tier.',
-  }
-end
 
 local examples = {
   {
@@ -91,6 +96,12 @@ local examples = {
     model_tier = "weak",
   },
 }
+
+-- The default model outranks any tier, so do not advertise one.
+if default_subagent.model then
+  schema.properties.model_tier = nil
+  examples[1].model_tier = nil
+end
 
 -- Process-wide cap on concurrent subagents.
 local semaphore = maki.async.semaphore(opts.max_concurrent)
@@ -122,9 +133,17 @@ local function handler(input, ctx)
     end
   end
 
+  -- A model the caller names brings its own thinking; otherwise the user's
+  -- default fills in whatever the caller left out.
+  local spec, thinking = input.model, input.thinking
+  if not spec then
+    spec = default_subagent.model
+    thinking = thinking or default_subagent.thinking
+  end
+
   local model, model_err = maki.agent.resolve_model(ctx, {
     tier = input.model_tier,
-    spec = opts.allow_model and input.model or nil,
+    spec = spec,
   })
   if model_err then
     return { llm_output = model_err, is_error = true }
@@ -183,7 +202,9 @@ local function handler(input, ctx)
       local_tools = local_tools,
       audience = audience,
       name = input.description,
-      thinking = input.thinking,
+      thinking = thinking,
+      -- A named model comes with the reasoning level it was picked for.
+      cap_thinking = spec == nil,
     })
     if sess_err then
       return { llm_output = sess_err, is_error = true }
@@ -255,7 +276,7 @@ end
 local function restore(_input, output, is_error, ctx)
   local tol = ctx:tool_output_lines()
   return ToolView.restore_markdown(output, is_error, {
-    max_lines = (tol and tol.task) or DEFAULT_OUTPUT_LINES,
+    max_lines = (tol and tol.subtask) or DEFAULT_OUTPUT_LINES,
     keep = "head",
     max_line_bytes = output_limits.DEFAULT_MAX_LINE_BYTES,
     width = math.max(maki.ui.terminal_size().cols - BODY_INDENT_COLS, MIN_MD_WIDTH),
@@ -263,7 +284,7 @@ local function restore(_input, output, is_error, ctx)
 end
 
 maki.api.register_tool({
-  name = "task",
+  name = "subtask",
   description = description,
   kind = "execute",
   audiences = { "main", "workflow" },

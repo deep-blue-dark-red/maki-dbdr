@@ -97,7 +97,7 @@ pub enum InputSource {
     Acp,
     /// `maki -p` and sdk mode.
     Headless,
-    /// A plugin prompting a session of its own, `task` subagents included.
+    /// A plugin prompting a session of its own, `subtask` subagents included.
     Plugin,
 }
 

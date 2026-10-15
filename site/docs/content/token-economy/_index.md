@@ -30,13 +30,13 @@ read main.rs                 outline main.rs
                              + read offset=812 limit=40
 ```
 
-**Subagents as garbage collectors.** A `task` subagent gets its own throwaway context. It can grep, read, and hit dead ends as much as it wants; only its final summary returns to your conversation. The mess is collected when it exits. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
+**Subagents as garbage collectors.** A `subtask` subagent gets its own throwaway context. It can grep, read, and hit dead ends as much as it wants; only its final summary returns to your conversation. The mess is collected when it exits. Model tiers make this cheap too: delegate a search to a weak model at a fraction of the cost, keep the strong model for judgment.
 
 ```
 main context                subagent context (discarded)
 ────────────                ────────────────────────────
-task("find auth") ───────►  glob, grep ×6, read ×9, ...
-                  ◄───────  "JWT middleware, auth.rs:120"
+subtask("find auth") ────►  glob, grep ×6, read ×9, ...
+                     ◄────  "JWT middleware, auth.rs:120"
 one line stays              ~20k tokens never seen
 ```
 
@@ -44,7 +44,7 @@ one line stays              ~20k tokens never seen
 
 **Truncation everywhere.** Tool output is capped (`agent.max_output_bytes`, `agent.max_output_lines`), overlong grep lines are skipped, and every builtin tool description nags the model to read only what it needs. The nagging works.
 
-**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `task` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
+**Interrupted work is not wasted.** Press Esc on a long tool, or let its deadline hit, and whatever it printed so far still reaches the model, tagged as partial: bash keeps its streamed lines, `code_execution` the script output, a `subtask` subagent its half transcript. Otherwise the next turn starts from nothing and you pay to run it all again.
 
 ## Fewer round-trips
 

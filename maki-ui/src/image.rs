@@ -159,7 +159,10 @@ mod tests {
     fn try_parse_image_paths_unescapes_a_single_file_with_parens() {
         let paths = try_parse_image_paths("/Users/me/holiday\\ \\(1\\).jpeg");
         assert_eq!(
-            paths.iter().map(|(p, _)| p.to_str().unwrap()).collect::<Vec<_>>(),
+            paths
+                .iter()
+                .map(|(p, _)| p.to_str().unwrap())
+                .collect::<Vec<_>>(),
             ["/Users/me/holiday (1).jpeg"]
         );
     }
@@ -168,7 +171,10 @@ mod tests {
     fn try_parse_image_paths_newline_and_uri_batches_still_parse() {
         let newline_batch = try_parse_image_paths("file:///tmp/one.png");
         assert_eq!(
-            newline_batch.iter().map(|(p, _)| p.to_str().unwrap()).collect::<Vec<_>>(),
+            newline_batch
+                .iter()
+                .map(|(p, _)| p.to_str().unwrap())
+                .collect::<Vec<_>>(),
             ["/tmp/one.png"]
         );
     }

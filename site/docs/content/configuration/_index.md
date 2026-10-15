@@ -65,7 +65,7 @@ All fields are optional. Typos in field names cause an error right away.
 |-------|------|---------|-----|-------------|
 | `always_yolo` | bool | `false` | - | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
 | `always_fast` | bool | `false` | - | Start every session with fast mode (Anthropic Opus or eligible Codex subscription models, ignored elsewhere) |
-| `always_workflow` | bool | `false` | - | Start every session with workflow mode (task callable inside code_execution) |
+| `always_workflow` | bool | `false` | - | Start every session with workflow mode (subtask callable inside code_execution) |
 | `always_thinking` | bool \| string | `false` | - | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget); the level last set in the session's folder outranks it |
 | `log_api` | bool | `false` | `MAKI_LOG_API` | Append every LLM request and response to a compressed `.mlog` wire log under the sessions directory (view with `mlog`) |
 
@@ -113,7 +113,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 |-------|---------|
 | `bash` | 5 |
 | `code_execution` | 5 |
-| `task` | 5 |
+| `subtask` | 5 |
 | `outline` | 3 |
 | `grep` | 3 |
 | `read` | 3 |
@@ -134,7 +134,7 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `stale_read_check` | bool | `true` | - | Require re-reading a file that changed on disk before editing it |
-| `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (task tool) |
+| `task_max_concurrent` | usize | `8` | 1 | Max concurrently running subagents (subtask tool) |
 | `keep_cache_warm` | bool | `true` | - | While a session is idle, replay the conversation in a tiny side request every 30 seconds so the provider's prompt cache outlives its TTL |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 | `rstring` | bool | `true` | - | Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking byte runs of 48+ chars are masked inline to `[masked r=<hash> n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked |
@@ -244,7 +244,7 @@ Every field also has an environment variable, shown in the Env column, and the v
 
 The `plugins` table turns plugins on or off and passes options to them. All bundled plugins are on by default. The opt-in plugins (`cronjob`) load only when a config says `enabled = true`. Set `enabled = false` to turn one off.
 
-A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `task` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
+A plugin that is off never loads, so its tool name is free for one of your own plugins to take. Permission rules are keyed by the tool name alone, and names such as `bash`, `write`, and `subtask` already have rules in maki. A plugin that takes one of them inherits those rules, together with any "always allow" you saved. Maki warns you at load when this happens.
 
 Each plugin checks its own options at startup. A typo, a wrong type, or an unknown plugin name gives you a clear error right away.
 
@@ -339,11 +339,11 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `plugin_dev` | boolean | `true` | - | Offer the builtin maki-plugin-dev skill for writing maki plugins. |
 
-### `plugins.task`
+### `plugins.subtask`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `allow_model` | boolean | `false` | - | Expose a `model` input that overrides the subagent model. Only enable if you trust callers to pick an exact model themselves. |
+| `default_subagent` | table | - | - | Model and reasoning level a subagent runs on unless the caller names a model, e.g. { model = "moonshot/kimi-k3", thinking = "low" }. |
 | `max_concurrent` | integer | `8` | 1 | Max concurrently running subagents. |
 
 ### `plugins.webfetch`

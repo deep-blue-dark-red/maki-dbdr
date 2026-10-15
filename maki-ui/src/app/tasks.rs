@@ -273,7 +273,7 @@ mod tests {
         assert_eq!(recorded, vec![OTHER_ID.to_owned()], "and stays dropped");
     }
 
-    /// The `task` tool closes the subagent session before it reports a failure,
+    /// The `subtask` tool closes the subagent session before it reports a failure,
     /// so the `SubagentHistory` that only knows "it ended" always arrives before
     /// the `ToolDone` holding the verdict. Let the first one decide and every
     /// failure reads as done.

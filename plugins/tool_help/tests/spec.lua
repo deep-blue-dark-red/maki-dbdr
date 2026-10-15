@@ -3,7 +3,6 @@ local th = require("maki.test_helpers")
 
 local case = th.case
 local eq = th.eq
-local has = th.has
 
 local ENTRY = {
   name = "spec_tool",
@@ -42,8 +41,21 @@ case("format_help_without_audiences_or_arguments", function()
   eq(help.format_help(entry), "bare\n\nd")
 end)
 
-case("handler_unknown_name_errors", function()
-  local result = help.handler({ name = "no_such_tool" })
+local CALLABLE = {
+  { name = "read", source = "native" },
+  { name = "rose__Query", source = "mcp" },
+}
+
+case("list_tools_sorts_callable_names", function()
+  eq(help.list_tools(CALLABLE), "Tools: read, rose__Query")
+end)
+
+case("unknown_name_errors_with_callable_tools", function()
+  local result = help.unknown("no_such_tool", CALLABLE)
   eq(result.is_error, true)
-  has(result.llm_output, "error: no tool named 'no_such_tool'")
+  eq(result.llm_output, "error: no tool named 'no_such_tool'. Tools: read, rose__Query")
+end)
+
+case("unknown_mcp_tool_points_at_its_definition", function()
+  eq(help.unknown("rose__Query", CALLABLE), string.format(help.NOT_BUILT_IN, "rose__Query", "an MCP tool"))
 end)

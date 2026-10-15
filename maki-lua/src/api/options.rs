@@ -27,10 +27,17 @@ pub enum OptionType {
     Integer,
     Number,
     String,
+    Table,
 }
 
 impl OptionType {
-    const ALL: &[Self] = &[Self::Boolean, Self::Integer, Self::Number, Self::String];
+    const ALL: &[Self] = &[
+        Self::Boolean,
+        Self::Integer,
+        Self::Number,
+        Self::String,
+        Self::Table,
+    ];
 
     fn as_str(self) -> &'static str {
         match self {
@@ -38,6 +45,7 @@ impl OptionType {
             Self::Integer => "integer",
             Self::Number => "number",
             Self::String => "string",
+            Self::Table => "table",
         }
     }
 
@@ -59,6 +67,7 @@ impl OptionType {
             JsonValue::Number(n) if n.is_i64() || n.is_u64() => Some(Self::Integer),
             JsonValue::Number(_) => Some(Self::Number),
             JsonValue::String(_) => Some(Self::String),
+            JsonValue::Object(_) => Some(Self::Table),
             _ => None,
         }
     }
@@ -241,7 +250,7 @@ fn validate_user_opts(
 ///
 /// @param spec table Map of option name to a spec table:
 ///   default (boolean|number|string) Optional. Used when the user sets nothing. Its Lua type becomes the option type.
-///   type    (string) Required when there is no default: "boolean", "integer", "number", or "string".
+///   type    (string) Required when there is no default: "boolean", "integer", "number", "string", or "table". A table has no default and its fields are the plugin's to check.
 ///   min     (number) Optional. Minimum accepted value, numeric options only.
 ///   desc    (string) Required. One line shown in the configuration docs.
 /// @return (table) Merged options: the user's value where set, otherwise the default, or nil when neither exists.

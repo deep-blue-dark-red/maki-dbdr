@@ -26,7 +26,8 @@ M.MATCH_FMT = "%d matches in %d %s"
 M.CHANGED_FMT = "%d changes in %d %s"
 M.APPLIED_FMT = "Applied %s."
 M.LIMIT_FMT = "... (%d of %d matches shown; raise `limit` for more)"
-M.STRICTNESS = { "cst", "smart", "ast", "relaxed", "signature", "template" }
+M.STRICTNESS_HELP =
+  "cst (exact) | smart (default, skips trivial syntax) | ast (named nodes only) | relaxed (ignores comments) | signature (kinds only) | template (text only)"
 
 --- ast-grep's usage errors are terse; the fix for the two we hit most.
 M.HINTS = {

@@ -1,4 +1,4 @@
-//! Tests the task plugin's structured-output policy end-to-end: real plugin
+//! Tests the subtask plugin's structured-output policy end-to-end: real plugin
 //! source, real `maki.json` / `maki.async`, with model I/O replaced by
 //! scriptable Lua stubs.
 
@@ -7,10 +7,10 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::{AgentMode, ToolOutput};
-use maki_lua::PluginHost;
+use maki_lua::{PluginError, PluginHost};
 use serde_json::{Value, json};
 
-const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
+const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/subtask/init.lua");
 
 // Mirrors of the plugin's error contracts and policy numbers.
 const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -24,7 +24,7 @@ const SUMMARY_MISSING_ERROR: &str = "subagent finished without providing a summa
 const UNKNOWN_SUBAGENT_ERR: &str = "unknown subagent type: bogus";
 const SUB_AGENT_ERROR_PREFIX: &str = "sub-agent error: ";
 
-const TASK_TOOL: &str = "task";
+const SUBTASK_TOOL: &str = "subtask";
 const PROBE_TOOL: &str = "probe";
 const TASK_PROMPT: &str = "do the thing";
 const PLAIN_TEXT: &str = "plain text result";
@@ -143,6 +143,7 @@ maki.agent.session = function(ctx, opts)
   recorder.sessions = recorder.sessions + 1
   recorder.has_local_tools = opts.local_tools ~= nil
   recorder.thinking = opts.thinking
+  recorder.cap_thinking = opts.cap_thinking
   local sess = { opts = opts }
   function sess:prompt(msg)
     recorder.prompts[#recorder.prompts + 1] = msg
@@ -175,6 +176,7 @@ maki.api.register_tool({
       prompt_count = #recorder.prompts,
       has_local_tools = recorder.has_local_tools,
       thinking = recorder.thinking,
+      cap_thinking = recorder.cap_thinking,
       first_ack = recorder.first_ack,
       first_err = recorder.first_err,
       second_ack = recorder.second_ack,
@@ -202,7 +204,15 @@ fn load_task_host_with_opts(
     opts: serde_json::Map<String, serde_json::Value>,
 ) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let host = try_load_task_host_with_opts(&reg, opts).unwrap();
+    (reg, host)
+}
+
+fn try_load_task_host_with_opts(
+    reg: &Arc<ToolRegistry>,
+    opts: serde_json::Map<String, serde_json::Value>,
+) -> Result<PluginHost, PluginError> {
+    let host = PluginHost::new(Arc::clone(reg)).unwrap();
     let prelude = STUB_PRELUDE
         .replace("@PLAIN_TEXT@", PLAIN_TEXT)
         .replace("@RECOVERED_TEXT@", RECOVERED_TEXT)
@@ -214,9 +224,8 @@ fn load_task_host_with_opts(
         "task_policy",
         &format!("{prelude}\n{TASK_PLUGIN_SRC}"),
         opts,
-    )
-    .unwrap();
-    (reg, host)
+    )?;
+    Ok(host)
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str, input: Value) -> Result<String, String> {
@@ -246,7 +255,11 @@ fn task_input(scenario: &str, output_schema: Option<Value>) -> Value {
     input
 }
 
-const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
+const FULL_MODEL_SPEC: &str = "openrouter/glm-5.3";
+const DEFAULT_SUBAGENT_SPEC: &str = "moonshot/kimi-k3";
+const DEFAULT_SUBAGENT_THINKING: &str = "low";
+const DEFAULT_SUBAGENT_ERR: &str =
+    "expected model (string) or thinking (string|number)";
 
 /// Advertised to the model, so the wording lives in the docs, not here: what
 /// matters is that the property exists and that whatever the model writes
@@ -256,26 +269,24 @@ const FULL_MODEL_SPEC: &str = "aperture/ollama/glm-5.2";
 #[test_case::test_case(None ; "inherit_parent_when_omitted")]
 fn thinking_forwards_to_session(thinking: Option<Value>) {
     let (reg, _host) = load_task_host();
-    let entry = reg.get(TASK_TOOL).expect("task tool missing");
+    let entry = reg.get(SUBTASK_TOOL).expect("subtask tool missing");
     assert!(entry.tool.schema()["properties"]["thinking"].is_object());
     let mut input = task_input(SCENARIO_PLAIN, None);
     if let Some(thinking) = &thinking {
         input["thinking"] = thinking.clone();
     }
 
-    exec_tool(&reg, TASK_TOOL, input).expect("task failed");
+    exec_tool(&reg, SUBTASK_TOOL, input).expect("task failed");
     let snap = probe(&reg);
     assert_eq!(snap.get("thinking"), thinking.as_ref());
 }
 
 #[test]
 fn model_spec_forwards_full_spec_to_resolve_model() {
-    let mut opts = serde_json::Map::new();
-    opts.insert("allow_model".into(), json!(true));
-    let (reg, _host) = load_task_host_with_opts(opts);
+    let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
     input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
+    let out = exec_tool(&reg, SUBTASK_TOOL, input).expect("task with model spec failed");
     assert_eq!(out, PLAIN_TEXT);
 
     let snap = probe(&reg);
@@ -289,22 +300,68 @@ fn model_spec_forwards_full_spec_to_resolve_model() {
     );
 }
 
-#[test]
-fn model_spec_ignored_when_allow_model_off() {
+#[test_case::test_case(Some(FULL_MODEL_SPEC), false ; "named_model_keeps_its_thinking")]
+#[test_case::test_case(None, true ; "inherited_model_caps_at_parent")]
+fn thinking_cap_follows_model_choice(model: Option<&str>, capped: bool) {
     let (reg, _host) = load_task_host();
     let mut input = task_input(SCENARIO_PLAIN, None);
-    input["model"] = json!(FULL_MODEL_SPEC);
-    let out = exec_tool(&reg, TASK_TOOL, input).expect("task with model spec failed");
-    assert_eq!(out, PLAIN_TEXT);
+    input["thinking"] = json!("high");
+    if let Some(model) = model {
+        input["model"] = json!(model);
+    }
+    exec_tool(&reg, SUBTASK_TOOL, input).expect("subtask failed");
 
     let snap = probe(&reg);
-    let opts = snap["resolve_opts"]
-        .as_object()
-        .expect("resolve_opts missing");
-    assert!(
-        opts.get("spec").is_none_or(Value::is_null),
-        "spec should not be forwarded when allow_model is off"
+    assert_eq!(snap["cap_thinking"], json!(capped));
+}
+
+#[test_case::test_case(None, None, DEFAULT_SUBAGENT_SPEC, Some(DEFAULT_SUBAGENT_THINKING) ; "default_pair_applies")]
+#[test_case::test_case(None, Some("high"), DEFAULT_SUBAGENT_SPEC, Some("high") ; "caller_thinking_beats_default")]
+#[test_case::test_case(Some(FULL_MODEL_SPEC), None, FULL_MODEL_SPEC, None ; "caller_model_drops_default_pair")]
+#[test_case::test_case(Some(FULL_MODEL_SPEC), Some("high"), FULL_MODEL_SPEC, Some("high") ; "caller_pair_beats_default")]
+fn default_subagent_fills_what_caller_omits(
+    model: Option<&str>,
+    thinking: Option<&str>,
+    expected_spec: &str,
+    expected_thinking: Option<&str>,
+) {
+    let mut opts = serde_json::Map::new();
+    opts.insert(
+        "default_subagent".into(),
+        json!({ "model": DEFAULT_SUBAGENT_SPEC, "thinking": DEFAULT_SUBAGENT_THINKING }),
     );
+    let (reg, _host) = load_task_host_with_opts(opts);
+    let schema = reg.get(SUBTASK_TOOL).expect("subtask tool missing").tool.schema();
+    assert!(
+        schema["properties"].get("model_tier").is_none(),
+        "model_tier should be hidden when a default model is configured"
+    );
+    let mut input = task_input(SCENARIO_PLAIN, None);
+    if let Some(model) = model {
+        input["model"] = json!(model);
+    }
+    if let Some(thinking) = thinking {
+        input["thinking"] = json!(thinking);
+    }
+    exec_tool(&reg, SUBTASK_TOOL, input).expect("subtask failed");
+
+    let snap = probe(&reg);
+    assert_eq!(snap["resolve_opts"]["spec"], json!(expected_spec));
+    assert_eq!(snap.get("thinking"), expected_thinking.map(|t| json!(t)).as_ref());
+    assert_eq!(snap["cap_thinking"], json!(false));
+}
+
+#[test_case::test_case(json!({ "modle": DEFAULT_SUBAGENT_SPEC }) ; "unknown_key")]
+#[test_case::test_case(json!({ "model": 3 }) ; "model_not_string")]
+#[test_case::test_case(json!({ "thinking": true }) ; "thinking_not_level")]
+fn bad_default_subagent_fails_load(default_subagent: Value) {
+    let mut opts = serde_json::Map::new();
+    opts.insert("default_subagent".into(), default_subagent);
+    let reg = Arc::new(ToolRegistry::new());
+    let Err(err) = try_load_task_host_with_opts(&reg, opts) else {
+        panic!("plugin load should fail");
+    };
+    assert!(err.to_string().contains(DEFAULT_SUBAGENT_ERR), "got: {err}");
 }
 
 fn answer_schema() -> Value {
@@ -342,7 +399,7 @@ fn bad_input_errors_before_any_session(extra: Value, expected_prefix: &str) {
     for (k, v) in extra.as_object().unwrap() {
         input[k.as_str()] = v.clone();
     }
-    let err = exec_tool(&reg, TASK_TOOL, input).unwrap_err();
+    let err = exec_tool(&reg, SUBTASK_TOOL, input).unwrap_err();
     assert!(err.starts_with(expected_prefix), "got: {err}");
     let snap = probe(&reg);
     assert_eq!(snap["sessions"], json!(0));
@@ -354,7 +411,7 @@ fn structured_happy_path_returns_validated_json() {
     let (reg, _host) = load_task_host();
     let out = exec_tool(
         &reg,
-        TASK_TOOL,
+        SUBTASK_TOOL,
         task_input(SCENARIO_HAPPY, Some(answer_schema())),
     )
     .expect("structured task failed");
@@ -383,7 +440,7 @@ fn invalid_then_valid_recovers_within_one_prompt() {
     let (reg, _host) = load_task_host();
     let out = exec_tool(
         &reg,
-        TASK_TOOL,
+        SUBTASK_TOOL,
         task_input(SCENARIO_INVALID_THEN_VALID, Some(answer_schema())),
     )
     .expect("task should succeed after inline retry");
@@ -409,7 +466,7 @@ fn missing_structured_output_nudges_then_errors() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(
         &reg,
-        TASK_TOOL,
+        SUBTASK_TOOL,
         task_input(SCENARIO_NEVER_STRUCTURED, Some(answer_schema())),
     )
     .unwrap_err();
@@ -431,7 +488,7 @@ fn invalid_only_errors_with_bounded_schema_errors() {
     let (reg, _host) = load_task_host();
     let err = exec_tool(
         &reg,
-        TASK_TOOL,
+        SUBTASK_TOOL,
         task_input(SCENARIO_INVALID_ONLY, Some(multi_error_schema())),
     )
     .unwrap_err();
@@ -451,7 +508,7 @@ fn invalid_only_errors_with_bounded_schema_errors() {
 #[test]
 fn prompt_error_maps_to_sub_agent_error() {
     let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
+    let err = exec_tool(&reg, SUBTASK_TOOL, task_input(SCENARIO_PROMPT_ERROR, None)).unwrap_err();
     assert_eq!(err, format!("{SUB_AGENT_ERROR_PREFIX}{PROMPT_ERR_MSG}"));
     let snap = probe(&reg);
     assert_eq!(snap["closed"], json!(1));
@@ -464,7 +521,7 @@ fn prompt_error_maps_to_sub_agent_error() {
 #[test]
 fn interrupted_prompt_reports_the_partial_transcript() {
     let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PARTIAL_ERROR, None)).unwrap_err();
+    let err = exec_tool(&reg, SUBTASK_TOOL, task_input(SCENARIO_PARTIAL_ERROR, None)).unwrap_err();
     assert_eq!(
         err,
         format!("sub-agent interrupted ({CANCELLED_ERR}). Partial output:\n{PARTIAL_TEXT}")
@@ -474,7 +531,7 @@ fn interrupted_prompt_reports_the_partial_transcript() {
 #[test]
 fn plain_path_returns_text_without_local_tools() {
     let (reg, _host) = load_task_host();
-    let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
+    let out = exec_tool(&reg, SUBTASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
 
     let snap = probe(&reg);
@@ -493,7 +550,7 @@ fn no_summary_nudges_then_recovers() {
     let (reg, _host) = load_task_host();
     let out = exec_tool(
         &reg,
-        TASK_TOOL,
+        SUBTASK_TOOL,
         task_input(SCENARIO_NO_SUMMARY_THEN_RECOVER, None),
     )
     .unwrap();
@@ -510,7 +567,7 @@ fn no_summary_nudges_then_recovers() {
 #[test]
 fn no_summary_errors_after_nudges() {
     let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_NO_SUMMARY, None)).unwrap_err();
+    let err = exec_tool(&reg, SUBTASK_TOOL, task_input(SCENARIO_NO_SUMMARY, None)).unwrap_err();
     assert_eq!(err, SUMMARY_MISSING_ERROR);
 
     let snap = probe(&reg);
@@ -524,7 +581,7 @@ fn no_summary_errors_after_nudges() {
 #[test]
 fn raising_prompt_does_not_leak_semaphore_permit() {
     let (reg, _host) = load_task_host();
-    let err = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
+    let err = exec_tool(&reg, SUBTASK_TOOL, task_input(SCENARIO_RAISE, None)).unwrap_err();
     assert!(err.contains(RAISE_MSG), "got: {err}");
 
     let snap = probe(&reg);
@@ -537,6 +594,6 @@ fn raising_prompt_does_not_leak_semaphore_permit() {
     assert_eq!(snap["released"], json!(1), "permit not explicitly released");
 
     // Pool is full again (released == acquired), so this cannot block.
-    let out = exec_tool(&reg, TASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
+    let out = exec_tool(&reg, SUBTASK_TOOL, task_input(SCENARIO_PLAIN, None)).unwrap();
     assert_eq!(out, PLAIN_TEXT);
 }

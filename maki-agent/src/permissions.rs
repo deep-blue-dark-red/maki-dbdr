@@ -26,7 +26,7 @@ pub const DECISION_SOURCE_USER_SESSION: &str = "user_session";
 pub const DECISION_SOURCE_USER_ALWAYS: &str = "user_always";
 pub const DECISION_SOURCE_USER_ABORT: &str = "user_abort";
 
-const TASK_TOOL: &str = "task";
+const SUBTASK_TOOL: &str = "subtask";
 const BASH_TOOL: &str = "bash";
 
 /// Splits the ask id from the encoded answer on the answer channel. A control
@@ -56,19 +56,19 @@ fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
         .iter()
         .map(|tool| allow(tool, &cwd_glob))
         .collect();
-    rules.push(allow(TASK_TOOL, "*"));
+    rules.push(allow(SUBTASK_TOOL, "*"));
     rules
 }
 
 pub const BOUNDARY_UNVERIFIABLE_PREFIX: &str = "Cannot verify project boundary for";
 
 /// Whether the builtin defaults treat `tool` specially. File write tools get
-/// the cwd allow and the plan mode allow, `task` gets a blanket allow, and an
+/// the cwd allow and the plan mode allow, `subtask` gets a blanket allow, and an
 /// "allow always" for `bash` is stored under the first word of the command.
 /// Rules are keyed by name alone, so a plugin taking one of these names
 /// inherits all of it.
 pub fn carries_builtin_defaults(tool: &str) -> bool {
-    FILE_WRITE_TOOLS.contains(&tool) || matches!(tool, TASK_TOOL | BASH_TOOL)
+    FILE_WRITE_TOOLS.contains(&tool) || matches!(tool, SUBTASK_TOOL | BASH_TOOL)
 }
 
 #[derive(Debug)]
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test_case("write", "/tmp/file.txt" => true ; "write_in_cwd")]
     #[test_case("write", "/etc/passwd" => false ; "write_outside_cwd")]
-    #[test_case("task", "task:research" => true ; "task_allowed")]
+    #[test_case("subtask", "subtask:research" => true ; "subtask_allowed")]
     #[test_case("bash", "cargo test" => false ; "bash_prompts")]
     fn builtin_check(tool: &str, scope: &str) -> bool {
         matches!(

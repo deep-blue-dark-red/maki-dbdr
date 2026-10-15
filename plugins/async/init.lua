@@ -35,7 +35,7 @@ local OUT_OF_ORDER_NOTE =
 local description = table.concat({
   "Run tool calls as background jobs; spawn returns job ids at once.",
   "",
-  "- spawn (default): jobs as {tool, parameters, name?, timeout_seconds?}; workers caps concurrency for this spawn.",
+  "- spawn (default): jobs as {tool, parameters, name?, timeout_seconds?}; workers caps concurrency for this spawn, the rest queue.",
   "- status: running jobs show a live output tail, settled jobs their output tail.",
   "- wait: block up to timeout_seconds (default 300; 0 returns at once) for job_ids (ids or names; default all unfinished). A wait timeout does not stop jobs.",
   "- cancel: job_ids (default all unfinished). Queued jobs never start; running jobs are killed with their child processes and their results discarded. Side effects remain.",
@@ -71,7 +71,7 @@ local schema = {
     },
     workers = {
       type = "integer",
-      description = "spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option",
+      description = "spawn: concurrent jobs for this spawn call, clamped to the plugin's workers option; extra jobs queue",
     },
     job_ids = {
       type = "array",

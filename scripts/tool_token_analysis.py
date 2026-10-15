@@ -298,7 +298,7 @@ def print_top_expensive_calls(all_calls, n=15):
             detail = str(inp.get("path", ""))[:60]
         elif name == "grep":
             detail = str(inp.get("pattern", ""))[:60]
-        elif name == "task":
+        elif name in ("task", "subtask"):
             detail = str(inp.get("description", ""))[:60]
         elif name == "batch":
             tools = inp.get("tool_calls", [])

@@ -86,35 +86,6 @@ Key flags:
 | `--append-system-prompt` | Inject skill body after the default system prompt |
 | `--output-format json` | Machine-parseable result with `is_error` field |
 
-### `skill_test` agent tool
-
-The `skill_test` tool (registered in `plugins/skill/init.lua`) provides the same capability through the agent. When invoked, it:
-
-1. Discovers the named skill using the standard skill search path
-2. Reads and parses the SKILL.md frontmatter with `maki.yaml.decode`
-3. Extracts the `tests:` array
-4. For each test case, spawns a `maki --print` subprocess using `maki.fn.jobstart`
-5. Parses the JSON result and checks `expect_contains` / `expect_not_contains`
-6. Returns a markdown report with per-test pass/fail status
-
-Usage from within maki:
-```
-use skill_test to test the create-plugin skill
-```
-
-The tool uses `maki.fn.jobwait` to block the Lua handler until all subprocesses complete (60s timeout per test, overridable per test case via `timeout_ms`). It sets `is_error = true` in its output when any test fails, so the agent can surface the failure clearly.
-
-Failure diagnostics: ERROR results include elapsed time, exit code (when the process exited), and one-line tails of captured stderr/stdout, so a timeout or crash shows *why* (e.g. provider 429s, config errors) instead of a bare `timeout after 60s`. FAIL results include the first 800 chars of the full LLM response. Tests may set `timeout_ms`:
-
-```yaml
-tests:
-  - prompt: "..."
-    timeout_ms: 120000   # optional; default 60000
-    expect_contains: ["..."]
-```
-
-The tool finds the maki binary by scanning for `target/release/maki` up the directory tree from cwd, falling back to `maki` on PATH.
-
 ---
 
 ## Architecture: `--append-system-prompt` in headless mode
@@ -140,7 +111,6 @@ This means `--append-system-prompt` now works as documented in both `--print` an
 
 ```
 maki/
-  plugins/skill/init.lua          ← skill_test tool (registered alongside skill tool)
   scripts/agent-test.sh           ← thin wrapper: invokes maki --print, checks output
   tests/agent/
     skill-test-create-plugin.sh   ← test script for the create-plugin skill
@@ -162,9 +132,6 @@ bash tests/agent/skill-test-create-plugin.sh
 
 # Run all agent tests
 make test-agent
-
-# Run skill_test from within maki (interactive or headless)
-maki "use skill_test to test the create-plugin skill" --print --yolo
 ```
 
 `MAKI` env var overrides the binary path:

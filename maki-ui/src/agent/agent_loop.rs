@@ -418,8 +418,10 @@ impl AgentLoop {
                 return false;
             }
             spawn_oauth_for_needs_auth(mcp);
-            // The earlier publish could not know the MCP tools yet.
-            self.publish_btw_tools();
+            // The earlier publish could not know the MCP tools or the servers'
+            // instructions yet; `/tool_prompt` and `/system_prompt` show both.
+            let slots = self.lua_handle.collect_prompt_slots_async().await;
+            self.publish_btw_prompts(&slots);
         }
         !teardown.is_cancelled()
     }

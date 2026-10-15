@@ -161,8 +161,8 @@ fn absorb_harness(
         }
     };
     if env.cwd.is_none() {
-        env.cwd = str_field(rec, "cwd")
-            .or_else(|| rec.get("payload").and_then(|p| str_field(p, "cwd")));
+        env.cwd =
+            str_field(rec, "cwd").or_else(|| rec.get("payload").and_then(|p| str_field(p, "cwd")));
     }
     if rec.get("type").and_then(Value::as_str) == Some("summary") {
         if env.name.is_none() {
@@ -344,7 +344,11 @@ fn render(env: &Envelope, o: &Opts) -> String {
     );
     let _ = writeln!(out, "- Index {}", o.index.unwrap_or(0));
     let _ = writeln!(out, "- Date {}", date_str(o.date.or(env.date)));
-    let _ = writeln!(out, "- Model {}", o.model.as_deref().or(env.model.as_deref()).unwrap_or("-"));
+    let _ = writeln!(
+        out,
+        "- Model {}",
+        o.model.as_deref().or(env.model.as_deref()).unwrap_or("-")
+    );
 
     // A call's answer lives in the user turn that follows it; index the
     // results first so each call renders joined to its output.
@@ -488,13 +492,20 @@ mod tests {
     use serde_json::json;
 
     const JSONL: &str = concat!(
-        r#"{"t":"header","v":2,"id":"s1","model":"zhipuai/glm","created_at":0}"#, "\n",
-        r#"{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"abc xzy"}]}}"#, "\n",
-        r#"{"t":"msg","d":{"role":"assistant","content":[{"type":"thinking","thinking":"why"},{"type":"text","text":"hello"}]}}"#, "\n",
-        r#"{"t":"msg","d":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.rs"}}]}}"#, "\n",
-        r#"{"t":"msg","d":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main() {}"}]}}"#, "\n",
-        r#"{"t":"msg","d":{"role":"user","content":"plain string"}}"#, "\n",
-        r#"{"t":"meta","title":"my session","updated_at":86466}"#, "\n",
+        r#"{"t":"header","v":2,"id":"s1","model":"zhipuai/glm","created_at":0}"#,
+        "\n",
+        r#"{"t":"msg","d":{"role":"user","content":[{"type":"text","text":"abc xzy"}]}}"#,
+        "\n",
+        r#"{"t":"msg","d":{"role":"assistant","content":[{"type":"thinking","thinking":"why"},{"type":"text","text":"hello"}]}}"#,
+        "\n",
+        r#"{"t":"msg","d":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.rs"}}]}}"#,
+        "\n",
+        r#"{"t":"msg","d":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main() {}"}]}}"#,
+        "\n",
+        r#"{"t":"msg","d":{"role":"user","content":"plain string"}}"#,
+        "\n",
+        r#"{"t":"meta","title":"my session","updated_at":86466}"#,
+        "\n",
     );
 
     #[test]
@@ -538,7 +549,14 @@ mod tests {
 
     #[test]
     fn no_thinking_drops_thinking_sections() {
-        let out = run(JSONL, &Opts { thinking: false, ..Opts::default() }).unwrap();
+        let out = run(
+            JSONL,
+            &Opts {
+                thinking: false,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
         assert!(!out.contains("## Thinking"));
         assert!(!out.contains("why\n"));
         assert!(out.contains("hello"));
@@ -546,7 +564,14 @@ mod tests {
 
     #[test]
     fn no_tools_drops_calls_and_outputs() {
-        let out = run(JSONL, &Opts { tools: false, ..Opts::default() }).unwrap();
+        let out = run(
+            JSONL,
+            &Opts {
+                tools: false,
+                ..Opts::default()
+            },
+        )
+        .unwrap();
         assert!(!out.contains("Tool Call"));
         assert!(!out.contains("fn main() {}"));
         assert!(out.contains("## Model 0\n\n## Thinking\n\nwhy\n\nhello\n"));
@@ -563,7 +588,9 @@ mod tests {
             ..Opts::default()
         };
         let out = run(JSONL, &o).unwrap();
-        assert!(out.contains("# named\n- /tmp/s.jsonl\n- Index 3\n- Date 1970-01-01_00-00-00\n- Model other\n"));
+        assert!(out.contains(
+            "# named\n- /tmp/s.jsonl\n- Index 3\n- Date 1970-01-01_00-00-00\n- Model other\n"
+        ));
     }
 
     #[test]
@@ -639,7 +666,8 @@ mod tests {
         assert!(out.contains("# first prompt\n"));
         assert!(out.contains("## Model 0\n\nhi\n"));
 
-        let arr = r#"[{"role":"user","content":"array prompt"},{"role":"assistant","content":"hello"}]"#;
+        let arr =
+            r#"[{"role":"user","content":"array prompt"},{"role":"assistant","content":"hello"}]"#;
         let out = run(arr, &Opts::default()).unwrap();
         assert!(out.contains("# array prompt\n"));
         assert!(out.contains("## Model 0\n\nhello\n"));

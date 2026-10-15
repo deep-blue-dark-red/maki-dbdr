@@ -285,7 +285,7 @@ pub(crate) fn start_subagent(app: &mut App, id: &str, name: &str) {
     ));
 }
 
-/// What a subagent's own session sends when it closes, which the `task` tool
+/// What a subagent's own session sends when it closes, which the `subtask` tool
 /// does before it reports success or failure.
 pub(crate) fn close_subagent_transcript(app: &mut App, id: &str) {
     app.update(agent_msg(AgentEvent::SubagentHistory {
@@ -1822,7 +1822,7 @@ fn sub_usage_text() -> String {
 fn session_cost_sums_what_each_model_recorded() {
     let mut app = streaming_app();
     app.update(main_turn());
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, "subtask")));
     app.update(sub_turn_complete());
 
     let expected = MAIN_COST.unwrap() + SUB_COST.unwrap();
@@ -1924,8 +1924,8 @@ fn status_bar_sigma_draws_the_session_cost() {
 #[test]
 fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
     let mut app = streaming_app();
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
-    app.update(agent_msg(tool_start("task2", "task")));
+    app.update(agent_msg(tool_start(TASK_ID, "subtask")));
+    app.update(agent_msg(tool_start("task2", "subtask")));
 
     app.update(sub_turn_complete());
     // The second turn's tokens differ, so a sum or a stale first turn would fail.
@@ -1952,7 +1952,7 @@ fn subagent_turn_complete_updates_matching_parent_header_with_last_turn() {
 fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
     let mut app = streaming_app();
     app.update(main_turn());
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, "subtask")));
     if subagent_ran {
         app.update(sub_turn_complete());
     }
@@ -1974,7 +1974,7 @@ fn parent_turn_flush_stamps_the_last_unstamped_tool(subagent_ran: bool) {
 fn tool_inside_subagent_chat_gets_its_turn_usage() {
     const TOOL_ID: &str = "sub_bash";
     let mut app = streaming_app();
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, "subtask")));
     app.update(subagent_msg(
         tool_start(TOOL_ID, "bash"),
         TASK_ID,
@@ -2073,7 +2073,7 @@ pub(crate) fn finish_subagent(app: &mut App, id: &str, is_error: bool) {
     app.update(agent_msg(AgentEvent::ToolDone(Box::new(ToolDoneEvent {
         call: None,
         id: id.into(),
-        tool: "task".into(),
+        tool: "subtask".into(),
         output: Arc::new(ToolOutput::Plain("result".into())),
         is_error,
         annotation: None,
@@ -2571,7 +2571,7 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
 fn tick_drains_live_bufs_of_background_chats() {
     let mut app = test_app();
     app.run_id = 1;
-    app.update(agent_msg(tool_start(TASK_ID, "task")));
+    app.update(agent_msg(tool_start(TASK_ID, "subtask")));
     app.update(subagent_msg(tool_start(SUB_TOOL_ID, "bash"), TASK_ID, None));
     let buf = Arc::new(maki_agent::SharedBuf::new());
     app.update(subagent_msg(
@@ -3460,7 +3460,7 @@ fn resolve_or_create_chat_sets_model_id_and_annotation() {
     app.run_id = 1;
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: TASK_ID.into(),
-        tool: "task".into(),
+        tool: "subtask".into(),
         summary: "research".into(),
         annotation: None,
         input: None,
@@ -4015,7 +4015,7 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
             name: "/tasks".into(),
             description: "Browse and search tasks".into(),
-            plugin: "task".into(),
+            plugin: "subtask".into(),
             max_args: 0,
         }]),
     );
@@ -5200,7 +5200,7 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
     let mut app = streaming_app_with_history();
     app.update(agent_msg(AgentEvent::ToolStart(Box::new(ToolStartEvent {
         id: "task1".into(),
-        tool: "task".into(),
+        tool: "subtask".into(),
         summary: "research".into(),
         annotation: None,
         input: None,

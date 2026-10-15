@@ -201,7 +201,7 @@ maki.api.register_tool({
     type = "object",
     properties = {
       pattern = { type = "string", description = "Regex pattern", required = true },
-      path = { type = "string", description = "Directory to search in (default: cwd)" },
+      path = { type = "string", description = "File or directory to search (default: cwd)" },
       include = {
         type = "string",
         description = "File glob filter (e.g. *.c)",
@@ -209,7 +209,7 @@ maki.api.register_tool({
       },
       context_before = { type = "integer", description = "Context lines before match" },
       context_after = { type = "integer", description = "Context lines after match" },
-      limit = { type = "integer", description = "Max match groups to return" },
+      limit = { type = "integer", description = "Max match groups (a match plus its context lines) to return" },
     },
   },
 
