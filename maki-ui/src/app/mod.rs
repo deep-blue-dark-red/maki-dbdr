@@ -63,7 +63,7 @@ use crate::components::system_prompt_modal::{
     SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
 };
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
-use crate::components::tool_prompt_modal::ToolPromptModal;
+use crate::components::tool_prompt_modal::{ToolPromptAction, ToolPromptModal};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, ExitRequest, Overlay, RetryInfo, Status, is_ctrl,
@@ -123,6 +123,7 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const CD_PICK_COMMAND: &str = "/cd-pick";
 const FLASH_CD_PICKER_MISSING: &str = "The cd plugin is disabled, so there is no folder picker";
 const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
+const TOOL_PROMPT_EXPORT_FILE: &str = "tool-prompt.md";
 const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
 const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";
 const FLASH_NO_INSTRUCTION_FILES: &str = "No instruction files loaded";
@@ -1274,7 +1275,39 @@ impl App {
         }
 
         if self.tool_prompt_modal.is_open() {
-            self.tool_prompt_modal.handle_key(key);
+            match self.tool_prompt_modal.handle_key(key) {
+                ToolPromptAction::Copy => {
+                    if let Some(text) = self.tool_prompt_modal.text() {
+                        match self.clipboard.copy_text(&text) {
+                            Ok(crate::clipboard::CopyResult::Copied) => {
+                                self.flash("Copied tool prompt to clipboard".into());
+                            }
+                            Ok(crate::clipboard::CopyResult::Noop) => {}
+                            Err(e) => self.flash(format!("Copy failed: {e}")),
+                        }
+                    }
+                }
+                ToolPromptAction::Save => {
+                    if let Some(text) = self.tool_prompt_modal.text() {
+                        let settings = UserSettings::load();
+                        let base_path = settings
+                            .resolved_export_path(std::path::Path::new(&self.state.session.cwd));
+                        let filepath = if base_path.is_file() {
+                            base_path
+                        } else {
+                            let _ = std::fs::create_dir_all(&base_path);
+                            base_path.join(TOOL_PROMPT_EXPORT_FILE)
+                        };
+                        match std::fs::write(&filepath, text) {
+                            Ok(_) => {
+                                self.flash(format!("Saved tool prompt to {}", filepath.display()))
+                            }
+                            Err(e) => self.flash(format!("Failed to save tool prompt: {e}")),
+                        }
+                    }
+                }
+                ToolPromptAction::None => {}
+            }
             return Some(vec![]);
         }
 

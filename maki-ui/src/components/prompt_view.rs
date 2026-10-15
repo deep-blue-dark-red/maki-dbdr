@@ -58,8 +58,7 @@ impl PromptViewModal {
     }
 
     /// The currently published resolved prompt, if any.
-    #[cfg(test)]
-    pub(crate) fn resolved_text(&self) -> Option<String> {
+    pub(crate) fn text(&self) -> Option<String> {
         self.source.as_ref().map(|source| source.load().to_string())
     }
 

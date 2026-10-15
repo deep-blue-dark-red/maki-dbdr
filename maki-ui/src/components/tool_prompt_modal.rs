@@ -13,7 +13,13 @@ use crate::components::prompt_view::PromptViewModal;
 const TITLE: &str = " Tool prompt — enabled tools ";
 pub(crate) const WIDTH_PERCENT: u16 = 90;
 const MAX_HEIGHT_PERCENT: u16 = 90;
-const HINT_PAIRS: &[(&str, &str)] = &[("esc", "close")];
+const HINT_PAIRS: &[(&str, &str)] = &[("y", "copy"), ("s", "save"), ("esc", "close")];
+
+pub enum ToolPromptAction {
+    Copy,
+    Save,
+    None,
+}
 
 /// Live view of the tool instructions the model is offered, one section per
 /// enabled tool. Like [`crate::components::SystemPromptModal`], it reads the
@@ -49,12 +55,19 @@ impl ToolPromptModal {
         self.0.scroll(delta);
     }
 
-    pub fn handle_key(&mut self, key_event: KeyEvent) {
-        if key_event.code == KeyCode::Esc || key::QUIT.matches(key_event) {
-            self.close();
-            return;
+    pub fn text(&self) -> Option<String> {
+        self.0.text()
+    }
+
+    pub fn handle_key(&mut self, key_event: KeyEvent) -> ToolPromptAction {
+        match key_event.code {
+            KeyCode::Char('y') => return ToolPromptAction::Copy,
+            KeyCode::Char('s') => return ToolPromptAction::Save,
+            KeyCode::Esc => self.close(),
+            _ if key::QUIT.matches(key_event) => self.close(),
+            _ => self.0.handle_scroll_key(key_event),
         }
-        self.0.handle_scroll_key(key_event);
+        ToolPromptAction::None
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -87,8 +100,30 @@ mod tests {
     #[test]
     fn esc_closes() {
         let mut modal = modal();
-        modal.handle_key(key_ev(KeyCode::Esc));
+        assert!(matches!(
+            modal.handle_key(key_ev(KeyCode::Esc)),
+            ToolPromptAction::None
+        ));
         assert!(!modal.is_open());
+    }
+
+    #[test]
+    fn copy_and_save_do_not_close() {
+        let mut modal = modal();
+        assert!(matches!(
+            modal.handle_key(key_ev(KeyCode::Char('y'))),
+            ToolPromptAction::Copy
+        ));
+        assert!(matches!(
+            modal.handle_key(key_ev(KeyCode::Char('s'))),
+            ToolPromptAction::Save
+        ));
+        assert!(modal.is_open());
+    }
+
+    #[test]
+    fn text_exposes_published_prompt() {
+        assert_eq!(modal().text().as_deref(), Some("body"));
     }
 
     #[test]

@@ -70,8 +70,8 @@ impl SystemPromptModal {
 
     /// The currently published resolved prompt, if any.
     #[cfg(test)]
-    pub fn resolved_text(&self) -> Option<String> {
-        self.0.resolved_text()
+    pub fn text(&self) -> Option<String> {
+        self.0.text()
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> SystemPromptAction {
@@ -178,7 +178,7 @@ mod tests {
         let mut modal = SystemPromptModal::new();
         modal.open(Arc::clone(&source));
         source.store(Arc::new("updated".to_string()));
-        assert_eq!(modal.resolved_text().as_deref(), Some("updated"));
+        assert_eq!(modal.text().as_deref(), Some("updated"));
     }
 
     /// Ctrl+E is line-down for the rest of the app; only here must it edit.
