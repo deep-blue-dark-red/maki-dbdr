@@ -17,6 +17,7 @@ use super::history::{History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
+use super::supervisor::{self, Supervisor, Worker, WorkerLink};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::RunLedger;
 use crate::cancel::{CancelMap, CancelToken};
@@ -171,6 +172,7 @@ pub struct Agent<'h> {
     ledger: Arc<RunLedger>,
     model_sync: Option<(Arc<ArcSwap<ModelSlot>>, RunContextBuilder)>,
     stop_continuations: u32,
+    supervisor: Option<WorkerLink>,
 }
 
 impl<'h> Agent<'h> {
@@ -216,6 +218,7 @@ impl<'h> Agent<'h> {
             ledger: params.ledger,
             model_sync: None,
             stop_continuations: 0,
+            supervisor: None,
         }
     }
 
@@ -314,6 +317,7 @@ impl<'h> Agent<'h> {
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
+        self.supervisor = self.attach_supervisor(&message);
 
         info!(
             model = %self.model.id,
@@ -397,6 +401,9 @@ impl<'h> Agent<'h> {
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
+            if self.deliver_supervision()? {
+                return Ok(DoneReason::Supervised);
+            }
             self.try_auto_compact().await?;
             match self.turn().await? {
                 TurnOutcome::Continue => {}
@@ -442,7 +449,12 @@ impl<'h> Agent<'h> {
         // bookkeeping below needs `&mut self` while `tools` is still in use
         // for the request below; a borrowed `Cow` tied to `&self` would
         // conflict with those mutations.
-        let tools = request_tools(&self.tools, self.mcp.as_ref()).into_owned();
+        let mut tools = request_tools(&self.tools, self.mcp.as_ref()).into_owned();
+        if self.supervisor.is_some()
+            && let Value::Array(definitions) = &mut tools
+        {
+            definitions.push(supervisor::tool_definition());
+        }
         let system = request_system(&self.system, self.mcp.as_ref()).into_owned();
         let estimated_tokens = estimate_prompt_tokens(self.history.as_slice(), &system, &tools);
         let turn_idx = (self.num_turns + 1) as usize;
@@ -470,7 +482,7 @@ impl<'h> Agent<'h> {
                 provider: &*self.provider,
                 model: &self.model,
                 messages: self.history.as_slice(),
-                system: &self.system,
+                system: &system,
                 tools: &tools,
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
@@ -624,6 +636,9 @@ impl<'h> Agent<'h> {
         // Everything the turn appended is answered, so a compaction from here
         // on may summarize it. Input arriving after this point may not.
         self.carry_from = self.history.len();
+        if let Some(link) = &mut self.supervisor {
+            link.observe(self.history.as_slice(), self.num_turns);
+        }
 
         if self.handle_queued_command().await? {
             return Ok(TurnOutcome::Continue);
@@ -697,6 +712,60 @@ impl<'h> Agent<'h> {
             Verdict::Unchanged | Verdict::Ask { .. } => message,
         };
         Ok(Some(if blank(&text) { String::new() } else { text }))
+    }
+
+    /// Only for a worker the session's supervisor outranks. The kickoff note
+    /// asks for a plan first, and the local tool is how the plan gets there.
+    fn attach_supervisor(&mut self, goal: &str) -> Option<WorkerLink> {
+        let supervisor = Supervisor::for_session(
+            self.session_id.as_ref(),
+            &self.config,
+            &self.model,
+            &self.model_policy,
+            self.timeouts,
+        )
+        .filter(|supervisor| supervisor.outranks(&self.model))?;
+        self.history
+            .push(Message::observation(supervisor::KICKOFF.into()));
+        let link = supervisor.attach(
+            Worker {
+                task_id: self.task_id.as_deref(),
+                goal,
+                ledger: Arc::clone(&self.ledger),
+                session_id: self.session_id.clone(),
+                retry: self.timeouts.retry,
+            },
+            self.history.len(),
+        );
+        let mut local_tools = (*self.local_tools).clone();
+        local_tools.insert(supervisor::TOOL_NAME.to_owned(), link.tool());
+        self.local_tools = Arc::new(local_tools);
+        Some(link)
+    }
+
+    /// Lands what the supervisor said since the last turn. True when it
+    /// stopped the run, with the reason left in history so a later run knows.
+    fn deliver_supervision(&mut self) -> Result<bool, AgentError> {
+        let Some(link) = &self.supervisor else {
+            return Ok(false);
+        };
+        if let Some(reason) = link.stop_reason() {
+            info!(%reason, "supervisor stopped the run");
+            self.history.push(Message::observation(format!(
+                "{} {reason}",
+                supervisor::HALTED_NOTE
+            )));
+            self.steer(SteerKind::Halted, reason)?;
+            return Ok(true);
+        }
+        for note in link.take_notes() {
+            self.history.push(Message::observation(format!(
+                "<supervisor turn=\"{}\" now=\"{}\">\n{}\n</supervisor>",
+                note.turn, self.num_turns, note.text
+            )));
+            self.steer(SteerKind::Advised, note.text)?;
+        }
+        Ok(false)
     }
 
     fn steer(&self, kind: SteerKind, text: String) -> Result<(), AgentError> {
@@ -864,12 +933,20 @@ impl<'h> Agent<'h> {
     async fn process_tool_calls(&mut self, response: StreamResponse) -> Result<(), AgentError> {
         let ctx = self.tool_context();
         let turn_idx = self.num_turns as usize;
+        // A stop that landed while the model was answering still beats the
+        // calls it asked for. The loop ends the run on its next pass.
+        let halted = self
+            .supervisor
+            .as_ref()
+            .and_then(WorkerLink::stop_reason)
+            .map(|_| supervisor::HALTED_CALL);
         let records = tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
             self.history,
             &self.event_tx,
             &ctx,
+            halted,
         )
         .await?;
         self.turn_state.record_tool_calls(turn_idx, records);
@@ -950,6 +1027,9 @@ impl<'h> Agent<'h> {
         let carry_len = self.history.len().saturating_sub(self.carry_from);
         self.compact_and_bill(steer.instructions.as_deref(), carry_len)
             .await?;
+        if let Some(link) = &mut self.supervisor {
+            link.rebase();
+        }
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
         if carry_len == 0 {
@@ -2386,6 +2466,101 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    const SUPERVISOR_NOTE: &str = "read site/docs/AGENTS.md first";
+    const SUPERVISOR_STOP: &str = "deleting the repo";
+
+    #[test]
+    fn supervisor_note_lands_as_observation() {
+        let mut history = History::new(Vec::new());
+        let (mut agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let note = supervisor::Note {
+            turn: 1,
+            text: SUPERVISOR_NOTE.into(),
+        };
+        agent.supervisor = Some(WorkerLink::scripted(vec![note], None).0);
+
+        assert!(!agent.deliver_supervision().unwrap());
+        assert!(!agent.deliver_supervision().unwrap());
+        drop(agent);
+
+        let notes: Vec<&Message> = history
+            .as_slice()
+            .iter()
+            .filter(|m| m.is_observation())
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0]
+                .first_text_content()
+                .unwrap()
+                .contains(SUPERVISOR_NOTE)
+        );
+        assert_eq!(
+            steers(&drain_events(&event_rx)),
+            [(SteerKind::Advised, SUPERVISOR_NOTE.to_owned())]
+        );
+    }
+
+    #[test]
+    fn supervisor_stop_skips_pending_calls_and_ends_the_run() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            agent.supervisor =
+                Some(WorkerLink::scripted(Vec::new(), Some(SUPERVISOR_STOP.into())).0);
+
+            agent
+                .process_tool_calls(tool_call_response("glob", "t1"))
+                .await
+                .unwrap();
+            assert!(agent.deliver_supervision().unwrap());
+            drop(agent);
+
+            let events = drain_events(&event_rx);
+            assert!(has_event(&events, |e| matches!(
+                e,
+                AgentEvent::ToolDone(done) if done.is_error && done.id == "t1"
+            )));
+            let skipped = history.as_slice().iter().any(|m| {
+                m.content.iter().any(|b| {
+                    matches!(
+                        b,
+                        ContentBlock::ToolResult { content, is_error: true, .. }
+                            if content == supervisor::HALTED_CALL
+                    )
+                })
+            });
+            assert!(skipped);
+            let last = history.as_slice().last().unwrap();
+            assert!(last.is_observation());
+            assert!(
+                last.first_text_content()
+                    .unwrap()
+                    .ends_with(SUPERVISOR_STOP)
+            );
+            assert_eq!(
+                steers(&events),
+                [(SteerKind::Halted, SUPERVISOR_STOP.to_owned())]
+            );
+        });
+    }
+
+    #[test]
+    fn unsupervised_run_offers_no_supervisor_tool() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let requests = Arc::clone(&provider.requests);
+            let (mut agent, _event_rx) = make_agent(provider, &mut history);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let tools = &requests.lock().unwrap()[0].tools;
+            assert!(!tools.to_string().contains(supervisor::TOOL_NAME));
+            assert!(!history.as_slice().iter().any(Message::is_observation));
+        });
     }
 
     const REWRITTEN: &str = "hello, with the CI log attached";

@@ -120,6 +120,7 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
         DoneReason::MaxTurns => Some("max_turns"),
         DoneReason::Cancelled => Some("cancelled"),
         DoneReason::Dropped => Some("dropped"),
+        DoneReason::Supervised => Some("supervised"),
         DoneReason::Compact => None,
     }
 }

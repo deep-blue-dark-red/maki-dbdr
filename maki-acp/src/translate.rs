@@ -355,6 +355,8 @@ pub fn map_done_reason(reason: DoneReason) -> StopReason {
         // The prompt never reached the model and stays out of the next one,
         // which is what ACP means by a refusal.
         DoneReason::Dropped => StopReason::Refusal,
+        // The agent's own supervisor ended it; the turn is over, not refused.
+        DoneReason::Supervised => StopReason::EndTurn,
     }
 }
 

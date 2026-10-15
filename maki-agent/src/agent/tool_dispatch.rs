@@ -900,6 +900,7 @@ async fn execute_mcp_tool(
 }
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
+/// `halted` skips every call with that note, for a run being stopped.
 ///
 /// Returns one record per call so the run can report what each call did
 /// (name, args, duration, error) without re-parsing the transcript.
@@ -909,6 +910,7 @@ pub(super) async fn process_tool_calls(
     history: &mut super::history::History,
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
+    halted: Option<&str>,
 ) -> Result<Vec<super::turn_state::ToolCallRecord>, AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
@@ -934,9 +936,10 @@ pub(super) async fn process_tool_calls(
         // after lets `input` move into whichever branch takes it.
         let doom_loop = recent_calls.is_doom_loop(&name, &input);
         recent_calls.record(name.clone(), &input);
-        if doom_loop {
-            warn!(tool = %name, "doom loop detected, skipping execution");
-            let err = ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE);
+        let skipped = halted.or_else(|| doom_loop.then_some(DOOM_LOOP_MESSAGE));
+        if let Some(note) = skipped {
+            warn!(tool = %name, note, "skipping execution");
+            let err = ToolDoneEvent::error(id.clone(), note);
             immediate_parts.push(ToolResultParts::from_event(&err));
             event_tx.try_send(AgentEvent::ToolDone(Box::new(err)));
             // A skipped call still counted as a call, and it came back an error.

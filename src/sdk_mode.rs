@@ -1197,10 +1197,11 @@ impl EventPump {
                 reason,
                 ..
             } => {
-                // An interrupted run leaves a partial answer and a dropped one
-                // never ran, so neither is a success.
+                // An interrupted run leaves a partial answer, a dropped one
+                // never ran, and a supervised one was stopped as going wrong,
+                // so none is a success.
                 let is_error = match reason {
-                    DoneReason::Cancelled | DoneReason::Dropped => true,
+                    DoneReason::Cancelled | DoneReason::Dropped | DoneReason::Supervised => true,
                     DoneReason::EndTurn
                     | DoneReason::MaxTokens
                     | DoneReason::MaxTurns

@@ -138,6 +138,11 @@ How many lines of output to show per tool in the UI. All values are `usize` with
 | `keep_cache_warm` | bool | `true` | - | While a session is idle, replay the conversation in a tiny side request every 30 seconds so the provider's prompt cache outlives its TTL |
 | `rtk` | bool | `true` | - | Rewrite bash commands with [rtk](https://github.com/rtk-ai/rtk) when it is installed |
 | `rstring` | bool | `true` | - | Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking byte runs of 48+ chars are masked inline to `[masked r=<hash> n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked |
+| `supervisor` | bool | `false` | - | Have a stronger model review the transcript of agents running on a weaker one in the background, injecting a rare corrective note or stopping the run |
+| `supervisor_model` | String | `none` | - | Supervisor model spec (e.g. `anthropic/claude-opus-4-6`); defaults to the strong tier, preferring the worker's provider |
+| `supervisor_batch_turns` | u32 | `6` | 1 | Worker turns per supervisor review |
+| `supervisor_batch_tokens` | u32 | `8000` | 500 | New transcript tokens that trigger a supervisor review before `supervisor_batch_turns` is reached |
+| `supervisor_max_notes` | u32 | `3` | - | Corrective notes the supervisor may give per run; past it only a stop gets through |
 
 ### `provider`
 

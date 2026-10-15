@@ -28,7 +28,7 @@ use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use maki_providers::model::ModelTier;
 use maki_providers::provider;
 use maki_providers::{
-    ContentBlock, ContextGauge, Model, ModelError, RequestOptions, Role, ThinkingConfig,
+    ContentBlock, ContextGauge, Message, Model, ModelError, RequestOptions, Role, ThinkingConfig,
     TokenUsage, add_cost,
 };
 use maki_storage::id::MakiId;
@@ -46,6 +46,7 @@ use crate::runtime::CANCELLED_MSG;
 
 const SESSION_CLOSED_ERR: &str = "session closed";
 const PROMPT_DROPPED_ERR: &str = "an `agent.user_message` layer dropped the prompt";
+const SUPERVISED_ERR: &str = "the supervisor stopped the subagent";
 const KILLED_MSG: &str = "killed";
 const DEFAULT_SESSION_AUDIENCE: ToolAudience = ToolAudience::GENERAL_SUB;
 
@@ -1084,6 +1085,13 @@ async fn run_prompt(s: &mut SessionState, message: String) -> Result<PromptOutco
         Err(e) => Some(e.to_string()),
         Ok(DoneReason::Cancelled) => Some(CANCELLED_MSG.to_owned()),
         Ok(DoneReason::Dropped) => Some(PROMPT_DROPPED_ERR.to_owned()),
+        // The reason is the last thing the run wrote to history.
+        Ok(DoneReason::Supervised) => Some(
+            turn.last()
+                .and_then(Message::first_text_content)
+                .unwrap_or(SUPERVISED_ERR)
+                .to_owned(),
+        ),
         Ok(
             DoneReason::EndTurn
             | DoneReason::MaxTokens

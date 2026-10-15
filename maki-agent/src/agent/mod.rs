@@ -4,6 +4,7 @@ pub mod hook;
 mod instructions;
 mod run;
 mod streaming;
+mod supervisor;
 pub mod tool_dispatch;
 
 pub use compaction::{checkpoint, compact, rename_session};

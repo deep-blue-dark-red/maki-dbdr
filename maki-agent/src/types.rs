@@ -608,6 +608,8 @@ pub enum DoneReason {
     /// An `agent.user_message` layer dropped the message before the model saw
     /// it.
     Dropped,
+    /// The supervisor watching a weaker model stopped the run.
+    Supervised,
 }
 
 impl From<Option<StopReason>> for DoneReason {
@@ -628,6 +630,10 @@ pub enum SteerKind {
     MessageDropped,
     /// `agent.stop` kept the run going after the model ended its turn.
     Continued,
+    /// The supervisor passed the model a corrective note.
+    Advised,
+    /// The supervisor stopped the run.
+    Halted,
 }
 
 /// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.

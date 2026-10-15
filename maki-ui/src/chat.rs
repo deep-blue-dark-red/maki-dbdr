@@ -36,6 +36,8 @@ const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
 const REWRITTEN_PREFIX: &str = "A plugin rewrote this message. The model got:";
 const DROPPED_PREFIX: &str = "A plugin kept this message from the model:";
 const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
+const ADVISED_PREFIX: &str = "The supervisor told the agent:";
+const HALTED_PREFIX: &str = "The supervisor stopped the agent:";
 
 pub enum ChatEventResult {
     Continue,
@@ -215,6 +217,8 @@ impl Chat {
                     SteerKind::MessageRewritten => REWRITTEN_PREFIX,
                     SteerKind::MessageDropped => DROPPED_PREFIX,
                     SteerKind::Continued => CONTINUED_PREFIX,
+                    SteerKind::Advised => ADVISED_PREFIX,
+                    SteerKind::Halted => HALTED_PREFIX,
                 };
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
@@ -1600,6 +1604,8 @@ mod tests {
     #[test_case(SteerKind::MessageRewritten, REWRITTEN_PREFIX ; "message_rewritten")]
     #[test_case(SteerKind::MessageDropped, DROPPED_PREFIX ; "message_dropped")]
     #[test_case(SteerKind::Continued, CONTINUED_PREFIX ; "continued")]
+    #[test_case(SteerKind::Advised, ADVISED_PREFIX ; "advised")]
+    #[test_case(SteerKind::Halted, HALTED_PREFIX ; "halted")]
     fn steered_shows_one_prefixed_assistant_message(kind: SteerKind, prefix: &str) {
         let mut chat = chat();
         chat.handle_event(

@@ -45,6 +45,9 @@ pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 40_000;
+pub const DEFAULT_SUPERVISOR_BATCH_TURNS: u32 = 6;
+pub const DEFAULT_SUPERVISOR_BATCH_TOKENS: u32 = 8_000;
+pub const DEFAULT_SUPERVISOR_MAX_NOTES: u32 = 3;
 /// What one turn asks to generate. A number of maki's own choosing rather than
 /// "whatever the window can spare", because the latter ties the output cap to a
 /// prompt estimate, and an estimate that reads low buys a rejection from every
@@ -80,6 +83,8 @@ pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
 pub const MIN_MAX_OUTPUT_TOKENS: u32 = 1;
 pub const MIN_MAX_TURN_OUTPUT: u32 = 1_024;
+pub const MIN_SUPERVISOR_BATCH_TURNS: u32 = 1;
+pub const MIN_SUPERVISOR_BATCH_TOKENS: u32 = 500;
 const MAX_COMPACTION_PERCENT: u8 = 99;
 const COMPACTION_BUFFER_EXPECTED: &str =
     r#"a token count (e.g. 12000) or a percent of the context window (e.g. "20%")"#;
@@ -760,6 +765,11 @@ pub struct AgentFileConfig {
     pub keep_cache_warm: Option<bool>,
     pub rtk: Option<bool>,
     pub rstring: Option<bool>,
+    pub supervisor: Option<bool>,
+    pub supervisor_model: Option<String>,
+    pub supervisor_batch_turns: Option<u32>,
+    pub supervisor_batch_tokens: Option<u32>,
+    pub supervisor_max_notes: Option<u32>,
 }
 
 impl AgentFileConfig {
@@ -779,7 +789,12 @@ impl AgentFileConfig {
             stale_read_check,
             keep_cache_warm,
             rtk,
-            rstring
+            rstring,
+            supervisor,
+            supervisor_model,
+            supervisor_batch_turns,
+            supervisor_batch_tokens,
+            supervisor_max_notes
         );
     }
 }
@@ -1504,6 +1519,28 @@ pub struct AgentConfig {
     )]
     pub rstring: bool,
 
+    #[config(
+        default = false,
+        desc = "Have a stronger model review the transcript of agents running on a weaker one in the background, injecting a rare corrective note or stopping the run"
+    )]
+    pub supervisor: bool,
+
+    #[config(
+        ty = "String",
+        default = "None",
+        desc = "Supervisor model spec (e.g. `anthropic/claude-opus-4-6`); defaults to the strong tier, preferring the worker's provider"
+    )]
+    pub supervisor_model: Option<String>,
+
+    #[config(default = DEFAULT_SUPERVISOR_BATCH_TURNS, min = MIN_SUPERVISOR_BATCH_TURNS, desc = "Worker turns per supervisor review")]
+    pub supervisor_batch_turns: u32,
+
+    #[config(default = DEFAULT_SUPERVISOR_BATCH_TOKENS, min = MIN_SUPERVISOR_BATCH_TOKENS, desc = "New transcript tokens that trigger a supervisor review before `supervisor_batch_turns` is reached")]
+    pub supervisor_batch_tokens: u32,
+
+    #[config(default = DEFAULT_SUPERVISOR_MAX_NOTES, desc = "Corrective notes the supervisor may give per run; past it only a stop gets through")]
+    pub supervisor_max_notes: u32,
+
     #[config(skip, default = "None")]
     pub max_turns: Option<u32>,
 
@@ -1538,6 +1575,17 @@ impl AgentConfig {
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),
             keep_cache_warm: file.keep_cache_warm.unwrap_or(true),
+            supervisor: file.supervisor.unwrap_or(false),
+            supervisor_model: file.supervisor_model,
+            supervisor_batch_turns: file
+                .supervisor_batch_turns
+                .unwrap_or(DEFAULT_SUPERVISOR_BATCH_TURNS),
+            supervisor_batch_tokens: file
+                .supervisor_batch_tokens
+                .unwrap_or(DEFAULT_SUPERVISOR_BATCH_TOKENS),
+            supervisor_max_notes: file
+                .supervisor_max_notes
+                .unwrap_or(DEFAULT_SUPERVISOR_MAX_NOTES),
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
