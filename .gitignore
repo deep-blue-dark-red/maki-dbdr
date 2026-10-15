@@ -20,3 +20,8 @@ bench/results/
 # Local code-search index dirs
 /.rose/
 /idx-p4/
+
+# Staging for the optional rose engine library, fetched from the release and packed
+# into the shipped archives (.github/scripts/fetch-rose-native.sh). Never committed:
+# it is a build artifact, present only inside a release run's workspace.
+/lib/
