@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use futures_lite::future;
 use serde_json::{Value, json};
+use smol::Timer;
 use tracing::{error, info, warn};
 
 use maki_providers::provider::Provider;
@@ -17,7 +19,7 @@ use super::history::{History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
 use super::streaming::{StreamError, StreamRequest, stream_with_retry};
-use super::supervisor::{self, Supervisor, Worker, WorkerLink};
+use super::supervisor::{self, Note, Supervisor, Worker, WorkerLink};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::RunLedger;
 use crate::cancel::{CancelMap, CancelToken};
@@ -98,6 +100,13 @@ pub type RunContextBuilder = Arc<dyn Fn(&Model, &AgentMode, bool) -> RunContext 
 enum TurnOutcome {
     Continue,
     Done(DoneReason),
+}
+
+/// What landed from the supervisor between two turns.
+enum Supervision {
+    Quiet,
+    Advised,
+    Halted,
 }
 
 #[derive(Clone)]
@@ -317,7 +326,15 @@ impl<'h> Agent<'h> {
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };
+        let carried = self
+            .supervisor
+            .take()
+            .map(WorkerLink::into_leftovers)
+            .unwrap_or_default();
         self.supervisor = self.attach_supervisor(&message);
+        for note in carried {
+            self.land_note(note)?;
+        }
 
         info!(
             model = %self.model.id,
@@ -401,12 +418,17 @@ impl<'h> Agent<'h> {
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
             }
-            if self.deliver_supervision()? {
+            if let Supervision::Halted = self.deliver_supervision()? {
                 return Ok(DoneReason::Supervised);
             }
             self.try_auto_compact().await?;
             match self.turn().await? {
                 TurnOutcome::Continue => {}
+                TurnOutcome::Done(DoneReason::EndTurn) => match self.review_exit().await? {
+                    Supervision::Quiet => return Ok(DoneReason::EndTurn),
+                    Supervision::Advised => {}
+                    Supervision::Halted => return Ok(DoneReason::Supervised),
+                },
                 TurnOutcome::Done(reason) => return Ok(reason),
             }
         }
@@ -450,10 +472,8 @@ impl<'h> Agent<'h> {
         // for the request below; a borrowed `Cow` tied to `&self` would
         // conflict with those mutations.
         let mut tools = request_tools(&self.tools, self.mcp.as_ref()).into_owned();
-        if self.supervisor.is_some()
-            && let Value::Array(definitions) = &mut tools
-        {
-            definitions.push(supervisor::tool_definition());
+        if let Some(link) = &self.supervisor {
+            link.supervise_tools(&mut tools);
         }
         let system = request_system(&self.system, self.mcp.as_ref()).into_owned();
         let estimated_tokens = estimate_prompt_tokens(self.history.as_slice(), &system, &tools);
@@ -714,8 +734,9 @@ impl<'h> Agent<'h> {
         Ok(Some(if blank(&text) { String::new() } else { text }))
     }
 
-    /// Only for a worker the session's supervisor outranks. The kickoff note
-    /// asks for a plan first, and the local tool is how the plan gets there.
+    /// Only for a worker the session's supervisor outranks, and only while it
+    /// answers: an offline one would get a plan nobody reads. The kickoff
+    /// note asks for a plan first, and the local tool is how it gets there.
     fn attach_supervisor(&mut self, goal: &str) -> Option<WorkerLink> {
         let supervisor = Supervisor::for_session(
             self.session_id.as_ref(),
@@ -724,13 +745,14 @@ impl<'h> Agent<'h> {
             &self.model_policy,
             self.timeouts,
         )
-        .filter(|supervisor| supervisor.outranks(&self.model))?;
+        .filter(|supervisor| supervisor.outranks(&self.model) && supervisor.online())?;
         self.history
-            .push(Message::observation(supervisor::KICKOFF.into()));
+            .push(Message::observation(supervisor.kickoff()));
         let link = supervisor.attach(
             Worker {
                 task_id: self.task_id.as_deref(),
                 goal,
+                model: &self.model,
                 ledger: Arc::clone(&self.ledger),
                 session_id: self.session_id.clone(),
                 retry: self.timeouts.retry,
@@ -743,11 +765,11 @@ impl<'h> Agent<'h> {
         Some(link)
     }
 
-    /// Lands what the supervisor said since the last turn. True when it
-    /// stopped the run, with the reason left in history so a later run knows.
-    fn deliver_supervision(&mut self) -> Result<bool, AgentError> {
+    /// Lands what the supervisor said since the last turn. On a stop the
+    /// reason stays in history so a later run knows.
+    fn deliver_supervision(&mut self) -> Result<Supervision, AgentError> {
         let Some(link) = &self.supervisor else {
-            return Ok(false);
+            return Ok(Supervision::Quiet);
         };
         if let Some(reason) = link.stop_reason() {
             info!(%reason, "supervisor stopped the run");
@@ -756,16 +778,56 @@ impl<'h> Agent<'h> {
                 supervisor::HALTED_NOTE
             )));
             self.steer(SteerKind::Halted, reason)?;
-            return Ok(true);
+            return Ok(Supervision::Halted);
         }
-        for note in link.take_notes() {
-            self.history.push(Message::observation(format!(
-                "<supervisor turn=\"{}\" now=\"{}\">\n{}\n</supervisor>",
-                note.turn, self.num_turns, note.text
-            )));
-            self.steer(SteerKind::Advised, note.text)?;
+        let notes = link.take_notes();
+        let advised = !notes.is_empty();
+        for note in notes {
+            self.land_note(note)?;
         }
-        Ok(false)
+        Ok(if advised {
+            Supervision::Advised
+        } else {
+            Supervision::Quiet
+        })
+    }
+
+    fn land_note(&mut self, note: Note) -> Result<(), AgentError> {
+        self.history.push(Message::observation(format!(
+            "<supervisor turn=\"{}\" now=\"{}\">\n{}\n</supervisor>",
+            note.turn, self.num_turns, note.text
+        )));
+        self.steer(SteerKind::Advised, note.text)
+    }
+
+    /// How a run ends is where unverified claims of success show, so the
+    /// supervisor gets a bounded look before the run returns. A note resumes
+    /// the run. An offline, stopped or slow supervisor costs at most the
+    /// wait, and whatever it says later reaches the next run.
+    async fn review_exit(&mut self) -> Result<Supervision, AgentError> {
+        let Some(link) = &mut self.supervisor else {
+            return Ok(Supervision::Quiet);
+        };
+        let settled = link.exit(self.history.as_slice(), self.num_turns);
+        let wait = link.exit_wait();
+        if !wait.is_zero() {
+            future::or(
+                async {
+                    let _ = settled.recv_async().await;
+                },
+                future::or(
+                    async {
+                        Timer::after(wait).await;
+                    },
+                    self.cancel.cancelled(),
+                ),
+            )
+            .await;
+        }
+        if self.cancel.is_cancelled() {
+            return Ok(Supervision::Quiet);
+        }
+        self.deliver_supervision()
     }
 
     fn steer(&self, kind: SteerKind, text: String) -> Result<(), AgentError> {
@@ -940,6 +1002,10 @@ impl<'h> Agent<'h> {
             .as_ref()
             .and_then(WorkerLink::stop_reason)
             .map(|_| supervisor::HALTED_CALL);
+        let strip_why = self
+            .supervisor
+            .as_ref()
+            .is_some_and(WorkerLink::requires_why);
         let records = tool_dispatch::process_tool_calls(
             response,
             &mut self.recent_calls,
@@ -947,6 +1013,7 @@ impl<'h> Agent<'h> {
             &self.event_tx,
             &ctx,
             halted,
+            strip_why,
         )
         .await?;
         self.turn_state.record_tool_calls(turn_idx, records);
@@ -1028,7 +1095,7 @@ impl<'h> Agent<'h> {
         self.compact_and_bill(steer.instructions.as_deref(), carry_len)
             .await?;
         if let Some(link) = &mut self.supervisor {
-            link.rebase();
+            link.rebase(self.history.len());
         }
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
@@ -2481,8 +2548,14 @@ mod tests {
         };
         agent.supervisor = Some(WorkerLink::scripted(vec![note], None).0);
 
-        assert!(!agent.deliver_supervision().unwrap());
-        assert!(!agent.deliver_supervision().unwrap());
+        assert!(matches!(
+            agent.deliver_supervision().unwrap(),
+            Supervision::Advised
+        ));
+        assert!(matches!(
+            agent.deliver_supervision().unwrap(),
+            Supervision::Quiet
+        ));
         drop(agent);
 
         let notes: Vec<&Message> = history
@@ -2508,14 +2581,20 @@ mod tests {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
-            agent.supervisor =
-                Some(WorkerLink::scripted(Vec::new(), Some(SUPERVISOR_STOP.into())).0);
+            let stop = supervisor::Note {
+                turn: 1,
+                text: SUPERVISOR_STOP.into(),
+            };
+            agent.supervisor = Some(WorkerLink::scripted(Vec::new(), Some(stop)).0);
 
             agent
                 .process_tool_calls(tool_call_response("glob", "t1"))
                 .await
                 .unwrap();
-            assert!(agent.deliver_supervision().unwrap());
+            assert!(matches!(
+                agent.deliver_supervision().unwrap(),
+                Supervision::Halted
+            ));
             drop(agent);
 
             let events = drain_events(&event_rx);
@@ -2543,6 +2622,68 @@ mod tests {
             assert_eq!(
                 steers(&events),
                 [(SteerKind::Halted, SUPERVISOR_STOP.to_owned())]
+            );
+        });
+    }
+
+    #[test]
+    fn exit_review_does_not_wait_on_a_gone_supervisor() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let policy = supervisor::Policy {
+                exit_wait_secs: u64::MAX / 2,
+                ..Default::default()
+            };
+            let (link, ticks) = WorkerLink::scripted_with(policy, Vec::new(), None);
+            drop(ticks);
+            agent.supervisor = Some(link);
+            assert!(matches!(
+                agent.review_exit().await.unwrap(),
+                Supervision::Quiet
+            ));
+        });
+    }
+
+    #[test]
+    fn exit_note_resumes_the_run() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let (mut agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let note = supervisor::Note {
+                turn: 1,
+                text: SUPERVISOR_NOTE.into(),
+            };
+            agent.supervisor = Some(WorkerLink::scripted(vec![note], None).0);
+            assert!(matches!(
+                agent.review_exit().await.unwrap(),
+                Supervision::Advised
+            ));
+        });
+    }
+
+    #[test]
+    fn late_note_reaches_the_next_run() {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            let note = supervisor::Note {
+                turn: 1,
+                text: SUPERVISOR_NOTE.into(),
+            };
+            agent.supervisor = Some(WorkerLink::scripted(vec![note], None).0);
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert!(history.as_slice().iter().any(|m| {
+                m.is_observation()
+                    && m.first_text_content()
+                        .is_some_and(|text| text.contains(SUPERVISOR_NOTE))
+            }));
+            assert_eq!(
+                steers(&drain_events(&event_rx)),
+                [(SteerKind::Advised, SUPERVISOR_NOTE.to_owned())]
             );
         });
     }

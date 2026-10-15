@@ -901,6 +901,8 @@ async fn execute_mcp_tool(
 
 /// Deduplicates doom-loop repeats, then runs remaining calls in parallel.
 /// `halted` skips every call with that note, for a run being stopped.
+/// `strip_why` drops the supervisor's `why` from each input before anything
+/// judges or runs it, so it neither reaches the tool nor hides a doom loop.
 ///
 /// Returns one record per call so the run can report what each call did
 /// (name, args, duration, error) without re-parsing the transcript.
@@ -911,11 +913,18 @@ pub(super) async fn process_tool_calls(
     event_tx: &crate::EventSender,
     ctx: &ToolContext,
     halted: Option<&str>,
+    strip_why: bool,
 ) -> Result<Vec<super::turn_state::ToolCallRecord>, AgentError> {
     let tool_uses: Vec<(String, String, Value)> = response
         .message
         .tool_uses()
-        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
+        .map(|(id, name, input)| {
+            let mut input = input.clone();
+            if strip_why {
+                super::supervisor::strip_why(&mut input);
+            }
+            (id.to_owned(), name.to_owned(), input)
+        })
         .collect();
 
     history.push(response.message);
