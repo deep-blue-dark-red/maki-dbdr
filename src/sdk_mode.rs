@@ -12,7 +12,7 @@ use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
@@ -30,11 +30,17 @@ use maki_agent::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{EMPTY_RESPONSE_MARKER, ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_shmem::Speaker;
+use maki_shmem::broadcast::{Broadcaster, SessionSnapshot as ShmemSnapshot, SessionState as ShmemState};
+use maki_shmem::control::{AckResult, Command};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
+
+/// How often the pump wakes to drain ring commands while a quiet tool runs.
+const COMMAND_POLL: Duration = Duration::from_millis(250);
 use serde_json::Value;
 use tracing::warn;
 
@@ -571,6 +577,17 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
 
     let startup_model = model.clone();
+    // The shmem feed the TUI and `maki chat` watch; cloning what the spawn
+    // consumes below.
+    let defaults_for_pump = defaults;
+    let broadcast_title = resumed
+        .session
+        .as_ref()
+        .map(|s| s.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "maki sdk".to_owned());
+    let broadcaster = Broadcaster::start().ok().map(Arc::new);
+    let stdin_broadcaster = broadcaster.clone();
     let (handle, events) = headless::spawn_interactive(InteractiveParams {
         model,
         config,
@@ -603,6 +620,20 @@ pub fn run(params: SdkParams) -> Result<()> {
         }
     });
 
+    // An initial status so clients see the session before its first event.
+    if let Some(b) = &stdin_broadcaster {
+        b.update(ShmemSnapshot {
+            state: ShmemState::Idle,
+            context_used: 0,
+            context_limit: startup_model.context_window,
+            cost_usd: 0.0,
+            session_id: handle.session_id.to_string(),
+            title: broadcast_title.clone(),
+            last_tool: String::new(),
+        });
+    }
+
+    let session_id_str = handle.session_id.to_string();
     let writer = SdkWriter {
         session_id: handle.session_id.clone(),
         out_tx,
@@ -665,6 +696,14 @@ pub fn run(params: SdkParams) -> Result<()> {
         lua_handle: lua_handle.clone(),
         session_id: handle.session_id.to_string(),
         snapshot,
+        broadcaster,
+        broadcast_title,
+        defaults: defaults_for_pump,
+        input_tx: handle.input_tx.clone(),
+        cancel_tx: handle.cancel_tx.clone(),
+        last_tool: String::new(),
+        context_used: 0,
+        context_limit: startup_model.context_window,
     }
     .spawn(events);
 
@@ -690,6 +729,9 @@ pub fn run(params: SdkParams) -> Result<()> {
                 let content = user.message.content;
                 let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
                 let images = content_images(&content);
+                if let Some(broadcaster) = &stdin_broadcaster {
+                    broadcaster.chat(&session_id_str, Speaker::User, &prompt);
+                }
                 let mode = {
                     let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
                     shared.turn_start = Instant::now();
@@ -956,27 +998,107 @@ struct EventPump {
     lua_handle: maki_lua::EventHandle,
     session_id: String,
     snapshot: HeadlessSnapshot,
+    broadcaster: Option<Arc<Broadcaster>>,
+    broadcast_title: String,
+    defaults: SessionDefaults,
+    input_tx: Sender<AgentInput>,
+    cancel_tx: Sender<()>,
+    last_tool: String,
+    context_used: u32,
+    context_limit: u32,
 }
 
 impl EventPump {
     fn spawn(mut self, mut events: SessionEvents) -> smol::Task<()> {
         smol::spawn(async move {
-            while let Some(envelope) = events.next().await {
-                // Folded in first, so a plugin handling `TurnEnd` finds the
-                // finished totals when it calls `maki.session.read()`.
-                self.snapshot.observe(&envelope);
-                maki_lua::agent_autocmd::dispatch(
-                    &self.lua_handle,
-                    &self.session_id,
-                    &envelope,
-                    envelope.subagent.is_some(),
-                );
-                if let Err(e) = self.handle(envelope) {
-                    warn!(error = %e, "sdk event pump stopped");
-                    break;
+            loop {
+                // Ticks keep the command path live while a single long tool
+                // emits nothing; the stream end and a tick are told apart by
+                // the wrapper.
+                let next = futures_lite::future::or(
+                    async { Some(events.next().await) },
+                    async {
+                        smol::Timer::after(COMMAND_POLL).await;
+                        None
+                    },
+                )
+                .await;
+                match next {
+                    Some(Some(envelope)) => {
+                        // Folded in first, so a plugin handling `TurnEnd` finds
+                        // the finished totals when it calls `maki.session.read()`.
+                        self.snapshot.observe(&envelope);
+                        maki_lua::agent_autocmd::dispatch(
+                            &self.lua_handle,
+                            &self.session_id,
+                            &envelope,
+                            envelope.subagent.is_some(),
+                        );
+                        if let Err(e) = self.handle(envelope) {
+                            warn!(error = %e, "sdk event pump stopped");
+                            break;
+                        }
+                    }
+                    Some(None) => break,
+                    None => {
+                        self.apply_commands();
+                    }
                 }
             }
         })
+    }
+
+    /// Commands from `maki chat`/haunt: Cancel stops the current run, Prompt
+    /// steers it as a queued user message. Returns whether a cancel landed.
+    fn apply_commands(&mut self) -> bool {
+        let Some(broadcaster) = self.broadcaster.as_ref() else {
+            return false;
+        };
+        let mut cancelled = false;
+        for pending in broadcaster.drain_commands() {
+            let result = if pending.session_id != self.session_id {
+                AckResult::NoSession
+            } else {
+                match pending.command {
+                    Command::Cancel => {
+                        cancelled = true;
+                        let _ = self.cancel_tx.send(());
+                        AckResult::Ok
+                    }
+                    Command::Prompt(text) => {
+                        let input = AgentInput::from_defaults(
+                            text,
+                            AgentMode::Build,
+                            Vec::new(),
+                            self.defaults,
+                            InputSource::Headless,
+                        );
+                        if self.input_tx.send(input).is_ok() {
+                            AckResult::Ok
+                        } else {
+                            AckResult::Rejected
+                        }
+                    }
+                    Command::Refresh => AckResult::Ok,
+                }
+            };
+            broadcaster.ack(&pending.session_id, pending.request_id, result);
+        }
+        cancelled
+    }
+
+    fn broadcast_status(&self, state: ShmemState) {
+        if let Some(broadcaster) = self.broadcaster.as_ref() {
+            broadcaster.update(ShmemSnapshot {
+                state,
+                context_used: self.context_used,
+                context_limit: self.context_limit,
+                cost_usd: self.cost.unwrap_or_default(),
+                session_id: self.session_id.clone(),
+                title: self.broadcast_title.clone(),
+                last_tool: self.last_tool.clone(),
+            });
+        }
     }
 
     fn model_id(&self) -> String {
@@ -1067,6 +1189,9 @@ impl EventPump {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
 
+                self.last_tool.clone_from(&name);
+                self.broadcast_status(ShmemState::Working);
+
                 if self.include_partial_messages {
                     let model = self.model_id();
                     let events = self.synth.tool_use(
@@ -1121,6 +1246,18 @@ impl EventPump {
             }
             AgentEvent::TurnComplete(tc) => {
                 add_cost(&mut self.cost, tc.cost);
+                if let Some(ctx) = tc.context_size {
+                    self.context_used = ctx;
+                }
+                self.context_limit = tc.context_window;
+                self.broadcast_status(ShmemState::Working);
+                if parent_tool_use_id.is_none()
+                    && let Some(text) = tc.message.first_text_content()
+                    && text != EMPTY_RESPONSE_MARKER
+                    && let Some(broadcaster) = self.broadcaster.as_ref()
+                {
+                    broadcaster.chat(&self.session_id, Speaker::Assistant, text);
+                }
                 if self.include_partial_messages {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
@@ -1209,9 +1346,11 @@ impl EventPump {
                 };
                 let result = mem::take(&mut self.result_text);
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
+                self.broadcast_status(ShmemState::Idle);
             }
             AgentEvent::Error { message } => {
                 self.emit_turn_result(true, message.clone(), 0, TokenUsage::default())?;
+                self.broadcast_status(ShmemState::Idle);
             }
         }
         Ok(())
@@ -1674,6 +1813,14 @@ mod tests {
             lua_handle: maki_lua::EventHandle::disconnected_for_test(),
             session_id: session_id.to_string(),
             snapshot: HeadlessSnapshot::default(),
+            broadcaster: None,
+            broadcast_title: String::new(),
+            defaults: SessionDefaults::default(),
+            input_tx: flume::unbounded().0,
+            cancel_tx: flume::unbounded().0,
+            last_tool: String::new(),
+            context_used: 0,
+            context_limit: 0,
         };
         (pump, out_rx)
     }
