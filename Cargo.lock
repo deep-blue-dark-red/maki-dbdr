@@ -2826,6 +2826,7 @@ version = "0.5.7"
 dependencies = [
  "clap",
  "color-eyre",
+ "crossterm",
  "flume 0.11.1",
  "futures-lite",
  "isahc",
@@ -2840,6 +2841,7 @@ dependencies = [
  "maki-storage",
  "maki-ui",
  "open",
+ "ratatui",
  "serde",
  "serde_json",
  "smol",

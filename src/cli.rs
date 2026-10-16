@@ -267,6 +267,12 @@ pub enum Command {
         #[arg(long)]
         yolo: bool,
     },
+    /// TUI client to live maki processes (TUI, `-p`, sdk): watch their
+    /// conversation, cancel, or steer with a prompt
+    Chat {
+        /// Session id to focus; defaults to the first live session
+        session: Option<String>,
+    },
     /// Show the rendered system prompt or tool definitions
     Prompt {
         /// Prompt variant: system (default), research, general

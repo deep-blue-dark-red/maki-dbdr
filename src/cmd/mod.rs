@@ -256,6 +256,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Acp { model, yolo }) => {
             acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
         }
+        Some(Command::Chat { session }) => {
+            let storage = StateDir::resolve().context("resolve data directory")?;
+            crate::chat::run(session.clone(), storage)?;
+        }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
         },

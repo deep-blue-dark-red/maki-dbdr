@@ -111,6 +111,15 @@ maki attach <id>    # watch a session live, read-only
 
 Opens a session in a viewer TUI without claiming it, so the process that owns the session, interactive or headless, keeps running. The transcript follows the session log as turns land, and while an owner is live the header shows its state, the running tool, context use, and cost from the shared-memory feed. `q` quits the viewer, `c` sends a cancel to the owner through the same control rings an external monitor uses, and the footer confirms when the owner acks it. An id from `maki session list` works here too.
 
+### `maki chat`
+
+```bash
+maki chat           # live sessions, first one selected
+maki chat <id>      # focus a session id
+```
+
+A client TUI to every maki process broadcasting on this machine: interactive sessions, `maki -p` runs, and stream-json SDK processes. The left pane lists live sessions with their state, the right pane tails the selected session's transcript as it is written. `tab` moves between sessions, `j`/`k` scroll, `c` cancels the selected session's run, and `p` types a prompt that is queued into the session through the control rings, so a run can be steered from outside the process that owns it. Commands are signed, and the footer shows the owner's ack.
+
 ### `maki session`
 
 ```bash

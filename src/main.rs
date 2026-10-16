@@ -1,3 +1,4 @@
+mod chat;
 mod cli;
 mod cmd;
 mod print;
