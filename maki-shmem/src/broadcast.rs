@@ -38,6 +38,26 @@ pub enum SessionState {
     Waiting = 3,
 }
 
+impl SessionState {
+    /// Wire value to state; anything unknown reads as `Working`, the safe
+    /// assumption for a live session.
+    pub const fn from_wire(value: u8) -> Self {
+        match value {
+            2 => SessionState::Idle,
+            3 => SessionState::Waiting,
+            _ => SessionState::Working,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            SessionState::Working => "working",
+            SessionState::Idle => "idle",
+            SessionState::Waiting => "waiting",
+        }
+    }
+}
+
 /// Who said a chat line. Wire values are the low byte of [`Chunk::reserved_14`]
 /// and the `sender_name` text of a [`ChatLine`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

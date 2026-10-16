@@ -8,7 +8,7 @@ use crate::{
     MakiCommand,
     auth::AuthKey,
     payload,
-    ring::{self, Consumer, Poll, Ring, StartAt},
+    ring::{self, Consumer, Poll, Ring, RingError, StartAt},
     schema::blit_runtime::from_bytes,
     text,
 };
@@ -49,6 +49,18 @@ pub enum AckResult {
     NoSession = 2,
     /// The command was understood but refused by the session.
     Rejected = 3,
+}
+
+impl AckResult {
+    /// Wire value to result; unknown values never reach an ack.
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(AckResult::Ok),
+            2 => Some(AckResult::NoSession),
+            3 => Some(AckResult::Rejected),
+            _ => None,
+        }
+    }
 }
 
 /// Every `haunt-<pid>.brng` this process is attached to.
@@ -191,6 +203,124 @@ pub fn control_ring_paths() -> Vec<String> {
     paths.sort();
     paths
 }
+
+/// The client side of the control channel: owns a `haunt-<pid>.brng` a maki
+/// process attaches to, keeps its heartbeat fresh on a background thread, and
+/// publishes signed [`MakiCommand`]s.
+///
+/// `ControlLinks` attaches at head, so the ring must exist a poll cycle
+/// before the first command or that command is skipped; the first send is
+/// held back until the attach window has passed.
+pub struct Commander {
+    tx: std::sync::mpsc::Sender<Msg>,
+    requests: std::sync::atomic::AtomicU64,
+}
+
+enum Msg {
+    Send {
+        request_id: u64,
+        target: String,
+        command: Command,
+    },
+}
+
+/// The delay before the first publish: one `BROADCAST_PERIOD` poll cycle,
+/// doubled for margin.
+const ATTACH_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+impl Commander {
+    /// Creates this process's control ring in the ring directory.
+    pub fn start() -> Result<Self, RingError> {
+        let pid = std::process::id();
+        let path = format!("{}/haunt-{pid}.brng", ring::ring_dir());
+        Self::start_at(&path)
+    }
+
+    fn start_at(path: &str) -> Result<Self, RingError> {
+        let ring = Ring::create(path, ring::HAUNT_NODE_ID, 0)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = path.to_owned();
+        std::thread::spawn(move || run(ring, &path, rx));
+        Ok(Self {
+            tx,
+            requests: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    /// Publishes a signed command and returns its request id, for matching
+    /// the `MakiAck` that comes back on the status ring.
+    pub fn send(&self, target: &str, command: Command) -> u64 {
+        let request_id = self
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.tx.send(Msg::Send {
+            request_id,
+            target: target.to_owned(),
+            command,
+        });
+        request_id
+    }
+}
+
+fn run(ring: Ring, path: &str, rx: std::sync::mpsc::Receiver<Msg>) {
+    let key = AuthKey::load_or_create();
+    let mut producer = ring::Producer::new(&ring);
+    ring.update_status(ring::Status::Running);
+    let ready_at = std::time::Instant::now() + ATTACH_WINDOW;
+    let mut hello = crate::Hello {
+        magic: 0x4D414B49,
+        version: 1,
+        role: 1,
+        reserved_7: 0,
+        pid: std::process::id(),
+        reserved_12: [0; 4],
+        timestamp_ns: ring::monotonic_nanos() as u64,
+        sender_name: [0; 64],
+        reserved_88: [0; 8],
+    };
+    text::encode(&mut hello.sender_name, "maki-client");
+    producer.publish(crate::Hello::MSG_ID.get(), &hello);
+    producer.flush();
+    ring.update_heartbeat(ring::monotonic_nanos());
+
+    let mut last_beat = std::time::Instant::now();
+    loop {
+        let remaining = BREATHE.saturating_sub(last_beat.elapsed());
+        match rx.recv_timeout(remaining) {
+            Ok(Msg::Send {
+                request_id,
+                target,
+                command,
+            }) => {
+                // Hold the first command until consumers have attached.
+                while std::time::Instant::now() < ready_at {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                let mut record = command_record(
+                    request_id,
+                    &target,
+                    &command,
+                    ring::monotonic_nanos() as u64,
+                );
+                if let Some(key) = key.as_ref() {
+                    key.sign_command(&mut record);
+                }
+                producer.publish(MakiCommand::MSG_ID.get(), &record);
+                producer.flush();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if last_beat.elapsed() >= BREATHE {
+            ring.update_heartbeat(ring::monotonic_nanos());
+            last_beat = std::time::Instant::now();
+        }
+    }
+    ring.update_status(ring::Status::Stopped);
+    let _ = std::fs::remove_file(path);
+}
+
+const BREATHE: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[cfg(test)]
 mod tests {

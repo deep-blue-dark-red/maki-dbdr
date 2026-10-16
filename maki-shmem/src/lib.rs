@@ -35,7 +35,9 @@ pub mod ring;
 
 pub mod broadcast;
 
-pub use broadcast::Speaker;
+pub mod feed;
+
+pub use broadcast::{SessionState, Speaker};
 
 pub mod control;
 
