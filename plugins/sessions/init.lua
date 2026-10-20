@@ -19,6 +19,19 @@ local TICK_MS = 100
 local AGE_TICKS = 10
 local GLOBAL_ON_HINT = "Showing sessions from all projects"
 local GLOBAL_OFF_HINT = "Showing sessions from this project"
+local ELLIPSIS = "…"
+local PREVIEW_BYTES = 64 * 1024
+local PREVIEW_FALLBACK_BYTES = 1024 * 1024
+local PREVIEW_CHARS = 400
+local PREVIEW_JOB_TIMEOUT_MS = 2000
+local NO_OUTLINE_HINT = "No tool calls to outline yet"
+local OUTLINE_DIFF_LINES = 40
+local OUTLINE_KEYS = {
+  { "←/Esc", "back" },
+  { "↑↓", "line" },
+  { "j/k", "other outline" },
+  { "PgUp/PgDn", "page" },
+}
 -- Placeholder only: the host swaps "spinner:*"-styled spans for the live
 -- animated frame, so working rows spin without this plugin redrawing.
 local WORKING_ICON = "· "
@@ -102,6 +115,12 @@ local function filter_words()
   return ListPicker.split_words(board.input:value())
 end
 
+-- A stored title is cut at 60 bytes (with "…") when maki derives it from the
+-- first prompt. The untruncated prompt is still in the session log, so the
+-- picker can spend the row's free columns on it instead of padding.
+local function label_of(s)
+  return board.previews[s.id] or s.title
+end
 local function sel_index()
   for i, s in ipairs(board.items) do
     if s.id == board.sel_id then
@@ -125,7 +144,7 @@ local function apply_filter()
   local words = filter_words()
   board.items = {}
   for _, s in ipairs(board.all) do
-    if ListPicker.matches(s.title, words) then
+    if ListPicker.matches(label_of(s), words) then
       board.items[#board.items + 1] = s
     end
   end
@@ -165,6 +184,170 @@ local function dispw(s)
   return utf8.len(s) or #s
 end
 
+local function log_path(id)
+  local state = maki.env.state_dir()
+  return state and (state .. "/sessions/" .. id .. ".jsonl")
+end
+
+-- User text hidden in a record too big to decode: an image-heavy first
+-- message puts its text block megabytes behind the base64 payload, so the
+-- head chunk ends mid-line. Pull the text blocks out of the raw JSON instead.
+local function raw_texts(line)
+  local parts = {}
+  local pos = 1
+  while true do
+    local _, stop = line:find('"type":"text","text":"', pos, true)
+    if not stop then
+      break
+    end
+    local i, buf = stop + 1, {}
+    while i <= #line do
+      local c = line:sub(i, i)
+      if c == '"' then
+        break
+      end
+      if c == "\\" then
+        buf[#buf + 1] = line:sub(i, i + 1)
+        i = i + 2
+      else
+        buf[#buf + 1] = c
+        i = i + 1
+      end
+    end
+    local text = table.concat(buf):gsub("\\([nrt])", " "):gsub("\\(.)", "%1")
+    text = text:gsub("%s+", " "):match("^%s*(.-)%s*$")
+    if text ~= "" then
+      parts[#parts + 1] = text
+    end
+    pos = i + 1
+  end
+  return parts
+end
+
+-- Every user text block in the head chunk, whitespace-normalized. The first
+-- message may be an image and hand the title to a later prose message, so the
+-- whole chunk is worth reading.
+local function user_texts(chunk)
+  local parts = {}
+  for line in chunk:gmatch("[^\n]+") do
+    -- Base64 image payloads make a line megabytes wide; decoding one only to
+    -- throw the images away costs more than scanning its text blocks raw.
+    local ok, rec = false, nil
+    if #line <= PREVIEW_BYTES then
+      ok, rec = pcall(maki.json.decode, line)
+    end
+    if ok and type(rec) == "table" and rec.t == "msg" then
+      local d = rec.d
+      if type(d) == "table" and d.role == "user" and type(d.content) == "table" then
+        for _, block in ipairs(d.content) do
+          if type(block) == "table" and block.type == "text" and type(block.text) == "string" then
+            local text = block.text:gsub("%s+", " "):match("^%s*(.-)%s*$")
+            if text ~= "" then
+              parts[#parts + 1] = text
+            end
+            break
+          end
+        end
+      end
+    elseif not ok and line:find('"t":"msg"', 1, true) and line:find('"role":"user"', 1, true) then
+      for _, text in ipairs(raw_texts(line)) do
+        parts[#parts + 1] = text
+      end
+    end
+  end
+  return table.concat(parts, " ")
+end
+
+-- Only a title that really came from this prompt grows back: strip the "…"
+-- the storage added and look for that prefix. A renamed session keeps its own
+-- words even when they happen to end in an ellipsis.
+local function extend_title(title, texts)
+  local cut = title:match("^(.-)…$")
+  if not cut or cut == "" then
+    return nil
+  end
+  local at = texts:find(cut, 1, true)
+  if not at then
+    return nil
+  end
+  return maki.ui.truncate_text(texts:sub(at), PREVIEW_CHARS).head
+end
+
+-- Reads only the beginning of the log, so a 100 MB session costs one row.
+local function read_head(path, bytes)
+  local ok, id = pcall(maki.fn.jobstart, { "head", "-c", tostring(bytes), path }, { scope = "plugin" })
+  if not ok or not id then
+    return nil
+  end
+  local waited, result = pcall(maki.fn.jobwait, id, PREVIEW_JOB_TIMEOUT_MS)
+  if not waited or not result then
+    pcall(maki.fn.jobstop, id)
+    return nil
+  end
+  return result.stdout
+end
+
+-- Reads previews off the main loop: one head job at a time, then a single
+-- dirty tick so every loaded row reflows together.
+local function load_previews()
+  local this_board = board
+  if board.preview_loading then
+    return
+  end
+  local want = {}
+  for _, s in ipairs(board.all) do
+    if s.title:sub(-3) == ELLIPSIS and not board.previews[s.id] and not board.preview_tried[s.id] then
+      want[#want + 1] = { id = s.id, title = s.title }
+      board.preview_tried[s.id] = true
+    end
+  end
+  if #want == 0 then
+    return
+  end
+  board.preview_loading = true
+  maki.async.run(function()
+    for _, entry in ipairs(want) do
+      if board ~= this_board then
+        return
+      end
+      local path = log_path(entry.id)
+      local chunk = path and read_head(path, PREVIEW_BYTES)
+      local texts = chunk and user_texts(chunk)
+      -- An image-heavy first message pushes its text past the first chunk;
+      -- only those pay for the larger read.
+      if texts == "" and path then
+        chunk = read_head(path, PREVIEW_FALLBACK_BYTES)
+        texts = chunk and user_texts(chunk) or ""
+      end
+      if texts and texts ~= "" then
+        local full = extend_title(entry.title, texts)
+        if full then
+          board.previews[entry.id] = full
+        end
+      end
+    end
+    if board ~= this_board then
+      return
+    end
+    board.preview_loading = false
+    -- Sessions found while this batch ran (the stored scan landing late, or a
+    -- new live one) need their own pass, so always ask for a refresh.
+    board.dirty = true
+  end)
+end
+
+-- One session, one row: the extra columns go to more of the title, cut right
+-- before the right-aligned context column.
+local function fit_label(label, width)
+  if width <= 0 then
+    return ""
+  end
+  if maki.ui.display_width(label) <= width then
+    return label
+  end
+  return maki.ui.truncate_text(label, math.max(width - 1, 0)).head .. ELLIPSIS
+end
+
 local function render()
   local lines = {}
   local inner = board.width - 4
@@ -177,6 +360,7 @@ local function render()
     local selected = s.id == board.sel_id
     local icon, icon_style, spinning = icon_of(s)
     local base = selected and "selected" or "item"
+    local match_style = selected and "match_selected" or "match"
     local ctx = "ctx: " .. format_context_size(s.context_size) .. " · "
     local right = ctx .. (s.focused and CURRENT_LABEL or age(s.updated_at))
     local right_style = selected and "selected" or (s.focused and "accent" or "dim")
@@ -188,14 +372,19 @@ local function render()
     if spinning then
       icon_style = "spinner:" .. icon_style
     end
+    local hint = board.confirm == s.id and CONFIRM_HINT or ""
+    local icon_w = dispw(icon)
+    local padw = 2 + icon_w
+    local first_width = inner - padw - dispw(hint) - dispw(right) - 1
+    local label = fit_label(label_of(s), first_width)
     local line = { { "  ", base }, { icon, icon_style } }
-    for _, sp in ipairs(ListPicker.highlight_spans(s.title, words, base, selected and "match_selected" or "match")) do
+    for _, sp in ipairs(ListPicker.highlight_spans(label, words, base, match_style)) do
       line[#line + 1] = sp
     end
-    local used = 2 + dispw(icon) + dispw(s.title)
-    if board.confirm == s.id then
-      line[#line + 1] = { CONFIRM_HINT, selected and "match_selected" or "error" }
-      used = used + dispw(CONFIRM_HINT)
+    local used = padw + maki.ui.display_width(label)
+    if hint ~= "" then
+      line[#line + 1] = { hint, selected and "match_selected" or "error" }
+      used = used + dispw(hint)
     end
     local pad = math.max(inner - used - dispw(right), 1)
     line[#line + 1] = { string.rep(" ", pad), base }
@@ -273,6 +462,7 @@ local function refresh()
   apply_filter()
   update_footer()
   render()
+  load_previews()
 end
 
 local function close()
@@ -392,6 +582,7 @@ local function commit_rename()
   if err then
     maki.ui.flash(err)
   else
+    board.previews[id] = nil
     local si = find_stored(id)
     if si then
       board.stored[si].title = title
@@ -519,6 +710,9 @@ local function open()
     items = {},
     rank = {},
     deleted = {},
+    previews = {},
+    preview_tried = {},
+    preview_loading = false,
     min_rank = 0,
     counts = { needs_input = 0, working = 0 },
     sel_id = nil,
