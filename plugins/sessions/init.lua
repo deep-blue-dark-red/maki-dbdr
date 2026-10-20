@@ -48,6 +48,7 @@ local FILTER_KEYS = {
   { "Ctrl+N", "new" },
   { "Ctrl+R", "rename" },
   { "Ctrl+D", "delete" },
+  { "→", "outline" },
   { "Ctrl+Shift+M", "all projects" },
 }
 local RENAME_KEYS = {
@@ -639,6 +640,145 @@ local function toggle_global()
   load_stored()
 end
 
+local function outline_line(text)
+  if text == "" then
+    return {}
+  end
+  local style = "item"
+  if text:match("^## ") then
+    style = "keybind_section"
+  elseif text:match("^# ") then
+    style = "accent"
+  elseif text:match("^%$ ") then
+    style = "dim"
+  end
+  return { { text, style } }
+end
+
+-- The same report session_history's "outline" format asks for: model replies
+-- interleaved with every command, thinking excluded, diff off. It is Markdown,
+-- so it goes through the normal renderer for headings and inline code.
+local function report_lines(session, width)
+  local ok, report, err = pcall(maki.session.summary, session.id, {
+    transcript = true,
+    diff = false,
+    diff_lines = OUTLINE_DIFF_LINES,
+  })
+  if not ok then
+    report, err = nil, tostring(report)
+  end
+  if not report then
+    local reason = err or "this session has no report yet"
+    if reason:find("no tool calls", 1, true) then
+      reason = NO_OUTLINE_HINT
+    end
+    return {
+      { { "Outline not available", "error" } },
+      { { reason, "dim" } },
+    }
+  end
+  local rendered_ok, rendered = pcall(maki.ui.markdown, report, width)
+  if rendered_ok and rendered and #rendered > 0 then
+    return rendered
+  end
+  local lines = {}
+  for text in (report .. "\n"):gmatch("(.-)\n") do
+    lines[#lines + 1] = outline_line(text)
+  end
+  return lines
+end
+
+local function outline_title(session)
+  local label = board and label_of(session) or session.title
+  return " Outline · " .. maki.ui.truncate_text(label, 50).head .. " "
+end
+
+local function show_outline()
+  local s = selected()
+  if not s then
+    return
+  end
+  local buf = maki.ui.buf()
+  local win = maki.ui.open_win(buf, {
+    title = outline_title(s),
+    width = "100%",
+    height = "90%",
+    border = "rounded",
+    focus = true,
+    footer = OUTLINE_KEYS,
+  })
+  local width = win.width
+  local shown = s
+  local lines = {}
+  local cursor = 1
+
+  local function show(session)
+    shown = session
+    lines = report_lines(session, width)
+    buf:set_lines(lines)
+    win:set_config({ title = outline_title(session) })
+    cursor = 1
+    win:set_cursor(cursor)
+  end
+
+  -- j/k walks the outline views, not the picker: the selection stays where it
+  -- was and ← returns to it, but the pane shows the neighbour's report.
+  local index = 1
+  for i, item in ipairs(board.items) do
+    if item.id == s.id then
+      index = i
+      break
+    end
+  end
+  local function switch(delta)
+    local count = board and #board.items or 0
+    if count == 0 then
+      return
+    end
+    index = (index - 1 + delta) % count + 1
+    show(board.items[index])
+  end
+
+  show(s)
+  while win:is_open() do
+    local ev = win:recv()
+    if not ev or ev.type == "close" then
+      break
+    end
+    if ev.type == "resize" then
+      width = ev.width
+      lines = report_lines(shown, width)
+      buf:set_lines(lines)
+      cursor = math.min(cursor, math.max(#lines, 1))
+      win:set_cursor(cursor)
+    elseif ev.type == "key" then
+      local key = ev.key
+      local page = math.max(win.height - 1, 1)
+      if key == "<Esc>" or key == "<Left>" or key == "<C-c>" or key == "q" then
+        win:close()
+        break
+      elseif key == "j" then
+        switch(1)
+      elseif key == "k" then
+        switch(-1)
+      elseif key == "<Up>" then
+        cursor = math.max(cursor - 1, 1)
+      elseif key == "<Down>" then
+        cursor = math.min(cursor + 1, math.max(#lines, 1))
+      elseif key == "<PageUp>" then
+        cursor = math.max(cursor - page, 1)
+      elseif key == "<PageDown>" then
+        cursor = math.min(cursor + page, math.max(#lines, 1))
+      elseif key == "<Home>" then
+        cursor = 1
+      elseif key == "<End>" then
+        cursor = math.max(#lines, 1)
+      end
+      win:set_cursor(cursor)
+    end
+  end
+end
+
 local function handle_key(key)
   if key == "<C-c>" then
     close()
@@ -667,6 +807,8 @@ local function handle_key(key)
     open_selected()
   elseif key == "<C-n>" then
     open_blank()
+  elseif key == "<Right>" then
+    show_outline()
   elseif key == "<C-r>" then
     start_rename()
   elseif key == "<C-d>" then
