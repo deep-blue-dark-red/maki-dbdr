@@ -367,6 +367,9 @@ impl CommandPalette {
         let injector = nucleo.injector();
 
         for item in Self::items(custom_commands, mcp_prompts, lua_commands) {
+            if matches!(item.command_type, CommandType::Lua(i) if lua_commands[i].hidden) {
+                continue;
+            }
             injector.push(item, |item, cols| {
                 cols[0] = Utf32String::from(item.name.as_str());
             });
@@ -1074,12 +1077,14 @@ mod tests {
                 description: Arc::from("View memory files"),
                 plugin: Arc::from("memory"),
                 max_args: 0,
+                hidden: false,
             },
             LuaCommandInfo {
                 name: Arc::from("/deploy"),
                 description: Arc::from("Deploy the project"),
                 plugin: Arc::from("deploy_plugin"),
                 max_args: 0,
+                hidden: false,
             },
         ])
     }
@@ -1090,6 +1095,7 @@ mod tests {
             description: Arc::from("Rename the current session"),
             plugin: Arc::from("sessions"),
             max_args,
+            hidden: false,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
         p.sync(input);
@@ -1133,6 +1139,21 @@ mod tests {
             .filter(|f| matches!(f.command_type, CommandType::Lua(_)))
             .count();
         assert_eq!(lua_count, 2);
+    }
+
+    #[test]
+    fn hidden_lua_command_stays_out_of_the_palette() {
+        let reader = LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: Arc::from("/cd-pick"),
+            description: Arc::from("Pick a folder"),
+            plugin: Arc::from("cd"),
+            max_args: 0,
+            hidden: true,
+        }]);
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        p.sync("/cd-pick");
+        assert!(p.find_lua_command("/cd-pick").is_some());
+        assert!(!p.filtered.iter().any(|m| p.item_name(m) == "/cd-pick"));
     }
 
     #[test]
@@ -1180,6 +1201,7 @@ mod tests {
             description: Arc::from("List models"),
             plugin: Arc::from("models"),
             max_args: 0,
+            hidden: false,
         }]);
         let mut palette = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
 
@@ -1213,6 +1235,7 @@ mod tests {
             description: Arc::from("old command"),
             plugin: Arc::from("p"),
             max_args: 0,
+            hidden: false,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
         p.sync("/");
@@ -1229,12 +1252,14 @@ mod tests {
                 description: Arc::from("new"),
                 plugin: Arc::from("p"),
                 max_args: 0,
+                hidden: false,
             },
             LuaCommandInfo {
                 name: Arc::from("/new2"),
                 description: Arc::from("new2"),
                 plugin: Arc::from("p"),
                 max_args: 0,
+                hidden: false,
             },
         ]);
         p.sync("/");

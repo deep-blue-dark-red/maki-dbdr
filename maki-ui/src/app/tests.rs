@@ -3900,6 +3900,7 @@ fn typed_lua_command_with_args_executes() {
             description: "Rename the current session".into(),
             plugin: "sessions".into(),
             max_args: usize::MAX,
+            hidden: false,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -3990,6 +3991,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             description: "Browse sessions".into(),
             plugin: "sessions".into(),
             max_args: 0,
+            hidden: false,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -4017,6 +4019,7 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
             description: "Browse and search tasks".into(),
             plugin: "subtask".into(),
             max_args: 0,
+            hidden: false,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -4043,6 +4046,7 @@ fn resume_command_forwards_to_sessions_plugin() {
             description: "Browse and switch sessions".into(),
             plugin: "sessions".into(),
             max_args: 0,
+            hidden: false,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();

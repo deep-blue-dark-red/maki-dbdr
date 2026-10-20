@@ -1027,6 +1027,8 @@ fn allow_is_delegated(
 ///   name        (string)   Required. The command name (e.g. "/hello"; a leading
 ///                            slash is added when missing).
 ///   description (string)   Optional. Short description shown in the command palette.
+///   hidden      (boolean)  Optional. Keep the command out of the palette while
+///                          still allowing it to run by name (default false).
 ///   nargs       (integer|string) Optional. How many arguments the command
 ///                          takes, spelled like nvim's nargs: 0 (default),
 ///                          1, "?" (zero or one), "*" (any number), or "+"
@@ -1750,6 +1752,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
         name.insert(0, '/');
     }
     let description: String = spec.get("description").unwrap_or_default();
+    let hidden: bool = spec.get("hidden").unwrap_or(false);
     let max_args = parse_nargs(spec)?;
     let handler: Function = spec
         .get("handler")
@@ -1769,6 +1772,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
                 handler: handler_key,
                 description,
                 max_args,
+                hidden,
             },
         );
     }

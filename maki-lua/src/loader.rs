@@ -1512,6 +1512,7 @@ mod tests {
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
             max_args: 0,
+            hidden: false,
         }]);
         let snap = reader.load();
         assert_eq!(snap.commands.len(), 1);
@@ -1670,6 +1671,26 @@ mod tests {
         let snap = host.command_reader().load();
         assert_eq!(snap.commands.len(), 1);
         assert_eq!(snap.commands[0].name.as_ref(), "/hello");
+    }
+
+    #[test]
+    fn register_command_carries_hidden_flag() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "hidden",
+            r#"
+            maki.api.register_command({
+                name = "/internal",
+                description = "not in the palette",
+                hidden = true,
+                handler = function() end,
+            })
+            "#,
+        )
+        .unwrap();
+
+        let snap = host.command_reader().load();
+        assert!(snap.commands[0].hidden);
     }
 
     #[test]

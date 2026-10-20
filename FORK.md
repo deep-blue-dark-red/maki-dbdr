@@ -34,7 +34,7 @@ Run `scripts/verify-fork.sh` after every upstream merge to catch regressions.
 
 ### Plugins (fork-only)
 - `plugins/outline/` — upstream's `plugins/index`, renamed; do not restore `index`
-- `plugins/cd/` — `/cd-pick`, the folder picker over `maki.dir_picker`
+- `plugins/cd/` — hidden `/cd-pick`, the folder picker over `maki.dir_picker`
 - `plugins/status/` — NDJSON status feed for external programs
 - `plugins/async/` — background job queue + jobs panel
 - `plugins/ast_grep/`, `plugins/tool_help/`, `plugins/create_plugin/`, `plugins/aa_scores/`, `plugins/cronjob/`, `plugins/compilerbrain/` (tool views for the foreign `compilerbrain.*` tools)
@@ -125,8 +125,8 @@ with the `@` printed only if the picker closes without a pick
 upstream's plugin would put two popups on the same `@`.
 
 `/cd` exists upstream, but the fork reworked it: a bare `/cd` opens the dir
-picker, the `change_cwd` action is bound to Ctrl+L, and `plugins/cd` adds
-`/cd-pick` on top.
+picker, the `change_cwd` action is bound to Ctrl+L, and `plugins/cd` adds a
+hidden `/cd-pick` that bare `/cd` runs.
 
 ---
 

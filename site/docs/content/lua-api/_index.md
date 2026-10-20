@@ -568,6 +568,8 @@ browsing memory files or toggling settings.
   - `name` (`string`) Required. The command name (e.g. "/hello"; a leading
     slash is added when missing).
   - `description` (`string`) Optional. Short description shown in the command palette.
+  - `hidden` (`boolean`) Optional. Keep the command out of the palette while
+    still allowing it to run by name (default false).
   - `nargs` (`integer|string`) Optional. How many arguments the command
     takes, spelled like nvim's nargs: 0 (default),
     1, "?" (zero or one), "*" (any number), or "+"

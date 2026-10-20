@@ -3,6 +3,7 @@ local DirPicker = require("maki.dir_picker")
 maki.api.register_command({
   name = "/cd-pick",
   description = "Pick a folder and change the working directory",
+  hidden = true,
   nargs = 0,
   handler = function()
     local target = DirPicker.open({ title = " Change directory " })

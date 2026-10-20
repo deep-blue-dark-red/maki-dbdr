@@ -47,10 +47,12 @@ pub fn parse_lua_commands(source: &str) -> Vec<LuaPluginCommand> {
         let block = &search[start + marker.len() - 1..];
         if let Some(end) = find_matching_brace(block, 0) {
             let inner = &block[1..end];
-            let name = extract_lua_field(inner, "name");
-            let desc = extract_lua_field(inner, "description");
-            if let (Some(name), Some(description)) = (name, desc) {
-                commands.push(LuaPluginCommand { name, description });
+            if !inner.contains("hidden = true") {
+                let name = extract_lua_field(inner, "name");
+                let desc = extract_lua_field(inner, "description");
+                if let (Some(name), Some(description)) = (name, desc) {
+                    commands.push(LuaPluginCommand { name, description });
+                }
             }
             search = &block[end..];
         } else {
