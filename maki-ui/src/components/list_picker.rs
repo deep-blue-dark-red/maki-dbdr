@@ -32,6 +32,11 @@ const DETAIL_RIGHT_PAD: u16 = 1;
 
 pub trait PickerItem {
     fn label(&self) -> &str;
+    /// The text fuzzy search matches against. Defaults to the label; items
+    /// whose identity lives outside the label (e.g. a provider name) widen it.
+    fn search_text(&self) -> &str {
+        self.label()
+    }
     fn suffix(&self) -> Option<&str> {
         None
     }
@@ -148,22 +153,20 @@ impl<T: PickerItem> State<T> {
                 Normalization::Smart,
                 AtomKind::Fuzzy,
             );
-            // Create labels with their original indices
             let labeled: Vec<(usize, &str)> = self
                 .items
                 .iter()
                 .enumerate()
-                .map(|(idx, item)| (idx, item.label()))
+                .map(|(idx, item)| (idx, item.search_text()))
                 .collect();
             let matches: HashSet<&str> = pattern
-                .match_list(labeled.iter().map(|(_, label)| *label), &mut self.matcher)
+                .match_list(labeled.iter().map(|(_, text)| *text), &mut self.matcher)
                 .into_iter()
                 .map(|(matched_str, _score)| matched_str)
                 .collect();
-            // Find back all indices that have matching labels
             self.filtered = labeled
                 .into_iter()
-                .filter(|(_, label)| matches.contains(label))
+                .filter(|(_, text)| matches.contains(text))
                 .map(|(idx, _)| idx)
                 .collect();
         }

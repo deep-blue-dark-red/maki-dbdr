@@ -77,6 +77,7 @@ fn tier_shortcut(key: KeyEvent) -> Option<ModelTier> {
     }
 }
 
+#[derive(Debug)]
 pub enum ModelPickerAction {
     Consumed,
     Select(String),
@@ -98,6 +99,8 @@ struct ModelEntry {
     spec: String,
     id: String,
     provider_display: String,
+    /// Everything a search should reach: display name, slug, and model id.
+    search: String,
     suffix: Option<String>,
     score: Option<Cell>,
     price: Option<Cell>,
@@ -111,6 +114,10 @@ struct ModelEntry {
 impl PickerItem for ModelEntry {
     fn label(&self) -> &str {
         &self.id
+    }
+
+    fn search_text(&self) -> &str {
+        &self.search
     }
 
     fn suffix(&self) -> Option<&str> {
@@ -457,6 +464,7 @@ fn parse_model_entry(spec: &str, scores: &AaScores) -> Option<ModelEntry> {
     Some(ModelEntry {
         spec: spec.to_string(),
         id,
+        search: format!("{provider_display} {spec}"),
         provider_display,
         suffix: None,
         score,
@@ -554,6 +562,23 @@ mod tests {
         let action = p.handle_key(key(KeyCode::Enter));
         assert!(
             matches!(action, ModelPickerAction::Select(ref s) if s == "anthropic/claude-opus-4-6-20260101")
+        );
+    }
+
+    /// The label is only the model id, so a provider named in the query must
+    /// still reach its rows: display name and slug are search text too.
+    #[test_case("zai", SWAPPED_SPEC          ; "slug")]
+    #[test_case("anthropic", "anthropic/claude-opus-4-6-20260101" ; "display_name_is_also_the_slug")]
+    fn provider_name_query_finds_models(query: &str, expected: &str) {
+        let mut p = ModelPicker::new(test_models());
+        p.open("");
+        for ch in query.chars() {
+            p.handle_key(key(KeyCode::Char(ch)));
+        }
+        let action = p.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ModelPickerAction::Select(ref s) if s == expected),
+            "query '{query}' should select {expected}, got {action:?}"
         );
     }
 
@@ -856,6 +881,7 @@ mod tests {
             spec: String::new(),
             id: String::new(),
             provider_display: String::new(),
+            search: String::new(),
             suffix: None,
             score,
             price,
