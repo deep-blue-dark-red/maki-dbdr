@@ -320,6 +320,12 @@ maki.setup({
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
 
+### `plugins.memory`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `global` | boolean | `false` | - | Join every project's memories in the memory tool and the /memory picker. |
+
 ### `plugins.outline`
 
 | Field | Type | Default | Min | Description |

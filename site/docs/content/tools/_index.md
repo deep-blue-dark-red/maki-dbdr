@@ -237,7 +237,7 @@ Track work of 3+ steps. Every call replaces the whole list, so include every ite
 
 ### `memory` {#memory}
 
-Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates.
+Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. Update or delete stale facts. list/read return the notes directory; use edit on <dir>/<path> for targeted updates. With global memory on, list and read-by-tags join every project's notes (prefixed <project>/); path-based read/write/delete stay in the current project.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

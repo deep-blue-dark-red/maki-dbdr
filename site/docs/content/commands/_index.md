@@ -50,7 +50,7 @@ Type `/` in the input box to open the command palette.
 | `/rewind` | Show rewind menu to delete turns |
 | `/aa_scores` | Refresh the cached Artificial Analysis intelligence scores |
 | `/custom_tools` | View, paste, edit, and unregister custom tools |
-| `/memory` | View, edit, move, and delete memory files |
+| `/memory` | View, edit, move, and delete memory files (G toggles global memory) |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
 | `/tasks` | Browse and search tasks |
