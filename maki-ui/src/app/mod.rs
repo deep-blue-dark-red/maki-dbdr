@@ -1208,7 +1208,6 @@ impl App {
             return None;
         }
         if key::QUIT.matches(key) {
-            self.command_palette.close();
             return Some(if !self.is_main_chat() || self.input_box.is_empty() {
                 if self.status == Status::Streaming {
                     return Some(self.handle_cancel());
@@ -1216,6 +1215,7 @@ impl App {
                 self.quit()
             } else {
                 self.input_box.discard();
+                self.input_changed(InputWriter::Anyone);
                 vec![]
             });
         }
@@ -2003,7 +2003,13 @@ impl App {
         }
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
-            InputAction::Submit(sub) => self.handle_submit(sub),
+            InputAction::Submit(sub) => {
+                // `submit` empties the buffer without a `Changed`, so the
+                // palettes resync here or the helper outlives its input.
+                let actions = self.handle_submit(sub);
+                self.input_changed(InputWriter::Anyone);
+                actions
+            }
             InputAction::Changed => {
                 self.input_changed(InputWriter::Anyone);
                 vec![]

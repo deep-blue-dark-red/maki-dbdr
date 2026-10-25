@@ -5480,6 +5480,44 @@ fn dollar_opens_tool_palette_and_tab_completes() {
 }
 
 #[test]
+fn enter_on_empty_param_list_submits_and_closes_the_helper() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    for ch in "ut_probe ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(app.tool_palette.is_active(), "space after a tool lists its params");
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.into_iter().next(),
+        Some(Action::UserToolCommand { name, .. }) if name == USER_TOOL_PROBE
+    ));
+    assert!(
+        !app.tool_palette.is_active(),
+        "the submit emptied the buffer, the helper must not outlive it"
+    );
+}
+
+#[test]
+fn ctrl_c_discard_closes_the_tool_helper() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    for ch in "ut_probe ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(app.tool_palette.is_active());
+
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(!app.tool_palette.is_active());
+    assert!(app.input_box.is_empty(), "ctrl+c discards the draft");
+}
+
+#[test]
 fn tool_palette_esc_closes_without_touching_input() {
     register_user_tool_probe();
     let mut app = test_app();
