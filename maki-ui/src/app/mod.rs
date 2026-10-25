@@ -13,6 +13,7 @@ mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
 pub(crate) mod tasks;
+pub(crate) mod user_tool;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod view;
@@ -75,6 +76,7 @@ use crate::theme;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
+use maki_agent::tools::ToolRegistry;
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     RunInterrupt, SharedMessages, SubagentInfo,
@@ -2130,6 +2132,30 @@ impl App {
             return vec![Action::ShellCommand {
                 id,
                 command: prefix.command,
+                visible: prefix.visible,
+            }];
+        }
+        if let Some(prefix) = user_tool::parse_user_tool_prefix(&sub.text) {
+            let Some(entry) = ToolRegistry::global().get(&prefix.name) else {
+                self.flash(format!("unknown tool: ${}", prefix.name));
+                return vec![];
+            };
+            let input = match user_tool::build_tool_input(&prefix.args, &entry.tool.schema()) {
+                Ok(input) => input,
+                Err(err) => {
+                    self.flash(err);
+                    return vec![];
+                }
+            };
+            let id = self.shell.reserve_id();
+            let sigil = if prefix.visible { "$" } else { "$$" };
+            let display = format!("{sigil} {} {}", prefix.name, prefix.args);
+            self.main_chat()
+                .show_user_message(display.trim_end().to_owned(), Vec::new());
+            return vec![Action::UserToolCommand {
+                id,
+                name: prefix.name,
+                input,
                 visible: prefix.visible,
             }];
         }

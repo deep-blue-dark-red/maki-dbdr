@@ -167,6 +167,13 @@ All fork overlays must be present: the five components above plus
 `system_prompt_modal`, `tool_prompt_modal` and `stats_modal` (the arrays claim
 23 entries).
 
+#### `$tool` input prefix
+`handle_submit` dispatches `$name args` (and hidden `$$name`) straight to the
+`ToolRegistry` via `app/user_tool.rs` and `Action::UserToolCommand`, mirroring
+the `!`/`!!` shell prefix in `app/shell.rs`. Unknown names flash, and text the
+prefix parser rejects (prose like `$100`) falls through to a normal message.
+The event loop owns the `user_tool_tx/rx` channel pair on `SessionRuntime`.
+
 ---
 
 ### 4. `maki-ui/src/components/keybindings.rs`

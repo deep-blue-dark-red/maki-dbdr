@@ -219,6 +219,13 @@ pub enum Action {
         command: String,
         visible: bool,
     },
+    /// A `$tool args` line: the user invokes a registry tool directly.
+    UserToolCommand {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        visible: bool,
+    },
     CancelAgent {
         run_id: u64,
     },

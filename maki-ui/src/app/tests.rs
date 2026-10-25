@@ -5331,6 +5331,102 @@ fn reserved_shell_survives_parent_done_until_shell_done() {
     assert!(!app.shell.active_ids().contains(&id));
 }
 
+const USER_TOOL_PROBE: &str = "ut_probe";
+
+fn register_user_tool_probe() {
+    use maki_agent::tools::test_support::mock_tool_with_schema;
+    use maki_agent::tools::{ToolRegistry, ToolAudience, ToolSource};
+
+    let _ = ToolRegistry::global().register(
+        mock_tool_with_schema(
+            USER_TOOL_PROBE,
+            ToolAudience::MAIN,
+            serde_json::json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"}
+                }
+            }),
+        ),
+        ToolSource::Lua {
+            plugin: USER_TOOL_PROBE.into(),
+        },
+    );
+}
+
+#[test_case("$" ; "sigil_only")]
+#[test_case("$100 dollars" ; "prose")]
+#[test_case("not $read at start" ; "mid_line")]
+fn user_tool_prefix_text_stays_a_chat_message(text: &str) {
+    let mut app = test_app();
+    let actions = app.handle_submit(Submission {
+        text: text.to_owned(),
+        images: vec![],
+    });
+    assert!(
+        matches!(actions.into_iter().next(), Some(Action::SendMessage(_))),
+        "non-tool text must reach the agent"
+    );
+}
+
+#[test_case("$ut_probe src/main.rs", true ; "visible")]
+#[test_case("$$ut_probe src/main.rs", false ; "hidden")]
+fn user_tool_prefix_dispatches_registered_tool(text: &str, visible: bool) {
+    register_user_tool_probe();
+    let mut app = test_app();
+    let actions = app.handle_submit(Submission {
+        text: text.to_owned(),
+        images: vec![],
+    });
+    let Some(Action::UserToolCommand {
+        name, input, visible: sent_visible, ..
+    }) = actions.into_iter().next()
+    else {
+        panic!("$tool must dispatch a user tool call");
+    };
+    assert_eq!(name, USER_TOOL_PROBE);
+    assert_eq!(input, serde_json::json!({"path": "src/main.rs"}));
+    assert_eq!(sent_visible, visible);
+}
+
+#[test]
+fn user_tool_unknown_name_flashes() {
+    let mut app = test_app();
+    let actions = app.handle_submit(Submission {
+        text: "$ut_never_registered x".to_owned(),
+        images: vec![],
+    });
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn user_tool_events_render_and_release() {
+    let mut app = test_app();
+    let id = app.shell.reserve_id();
+
+    app.handle_user_tool_event(user_tool::UserToolEvent::Start {
+        id: id.clone(),
+        name: USER_TOOL_PROBE.into(),
+        summary: "src/main.rs".into(),
+        input: "{}".into(),
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 1);
+
+    app.handle_user_tool_event(user_tool::UserToolEvent::Done {
+        id: id.clone(),
+        name: USER_TOOL_PROBE.into(),
+        display: "$ ut_probe src/main.rs".into(),
+        output: "ok".into(),
+        is_error: false,
+        visible: true,
+    });
+    assert_eq!(app.chats[0].in_progress_count(), 0);
+    assert!(!app.shell.active_ids().contains(&id));
+    assert_eq!(app.shell.drain_results().len(), 1);
+}
+
 #[test]
 fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     let mut app = streaming_app_with_history();
