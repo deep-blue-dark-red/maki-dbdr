@@ -8,9 +8,9 @@ local M = {}
 local known_paths = require("maki.known_paths")
 M.project_id = known_paths.project_id
 M.known_projects = known_paths.known
-
 M.MAX_TAGS = 50
 M.MAX_FILE_BYTES = 20 * 1024
+M.DATE_FMT = "%Y-%m-%d"
 M.CAP_HINT_REWRITE = "rewrite the memory to fit under the cap"
 M.CAP_HINT_NARROW = "narrow tags or read files by path"
 M.CAP_HINT_FILTER = "pass tags=[...] to filter the list"
@@ -22,16 +22,34 @@ local SIZE_UNIT = 1024
 local DETAIL_SEP = "·"
 local TAG_STYLE = "keybind_section"
 local SIZE_STYLE = "dim"
+local DATE_PATTERN = "^%d%d%d%d%-%d%d%-%d%d$"
 local WRITE_REJECT_PREFIX = "invalid tag(s) rejected: "
 local READ_REJECT_PREFIX = "warning: ignored invalid tag(s): "
 local UNREADABLE_PREFIX = "warning: unreadable memory files: "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
+local PROJECT_ID_SUFFIX = "%-%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$"
 local COMMANDS = { "list", "read", "write", "delete" }
 local VALID_COMMANDS = {}
 for _, c in ipairs(COMMANDS) do
   VALID_COMMANDS[c] = true
+end
+
+local function today()
+  return os.date(M.DATE_FMT)
+end
+
+local function epoch_date(epoch)
+  return epoch and os.date(M.DATE_FMT, epoch) or nil
+end
+
+-- Newest first, name breaks ties; notes without any date sink to the bottom.
+local function by_recency(a, b)
+  if a.date ~= b.date then
+    return (a.date or "") > (b.date or "")
+  end
+  return a.name < b.name
 end
 
 -- Lua's bit32 is 32-bit only, so we split the 64-bit FNV-1a state into
@@ -82,9 +100,54 @@ local function file_entries(dir)
     end
   end
   table.sort(files, function(a, b)
-    return a[1] < b[1]
-  end)
+      return a[1] < b[1]
+    end)
   return files
+end
+
+-- Every dir-taking helper accepts one memories dir (string) or a list of them;
+-- a list joins the projects and prefixes file names with the project.
+local function to_dirs(scope)
+  if type(scope) == "table" then
+    return scope
+  end
+  return { scope }
+end
+
+-- The memories dir is `<project basename>-<hash>/memories`; the hash is noise
+-- in a joined list, so the label keeps only the basename.
+local function project_label(dir)
+  local id = maki.fs.basename(maki.fs.dirname(dir)) or dir
+  return (id:gsub(PROJECT_ID_SUFFIX, ""))
+end
+
+-- Joined entries carry `<project>/<name>` so same-named notes stay distinct;
+-- a single dir keeps the bare name.
+local function label_for(dir, name, multi)
+  if not multi then
+    return name
+  end
+  return project_label(dir) .. "/" .. name
+end
+
+-- All memories dirs under the state dir, current project included when it
+-- exists on disk. Sorted, so joined output is stable.
+function M.all_memory_dirs(state_dir)
+  if not state_dir then
+    return {}
+  end
+  local dirs = {}
+  for _, entry in ipairs(maki.fs.dir(maki.fs.joinpath(state_dir, "projects")) or {}) do
+    if entry[2] == "directory" then
+      local mem = maki.fs.joinpath(state_dir, "projects", entry[1], "memories")
+      local meta = maki.fs.metadata(mem)
+      if meta and meta.is_dir then
+        dirs[#dirs + 1] = mem
+      end
+    end
+  end
+  table.sort(dirs)
+  return dirs
 end
 
 -- Coerces rather than rejects: any non-alphanumeric run becomes "_".
@@ -229,6 +292,23 @@ function M.parse_frontmatter(content)
   return fm, body
 end
 
+-- Frontmatter dates are plain DATE_FMT strings; anything else is dropped so a
+-- hand-edited note can never poison the recency sort.
+function M.extract_dates(frontmatter)
+  if type(frontmatter) ~= "table" then
+    return nil, nil
+  end
+  local ctime = frontmatter.ctime
+  local mtime = frontmatter.mtime
+  if type(ctime) ~= "string" or not ctime:match(DATE_PATTERN) then
+    ctime = nil
+  end
+  if type(mtime) ~= "string" or not mtime:match(DATE_PATTERN) then
+    mtime = nil
+  end
+  return ctime, mtime
+end
+
 function M.extract_tags(frontmatter)
   if type(frontmatter) ~= "table" then
     return nil
@@ -244,37 +324,41 @@ function M.extract_tags(frontmatter)
   return #out > 0 and out or nil
 end
 
+-- The note's index entry: frontmatter tags (stem fallback), a read warning,
+-- and the frontmatter mtime for recency ordering.
 function M.tags_for_file(path, content, read_err)
+  local fm
   if content then
-    local tags = M.extract_tags(M.parse_frontmatter(content))
-    if tags then
-      return tags, nil
-    end
+    fm = M.parse_frontmatter(content)
   end
-  return { stem_tag(path) }, read_err or (content == nil and "read error" or nil)
+  local _, mtime = M.extract_dates(fm)
+  local tags = M.extract_tags(fm)
+  if tags then
+    return tags, nil, mtime
+  end
+  return { stem_tag(path) }, read_err or (content == nil and "read error" or nil), mtime
 end
 
-local function read_tags(dir, name)
+local function read_note(dir, name)
   local content, read_err = maki.fs.read(maki.fs.joinpath(dir, name))
-  local tags, warn = M.tags_for_file(name, content, read_err and tostring(read_err))
-  return tags, warn
+  return M.tags_for_file(name, content, read_err and tostring(read_err))
 end
 
--- Tags per file, keyed on mtime and size so unchanged files are never re-read.
+-- Tags and mtime per file, keyed on mtime and size so unchanged files are never re-read.
 -- Unreadable files are never cached: a transient failure cannot pin stale stem tags.
 local tag_cache = {}
 
-local function cached_tags(dir, name, size, mtime)
+local function cached_meta(dir, name, size, fs_mtime)
   local key = maki.fs.joinpath(dir, name)
   local c = tag_cache[key]
-  if c and mtime and c.mtime == mtime and c.size == size then
-    return c.tags
+  if c and fs_mtime and c.fs_mtime == fs_mtime and c.size == size then
+    return c.tags, nil, c.mtime
   end
-  local tags, warn = read_tags(dir, name)
-  if not warn and mtime then
-    tag_cache[key] = { mtime = mtime, size = size, tags = tags }
+  local tags, warn, mtime = read_note(dir, name)
+  if not warn and fs_mtime then
+    tag_cache[key] = { fs_mtime = fs_mtime, size = size, tags = tags, mtime = mtime }
   end
-  return tags, warn
+  return tags, warn, mtime
 end
 
 local function has_wanted_tag(tags, want)
@@ -286,38 +370,41 @@ local function has_wanted_tag(tags, want)
   return false
 end
 
-local function matching_entries(dir, want)
+local function matching_entries(scope, want)
+  local dirs = to_dirs(scope)
+  local multi = #dirs > 1
   local matches, warnings = {}, {}
-  for _, f in ipairs(file_entries(dir)) do
-    local name, size, mtime = f[1], f[2], f[3]
-    local tags, warn = cached_tags(dir, name, size, mtime)
-    if warn then
-      warnings[#warnings + 1] = name .. ": " .. warn
-    elseif has_wanted_tag(tags, want) then
-      local content, read_err = maki.fs.read(maki.fs.joinpath(dir, name))
-      if content then
-        matches[#matches + 1] = { name = name, content = content, size = size }
-      else
-        warnings[#warnings + 1] = name .. ": " .. tostring(read_err)
+  for _, dir in ipairs(dirs) do
+    for _, f in ipairs(file_entries(dir)) do
+      local name, size, fs_mtime = f[1], f[2], f[3]
+          matches[#matches + 1] =
+            { name = name, label = label_for(dir, name, multi), content = content, size = size, date = mtime or epoch_date(fs_mtime) }
+        else
+          warnings[#warnings + 1] = name .. ": " .. tostring(read_err)
+        end
       end
     end
   end
+  table.sort(matches, by_recency)
   return matches, warnings
 end
 
--- Name-sorted, tags in frontmatter order, and unreadable files land in warnings
--- instead of the list.
-function M.files_with_tags(dir)
+-- Recency-sorted (frontmatter mtime; the file mtime covers legacy notes without
+-- dates), tags in frontmatter order, and unreadable files land in warnings
+-- instead of the list. {label} prefixes the project when several dirs are joined.
+function M.files_with_tags(scope)
+  local dirs = to_dirs(scope)
+  local multi = #dirs > 1
   local files, warnings = {}, {}
-  for _, f in ipairs(file_entries(dir)) do
-    local name, size = f[1], f[2]
-    local tags, warn = cached_tags(dir, name, size, f[3])
-    if warn then
-      warnings[#warnings + 1] = name .. ": " .. warn
-    else
-      files[#files + 1] = { name = name, size = size, tags = tags }
+  for _, dir in ipairs(dirs) do
+    for _, f in ipairs(file_entries(dir)) do
+      local name, size, fs_mtime = f[1], f[2], f[3]
+        files[#files + 1] =
+          { name = name, label = label_for(dir, name, multi), dir = dir, size = size, tags = tags, date = mtime or epoch_date(fs_mtime) }
+      end
     end
   end
+  table.sort(files, by_recency)
   return files, warnings
 end
 
@@ -332,7 +419,7 @@ function M.group_by_tag(files)
         by_tag[t] = g
         groups[#groups + 1] = g
       end
-      g.files[#g.files + 1] = { name = f.name, size = f.size }
+      g.files[#g.files + 1] = { name = f.name, label = f.label or f.name, size = f.size, date = f.date }
     end
   end
   table.sort(groups, function(a, b)
@@ -387,10 +474,35 @@ function M.format_tag_line(dir, max_tags)
   return line
 end
 
--- serde_yaml renders an empty list as an empty mapping; extract_tags treats both as empty.
-function M.encode_frontmatter(tags)
+-- serde_yaml renders an empty tag list as an empty mapping; extract_tags treats
+-- both as empty. Dates are appended by hand: serde_yaml orders and quotes
+-- mapping keys its own way, and these are always plain scalars.
+function M.encode_frontmatter(tags, ctime, mtime)
   local yaml, _ = maki.yaml.encode({ tags = tags })
-  return "---\n" .. yaml .. "---\n"
+  local out = "---\n" .. yaml
+  if ctime then
+    out = out .. "ctime: " .. ctime .. "\n"
+  end
+  if mtime then
+    out = out .. "mtime: " .. mtime .. "\n"
+  end
+  return out .. "---\n"
+end
+
+-- The dates a write stamps: created once (kept across rewrites and moves),
+-- modified every write. A legacy note without dates claims the file's mtime as
+-- its created date instead of looking written today.
+function M.stamp_dates(file_path)
+  local content = maki.fs.read(file_path)
+  local ctime
+  if content then
+    ctime = M.extract_dates(M.parse_frontmatter(content))
+  end
+  if not ctime then
+    local meta = maki.fs.metadata(file_path)
+    ctime = (meta and epoch_date(meta.mtime)) or today()
+  end
+  return ctime, today()
 end
 
 function M.cap_read_output(s, hint)
@@ -477,7 +589,7 @@ function M.format_list(dir, raw_tags)
       matched = matched + 1
       lines[#lines + 1] = g.tag .. " (" .. #g.files .. ")"
       for _, f in ipairs(g.files) do
-        lines[#lines + 1] = "  - " .. f.name .. " (" .. f.size .. " bytes)"
+        lines[#lines + 1] = "  - " .. (f.label or f.name) .. " (" .. f.size .. " bytes)" .. (f.date and (" " .. f.date) or "")
       end
       lines[#lines + 1] = ""
     end
@@ -503,7 +615,7 @@ function M.format_read(dir, raw_tags)
   local matches, read_warnings = matching_entries(dir, want)
   local parts = {}
   for _, m in ipairs(matches) do
-    parts[#parts + 1] = M.format_read_entry(m.name, m.size, m.content)
+    parts[#parts + 1] = M.format_read_entry(m.label or m.name, m.size, m.content)
   end
 
   local hint = #parts <= 1 and M.CAP_HINT_REWRITE or M.CAP_HINT_NARROW

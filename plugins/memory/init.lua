@@ -7,6 +7,14 @@ local Toast = require("maki.toast")
 
 local WRITE_TOOLS = { "write", "edit", "multiedit", "edit_lines", "insert_lines", "ast_grep_replace", "create_plugin" }
 local VIEW_PREF_FILE = "picker_view"
+local GLOBAL_PREF_FILE = "global"
+
+local opts = maki.api.register_options({
+  global = {
+    default = false,
+    desc = "Join every project's memories in the memory tool and the /memory picker.",
+  },
+})
 
 -- A toast and not a flash, because this feedback has to stay readable while
 -- the picker is still covering the screen. Kept local on purpose: claiming the
@@ -34,15 +42,54 @@ local function legacy_dir_if_exists(suffix)
   end
 end
 
+-- A preference, not project data, so like the picker view it lives with maki's
+-- other state. Absent file falls back to the plugins.memory.global default.
+local function pref_path(name)
+  local state = maki.env.state_dir()
+  return state and maki.fs.joinpath(state, "memory", name)
+end
+
+local function global_on()
+  local path = pref_path(GLOBAL_PREF_FILE)
+  local saved = path and maki.fs.read(path)
+  if saved == "on" then
+    return true
+  end
+  if saved == "off" then
+    return false
+  end
+  return opts.global == true
+end
+
+local function set_global(on)
+  local path = pref_path(GLOBAL_PREF_FILE)
+  if not path then
+    return
+  end
+  local _, err = maki.fs.mkdir(maki.fs.dirname(path), { parents = true })
+  if not err then
+    _, err = maki.fs.write(path, on and "on" or "off")
+  end
+  if err then
+    maki.log.warn("memory: cannot save the global preference to " .. path .. ": " .. tostring(err))
+  end
+end
+
 -- Notes live outside cwd, where file-write tools normally prompt; pre-allow
 -- them here so the agent can edit notes directly. Reads may come from the
--- legacy dir while writes go to the state dir, so cover both.
+-- legacy dir while writes go to the state dir, so cover both. Global memory
+-- also pre-allows the other projects' memories dirs.
 local function register_write_rules()
   local suffix = memories_path_suffix()
   local dirs = { legacy_dir_if_exists(suffix) }
   local state = maki.env.state_dir()
   if state then
     dirs[#dirs + 1] = maki.fs.joinpath(state, suffix)
+    if global_on() then
+      for _, d in ipairs(helpers.all_memory_dirs(state)) do
+        dirs[#dirs + 1] = d
+      end
+    end
   end
   for _, dir in ipairs(dirs) do
     for _, tool in ipairs(WRITE_TOOLS) do
@@ -72,6 +119,23 @@ local function resolve_dir(check_legacy)
   return maki.fs.joinpath(state, suffix)
 end
 
+-- The dirs list/read join: this project's memories alone, or every project's
+-- when global memory is on. The current dir joins even when it does not exist
+-- on disk yet, so a fresh project still sees the join.
+local function scope_dirs(dir)
+  if not global_on() then
+    return { dir }
+  end
+  local dirs = {}
+  for _, d in ipairs(helpers.all_memory_dirs(maki.env.state_dir())) do
+    if d ~= dir then
+      dirs[#dirs + 1] = d
+    end
+  end
+  dirs[#dirs + 1] = dir
+  return dirs
+end
+
 maki.api.register_prompt_hint({
   prompt = "system",
   slot = "after_instructions",
@@ -80,7 +144,7 @@ maki.api.register_prompt_hint({
     if not dir then
       return nil
     end
-    local tag_line = helpers.format_tag_line(dir, helpers.MAX_TAGS)
+    local tag_line = helpers.format_tag_line(scope_dirs(dir), helpers.MAX_TAGS)
     if not tag_line then
       return nil
     end
@@ -143,7 +207,8 @@ local function cmd_write(path, content, tags, dir, ctx)
   if tag_err then
     return nil, tag_err
   end
-  local full = helpers.encode_frontmatter(normalized) .. content
+  local ctime, mtime = helpers.stamp_dates(file_path)
+  local full = helpers.encode_frontmatter(normalized, ctime, mtime) .. content
   maki.fs.mkdir(dir, { parents = true })
   local ok, write_err = maki.fs.write(file_path, full)
   if not ok then
@@ -175,8 +240,12 @@ local function cmd_delete(path, dir)
   return "deleted " .. path
 end
 
-local function with_dir(res, dir)
-  local prefix = "dir: " .. dir .. "\n\n"
+local function with_dir(res, dir, scope)
+  local prefix = "dir: " .. dir
+  if scope and #scope > 1 then
+    prefix = prefix .. " (global memory on: joined across " .. #scope .. " projects; write/delete by path stay here)"
+  end
+  prefix = prefix .. "\n\n"
   if type(res) == "string" then
     return prefix .. res
   end
@@ -188,7 +257,9 @@ maki.api.register_tool({
   name = "memory",
   description = "Save and retrieve concise project facts across sessions. Reuse relevant tags from the system prompt. "
     .. "Update or delete stale facts. list/read return the notes directory; "
-    .. "use edit on <dir>/<path> for targeted updates.",
+    .. "use edit on <dir>/<path> for targeted updates. With global memory on, "
+    .. "list and read-by-tags join every project's notes (prefixed <project>/); "
+    .. "path-based read/write/delete stay in the current project.",
 
   schema = {
     type = "object",
@@ -244,11 +315,12 @@ maki.api.register_tool({
     end
 
     local result, err
+    local scope = scope_dirs(dir)
     if cmd == "list" then
-      result, err = helpers.format_list(dir, input.tags)
+      result, err = helpers.format_list(scope, input.tags)
     elseif cmd == "read" then
       if input.tags and #input.tags > 0 then
-        result, err = helpers.format_read(dir, input.tags)
+        result, err = helpers.format_read(scope, input.tags)
       else
         result, err = cmd_read(input.path, dir, ctx)
       end
@@ -261,7 +333,7 @@ maki.api.register_tool({
       return { llm_output = "error: " .. err, is_error = true }
     end
     if cmd == "list" or cmd == "read" then
-      return with_dir(result, dir)
+      return with_dir(result, dir, scope)
     end
     return result
   end,

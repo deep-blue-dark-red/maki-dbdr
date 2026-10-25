@@ -5,6 +5,7 @@ local safe_resolve = h.safe_resolve
 local normalize_tag = h.normalize_tag
 local parse_frontmatter = h.parse_frontmatter
 local extract_tags = h.extract_tags
+local extract_dates = h.extract_dates
 local tags_for_file = h.tags_for_file
 local format_tag_line = h.format_tag_line
 local encode_frontmatter = h.encode_frontmatter
@@ -15,6 +16,7 @@ local validate_write_tags = h.validate_write_tags
 local validate_write_size = h.validate_write_size
 local validate_input = h.validate_input
 local move_to_project = h.move_to_project
+local stamp_dates = h.stamp_dates
 
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 
@@ -54,8 +56,8 @@ local function case_tmp(name, fn)
   end)
 end
 
-local function write_mem(dir, name, tags, body)
-  maki.fs.write(maki.fs.joinpath(dir, name), encode_frontmatter(tags) .. body)
+local function write_mem(dir, name, tags, body, ctime, mtime)
+  maki.fs.write(maki.fs.joinpath(dir, name), encode_frontmatter(tags, ctime, mtime) .. body)
 end
 
 case("safe_resolve_rejects_bad_paths", function()
@@ -145,6 +147,16 @@ case_tmp("format_list_filters_by_tag_union", function(dir)
   assert(not result:find("c%.md"), "other tags filtered out")
 
   eq(format_list(dir, { "nope" }), NO_MATCH_MSG)
+end)
+
+case_tmp("format_list_shows_dates_newest_first", function(dir)
+  write_mem(dir, "a.md", { "t" }, "A", "2001-01-02", "2001-01-02")
+  write_mem(dir, "b.md", { "t" }, "B", "2099-01-02", "2099-01-02")
+
+  local result = format_list(dir)
+  local bpos = result:find("b%.md %(%d+ bytes%) 2099%-01%-02")
+  local apos = result:find("a%.md %(%d+ bytes%) 2001%-01%-02")
+  assert(bpos and apos and bpos < apos, "rows carry their mtime date, newest first")
 end)
 
 case_tmp("format_list_invalid_tags", function(dir)
@@ -474,13 +486,48 @@ case("cap_read_output_never_splits_utf8_codepoint", function()
 end)
 
 case("encode_frontmatter_round_trips", function()
-  local fm = encode_frontmatter({ "auth", "sessions" })
+  local fm = encode_frontmatter({ "auth", "sessions" }, "2026-01-02", "2026-03-04")
   assert(fm:find("^%-%-%-\n") and fm:find("\n%-%-%-\n$"), "fenced frontmatter")
-  local parsed = extract_tags(parse_frontmatter(fm .. "body"))
-  eq(parsed[1], "auth")
-  eq(parsed[2], "sessions")
+  local parsed = parse_frontmatter(fm .. "body")
+  local tags = extract_tags(parsed)
+  eq(tags[1], "auth")
+  eq(tags[2], "sessions")
+  local ctime, mtime = extract_dates(parsed)
+  eq(ctime, "2026-01-02", "dates survive the YAML round-trip")
+  eq(mtime, "2026-03-04")
 
+  local no_dates = extract_dates(parse_frontmatter(encode_frontmatter({}) .. "body"))
+  eq(no_dates, nil, "dates stay optional")
   eq(extract_tags(parse_frontmatter(encode_frontmatter({}) .. "body")), nil, "empty tags round-trip to stem fallback")
+end)
+
+case("extract_dates_drops_malformed_values", function()
+  local ctime, mtime = extract_dates({ ctime = "2026-01-02", mtime = "2026-03-04" })
+  eq(ctime, "2026-01-02")
+  eq(mtime, "2026-03-04")
+
+  local bad_c, bad_m = extract_dates({ ctime = "20260102", mtime = "not a date" })
+  eq(bad_c, nil, "wrong format is ignored")
+  eq(bad_m, nil)
+  eq((extract_dates({})), nil)
+  eq((extract_dates(nil)), nil)
+end)
+
+case_tmp("stamp_dates_keeps_ctime_across_rewrites", function(dir)
+  local path = maki.fs.joinpath(dir, "a.md")
+  local ctime, mtime = stamp_dates(path)
+  eq(ctime, os.date(h.DATE_FMT), "new note is created today")
+  eq(mtime, os.date(h.DATE_FMT))
+
+  maki.fs.write(path, "legacy note without frontmatter")
+  local legacy_ctime, legacy_mtime = stamp_dates(path)
+  eq(legacy_ctime, os.date(h.DATE_FMT), "legacy note claims the file mtime as its created date")
+  eq(legacy_mtime, os.date(h.DATE_FMT))
+
+  maki.fs.write(path, encode_frontmatter({ "t" }, "2001-01-02", "2002-03-04") .. "body")
+  local kept, bumped = stamp_dates(path)
+  eq(kept, "2001-01-02", "a rewrite keeps the original ctime")
+  eq(bumped, os.date(h.DATE_FMT), "a rewrite stamps today as mtime")
 end)
 
 case_tmp("format_read_union_headers_and_no_match", function(dir)
@@ -499,6 +546,16 @@ case_tmp("format_read_union_headers_and_no_match", function(dir)
   assert(union:find("a%.md") and union:find("b%.md") and union:find("c%.md"), "tags select the union")
 
   eq(format_read(dir, { "nope" }), NO_MATCH_MSG)
+end)
+
+case_tmp("format_read_orders_matches_newest_first", function(dir)
+  write_mem(dir, "old.md", { "t" }, "old body", "2001-01-02", "2001-01-02")
+  write_mem(dir, "new.md", { "t" }, "new body", "2099-01-02", "2099-01-02")
+
+  local out = format_read(dir, { "t" })
+  local new_pos = out:find("new%.md")
+  local old_pos = out:find("old%.md")
+  assert(new_pos and old_pos and new_pos < old_pos, "newest body first, so caps drop the stale ones")
 end)
 
 case_tmp("format_read_normalizes_request_and_stem", function(dir)
@@ -593,15 +650,26 @@ end)
 case_tmp("files_with_tags_lists_every_file_once", function(dir)
   eq(#h.files_with_tags(dir), 0, "empty dir lists nothing")
 
-  write_mem(dir, "b.md", { "gotchas", "architecture" }, "body")
-  write_mem(dir, "a.md", { "architecture" }, "longer body here")
+  write_mem(dir, "b.md", { "gotchas", "architecture" }, "body", "2001-01-02", "2001-01-02")
+  write_mem(dir, "a.md", { "architecture" }, "longer body here", "2001-01-02", "2001-01-02")
 
   local files = h.files_with_tags(dir)
   eq(#files, 2, "one entry per file, not per tag")
-  eq(files[1].name, "a.md", "name sorted")
+  eq(files[1].name, "a.md", "same mtime ties break by name")
   eq(files[2].name, "b.md")
-  eq(files[1].size, #encode_frontmatter({ "architecture" }) + #"longer body here")
+  eq(files[1].size, #encode_frontmatter({ "architecture" }, "2001-01-02", "2001-01-02") + #"longer body here")
   eq(table.concat(files[2].tags, ","), "gotchas,architecture", "frontmatter tag order is kept")
+end)
+
+case_tmp("files_with_tags_sorts_by_mtime_newest_first", function(dir)
+  write_mem(dir, "old.md", { "t" }, "old", "2001-01-02", "2001-01-02")
+  write_mem(dir, "new.md", { "t" }, "new", "2099-01-02", "2099-01-02")
+  write_mem(dir, "legacy.md", { "t" }, "legacy")
+
+  local files = h.files_with_tags(dir)
+  eq(files[1].name, "new.md")
+  eq(files[2].name, "legacy.md", "a note without dates sorts on the file mtime")
+  eq(files[3].name, "old.md", "stale notes sink")
 end)
 
 case("group_by_tag_sorts_by_count_then_name", function()
@@ -643,12 +711,15 @@ case_tmp("move_to_project_rekeys_the_note", function(dir)
   local src_mem = maki.fs.joinpath(dir, "src_mem")
   local target_root = maki.fs.joinpath(dir, "target_proj")
   maki.fs.mkdir(src_mem)
-  write_mem(src_mem, "old.md", { "gotchas" }, "the body")
+  write_mem(src_mem, "old.md", { "gotchas" }, "the body", "2001-01-02", "2002-03-04")
 
   eq(move_to_project(src_mem, "old.md", target_root, state), true)
   local content = maki.fs.read(maki.fs.joinpath(state, "projects", h.project_id(target_root), "memories", "old.md"))
   assert(content:find("the body"), "body should survive the move")
   assert(content:find("gotchas"), "frontmatter should survive the move")
+  local ctime, mtime = extract_dates(parse_frontmatter(content))
+  eq(ctime, "2001-01-02", "a move must not change ctime")
+  eq(mtime, "2002-03-04", "a move must not change mtime")
   assert(not maki.fs.metadata(maki.fs.joinpath(src_mem, "old.md")), "source should be gone")
 end)
 
