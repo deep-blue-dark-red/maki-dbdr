@@ -379,7 +379,7 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 | Logs | `~/.local/logs/maki/` | `%APPDATA%\maki\` |
 | Cache | `~/.cache/maki/` | `%LOCALAPPDATA%\maki\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
+Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, custom tools, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
 
 `~/.config/maki/` is still read as a legacy fallback, so files saved there by older versions keep working; anything maki writes lands in `~/.maki/`.
 
@@ -409,5 +409,13 @@ The `memory` tool and `/memory` command store small Markdown notes under the sta
 `…/state/maki/projects/<project-id>/memories/`
 
 (Linux/macOS: `~/.local/state/maki/…`; Windows: `%APPDATA%\maki\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
+
+## Custom tools
+
+The `custom_tools` tool and `/custom_tools` command keep an index of executable helper scripts, scoped per project. The scripts themselves (bash, python, or any language) live wherever you build them in the project tree; only the index — paths, tags, descriptions — is stored under the state directory:
+
+`…/state/maki/projects/<project-id>/custom_tools/`
+
+Register a tool only when it saves tokens and will be reused in this or later sessions. Each one must run on the host from bash, support `--help`, and document its arguments; any language works. The picker can open, edit, or unregister tools; deleting a registration never deletes the file.
 
 Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).

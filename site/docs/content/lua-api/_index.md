@@ -4057,6 +4057,61 @@ local report, err = maki.session.summary(id, { diff_lines = 40 })
 
 ---
 
+### `maki.session.subtasks()` {#maki-session-subtasks}
+
+```lua
+maki.session.subtasks({source})
+```
+
+Lists the subtasks (subagents) recorded in a stored transcript, in display
+order and 0-based like a session position.
+
+**Parameters:**
+
+- `{source}` (`string`) Session id, or a transcript path.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, model, messages, files, added, removed, task}`, or nil and an error.
+
+**Example:**
+
+```lua
+local tasks = maki.session.subtasks(id)
+print(tasks[1].name, tasks[1].added, tasks[1].removed)
+```
+
+---
+
+### `maki.session.subtask()` {#maki-session-subtask}
+
+```lua
+maki.session.subtask({source}, {opts})
+```
+
+Renders one subtask of a stored transcript, or searches every subtask's
+messages when `query` is given and `index` is omitted.
+
+**Parameters:**
+
+- `{source}` (`string`) Session id, or a transcript path.
+- `{opts}` (`table`) Options:
+  - `index` (`integer?`) 0-based subtask; required without `query`.
+  - `format` (`string?`) `"outline"` (default), `"summary"` or `"conversation"`.
+  - `query` (`string?`) regex matched against text, tool calls and tool results.
+  - `diff` (`boolean?`) outline/summary: include the subtask's net diff (default false).
+  - `diff_lines` (`integer?`) outline/summary: cap each file's diff.
+  - `limit` (`integer?`) query: matches per subtask (default 20).
+
+**Returns:** (`string|nil`, `string|nil`) Rendered text, or nil and an error.
+
+**Example:**
+
+```lua
+local outline = maki.session.subtask(id, { index = 0, format = "summary" })
+local hits = maki.session.subtask(id, { query = "cache" })
+```
+
+---
+
 ### `maki.session.focus()` {#maki-session-focus}
 
 ```lua
@@ -5859,6 +5914,30 @@ maki.ui.flash("Copied to clipboard!")
 
 ---
 
+### `maki.ui.copy()` {#maki-ui-copy}
+
+```lua
+maki.ui.copy({text})
+```
+
+Copies {text} to the system clipboard, falling back to OSC 52 when the
+native clipboard is unavailable, so it also works over SSH in a terminal
+that supports it.
+
+**Parameters:**
+
+- `{text}` (`string`) Text to copy.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+
+**Example:**
+
+```lua
+local ok, err = maki.ui.copy("hello")
+```
+
+---
+
 ### `maki.ui.action()` {#maki-ui-action}
 
 ```lua
@@ -6098,6 +6177,29 @@ host re-places it every frame, so it follows wraps and resizes.
 ```lua
 local st = maki.ui.input()
 local before = st.text:sub(1, st.cursor)
+```
+
+---
+
+### `maki.ui.input_history()` {#maki-ui-input_history}
+
+```lua
+maki.ui.input_history()
+```
+
+Reads the chat input's recall history: the prompts the up and down keys
+walk, newest first.
+
+The list belongs to the focused tab and follows `/cd`, since history is
+per project. It holds submitted prompts, not the draft in the box now.
+
+**Returns:** (`table|nil`, `string|nil`) Array of prompt strings, or nil and an error.
+
+**Example:**
+
+```lua
+local entries = maki.ui.input_history()
+if entries and #entries > 0 then print(entries[1]) end
 ```
 
 ---
@@ -6909,6 +7011,11 @@ function ListPicker.render_header(win, lines, input, prefix, inner)
 --   key: function(item) -> string|nil, a row's identity. Rows sharing the
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
+--   filter: function(items, query) -> filtered, indices, replaces the built-in
+--     word-substring filter. {indices} are 1-based positions in {items}, so
+--     {event.index} still names the original row. A returned item table may
+--     carry { highlights = { {start, stop}, ... } }, ascending 1-based byte
+--     ranges into its label, to show what matched instead of the query
 --   refresh: function() -> items|nil, polled every {refresh_ms} (default 500)
 --     while the picker is open so rows track a changing source. Returning nil
 --     skips the swap, so callers re-build rows only when something changed

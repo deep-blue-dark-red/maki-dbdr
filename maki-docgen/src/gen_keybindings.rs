@@ -24,7 +24,7 @@ const LUA_CONTEXT_BINDS: &[(&str, &str, &str)] = &[
 
 // Built-in plugins own these globally, so they never reach `KEYBINDS`.
 const PLUGIN_BINDS: &[(&str, &str)] = &[
-    ("`Ctrl+P`", "Browse sessions"),
+    ("`Ctrl+P`", "Input history"),
     ("`Ctrl+X`", "Open tasks"),
     ("`Ctrl+T`", "Thinking effort"),
     ("`Ctrl+G`", "Inspect background jobs"),
@@ -225,6 +225,11 @@ fn write_overrides(out: &mut String) {
         "These are input conventions, not remappable key rows:\n\n\
          - Prefix a line with `!` to run a shell command yourself (5 minute \
          timeout). Use `!!` to hide the command and its output from the agent.\n\
+         - Prefix a line with `$` to call a tool yourself, the same tools the \
+         agent uses (`$grep TODO`, `$read src/main.rs`). Arguments are \
+         `key=value` pairs or a JSON object, and bare values fill the tool's \
+         string parameters in order. `$$` hides the call and its output from \
+         the agent.\n\
          - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
          model supports vision. You can also paste image file paths.\n\
          - Middle-click inserts the PRIMARY selection, the same text \

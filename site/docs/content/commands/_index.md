@@ -49,6 +49,7 @@ Type `/` in the input box to open the command palette.
 | `/plugins` | Enable or disable built-in Lua plugins |
 | `/rewind` | Show rewind menu to delete turns |
 | `/aa_scores` | Refresh the cached Artificial Analysis intelligence scores |
+| `/custom_tools` | View, paste, edit, and unregister custom tools |
 | `/memory` | View, edit, move, and delete memory files |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
@@ -57,7 +58,7 @@ Type `/` in the input box to open the command palette.
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete, and `→` opens the selected session's outline (`←` goes back, `j`/`k` flip through the other sessions' outlines without changing the selection).
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete, and `→` opens the selected session's outline (`←` goes back, `j`/`k` flip through the other sessions' outlines without changing the selection, `Ctrl+E` exports the outline to the clipboard or a file).
 
 ## Modes and toggles
 
@@ -69,6 +70,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: one-shot side question with no tools and no history pollution.
 - **`/memory`**: open the memory file picker (view / edit / delete). See the `memory` tool under [Tools](/docs/tools/).
+- **`/custom_tools`**: open the custom tools picker (view / paste / edit / unregister). See the `custom_tools` tool under [Tools](/docs/tools/).
 
 ## Custom commands
 

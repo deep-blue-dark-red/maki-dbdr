@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 26 built-in tools in this reference (25 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -245,6 +245,20 @@ Save and retrieve concise project facts across sessions. Reuse relevant tags fro
 | `content` | string | no | Body for write (frontmatter added automatically). |
 | `path` | string | no | Relative path, e.g. 'architecture.md'. |
 | `tags` | array | no | snake_case tags. Filter for list/read; assigned on write (defaults to filename stem). |
+
+### `custom_tools` {#custom_tools}
+
+Persist helper tools across sessions: scripts (bash, python) or small projects in any language, built wherever you like inside the project with write/edit, then registered here so later sessions can find and run them from bash. When you are about to write a script for a task you may face again (project-specific build/test/search/git chores), build it in the project, register it once, and reuse it instead of reinventing it. Before writing a new helper, `list` existing ones to avoid duplicates; `info` shows metadata and help without the source; `read` returns the source. A file tool must run from bash, support `--help`, and document its arguments. A command tool is defined by its `body` and needs no project file. Register one only when it saves tokens and will be reused in later sessions or more than three times in this session; do not build tools for their own sake. list: optional tags, query, and group_by='tag'; returns one row per tool by default. info: path, tags, or query; returns description, tags, and help or the command body without the source. read: path or tags; returns source or command body. write: registers an existing project file (path relative to the project root); omitted tags are derived from the path and an omitted description from the leading comment; it verifies `--help` and warns on failure. Pass `body` to define a command tool instead: the body is a shell command and no project file is required. Re-registering updates tags/description/body without re-sending the file. delete: unregisters; the file stays. Edit a registered tool directly with write/edit; re-register only to change tags or description.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `body` | string | no | write: shell command defining a command tool; no project file is required. Omit to keep an existing body or register a file. |
+| `command` | string | yes | Action name only: list, read, info, write, or delete. Pass arguments in separate fields. list: optional tags, query, and group_by; one row per tool by default. read: tags (all matching sources) or path (one tool); tags win. info: path, tags, or query; metadata and help or the command body without the source. write: registers an existing project file, defines a command tool when body is set, or updates its tags/description/body. delete: unregisters; the file stays. |
+| `description` | string | no | One-line summary of what the tool does and when to use it. Optional on first write: derived from the file's leading comment when omitted. |
+| `group_by` | string | no | list: 'tool' (default) shows one row per tool; 'tag' groups rows under tag sections. |
+| `path` | string | no | Path relative to the project root, e.g. 'scripts/commit-helper.sh'. |
+| `query` | string | no | list/info: case-insensitive substring filter over path, description, and tags. |
+| `tags` | array | no | snake_case categories. Filter for list/read/info; derived from the path when omitted on write. |
 
 ### `skill` {#skill}
 

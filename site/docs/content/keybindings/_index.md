@@ -105,7 +105,7 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 
 | Key | Action |
 |-----|--------|
-| `Ctrl+P` | Browse sessions |
+| `Ctrl+P` | Input history |
 | `Ctrl+X` | Open tasks |
 | `Ctrl+T` | Thinking effort |
 | `Ctrl+G` | Inspect background jobs |
@@ -148,5 +148,6 @@ The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 These are input conventions, not remappable key rows:
 
 - Prefix a line with `!` to run a shell command yourself (5 minute timeout). Use `!!` to hide the command and its output from the agent.
+- Prefix a line with `$` to call a tool yourself, the same tools the agent uses (`$grep TODO`, `$read src/main.rs`). Arguments are `key=value` pairs or a JSON object, and bare values fill the tool's string parameters in order. `$$` hides the call and its output from the agent.
 - `Ctrl+V` pastes an image from the clipboard into the prompt when the model supports vision. You can also paste image file paths.
 - Middle-click inserts the PRIMARY selection, the same text middle-click pastes in a shell. Linux only, since other platforms have no PRIMARY selection. On Wayland the compositor must support it.
