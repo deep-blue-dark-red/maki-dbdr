@@ -435,8 +435,3 @@ maki.api.register_tool({
   header = header,
   restore = restore,
 })
-
-maki.api.register_prompt_hint({
-  slot = "efficient_tools",
-  content = "code_execution",
-})

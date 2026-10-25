@@ -160,7 +160,6 @@ pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CL
 - Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. **never** use bash echo or other command-line tools to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
 - **never** create files unless absolutely necessary. **always** prefer editing existing files. Use /tmp/maki/" if necessary"#;
 
-const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "outline", "list", "code_execution", "subtask"];
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
 
 /// Singleton: alphabetically last plugin wins, discarding all prior content
@@ -183,6 +182,8 @@ pub enum Slot {
     Identity,
     Tone,
     ToolUsage,
+    /// Deprecated: still accepted from plugins and still stripped from custom
+    /// templates, but no prompt exposes the marker and its content is ignored.
     EfficientTools,
     Conventions,
     AfterInstructions,
@@ -293,7 +294,7 @@ impl PromptId {
 
 fn render_slot(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> String {
     if slot == Slot::EfficientTools {
-        return render_efficient_tools(slots, prompt);
+        return String::new();
     }
     let entries = slots.get(prompt, slot);
     match slot.kind() {
@@ -317,17 +318,6 @@ fn render_slot(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> String {
     }
 }
 
-fn render_efficient_tools(slots: &ResolvedSlots, prompt: PromptId) -> String {
-    let extras = slots.get(prompt, Slot::EfficientTools);
-    let names = NATIVE_EFFICIENT_TOOLS
-        .iter()
-        .copied()
-        .chain(extras.iter().map(|e| e.content.as_str()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("Most efficient tools: {names}.")
-}
-
 /// Fill each `{{slot}}` marker in the template with its rendered content and
 /// drop the project instructions (AGENTS.md and friends) into `{{instructions}}`.
 pub fn assemble(id: PromptId, slots: &ResolvedSlots, instructions: &str) -> String {
@@ -343,6 +333,12 @@ fn fill_template(
     slots: &ResolvedSlots,
     instructions: &str,
 ) -> String {
+    if out.contains(Slot::EfficientTools.marker()) {
+        tracing::warn!(
+            "{} is deprecated and ignored",
+            Slot::EfficientTools.marker()
+        );
+    }
     for slot in Slot::iter() {
         out = fill_marker(&out, slot.marker(), &render_slot(slots, id, slot));
     }
@@ -365,9 +361,6 @@ fn fill_marker(template: &str, marker: &str, content: &str) -> String {
 mod tests {
     use super::*;
     use test_case::test_case;
-
-    const NATIVE_EFFICIENT_LINE: &str =
-        "Most efficient tools: batch, outline, list, code_execution, subtask";
 
     fn slots(prompt: PromptId, entries: &[(Slot, &str)]) -> ResolvedSlots {
         let mut slots = ResolvedSlots::default();
@@ -435,19 +428,39 @@ mod tests {
     }
 
     #[test]
-    fn empty_slots_fill_and_subagents_emit_native_line() {
-        let out = assemble(PromptId::System, &ResolvedSlots::default(), "");
-        assert!(out.starts_with("You are Maki"));
-        assert!(
-            !out.contains("{{"),
-            "unfilled marker left in output:\n{out}"
-        );
-        assert!(
-            !out.contains(NATIVE_EFFICIENT_LINE),
-            "efficient line was dropped from the default prompt:\n{out}"
-        );
-        let sub = assemble(PromptId::General, &ResolvedSlots::default(), "");
-        assert!(sub.contains(&format!("{NATIVE_EFFICIENT_LINE}.")));
+    fn all_prompts_carry_static_tool_guidance() {
+        for prompt in PromptId::ALL {
+            let out = assemble(*prompt, &ResolvedSlots::default(), "");
+            assert!(
+                !out.contains("{{"),
+                "unfilled marker left in output:\n{out}"
+            );
+            for section in ["# Search — Pick by What You Know", "# Read", "# Execute"] {
+                assert!(
+                    out.contains(section),
+                    "{prompt}: missing static section {section}:\n{out}"
+                );
+            }
+            assert!(
+                out.contains("`rg` via **bash**"),
+                "{prompt}: missing rg guidance:\n{out}"
+            );
+        }
+        let general = assemble(PromptId::General, &ResolvedSlots::default(), "");
+        assert!(general.starts_with("You are Maki"));
+        assert!(general.contains("# Edit"));
+        assert!(!general.contains("**subtask**"));
+        assert!(!assemble(PromptId::Research, &ResolvedSlots::default(), "").contains("# Edit"));
+    }
+
+    /// Subagents have no `question` tool: they surface questions in their
+    /// result and the parent decides whether to ask the user.
+    #[test_case(PromptId::General ; "general")]
+    #[test_case(PromptId::Research ; "research")]
+    fn subagents_route_questions_to_the_parent(prompt: PromptId) {
+        let out = assemble(prompt, &ResolvedSlots::default(), "");
+        assert!(!out.contains("**question**"), "{prompt}:\n{out}");
+        assert!(out.contains("parent agent can ask"), "{prompt}:\n{out}");
     }
 
     /// One test to pin the whole System layout: every slot shows up, in order,
@@ -469,35 +482,30 @@ mod tests {
         );
     }
 
-    /// Regression: a `tool_usage` hint must land inside the `# Tool usage`
-    /// section, not be appended after the rest of the prompt.
+    /// Aggregate hints still fill their marker when a custom template keeps it.
     #[test]
-    fn tool_usage_hint_lands_inside_tool_usage_section() {
+    fn aggregate_hint_fills_its_marker() {
         const HINT: &str = "- HINT_LINE";
         let s = slots(PromptId::General, &[(Slot::ToolUsage, HINT)]);
-        let out = assemble(PromptId::General, &s, "");
-        let hint = at(&out, HINT);
-        assert!(
-            at(&out, "# Tool usage") < hint,
-            "hint before its section:\n{out}"
+        let out = fill_template(
+            "# Tool usage\n{{tool_usage}}\n# Conventions\n{{conventions}}".to_string(),
+            PromptId::General,
+            &s,
+            "",
         );
-        assert!(
-            hint < at(&out, "# Conventions"),
-            "hint leaked past section:\n{out}"
-        );
+        assert!(out.contains(&format!("# Tool usage\n{HINT}\n# Conventions")));
     }
 
     #[test]
-    fn efficient_tools_extras_join_native_list() {
-        let s = slots(
-            PromptId::General,
-            &[
-                (Slot::EfficientTools, "mcp_git"),
-                (Slot::EfficientTools, "foo"),
-            ],
+    fn deprecated_efficient_tools_renders_nothing() {
+        let s = slots(PromptId::System, &[(Slot::EfficientTools, "index")]);
+        let out = fill_template(
+            "A\n{{efficient_tools}}\nB".to_string(),
+            PromptId::System,
+            &s,
+            "",
         );
-        let out = assemble(PromptId::General, &s, "");
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, mcp_git, foo.")));
+        assert_eq!(out, "A\nB");
     }
 
     #[test]
@@ -510,10 +518,9 @@ mod tests {
         assert!(at(&out, "FIRST") < at(&out, "SECOND"));
     }
 
-    /// Only System carries AfterInstructions, so the same content shows up there
-    /// but never leaks into the subagent prompts.
+    /// General mirrors the main prompt, so only the read-only research variant lacks after-instructions.
     #[test]
-    fn after_instructions_only_reaches_system() {
+    fn after_instructions_reaches_full_prompts_only() {
         let mut s = ResolvedSlots::default();
         for &pid in PromptId::ALL {
             s.insert(
@@ -527,11 +534,11 @@ mod tests {
         }
         assert!(assemble(PromptId::System, &s, "").contains("AFTER"));
         assert!(!assemble(PromptId::Research, &s, "").contains("AFTER"));
-        assert!(!assemble(PromptId::General, &s, "").contains("AFTER"));
+        assert!(assemble(PromptId::General, &s, "").contains("AFTER"));
     }
 
     #[test]
-    fn research_drops_conventions_but_keeps_efficient_extras() {
+    fn research_drops_conventions_and_efficient_extras() {
         let s = slots(
             PromptId::Research,
             &[
@@ -541,15 +548,15 @@ mod tests {
         );
         let out = assemble(PromptId::Research, &s, "");
         assert!(!out.contains("DROPPED"));
-        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, EXTRA.")));
+        assert!(!out.contains("EXTRA"));
     }
 
     #[test_case(PromptId::System, Slot::ToolUsage, false ; "system_no_tool_usage")]
     #[test_case(PromptId::System, Slot::EfficientTools, false ; "system_no_efficient")]
-    #[test_case(PromptId::General, Slot::ToolUsage, true ; "general_tool_usage")]
-    #[test_case(PromptId::General, Slot::EfficientTools, true ; "general_efficient")]
-    #[test_case(PromptId::Research, Slot::ToolUsage, true ; "research_tool_usage")]
-    #[test_case(PromptId::Research, Slot::EfficientTools, true ; "research_efficient")]
+    #[test_case(PromptId::General, Slot::ToolUsage, false ; "general_no_tool_usage")]
+    #[test_case(PromptId::General, Slot::EfficientTools, false ; "general_no_efficient")]
+    #[test_case(PromptId::Research, Slot::ToolUsage, false ; "research_no_tool_usage")]
+    #[test_case(PromptId::Research, Slot::EfficientTools, false ; "research_no_efficient")]
     #[test_case(PromptId::System, Slot::Conventions, true ; "system_conventions")]
     #[test_case(PromptId::System, Slot::AfterInstructions, true ; "system_after")]
     #[test_case(PromptId::System, Slot::Identity, true ; "system_identity")]
@@ -558,14 +565,15 @@ mod tests {
     #[test_case(PromptId::Research, Slot::AfterInstructions, false ; "research_no_after")]
     #[test_case(PromptId::Research, Slot::Identity, false ; "research_no_identity")]
     #[test_case(PromptId::Research, Slot::Tone, false ; "research_no_tone")]
-    #[test_case(PromptId::General, Slot::AfterInstructions, false ; "general_no_after")]
-    #[test_case(PromptId::General, Slot::Identity, false ; "general_no_identity")]
-    #[test_case(PromptId::General, Slot::Tone, false ; "general_no_tone")]
+    #[test_case(PromptId::General, Slot::AfterInstructions, true ; "general_after")]
+    #[test_case(PromptId::General, Slot::Identity, true ; "general_identity")]
+    #[test_case(PromptId::General, Slot::Tone, true ; "general_tone")]
     fn has_slot(prompt: PromptId, slot: Slot, expected: bool) {
         assert_eq!(prompt.has_slot(slot), expected);
     }
 
     #[test_case("after_instructions", Some(Slot::AfterInstructions) ; "valid_slot")]
+    #[test_case("efficient_tools", Some(Slot::EfficientTools) ; "deprecated_slot_still_parses")]
     #[test_case("tool_usagee", None ; "typo_slot")]
     #[test_case("identity", Some(Slot::Identity) ; "identity_slot")]
     #[test_case("tone", Some(Slot::Tone) ; "tone_slot")]
@@ -637,17 +645,17 @@ mod tests {
     }
 
     #[test]
-    fn identity_only_in_system_not_subagents() {
+    fn identity_only_in_full_prompts() {
         assert!(PromptId::System.has_slot(Slot::Identity));
         assert!(!PromptId::Research.has_slot(Slot::Identity));
-        assert!(!PromptId::General.has_slot(Slot::Identity));
+        assert!(PromptId::General.has_slot(Slot::Identity));
     }
 
     #[test]
-    fn tone_only_in_system_not_subagents() {
+    fn tone_only_in_full_prompts() {
         assert!(PromptId::System.has_slot(Slot::Tone));
         assert!(!PromptId::Research.has_slot(Slot::Tone));
-        assert!(!PromptId::General.has_slot(Slot::Tone));
+        assert!(PromptId::General.has_slot(Slot::Tone));
     }
 
     #[test]

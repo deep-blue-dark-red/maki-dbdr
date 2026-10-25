@@ -16,17 +16,6 @@ local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  prompt = { "research", "general" },
-  content = '- Use **semble** for "How does X work?" questions or when you don\'t know the right names. Use **grep** for known symbols.',
-})
-
-maki.api.register_prompt_hint({
-  slot = "efficient_tools",
-  content = "semble",
-})
-
 maki.api.register_tool({
   name = "semble",
   description = [[Search code semantically using semble.

@@ -159,6 +159,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/memory"),
     },
     BundledPlugin {
+        name: "custom_tools",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/custom_tools"),
+    },
+    BundledPlugin {
         name: "subtask",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/subtask"),
     },
@@ -173,6 +177,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "view_image",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/view_image"),
+    },
+    BundledPlugin {
+        name: "input_history",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/input_history"),
     },
     BundledPlugin {
         name: "lib",
@@ -1467,7 +1475,7 @@ mod tests {
         let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "hinted",
-            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "live" })"#,
+            r#"maki.api.register_prompt_hint({ slot = "conventions", content = "live" })"#,
         )
         .unwrap();
         let handle = host.event_handle();
@@ -1475,13 +1483,13 @@ mod tests {
 
         let slots = handle.collect_prompt_slots();
         assert!(
-            contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
+            contents(&slots, PromptId::System, Slot::Conventions).is_empty(),
             "dead host must yield defaults, not real slots"
         );
 
         drop(host);
         let slots = handle.collect_prompt_slots();
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
 
     /// Load `src` as one plugin, collect resolved slots.
@@ -1989,17 +1997,17 @@ mod tests {
             "cb",
             r#"
             maki.api.register_prompt_hint({
-                slot = "tool_usage",
+                slot = "conventions",
                 prompt = "general",
                 content = function() return "from_cb" end,
             })
             "#,
         );
         assert_eq!(
-            contents(&slots, PromptId::General, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::Conventions),
             ["from_cb"]
         );
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
 
     #[test]
@@ -2008,17 +2016,17 @@ mod tests {
             "nil_cb",
             r#"
             maki.api.register_prompt_hint({
-                slot = "tool_usage",
+                slot = "conventions",
                 content = function() return nil end,
             })
             "#,
         );
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
 
-    /// A hint with no `prompt` is a default: it lands on every prompt that has the slot.
+    /// Deprecated slots stay accepted at load time but never resolve.
     #[test]
-    fn static_no_prompt_lands_on_all_prompts_with_slot() {
+    fn deprecated_efficient_tools_hint_is_ignored() {
         let (_host, slots) = slots_from(
             "static_hint",
             r#"
@@ -2028,10 +2036,9 @@ mod tests {
             })
             "#,
         );
-        for pid in [PromptId::Research, PromptId::General] {
-            assert_eq!(contents(&slots, pid, Slot::EfficientTools), ["index"]);
+        for pid in PromptId::ALL {
+            assert!(contents(&slots, *pid, Slot::EfficientTools).is_empty());
         }
-        assert!(contents(&slots, PromptId::System, Slot::EfficientTools).is_empty());
     }
 
     /// `conventions` lives on system and general but not research, so a default
@@ -2081,21 +2088,21 @@ mod tests {
             "list",
             r#"
             maki.api.register_prompt_hint({
-                slot = "tool_usage",
-                prompt = { "research", "general" },
+                slot = "conventions",
+                prompt = { "system", "general" },
                 content = "shared",
             })
             "#,
         );
         assert_eq!(
-            contents(&slots, PromptId::Research, Slot::ToolUsage),
+            contents(&slots, PromptId::System, Slot::Conventions),
             [CONTENT]
         );
         assert_eq!(
-            contents(&slots, PromptId::General, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::Conventions),
             [CONTENT]
         );
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::Research, Slot::Conventions).is_empty());
     }
 
     #[test]
@@ -2105,7 +2112,7 @@ mod tests {
             host.load_source(
                 plugin,
                 r#"
-                maki.api.register_prompt_hint({ slot = "tool_usage", content = "from_PLUGIN" })
+                maki.api.register_prompt_hint({ slot = "conventions", content = "from_PLUGIN" })
                 "#
                 .replace("PLUGIN", plugin)
                 .as_str(),
@@ -2114,7 +2121,7 @@ mod tests {
         }
         let slots = host.event_handle().collect_prompt_slots();
         assert_eq!(
-            contents(&slots, PromptId::General, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::Conventions),
             ["from_aaa", "from_zzz"],
             "entries must be ordered by plugin name"
         );
@@ -2127,8 +2134,8 @@ mod tests {
         host.load_source(
             "multi",
             r#"
-            maki.api.register_prompt_hint({ slot = "tool_usage", prompt = "research", content = "usage" })
-            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "conv" })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "general", content = "conv" })
+            maki.api.set_prompt({ slot = "identity", prompt = "system", content = "ident" })
             "#,
         )
         .unwrap();
@@ -2136,18 +2143,18 @@ mod tests {
 
         let slots = handle.collect_prompt_slots();
         assert_eq!(
-            contents(&slots, PromptId::Research, Slot::ToolUsage),
-            ["usage"]
+            contents(&slots, PromptId::General, Slot::Conventions),
+            ["conv"]
         );
         assert_eq!(
-            contents(&slots, PromptId::System, Slot::Conventions),
-            ["conv"]
+            contents(&slots, PromptId::System, Slot::Identity),
+            ["ident"]
         );
 
         host.unload("multi").unwrap();
         let slots = handle.collect_prompt_slots();
-        assert!(contents(&slots, PromptId::Research, Slot::ToolUsage).is_empty());
-        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Conventions).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Identity).is_empty());
     }
 
     #[test_case(r#"{ slot = "nonexistent", content = "x" }"# ; "invalid_slot")]
@@ -2164,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_slot_lands_on_system_only() {
+    fn identity_slot_lands_on_full_prompts_only() {
         let (_host, slots) = slots_from(
             "id",
             r#"
@@ -2178,12 +2185,15 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Identity),
             ["Custom identity"]
         );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::Identity),
+            ["Custom identity"]
+        );
         assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
     }
 
     #[test]
-    fn tone_slot_lands_on_system_only() {
+    fn tone_slot_lands_on_full_prompts_only() {
         let (_host, slots) = slots_from(
             "tone",
             r#"
@@ -2197,8 +2207,11 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Tone),
             ["Custom tone"]
         );
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::Tone),
+            ["Custom tone"]
+        );
         assert!(contents(&slots, PromptId::Research, Slot::Tone).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Tone).is_empty());
     }
 
     #[test]
@@ -2269,17 +2282,17 @@ mod tests {
             "targeter",
             r#"
             maki.api.register_prompt_hint({
-                slot = "tool_usage",
+                slot = "conventions",
                 prompt = "general",
                 content = "General hint",
             })
             "#,
         );
         assert_eq!(
-            contents(&slots, PromptId::General, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::Conventions),
             ["General hint"]
         );
-        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
 
     #[test]
@@ -2297,7 +2310,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "hint",
-            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "HINT" })"#,
+            r#"maki.api.register_prompt_hint({ slot = "conventions", content = "HINT" })"#,
         )
         .unwrap();
         host.load_source(
@@ -2307,7 +2320,7 @@ mod tests {
         .unwrap();
         let slots = host.event_handle().collect_prompt_slots();
         assert_eq!(
-            contents(&slots, PromptId::General, Slot::ToolUsage),
+            contents(&slots, PromptId::General, Slot::Conventions),
             ["HINT"]
         );
         assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["SET"]);
