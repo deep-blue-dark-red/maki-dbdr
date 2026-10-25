@@ -18,6 +18,7 @@ use test_case::test_case;
 #[test_case("subtask", include_str!("../../plugins/subtask/tests/spec.lua") ; "subtask_plugin_spec")]
 #[test_case("thinking", include_str!("../../plugins/thinking/tests/spec.lua") ; "thinking_plugin_spec")]
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
+#[test_case("input_history", include_str!("../../plugins/input_history/tests/spec.lua") ; "input_history_plugin_spec")]
 #[test_case("cronjob", include_str!("../../plugins/cronjob/tests/spec.lua") ; "cronjob_plugin_spec")]
 #[test_case("create_plugin", include_str!("../../plugins/create_plugin/tests/spec.lua") ; "create_plugin_plugin_spec")]
 #[test_case("aa_scores", include_str!("../../plugins/aa_scores/tests/spec.lua") ; "aa_scores_plugin_spec")]

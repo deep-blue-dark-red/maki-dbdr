@@ -1705,6 +1705,27 @@ fn chat_navigation_actions() {
     assert_eq!(app.active_chat, 0);
 }
 
+/// `prev_chat`/`next_chat` are advertised binds, so the keys themselves have
+/// to move between chats, not only the builtin actions.
+#[test]
+fn chat_navigation_keys_switch_task_chats() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(subagent_msg(
+        AgentEvent::TextDelta { text: "sub".into() },
+        TASK_ID,
+        Some("research"),
+    ));
+    assert_eq!(app.chats.len(), 2);
+
+    app.update(Msg::Key(kb::NEXT_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 1);
+
+    app.update(Msg::Key(kb::PREV_CHAT.to_key_event()));
+    assert_eq!(app.active_chat, 0);
+}
+
 #[test]
 fn subagents_get_descriptive_names() {
     let mut app = test_app();
@@ -2770,6 +2791,16 @@ fn input_snapshot_offsets_are_byte_offsets() {
     let cursor = st["cursor"].as_u64().unwrap() as usize;
     assert_eq!(cursor, 6);
     assert_eq!(&text[..cursor], "日本", "the offset has to slice the value");
+}
+
+#[test]
+fn input_history_is_newest_first() {
+    let mut app = test_app();
+    for prompt in ["first", "second"] {
+        app.input_box.set_input(prompt.into());
+        app.input_box.submit();
+    }
+    assert_eq!(app.input_history(), serde_json::json!(["second", "first"]));
 }
 
 /// The line and column the cursor sits on are a slice of `text` and `cursor`,

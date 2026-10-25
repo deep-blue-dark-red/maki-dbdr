@@ -793,6 +793,17 @@ impl App {
         })
     }
 
+    /// What `maki.ui.input_history` hands to Lua: the prompts the up and down
+    /// keys recall, newest first.
+    pub(crate) fn input_history(&self) -> serde_json::Value {
+        let history = self.input_box.history();
+        let entries: Vec<&str> = (0..history.len())
+            .rev()
+            .filter_map(|i| history.get(i))
+            .collect();
+        serde_json::json!(entries)
+    }
+
     /// Refuses an edit the input has moved on from: another tab now focused, a
     /// version the buffer has left behind, or a range it has outgrown. See
     /// [`InputBox::replace_range`].
@@ -1204,6 +1215,12 @@ impl App {
         }
         if key::HELP.matches(key) {
             return Some(self.run_builtin(BuiltinAction::Help));
+        }
+        if key::PREV_CHAT.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::PrevChat));
+        }
+        if key::NEXT_CHAT.matches(key) {
+            return Some(self.run_builtin(BuiltinAction::NextChat));
         }
         if key::SCROLL_HALF_UP.matches(key) {
             let half = self.chats[self.active_chat].half_page();

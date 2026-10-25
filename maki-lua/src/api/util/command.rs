@@ -594,6 +594,7 @@ pub struct InputEdit {
 
 pub enum InputRequest {
     Read,
+    History,
     Edit(InputEdit),
 }
 
@@ -636,6 +637,10 @@ pub enum UiAction {
         cmd_rx: flume::Receiver<WinCommand>,
     },
     Flash(String),
+    Copy {
+        text: String,
+        reply_tx: flume::Sender<Result<(), String>>,
+    },
     SetWindowTitle(String),
     /// OSC 9;4 taskbar/tab progress: `state` is 0 clear, 1 normal, 2 error,
     /// 3 indeterminate, 4 paused; `percent` is 0..=100.

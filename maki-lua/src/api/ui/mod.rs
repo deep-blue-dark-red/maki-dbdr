@@ -13,10 +13,11 @@ use strum::VariantNames;
 use crate::api::keymap::accept_key;
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
-    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
+    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
+    ui_send,
 };
 use crate::api::util::convert::{opt, opt_bool};
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
 pub(crate) mod blit;
@@ -362,6 +363,27 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
     Ok(())
 }
 
+/// Copies {text} to the system clipboard, falling back to OSC 52 when the
+/// native clipboard is unavailable, so it also works over SSH in a terminal
+/// that supports it.
+///
+/// @param text string Text to copy.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error.
+/// @example
+/// local ok, err = maki.ui.copy("hello")
+#[lua_fn]
+async fn copy(
+    _lua: Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    text: String,
+) -> LuaResult<Pair<bool>> {
+    let copied = match ui_roundtrip(Some(&tx), |reply_tx| UiAction::Copy { text, reply_tx }).await {
+        Ok(result) => result.map(|()| true),
+        Err(e) => Err(e.to_owned()),
+    };
+    Ok(pair(copied))
+}
+
 /// Sets the terminal emulator's window title. Pass an empty string to
 /// clear it.
 ///
@@ -500,6 +522,24 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 #[lua_fn]
 async fn input(lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<Pair<mlua::Value>> {
     input_roundtrip(lua, &tx, InputRequest::Read).await
+}
+
+/// Reads the chat input's recall history: the prompts the up and down keys
+/// walk, newest first.
+///
+/// The list belongs to the focused tab and follows `/cd`, since history is
+/// per project. It holds submitted prompts, not the draft in the box now.
+///
+/// @return (table|nil, string|nil) Array of prompt strings, or nil and an error.
+/// @example
+/// local entries = maki.ui.input_history()
+/// if entries and #entries > 0 then print(entries[1]) end
+#[lua_fn]
+async fn input_history(
+    lua: Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+) -> LuaResult<Pair<mlua::Value>> {
+    input_roundtrip(lua, &tx, InputRequest::History).await
 }
 
 /// Replaces a byte range of the chat input, as if the user had selected it
@@ -772,8 +812,8 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title, manual set_progress, manual input, manual input_edit,
+        manual flash, manual copy, manual action, manual open_editor, manual open_win, manual set_status_hint,
+        manual set_window_title, manual set_progress, manual input, manual input_history, manual input_edit,
     ]
 }
 
@@ -787,11 +827,13 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        copy__register(&t, lua, tx.clone())?;
         set_window_title__register(&t, lua, tx.clone())?;
         set_progress__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         input__register(&t, lua, tx.clone())?;
+        input_history__register(&t, lua, tx.clone())?;
         input_edit__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
         open_win__register(&t, lua, tx, Arc::clone(&plugin))?;
     }
@@ -1748,6 +1790,7 @@ mod tests {
 
     const STALE_RANGE_ERR: &str = "stop 99 is past the end of the input (5)";
     const READ_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const HISTORY: &[&str] = &["newest prompt", "older prompt"];
     const INPUT_PLUGIN: &str = "test";
 
     /// Stands in for the focused session's input box: reads answer with a
@@ -1763,6 +1806,7 @@ mod tests {
                         "cursor": 5,
                         "version": 7,
                     })),
+                    InputRequest::History => Ok(serde_json::json!(HISTORY)),
                     InputRequest::Edit(edit_req) => edit(edit_req),
                 };
                 let _ = reply_tx.send(reply);
@@ -1814,6 +1858,14 @@ mod tests {
         assert_eq!(val["cursor"], 5);
         assert_eq!(val["version"], 7);
         assert_eq!(val["session_id"], READ_SESSION_ID);
+    }
+
+    #[test]
+    fn input_history_reports_every_entry_newest_first() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, "return ui.input_history()");
+        assert_eq!(err, None);
+        assert_eq!(val, serde_json::json!(HISTORY));
     }
 
     #[test]
@@ -1886,5 +1938,24 @@ mod tests {
         let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\""));
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
+    }
+
+    #[test]
+    fn copy_sends_the_text_and_reports_the_host_result() {
+        const TEXT: &str = "outline text";
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        std::thread::spawn(move || {
+            while let Ok(UiAction::Copy { text, reply_tx }) = rx.recv() {
+                let _ = reply_tx.send(Err(format!("cannot copy {text}")));
+            }
+        });
+        let lua = Lua::new();
+        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        lua.globals().set("ui", t).unwrap();
+        lua.globals().set("text", TEXT).unwrap();
+        let (ok, err): (mlua::Value, Option<String>) =
+            smol::block_on(lua.load("return ui.copy(text)").eval_async()).unwrap();
+        assert!(ok.is_nil());
+        assert_eq!(err.as_deref(), Some("cannot copy outline text"));
     }
 }

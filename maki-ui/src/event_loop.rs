@@ -1092,6 +1092,14 @@ impl<'t> EventLoop<'t> {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
             }
+            UiAction::Copy { text, reply_tx } => {
+                let reply = match self.focused_app().clipboard.copy_text(&text) {
+                    Ok(crate::clipboard::CopyResult::Copied) => Ok(()),
+                    Ok(crate::clipboard::CopyResult::Noop) => Err("nothing to copy".to_owned()),
+                    Err(e) => Err(e),
+                };
+                let _ = reply_tx.send(reply);
+            }
             UiAction::OpenEditor { path, reply_tx } => {
                 let code = self.open_editor(self.focused, &path);
                 let _ = reply_tx.send(code);
@@ -1895,6 +1903,15 @@ impl<'t> EventLoop<'t> {
                     cancel,
                     self.ctx.config.clone(),
                 );
+            }
+            Action::UserToolCommand {
+                id,
+                name,
+                input,
+                visible,
+            } => {
+                let rt = &mut self.sessions[idx];
+                spawn_user_tool(name, input, id, visible, rt.user_tool_tx.clone());
             }
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);
