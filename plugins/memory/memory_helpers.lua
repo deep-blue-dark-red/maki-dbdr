@@ -29,7 +29,7 @@ local UNREADABLE_PREFIX = "warning: unreadable memory files: "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
-local PROJECT_ID_SUFFIX = "%-%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$"
+local PROJECT_ID_SUFFIX = "%-%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$"
 local COMMANDS = { "list", "read", "write", "delete" }
 local VALID_COMMANDS = {}
 for _, c in ipairs(COMMANDS) do
@@ -100,8 +100,8 @@ local function file_entries(dir)
     end
   end
   table.sort(files, function(a, b)
-      return a[1] < b[1]
-    end)
+    return a[1] < b[1]
+  end)
   return files
 end
 
@@ -377,8 +377,19 @@ local function matching_entries(scope, want)
   for _, dir in ipairs(dirs) do
     for _, f in ipairs(file_entries(dir)) do
       local name, size, fs_mtime = f[1], f[2], f[3]
-          matches[#matches + 1] =
-            { name = name, label = label_for(dir, name, multi), content = content, size = size, date = mtime or epoch_date(fs_mtime) }
+      local tags, warn, mtime = cached_meta(dir, name, size, fs_mtime)
+      if warn then
+        warnings[#warnings + 1] = name .. ": " .. warn
+      elseif has_wanted_tag(tags, want) then
+        local content, read_err = maki.fs.read(maki.fs.joinpath(dir, name))
+        if content then
+          matches[#matches + 1] = {
+            name = name,
+            label = label_for(dir, name, multi),
+            content = content,
+            size = size,
+            date = mtime or epoch_date(fs_mtime),
+          }
         else
           warnings[#warnings + 1] = name .. ": " .. tostring(read_err)
         end
@@ -399,8 +410,18 @@ function M.files_with_tags(scope)
   for _, dir in ipairs(dirs) do
     for _, f in ipairs(file_entries(dir)) do
       local name, size, fs_mtime = f[1], f[2], f[3]
-        files[#files + 1] =
-          { name = name, label = label_for(dir, name, multi), dir = dir, size = size, tags = tags, date = mtime or epoch_date(fs_mtime) }
+      local tags, warn, mtime = cached_meta(dir, name, size, fs_mtime)
+      if warn then
+        warnings[#warnings + 1] = name .. ": " .. warn
+      else
+        files[#files + 1] = {
+          name = name,
+          label = label_for(dir, name, multi),
+          dir = dir,
+          size = size,
+          tags = tags,
+          date = mtime or epoch_date(fs_mtime),
+        }
       end
     end
   end
@@ -419,7 +440,7 @@ function M.group_by_tag(files)
         by_tag[t] = g
         groups[#groups + 1] = g
       end
-      g.files[#g.files + 1] = { name = f.name, label = f.label or f.name, size = f.size, date = f.date }
+      g.files[#g.files + 1] = { name = f.name, label = f.label or f.name, dir = f.dir, size = f.size, date = f.date }
     end
   end
   table.sort(groups, function(a, b)
@@ -589,7 +610,12 @@ function M.format_list(dir, raw_tags)
       matched = matched + 1
       lines[#lines + 1] = g.tag .. " (" .. #g.files .. ")"
       for _, f in ipairs(g.files) do
-        lines[#lines + 1] = "  - " .. (f.label or f.name) .. " (" .. f.size .. " bytes)" .. (f.date and (" " .. f.date) or "")
+        lines[#lines + 1] = "  - "
+          .. (f.label or f.name)
+          .. " ("
+          .. f.size
+          .. " bytes)"
+          .. (f.date and (" " .. f.date) or "")
       end
       lines[#lines + 1] = ""
     end

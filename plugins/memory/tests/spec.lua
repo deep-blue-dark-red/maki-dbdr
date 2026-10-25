@@ -745,6 +745,71 @@ case_tmp("move_to_project_rejects_bad_moves", function(dir)
   assert(maki.fs.metadata(maki.fs.joinpath(src_mem, "a.md")), "a failed move keeps the source")
 end)
 
+-- Two projects' memories dirs, named the way the state dir names them, so the
+-- joined labels exercise the project-id stripping.
+local function project_mem(state, id)
+  local mem = maki.fs.joinpath(state, "projects", id, "memories")
+  maki.fs.mkdir(mem, { parents = true })
+  return mem
+end
+
+case_tmp("all_memory_dirs_collects_every_project", function(dir)
+  local state = maki.fs.joinpath(dir, "state")
+  eq(#h.all_memory_dirs(state), 0, "no projects dir yields no dirs")
+  eq(#h.all_memory_dirs(nil), 0)
+
+  local a = project_mem(state, h.project_id("/code/alpha"))
+  local b = project_mem(state, h.project_id("/code/beta"))
+  maki.fs.mkdir(maki.fs.joinpath(state, "projects", "empty-proj"), { parents = true })
+
+  local dirs = h.all_memory_dirs(state)
+  eq(#dirs, 2, "only projects with a memories dir")
+  eq(dirs[1], a)
+  eq(dirs[2], b, "sorted, so joined output is stable")
+end)
+
+case_tmp("files_with_tags_joins_dirs_with_project_labels", function(dir)
+  local a = project_mem(dir, "alpha-0123456789abcdef")
+  local b = project_mem(dir, "beta-0123456789abcdef")
+  write_mem(a, "note.md", { "shared" }, "A body", "2001-01-02", "2001-01-02")
+  write_mem(b, "note.md", { "shared" }, "B body", "2099-01-02", "2099-01-02")
+
+  local single = h.files_with_tags(a)
+  eq(single[1].label, "note.md", "one dir keeps the bare name")
+  eq(single[1].dir, a)
+  eq(single[1].name, "note.md")
+
+  local joined = h.files_with_tags({ a, b })
+  eq(#joined, 2)
+  eq(joined[1].label, "beta/note.md", "joined labels carry the project, hash stripped")
+  eq(joined[1].dir, b)
+  eq(joined[2].label, "alpha/note.md", "same-named notes stay distinct")
+  eq(joined[2].dir, a)
+end)
+
+case_tmp("format_list_and_read_join_across_dirs", function(dir)
+  local a = project_mem(dir, "alpha-0123456789abcdef")
+  local b = project_mem(dir, "beta-0123456789abcdef")
+  write_mem(a, "a.md", { "auth" }, "A body")
+  write_mem(b, "b.md", { "auth", "sessions" }, "B body", "2099-01-02", "2099-01-02")
+  local scope = { a, b }
+
+  local list, err = format_list(scope)
+  eq(err, nil)
+  assert(list:find("auth %(2%)"), "the tag group counts both projects' files")
+  assert(list:find("beta/b%.md %(%d+ bytes%) 2099%-01%-02"), "joined rows carry the project prefix")
+  assert(list:find("alpha/a%.md"), "and each project's files are listed")
+  assert(list:find("sessions %(1%)"), "a tag from one project still groups")
+
+  local read, rerr = format_read(scope, { "auth" })
+  eq(rerr, nil)
+  assert(read:find("beta/b%.md %(%d+ bytes%) %[auth, sessions%]"), "read headers carry the project prefix")
+  assert(read:find("A body") and read:find("B body"), "bodies from every project join")
+  local bpos = read:find("beta/b%.md")
+  local apos = read:find("alpha/a%.md")
+  assert(bpos and apos and bpos < apos, "newest note first across projects")
+end)
+
 if #failures > 0 then
   error(#failures .. " case(s) failed:\n\n" .. table.concat(failures, "\n\n"))
 end
