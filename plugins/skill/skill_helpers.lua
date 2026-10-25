@@ -18,7 +18,7 @@ function M.parse_frontmatter(content)
   return fm, body
 end
 
-function M.build_skill_list(skills)
+function M.build_skill_list(skills, roots)
   local sorted = {}
   for _, s in pairs(skills) do
     sorted[#sorted + 1] = s
@@ -27,15 +27,24 @@ function M.build_skill_list(skills)
     return a.name < b.name
   end)
 
-  if #sorted == 0 then
-    return "\n\n<available_skills>\nNo skills available.\n</available_skills>"
+  local parts = {}
+  if roots and #roots > 0 then
+    local dirs = { "Skill directories:" }
+    for _, r in ipairs(roots) do
+      dirs[#dirs + 1] = "- " .. r.label .. ": " .. r.path
+    end
+    parts[#parts + 1] = table.concat(dirs, "\n")
   end
 
-  local lines = {}
-  for _, s in ipairs(sorted) do
-    lines[#lines + 1] = "- " .. s.name .. ": " .. s.description
+  if #sorted == 0 then
+    parts[#parts + 1] = "No skills available."
+    return table.concat(parts, "\n\n")
   end
-  return "\n\n<available_skills>\n" .. table.concat(lines, "\n") .. "\n</available_skills>"
+
+  for _, s in ipairs(sorted) do
+    parts[#parts + 1] = "**" .. s.name .. "**: " .. s.description
+  end
+  return table.concat(parts, "\n\n")
 end
 
 return M

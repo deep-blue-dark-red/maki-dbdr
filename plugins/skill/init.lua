@@ -9,15 +9,15 @@ local parse_frontmatter = helpers.parse_frontmatter
 local build_skill_list = helpers.build_skill_list
 
 local PROJECT_SKILL_DIRS = {
-  ".maki/skills",
-  ".claude/skills",
-  ".opencode/skills",
-  ".agents/skills",
+  { "project", ".maki/skills" },
+  { "claude", ".claude/skills" },
+  { "opencode", ".opencode/skills" },
+  { "global", ".agents/skills" },
 }
 local GLOBAL_SKILL_DIRS = {
-  ".claude/skills",
-  ".config/opencode/skills",
-  ".agents/skills",
+  { "claude", ".claude/skills" },
+  { "opencode", ".config/opencode/skills" },
+  { "global", ".agents/skills" },
 }
 
 local function scan_skill_dir(dir, skills, excluded)
@@ -116,6 +116,13 @@ local function discover_skills()
   end
 
   local skills = {}
+  local roots = {}
+  local function scan_root(label, dir)
+    if maki.fs.metadata(dir) then
+      roots[#roots + 1] = { label = label, path = shorten_path(dir) }
+      scan_skill_dir(dir, skills, excluded)
+    end
+  end
 
   if builtin and opts.plugin_dev then
     skills[builtin.name] = {
@@ -129,23 +136,23 @@ local function discover_skills()
 
   local config = maki.env.config_dir()
   if config then
-    scan_skill_dir(maki.fs.joinpath(config, "skills"), skills, excluded)
+    scan_root("maki", maki.fs.joinpath(config, "skills"))
   end
 
   local home = maki.uv.os_homedir()
   if home then
-    for _, rel in ipairs(GLOBAL_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(home, rel), skills, excluded)
+    for _, dir in ipairs(GLOBAL_SKILL_DIRS) do
+      scan_root(dir[1], maki.fs.joinpath(home, dir[2]))
     end
   end
 
   for _, ancestor in ipairs(find_project_ancestors()) do
-    for _, rel in ipairs(PROJECT_SKILL_DIRS) do
-      scan_skill_dir(maki.fs.joinpath(ancestor, rel), skills, excluded)
+    for _, dir in ipairs(PROJECT_SKILL_DIRS) do
+      scan_root(dir[1], maki.fs.joinpath(ancestor, dir[2]))
     end
   end
 
-  return skills
+  return skills, roots
 end
 
 maki.api.register_tool({
@@ -173,15 +180,15 @@ maki.api.register_tool({
   end,
 
   handler = function(input, ctx)
-    local skills = discover_skills()
+    local skills, roots = discover_skills()
     if not input.name or input.name == "" then
-      return "Available skills:" .. build_skill_list(skills)
+      return build_skill_list(skills, roots)
     end
 
     local skill = skills[input.name]
     if not skill then
-      local available = build_skill_list(skills)
-      return { llm_output = NOT_FOUND .. input.name .. available, is_error = true }
+      local available = build_skill_list(skills, roots)
+      return { llm_output = NOT_FOUND .. input.name .. "\n\n" .. available, is_error = true }
     end
     if skill.resolve then
       skill.content = skill.resolve()

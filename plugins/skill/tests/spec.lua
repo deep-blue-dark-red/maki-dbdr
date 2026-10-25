@@ -74,8 +74,8 @@ end)
 case("build_skill_list_empty", function()
   local result = build_skill_list({})
   assert(result:find("No skills available"), "empty list should say no skills available")
-  assert(result:find("<available_skills>"), "should have opening tag")
-  assert(result:find("</available_skills>"), "should have closing tag")
+  assert(not result:find("<available_skills>"), "should not have xml tags")
+  assert(not result:find("%-%-%-"), "should not have stray frontmatter dashes")
 end)
 
 case("build_skill_list_single_skill", function()
@@ -83,7 +83,7 @@ case("build_skill_list_single_skill", function()
     test = { name = "test-skill", description = "A test skill" },
   }
   local result = build_skill_list(skills)
-  assert(result:find("test%-skill"), "should contain skill name")
+  assert(result:find("%*%*test%-skill%*%*"), "skill name should be bold")
   assert(result:find("A test skill"), "should contain description")
   assert(not result:find("No skills available"), "should not say no skills")
 end)
@@ -100,6 +100,34 @@ case("build_skill_list_sorted_alphabetically", function()
   local zebra_pos = result:find("zebra")
   assert(alpha_pos < middle_pos, "alpha should come before middle")
   assert(middle_pos < zebra_pos, "middle should come before zebra")
+end)
+
+case("build_skill_list_separates_entries_with_blank_lines", function()
+  local skills = {
+    a = { name = "alpha", description = "A skill" },
+    b = { name = "beta", description = "B skill" },
+  }
+  local result = build_skill_list(skills)
+  local entry = "%*%*alpha%*%*: A skill\n\n%*%*beta%*%*: B skill"
+  assert(result:find(entry), "entries should be separated by a blank line, got: " .. result)
+end)
+
+case("build_skill_list_lists_skill_directories", function()
+  local roots = {
+    { label = "maki", path = "~/.config/maki/skills" },
+    { label = "claude", path = "~/.claude/skills" },
+  }
+  local result = build_skill_list({}, roots)
+  local dirs = "Skill directories:\n%- maki: ~/%.config/maki/skills\n%- claude: ~/%.claude/skills"
+  assert(result:find(dirs), "should list scanned directories, got: " .. result)
+  local dirs_pos = result:find("Skill directories:")
+  local no_skills_pos = result:find("No skills available")
+  assert(dirs_pos < no_skills_pos, "directory tree should come before the skill list")
+end)
+
+case("build_skill_list_without_roots_skips_directory_section", function()
+  local result = build_skill_list({ a = { name = "alpha", description = "A skill" } }, {})
+  assert(not result:find("Skill directories:"), "should not list directories when no roots exist")
 end)
 
 -- ── builtin plugin_dev skill ──
