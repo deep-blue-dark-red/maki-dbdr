@@ -578,6 +578,35 @@ function M.move_to_project(dir, name, target_root, state_dir)
   return true
 end
 
+-- Deletes quarantine instead of unlinking: the notes dir lives outside Git, so
+-- rm would be forever. The note moves to {dir}/.trash/<name>.<epoch>, restorable
+-- by hand; listings only see regular files, so the trash stays invisible.
+-- Returns the trash path relative to {dir}.
+function M.quarantine(dir, name, now)
+  local from, err = M.safe_resolve(dir, name)
+  if not from then
+    return nil, err
+  end
+  if not maki.fs.metadata(from) then
+    return nil, "'" .. name .. "' does not exist"
+  end
+  local _, mkdir_err = maki.fs.mkdir(maki.fs.joinpath(dir, ".trash"), { parents = true })
+  if mkdir_err then
+    return nil, "mkdir error: " .. tostring(mkdir_err)
+  end
+  local stamp = now or os.time()
+  local rel = ".trash/" .. name .. "." .. stamp
+  while maki.fs.metadata(maki.fs.joinpath(dir, rel)) do
+    stamp = stamp + 1
+    rel = ".trash/" .. name .. "." .. stamp
+  end
+  local ok, rename_err = maki.fs.rename(from, maki.fs.joinpath(dir, rel))
+  if not ok then
+    return nil, "delete error: " .. tostring(rename_err)
+  end
+  return rel
+end
+
 function M.format_read_entry(name, size, content)
   local fm, body = M.parse_frontmatter(content)
   local tags = M.extract_tags(fm) or {}

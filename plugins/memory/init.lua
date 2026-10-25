@@ -227,18 +227,11 @@ local function cmd_write(path, content, tags, dir, ctx)
 end
 
 local function cmd_delete(path, dir)
-  local file_path, err = helpers.safe_resolve(dir, path)
-  if not file_path then
+  local trash, err = helpers.quarantine(dir, path)
+  if not trash then
     return nil, err
   end
-  if not maki.fs.metadata(file_path) then
-    return nil, "'" .. path .. "' does not exist"
-  end
-  local ok, rm_err = maki.fs.rm(file_path)
-  if not ok then
-    return nil, "delete error: " .. tostring(rm_err)
-  end
-  return "deleted " .. path
+  return "deleted " .. path .. " (recoverable from " .. trash .. ")"
 end
 
 local function with_dir(res, dir, scope)
