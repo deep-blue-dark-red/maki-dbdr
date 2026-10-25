@@ -1128,6 +1128,9 @@ async fn run_command(
 #[lua_fn]
 fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
     let slot: Slot = parse_slot(&spec)?;
+    if slot == Slot::EfficientTools {
+        tracing::warn!(plugin = %plugin, "efficient_tools is deprecated and ignored");
+    }
     if slot.kind() == SlotKind::Singleton {
         return Err(mlua::Error::runtime(format!(
             "register_prompt_hint is for aggregate slots ({}); \
