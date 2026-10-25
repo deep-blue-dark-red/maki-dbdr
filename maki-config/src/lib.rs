@@ -264,8 +264,22 @@ pub fn expand_env(value: &str) -> Result<String, String> {
 }
 
 pub static LOG_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The session this process is writing. Wire logs key their file on it, so
+/// `None` means nothing is logged. Published by every run front end, not just
+/// the TUI, since `-p`, SDK, and ACP runs log requests too.
 pub static CURRENT_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Display name for the session's wire log symlink. Cosmetic: the `.mlog`
+/// itself is keyed by [`CURRENT_SESSION_ID`].
 pub static CURRENT_SESSION_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Publish the running session for wire logging. Last writer wins; call it
+/// before the first request of the run.
+pub fn set_current_session(id: &str, name: &str) {
+    *CURRENT_SESSION_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_owned());
+    *CURRENT_SESSION_NAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(name.to_owned());
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigValue {

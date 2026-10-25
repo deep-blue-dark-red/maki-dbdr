@@ -128,6 +128,19 @@ fn advertised_tool_names(tools: &Value, mcp: Option<&McpSession>) -> Vec<String>
     extract_tool_names(&probe)
 }
 
+/// Publish the session before the first request: wire logs key their file on
+/// it. A resumed session keeps its stored title; a fresh one uses the caller's
+/// fallback, since the title model has not run yet.
+fn publish_session(resumed: &Resumed, fallback_name: &str) {
+    let name = resumed
+        .session
+        .as_ref()
+        .map(|s| s.title.as_str())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(fallback_name);
+    maki_config::set_current_session(&resumed.id.to_string(), name);
+}
+
 pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
     let mode = AgentMode::Build;
@@ -161,6 +174,10 @@ pub fn spawn(params: HeadlessParams) -> (HeadlessHandle, SessionEvents) {
     let event_tx = guard.sender(0);
 
     let session_ref = params.resumed.id.clone();
+    publish_session(
+        &params.resumed,
+        params.prompt.lines().next().unwrap_or("maki"),
+    );
     let mailbox = SessionMailbox::register(session_ref.id());
     let run_session_ref = session_ref.clone();
     let defaults = params.defaults;
@@ -311,6 +328,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
     let (model_tx, model_rx) = flume::unbounded::<Model>();
 
     let session_ref = params.resumed.id.clone();
+    publish_session(&params.resumed, "maki");
     let mailbox = SessionMailbox::register(session_ref.id());
 
     let working_dir = params.initial_wd.to_string_lossy().into_owned();
