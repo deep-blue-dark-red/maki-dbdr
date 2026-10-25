@@ -5459,6 +5459,70 @@ fn user_tool_events_render_and_release() {
 }
 
 #[test]
+fn dollar_opens_tool_palette_and_tab_completes() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    assert!(app.tool_palette.is_active(), "bare $ lists the tools");
+
+    for ch in "ut_pr".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.input_box.buffer.value(), "$ut_probe ");
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        actions.into_iter().next(),
+        Some(Action::UserToolCommand { name, .. }) if name == USER_TOOL_PROBE
+    ));
+}
+
+#[test]
+fn tool_palette_esc_closes_without_touching_input() {
+    register_user_tool_probe();
+    let mut app = test_app();
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    assert!(app.tool_palette.is_active());
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.tool_palette.is_active());
+    assert_eq!(app.input_box.buffer.value(), "$");
+}
+
+#[test]
+fn tool_palette_completes_argument_names() {
+    register_user_tool_probe();
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('$'))));
+    for ch in "ut_probe ".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(app.tool_palette.is_active(), "space after a tool lists its params");
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert!(app.input_box.buffer.value().starts_with("$ut_probe "), "params complete after the prefix");
+    assert!(app.input_box.buffer.value().ends_with('='));
+}
+
+#[test]
+fn tool_prefix_overrides_mode() {
+    let mut app = test_app();
+
+    app.input_box.set_input("$ read".into());
+    assert_eq!(&*app.mode_label().0, "[TOOL]");
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(
+        app.state.mode,
+        Mode::Build,
+        "tab must not toggle while tool prefix present"
+    );
+}
+
+#[test]
 fn active_shell_survives_agent_error_while_agent_and_child_tools_fail() {
     let mut app = streaming_app_with_history();
     let shell_id = app.shell.reserve_id();

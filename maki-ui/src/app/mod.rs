@@ -38,6 +38,7 @@ use crate::components::cache_miss_prompt::{
     Answer as CacheMissAnswer, CacheMissPrompt, Risk as CacheMissRisk,
 };
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::tool_palette::{ToolAction, ToolPalette};
 use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
@@ -386,6 +387,7 @@ pub struct App {
     pub(super) chat_index: HashMap<String, usize>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
+    pub(super) tool_palette: ToolPalette,
     pub(super) theme_picker: ThemePicker,
     pub(super) model_picker: ModelPicker,
     pub(super) login_picker: LoginPicker,
@@ -582,6 +584,7 @@ impl App {
                 mcp_reader.clone(),
                 lua_command_reader,
             ),
+            tool_palette: ToolPalette::new(),
             theme_picker: ThemePicker::new(),
             model_picker: ModelPicker::new(available_models),
             login_picker: LoginPicker::new(),
@@ -852,7 +855,10 @@ impl App {
     /// tick diff reports those unlabelled: the version stamped here no longer
     /// matches what they left.
     fn input_changed(&mut self, writer: InputWriter) {
-        self.command_palette.sync(&self.input_box.buffer.value());
+        let value = self.input_box.buffer.value();
+        self.command_palette.sync(&value);
+        let cwd = self.state.session.cwd.clone();
+        self.tool_palette.sync(&value, &self.storage, &cwd);
         self.input_writer = self.input_writer.take().merge(writer);
     }
 
@@ -1734,6 +1740,19 @@ impl App {
             }
         }
 
+        if self.is_main_chat() && !is_ctrl(&key) {
+            match self.tool_palette.handle_key(key) {
+                ToolAction::Consumed => return Some(vec![]),
+                ToolAction::Complete(text) => {
+                    self.input_box.set_input(text);
+                    self.input_box.buffer.move_to_end();
+                    self.input_changed(InputWriter::Anyone);
+                    return Some(vec![]);
+                }
+                ToolAction::Passthrough => {}
+            }
+        }
+
         None
     }
 
@@ -1850,7 +1869,7 @@ impl App {
 
         if !self.is_main_chat() {
             return match key.code {
-                KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => self.toggle_mode(),
                 // A paused task's pane goes finished when its tool returns, so
                 // liveness is what keeps the dismiss Esc reachable after it.
                 KeyCode::Esc if self.task_pane_takes_esc() => {
@@ -2002,7 +2021,7 @@ impl App {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
-                    KeyCode::Tab if !self.is_bash_input() => self.toggle_mode(),
+                    KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => self.toggle_mode(),
                     KeyCode::Esc => {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration

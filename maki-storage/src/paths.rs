@@ -149,11 +149,16 @@ pub fn canonical_key(path: &Path) -> PathBuf {
 /// `projects/<id>/` so both land in one folder: the project is the nearest
 /// ancestor of `cwd` holding a `.git`, else `cwd` itself, taken as spelled.
 pub fn project_dir(state: &StateDir, cwd: &Path) -> PathBuf {
-    let root = cwd
-        .ancestors()
+    state.path().join(PROJECTS_DIR).join(project_id(&project_root(cwd)))
+}
+
+/// The nearest ancestor of `cwd` holding a `.git`, else `cwd` itself, taken
+/// as spelled.
+pub fn project_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
         .find(|dir| dir.join(GIT_MARKER).exists())
-        .unwrap_or(cwd);
-    state.path().join(PROJECTS_DIR).join(project_id(root))
+        .unwrap_or(cwd)
+        .to_path_buf()
 }
 
 fn project_id(root: &Path) -> String {

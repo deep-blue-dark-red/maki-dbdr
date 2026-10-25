@@ -174,6 +174,18 @@ the `!`/`!!` shell prefix in `app/shell.rs`. Unknown names flash, and text the
 prefix parser rejects (prose like `$100`) falls through to a normal message.
 The event loop owns the `user_tool_tx/rx` channel pair on `SessionRuntime`.
 
+Completion is `components/tool_palette.rs`, wired exactly like the `/`
+`CommandPalette` (`input_changed` sync, the `dispatch_overlay` key pass,
+`view` beside `command_palette.view`), with `Tab` completing the pinned name
+and `is_tool_input` in `app/mode.rs` keeping `Tab` from toggling plan mode.
+After the name, the same popup completes the tool's schema parameters
+(already-set keys excluded, enum values after `key=`), sharing
+`user_tool::is_param_name`. It also lists `custom_tools` registrations
+(`maki_storage::paths::project_dir`/`project_root` + the plugin's flat
+`custom_tools/*.yaml` format, mtime-cached); those rows complete to the
+`$bash` line that runs the file or command body, and registry names win on
+collision.
+
 ---
 
 ### 4. `maki-ui/src/components/keybindings.rs`

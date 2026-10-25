@@ -154,6 +154,8 @@ impl App {
     pub(super) fn mode_label(&self) -> (Cow<'static, str>, Style) {
         let label: Cow<'static, str> = if self.is_bash_input() {
             "[BASH]".into()
+        } else if self.is_tool_input() {
+            "[TOOL]".into()
         } else {
             match self.state.mode {
                 Mode::Build => "[build]".into(),
@@ -167,15 +169,23 @@ impl App {
     }
 
     pub(crate) fn is_bash_input(&self) -> bool {
+        self.first_line_starts_with('!')
+    }
+
+    pub(crate) fn is_tool_input(&self) -> bool {
+        self.first_line_starts_with('$')
+    }
+
+    fn first_line_starts_with(&self, sigil: char) -> bool {
         self.input_box
             .buffer
             .lines()
             .first()
-            .is_some_and(|l| l.starts_with('!'))
+            .is_some_and(|l| l.starts_with(sigil))
     }
 
     pub(super) fn effective_mode_color(&self) -> Color {
-        if self.is_bash_input() {
+        if self.is_bash_input() || self.is_tool_input() {
             theme::current().mode_bash
         } else {
             self.state.mode.color()

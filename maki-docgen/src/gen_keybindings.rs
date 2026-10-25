@@ -229,7 +229,12 @@ fn write_overrides(out: &mut String) {
          agent uses (`$grep TODO`, `$read src/main.rs`). Arguments are \
          `key=value` pairs or a JSON object, and bare values fill the tool's \
          string parameters in order. `$$` hides the call and its output from \
-         the agent.\n\
+         the agent. Typing `$` opens a popup of tool names, and after the \
+         name it offers the tool's parameters: `Tab` or `Enter` completes \
+         the selected row inline (Enter with nothing typed submits the call), \
+         `Up`/`Down` move, `Esc` closes. custom_tools \
+         registrations are in the list too, completing to the `$bash` line \
+         that runs them.\n\
          - `Ctrl+V` pastes an image from the clipboard into the prompt when the \
          model supports vision. You can also paste image file paths.\n\
          - Middle-click inserts the PRIMARY selection, the same text \

@@ -98,7 +98,9 @@ pub(crate) fn build_tool_input(args: &str, schema: &Value) -> Result<Value, Stri
     Ok(Value::Object(map))
 }
 
-fn is_param_name(token: &str) -> bool {
+/// A `key=value` token's key half; shared with the tool palette, which
+/// excludes keys already typed from its candidates.
+pub(crate) fn is_param_name(token: &str) -> bool {
     !token.is_empty()
         && token
             .chars()
@@ -118,34 +120,88 @@ fn unquote(token: &str) -> String {
     }
 }
 
-/// Schema property names that accept a bare string, `required` entries first
-/// so `$read file.rs` lands on `path` rather than an incidental default.
-fn string_properties(schema: &Value) -> Vec<String> {
+/// One `properties` entry of a tool's input schema, in the order completion
+/// and positional fill should offer them: `required` entries first (in the
+/// schema's own declaration order), then the rest.
+pub(crate) struct SchemaProp {
+    pub name: String,
+    pub type_name: String,
+    pub description: String,
+    pub variants: Vec<String>,
+    /// A bare positional token can fill it: string-typed or untyped.
+    pub accepts_positional: bool,
+}
+
+pub(crate) fn schema_props(schema: &Value) -> Vec<SchemaProp> {
     let Some(props) = schema.get("properties").and_then(Value::as_object) else {
         return Vec::new();
     };
-    let accepts_string = |schema: &Value| match schema.get("type") {
-        None => true,
-        Some(Value::String(t)) => t == "string",
-        Some(Value::Array(types)) => types
-            .iter()
-            .any(|t| matches!(t, Value::String(s) if s == "string")),
-        Some(_) => false,
-    };
-    let mut names: Vec<String> = props
-        .iter()
-        .filter(|(_, s)| accepts_string(s))
-        .map(|(k, _)| k.clone())
-        .collect();
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        names.sort_by_key(|name| {
-            required
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
                 .iter()
-                .position(|r| r.as_str() == Some(name.as_str()))
-                .unwrap_or(usize::MAX)
-        });
-    }
-    names
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut out: Vec<SchemaProp> = props
+        .iter()
+        .map(|(name, prop)| {
+            let type_value = prop.get("type");
+            let accepts_positional = match type_value {
+                None => true,
+                Some(Value::String(t)) => t == "string",
+                Some(Value::Array(types)) => types
+                    .iter()
+                    .any(|t| matches!(t, Value::String(s) if s == "string")),
+                Some(_) => false,
+            };
+            SchemaProp {
+                name: name.clone(),
+                type_name: type_value
+                    .and_then(Value::as_str)
+                    .unwrap_or("any")
+                    .to_owned(),
+                description: prop
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                variants: prop
+                    .get("enum")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                accepts_positional,
+            }
+        })
+        .collect();
+    let rank = |prop: &SchemaProp| {
+        required
+            .iter()
+            .position(|r| *r == prop.name.as_str())
+            .unwrap_or(usize::MAX)
+    };
+    out.sort_by_key(rank);
+    out
+}
+
+/// Schema property names that accept a bare string, `required` entries first
+/// so `$read file.rs` lands on `path` rather than an incidental default.
+fn string_properties(schema: &Value) -> Vec<String> {
+    schema_props(schema)
+        .into_iter()
+        .filter(|prop| prop.accepts_positional)
+        .map(|prop| prop.name)
+        .collect()
 }
 
 pub(crate) enum UserToolEvent {
@@ -368,5 +424,27 @@ mod tests {
         let schema = json!({"type": "object", "properties": {"path": {"type": "string"}}});
         let input = build_tool_input(r#""src/main.rs""#, &schema).unwrap();
         assert_eq!(input, json!({"path": "src/main.rs"}));
+    }
+
+    /// The write tool's real shape: two required strings whose emitted
+    /// `properties` come out alphabetical while `required` keeps declaration
+    /// order. Positional fill must follow `required`, not the alphabet, or
+    /// `$write file text` swaps path and content.
+    #[test]
+    fn build_input_positional_follows_required_not_alphabet() {
+        let schema = json!({
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "append": {"type": "boolean"},
+                "content": {"type": "string"},
+                "path": {"type": "string"}
+            }
+        });
+        let input = build_tool_input("/tmp/a.txt hello", &schema).unwrap();
+        assert_eq!(
+            input,
+            json!({"path": "/tmp/a.txt", "content": "hello"})
+        );
     }
 }

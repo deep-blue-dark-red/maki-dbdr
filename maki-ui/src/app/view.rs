@@ -261,6 +261,7 @@ impl App {
                 panel_hint,
             );
             self.command_palette.view(frame, layout.input_area);
+            self.tool_palette.view(frame, layout.input_area);
             return caret;
         }
         None

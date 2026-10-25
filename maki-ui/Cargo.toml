@@ -22,6 +22,7 @@ syntect = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 arboard = { workspace = true }
 jiff = { workspace = true }
 smol = { workspace = true }
