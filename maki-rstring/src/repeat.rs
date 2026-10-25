@@ -21,7 +21,9 @@
 
 const MIN_CAND: usize = 12; // shorter repeats can't pay for a ref
 const MAX_CAND: usize = 1024; // cap: useful repeats are prefixes, not bodies
-const MIN_NET: isize = 8; // net bytes required before a ref is kept
+const MIN_NET: isize = 64; // net bytes a legend must save: refs scattered through
+// short spans (a hostname x3, a timestamp prefix x5) read as corruption while
+// saving a dozen bytes, so only bulk repetition pays
 const SCAN_BUDGET: usize = 24 << 20; // per-run candidate-scan byte budget
 const MAX_CANDS: usize = 64;
 const PRE_RANK: usize = 256; // candidates counted before the true ranking

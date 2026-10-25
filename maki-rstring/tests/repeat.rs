@@ -39,6 +39,40 @@ fn unique_lines_pass_through() {
 }
 
 #[test]
+fn marginal_repeats_stay_verbatim() {
+    // A hostname x3 and a 15-byte timestamp prefix x5 save ~50 bytes as refs
+    // but read as corruption; factoring must not fire below MIN_NET.
+    let text = jobs_table();
+    assert_eq!(repeat::run(&text), text);
+}
+
+fn jobs_table() -> String {
+    [
+        "2026-10-22T08:33:12Z",
+        "880  RUNNING  minic         cpus 3; host/minic 1000; mem 15726",
+        "881  RUNNING  bigd          cpus 16; gpus/nvidia 1; host/bigd 1000; mem 31995",
+        "882  RUNNING  mina-fs       cpus 2; host/fs 1000; mem 2028",
+        "884  RUNNING  silver.local  cpus 6; host/silver 1000; mem 24576",
+        "911  RUNNING  m3.local      cpus 8; host/m3 1000; mem 18432",
+        "912  RUNNING  mina-llama    cpus 4; host/llama 1000; mem 38000",
+        "minic -> 3 cpus (RUNNING)",
+        "bigd -> 16 cpus (RUNNING)",
+        "mina-fs -> 2 cpus (RUNNING)",
+        "silver.local -> 6 cpus (RUNNING)",
+        "m3.local -> 8 cpus (RUNNING)",
+        "mina-llama -> 4 cpus (RUNNING)",
+        "minic         2026-10-22T08:34:39Z",
+        "bigd          2026-10-22T08:34:42Z",
+        "mina-fs       2026-10-22T08:35:01Z",
+        "silver.local  2026-10-22T08:36:56Z",
+        "m3.local      2026-10-22T15:01:45Z",
+        "mina-llama    2026-10-22T15:06:05Z",
+    ]
+    .join("\n")
+    + "\n"
+}
+
+#[test]
 fn stream_factors_repeats() {
     let text = grepish();
     let out = stream(&text, &mut SideTable::default(), &Cfg::default());
