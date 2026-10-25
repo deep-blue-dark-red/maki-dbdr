@@ -348,7 +348,7 @@ fn fenced(text: &str) -> String {
     format!("{fence}\n{}\n{fence}", text.trim_end_matches('\n'))
 }
 
-fn clip_chars(text: &str, max: usize) -> Cow<'_, str> {
+pub(crate) fn clip_chars(text: &str, max: usize) -> Cow<'_, str> {
     match text.char_indices().nth(max) {
         None => Cow::Borrowed(text),
         Some((cut, _)) => {

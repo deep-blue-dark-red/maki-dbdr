@@ -180,6 +180,7 @@ mod tests {
             event(
                 1,
                 EventKind::Detached(Subagent {
+                    id: "t1",
                     name: Some("detached"),
                     model: None,
                     events: vec![

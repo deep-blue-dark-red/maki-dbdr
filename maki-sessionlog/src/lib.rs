@@ -8,6 +8,7 @@ pub mod model;
 pub mod render;
 pub mod shell;
 pub mod stats;
+pub mod subtasks;
 #[cfg(test)]
 mod testutil;
 

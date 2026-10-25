@@ -3,6 +3,7 @@
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use maki_agent::SessionMailbox;
 use maki_agent::agent::live_history;
@@ -10,6 +11,7 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
 use maki_sessionlog::effects::{DiffView, EffectsOpts};
 use maki_sessionlog::effects_log;
+use maki_sessionlog::subtasks::{self, SubtaskFormat, ViewOpts};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::sessions::SESSIONS_DIR;
@@ -35,6 +37,9 @@ const NO_FOCUSED_ERR: &str = "no focused session";
 const NO_TOOL_CALLS_ERR: &str = "session made no tool calls";
 const DEFAULT_SUMMARY_EXAMPLES: usize = 5;
 const DEFAULT_SUMMARY_CONTEXT: usize = 2;
+const SUBTASK_INDEX_ERR: &str = "index is required when no query is given";
+const EMPTY_QUERY_ERR: &str = "query must not be empty";
+const UNKNOWN_SUBTASK_FORMAT: &str = "format must be conversation, outline or summary";
 
 async fn roundtrip(
     lua: Lua,
@@ -485,6 +490,90 @@ async fn set_title(
     roundtrip(lua, tx, req).await
 }
 
+/// A session id resolves under the state dir; anything else is taken as a
+/// transcript path, which is how a by-path link reaches this API without
+/// exposing ids.
+fn transcript_path(source: &str) -> Result<PathBuf, String> {
+    if let Ok(id) = source.parse::<MakiId>() {
+        let state = StateDir::resolve().map_err(|e| e.to_string())?;
+        return Ok(state.path().join(SESSIONS_DIR).join(format!("{id}.jsonl")));
+    }
+    Ok(maki_storage::paths::expand_tilde(Path::new(source)))
+}
+
+fn read_transcript(source: &str) -> Result<String, String> {
+    let path = transcript_path(source)?;
+    fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Lists the subtasks (subagents) recorded in a stored transcript, in display
+/// order and 0-based like a session position.
+///
+/// @param source string Session id, or a transcript path.
+/// @return (table|nil, string|nil) Array of `{id, name, model, messages, files, added, removed, task}`, or nil and an error.
+/// @example
+/// local tasks = maki.session.subtasks(id)
+/// print(tasks[1].name, tasks[1].added, tasks[1].removed)
+#[lua_fn]
+fn subtasks(lua: &Lua, source: String) -> LuaResult<Pair<Value>> {
+    let text = try_pair!(read_transcript(&source));
+    let infos = try_pair!(subtasks::list(&text));
+    let json = serde_json::to_value(infos).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+    Ok((Some(json_to_lua(lua, &json)?), None))
+}
+
+/// Renders one subtask of a stored transcript, or searches every subtask's
+/// messages when `query` is given and `index` is omitted.
+///
+/// @param source string Session id, or a transcript path.
+/// @param opts table Options:
+///   `index` (integer?) 0-based subtask; required without `query`.
+///   `format` (string?) `"outline"` (default), `"summary"` or `"conversation"`.
+///   `query` (string?) regex matched against text, tool calls and tool results.
+///   `diff` (boolean?) outline/summary: include the subtask's net diff (default false).
+///   `diff_lines` (integer?) outline/summary: cap each file's diff.
+///   `limit` (integer?) query: matches per subtask (default 20).
+/// @return (string|nil, string|nil) Rendered text, or nil and an error.
+/// @example
+/// local outline = maki.session.subtask(id, { index = 0, format = "summary" })
+/// local hits = maki.session.subtask(id, { query = "cache" })
+#[lua_fn]
+fn subtask(_lua: &Lua, source: String, opts: Table) -> LuaResult<Pair<String>> {
+    let text = try_pair!(read_transcript(&source));
+    let index: Option<usize> = opts.get("index")?;
+    if let Some(pattern) = opts.get::<Option<String>>("query")? {
+        if pattern.is_empty() {
+            return Ok(err_pair(EMPTY_QUERY_ERR));
+        }
+        let limit = opts
+            .get::<Option<usize>>("limit")?
+            .unwrap_or(subtasks::DEFAULT_QUERY_LIMIT);
+        let rendered = try_pair!(subtasks::query(&text, index, &pattern, limit));
+        return Ok((Some(rendered), None));
+    }
+
+    let Some(index) = index else {
+        return Ok(err_pair(SUBTASK_INDEX_ERR));
+    };
+    let format = match opts.get::<Option<String>>("format")?.as_deref() {
+        None | Some("outline") => SubtaskFormat::Outline,
+        Some("summary") => SubtaskFormat::Summary,
+        Some("conversation") => SubtaskFormat::Conversation,
+        Some(_) => return Ok(err_pair(UNKNOWN_SUBTASK_FORMAT)),
+    };
+    let diff = opts.get::<Option<bool>>("diff")?.unwrap_or(false);
+    let diff_lines = opts.get::<Option<usize>>("diff_lines")?;
+    let view = ViewOpts {
+        format,
+        diff: diff.then_some(DiffView {
+            context: DEFAULT_SUMMARY_CONTEXT,
+            max_lines: diff_lines,
+        }),
+    };
+    let rendered = try_pair!(subtasks::view(&text, index, view));
+    Ok((Some(rendered), None))
+}
+
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once; these functions let plugins list, create, focus, rename, and
@@ -492,7 +581,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), summary(), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), summary(), subtasks(), subtask(), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
 
 #[cfg(test)]
@@ -524,6 +613,93 @@ mod tests {
         let t = create_session_table(&lua, tx).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
+    }
+
+    const SUBTASK_LOG: &str = concat!(
+        r#"{"t":"header","v":2,"id":"s","model":"m","cwd":"/w","created_at":0}"#,
+        "\n",
+        r#"{"t":"msg","d":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"subtask","input":{}}]}}"#,
+        "\n",
+        r#"{"t":"sub_msg","sub":"t1","d":{"role":"user","content":[{"type":"text","text":"watch the logs"}]}}"#,
+        "\n",
+        r#"{"t":"sub_msg","sub":"t1","d":{"role":"assistant","content":[{"type":"text","text":"checking"}]}}"#,
+        "\n",
+        r#"{"t":"meta","title":"t","updated_at":0,"subagents":[{"tool_use_id":"t1","name":"scout","model":"fast"}]}"#,
+    );
+
+    #[test]
+    fn subtasks_list_and_render_a_transcript_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        fs::write(&path, SUBTASK_LOG).unwrap();
+        let lua = lua_with_session(None);
+
+        let (value, err): (Value, Option<String>) = lua
+            .load(format!("return session.subtasks('{}')", path.display()))
+            .eval()
+            .unwrap();
+        assert_eq!(err, None);
+        let first = value.as_table().unwrap().get::<Table>(1).unwrap();
+        assert_eq!(first.get::<String>("name").unwrap(), "scout");
+        assert_eq!(first.get::<String>("model").unwrap(), "fast");
+        assert_eq!(first.get::<i64>("messages").unwrap(), 2);
+
+        let (text, err): (String, Option<String>) = lua
+            .load(format!(
+                "return session.subtask('{}', {{ index = 0, format = 'conversation' }})",
+                path.display()
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(err, None);
+        assert!(text.contains("user: watch the logs"), "{text}");
+        assert!(text.contains("assistant: checking"), "{text}");
+    }
+
+    #[test]
+    fn subtask_query_searches_one_or_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        fs::write(&path, SUBTASK_LOG).unwrap();
+        let lua = lua_with_session(None);
+
+        let (one, err): (String, Option<String>) = lua
+            .load(format!(
+                "return session.subtask('{}', {{ index = 0, query = 'logs' }})",
+                path.display()
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(err, None);
+        assert!(one.contains("1 hit(s)"), "{one}");
+
+        let (all, err): (String, Option<String>) = lua
+            .load(format!(
+                "return session.subtask('{}', {{ query = 'checking' }})",
+                path.display()
+            ))
+            .eval()
+            .unwrap();
+        assert_eq!(err, None);
+        assert!(all.contains("subtask 0: scout"), "{all}");
+    }
+
+    #[test]
+    fn subtask_without_an_index_or_query_reports_the_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        fs::write(&path, SUBTASK_LOG).unwrap();
+        let lua = lua_with_session(None);
+
+        let (value, err): (Value, Option<String>) = lua
+            .load(format!(
+                "return session.subtask('{}', {{}})",
+                path.display()
+            ))
+            .eval()
+            .unwrap();
+        assert!(value.is_nil());
+        assert_eq!(err.as_deref(), Some(SUBTASK_INDEX_ERR));
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub struct Call<'a> {
 
 #[derive(Debug)]
 pub struct Subagent<'a> {
+    pub id: &'a str,
     pub name: Option<&'a str>,
     pub model: Option<&'a str>,
     pub events: Vec<Event<'a>>,
@@ -125,17 +126,18 @@ impl<'a> Builder<'a> {
         events
     }
 
-    fn subagent(&self, call_id: &str) -> Option<Subagent<'a>> {
+    fn subagent(&self, call_id: &'a str) -> Option<Subagent<'a>> {
         let turns = self.session.subagent_turns.get(call_id)?;
         Some(self.subagent_of(call_id, turns))
     }
 
-    fn subagent_of(&self, call_id: &str, turns: &'a [Turn<'a>]) -> Subagent<'a> {
+    fn subagent_of(&self, call_id: &'a str, turns: &'a [Turn<'a>]) -> Subagent<'a> {
         let info = self
             .subagents
             .iter()
             .find(|info| info.tool_use_id == call_id);
         Subagent {
+            id: call_id,
             name: info.map(|info| &*info.name),
             model: info.and_then(|info| info.model.as_deref()),
             events: self.events(turns),

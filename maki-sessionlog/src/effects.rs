@@ -333,7 +333,13 @@ fn clip(text: &str) -> String {
 }
 
 pub fn render(session: &Session, report: &Report, opts: EffectsOpts) -> String {
-    let mut out = session_header(session, "# ");
+    render_titled(&session_header(session, "# "), report, opts)
+}
+
+/// Renders the report under a caller-supplied header, for views that are not
+/// the whole session (a subtask transcript).
+pub fn render_titled(header: &str, report: &Report, opts: EffectsOpts) -> String {
+    let mut out = header.to_owned();
     let counts = &report.counts;
     let _ = writeln!(
         out,
