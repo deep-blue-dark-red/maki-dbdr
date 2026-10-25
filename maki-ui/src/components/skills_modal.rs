@@ -252,7 +252,7 @@ impl SkillsModal {
                 }
                 SkillsAction::None
             }
-            KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete
+            KeyCode::Char('D') | KeyCode::Backspace | KeyCode::Delete
                 if self.focus == Focus::Folders =>
             {
                 if let Some(folder) = self.folders.get(self.selected_folder) {
@@ -495,7 +495,7 @@ impl SkillsModal {
                     match folder.tag {
                         FolderTag::Custom => {
                             details_lines.push(Line::from(vec![
-                                Span::styled("This is a custom workspace skills folder. Press Space/Enter to toggle inclusion in skills.json entries, or 'd' to remove it.", t.item_desc)
+                                Span::styled("This is a custom workspace skills folder. Press Space/Enter to toggle inclusion in skills.json entries, or 'D' to remove it.", t.item_desc)
                             ]));
                         }
                         FolderTag::Local => {
@@ -505,7 +505,7 @@ impl SkillsModal {
                         }
                         other => {
                             details_lines.push(Line::from(vec![
-                                Span::styled(format!("This is a {} standard skills folder. It is defined in your maki.config and can be removed by pressing 'd'.", other.label()), t.item_desc)
+                                Span::styled(format!("This is a {} standard skills folder. It is defined in your maki.config and can be removed by pressing 'D'.", other.label()), t.item_desc)
                             ]));
                         }
                     }
@@ -561,7 +561,7 @@ impl SkillsModal {
             ),
         ]));
         details_lines.push(Line::from(vec![
-            Span::styled("  d/Backspace", t.accent),
+            Span::styled("  D/Backspace", t.accent),
             Span::styled("Remove selected skills folder", t.item_desc),
         ]));
         details_lines.push(Line::from(vec![
@@ -616,6 +616,47 @@ fn parse_skill_md(content: &str) -> Option<(String, String)> {
         }
     }
     Some((name?, description.unwrap_or_default()))
+}
+
+/// Skills found in the enabled folders, independent of how the folders were
+/// discovered.
+fn scan_skill_folders(folders: &[FolderInfo]) -> Vec<SkillInfo> {
+    let mut skills = Vec::new();
+    for folder in folders {
+        if !folder.is_enabled || !folder.path.exists() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&folder.path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let skill_md = path.join("SKILL.md");
+            if !skill_md.exists() {
+                continue;
+            }
+            let folder_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let (name, description) = std::fs::read_to_string(&skill_md)
+                .ok()
+                .and_then(|c| parse_skill_md(&c))
+                .unwrap_or_else(|| (folder_name.clone(), String::new()));
+            skills.push(SkillInfo {
+                name,
+                description,
+                path: skill_md,
+                folder_name,
+                source_dir: folder.path.clone(),
+            });
+        }
+    }
+    skills
 }
 
 fn find_project_ancestors(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -752,38 +793,7 @@ pub fn discover_skills_and_folders(
         });
     }
 
-    for folder in &folders {
-        if !folder.is_enabled || !folder.path.exists() {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(&folder.path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let skill_md = path.join("SKILL.md");
-                    if skill_md.exists() {
-                        let folder_name = path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned();
-                        let (name, description) = std::fs::read_to_string(&skill_md)
-                            .ok()
-                            .and_then(|c| parse_skill_md(&c))
-                            .unwrap_or_else(|| (folder_name.clone(), String::new()));
-
-                        skills.push(SkillInfo {
-                            name,
-                            description,
-                            path: skill_md,
-                            folder_name,
-                            source_dir: folder.path.clone(),
-                        });
-                    }
-                }
-            }
-        }
-    }
+    skills.extend(scan_skill_folders(&folders));
 
     let mut unique_skills = Vec::new();
     for s in skills {
@@ -820,6 +830,41 @@ mod tests {
     }
 
     // ── maki-dbdr fork tests ───────────────────────────────────────────────────────
+    #[test]
+    fn scan_skill_folders_reads_skill_md_in_each_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for (dir, name) in [(&a, "first"), (&b, "second")] {
+            let skill = dir.join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nbody"),
+            )
+            .unwrap();
+        }
+        // A stray file next to the skills and a folder without SKILL.md are skipped.
+        std::fs::write(a.join("notes.md"), "x").unwrap();
+        std::fs::create_dir_all(b.join("empty")).unwrap();
+
+        let folders: Vec<FolderInfo> = [(&a, FolderTag::Local), (&b, FolderTag::Global)]
+            .into_iter()
+            .map(|(path, tag)| FolderInfo {
+                path: path.clone(),
+                display_path: String::new(),
+                tag,
+                is_enabled: true,
+            })
+            .collect();
+        let skills = scan_skill_folders(&folders);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(names, vec!["first", "second"]);
+        assert_eq!(skills[0].source_dir, a);
+        assert_eq!(skills[1].source_dir, b);
+    }
+
     #[test]
     fn test_find_project_ancestors_stops_at_git() {
         let temp = tempfile::TempDir::new().unwrap();
