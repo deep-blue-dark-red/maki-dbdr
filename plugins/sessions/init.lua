@@ -31,7 +31,26 @@ local OUTLINE_KEYS = {
   { "↑↓", "line" },
   { "j/k", "other outline" },
   { "PgUp/PgDn", "page" },
+  { "Ctrl+E", "export" },
 }
+local EXPORT_TITLE = " Export outline "
+local EXPORT_KEYS = {
+  { "Enter", "export" },
+  { "Esc", "cancel" },
+}
+local EXPORT_TO_CLIPBOARD = "clipboard"
+local EXPORT_TO_FILE = "file"
+local EXPORT_ITEMS = {
+  { label = "Copy to clipboard", action = EXPORT_TO_CLIPBOARD },
+  { label = "Save to file", action = EXPORT_TO_FILE },
+}
+local EXPORT_FILE_PREFIX = "session-"
+local EXPORT_FILE_SUFFIX = "-outline.md"
+local EXPORT_COPIED = "Outline copied to clipboard"
+local EXPORT_COPY_FAILED = "Copy failed: "
+local EXPORT_SAVED = "Outline saved to "
+local EXPORT_SAVE_FAILED = "Save failed: "
+local EXPORT_NO_CWD = "Cannot resolve the current directory"
 -- Placeholder only: the host swaps "spinner:*"-styled spans for the live
 -- animated frame, so working rows spin without this plugin redrawing.
 local WORKING_ICON = "· "
@@ -658,7 +677,7 @@ end
 -- The same report session_history's "outline" format asks for: model replies
 -- interleaved with every command, thinking excluded, diff off. It is Markdown,
 -- so it goes through the normal renderer for headings and inline code.
-local function report_lines(session, width)
+local function outline_report(session)
   local ok, report, err = pcall(maki.session.summary, session.id, {
     transcript = true,
     diff = false,
@@ -672,11 +691,12 @@ local function report_lines(session, width)
     if reason:find("no tool calls", 1, true) then
       reason = NO_OUTLINE_HINT
     end
-    return {
-      { { "Outline not available", "error" } },
-      { { reason, "dim" } },
-    }
+    return nil, reason
   end
+  return report
+end
+
+local function report_lines(report, width)
   local rendered_ok, rendered = pcall(maki.ui.markdown, report, width)
   if rendered_ok and rendered and #rendered > 0 then
     return rendered
@@ -686,6 +706,36 @@ local function report_lines(session, width)
     lines[#lines + 1] = outline_line(text)
   end
   return lines
+end
+
+local function unavailable_lines(reason)
+  return {
+    { { "Outline not available", "error" } },
+    { { reason, "dim" } },
+  }
+end
+
+local function export_outline(session, report)
+  local event = ListPicker.open(EXPORT_ITEMS, {
+    title = EXPORT_TITLE,
+    footer = EXPORT_KEYS,
+  })
+  if event.type ~= "choice" then
+    return
+  end
+  if event.item.action == EXPORT_TO_CLIPBOARD then
+    local ok, err = maki.ui.copy(report)
+    maki.ui.flash(ok and EXPORT_COPIED or (EXPORT_COPY_FAILED .. tostring(err)))
+    return
+  end
+  local cwd = maki.uv.cwd()
+  if not cwd then
+    maki.ui.flash(EXPORT_NO_CWD)
+    return
+  end
+  local path = maki.fs.joinpath(cwd, EXPORT_FILE_PREFIX .. session.id .. EXPORT_FILE_SUFFIX)
+  local ok, err = maki.fs.write(path, report)
+  maki.ui.flash(ok and (EXPORT_SAVED .. path) or (EXPORT_SAVE_FAILED .. tostring(err)))
 end
 
 local function outline_title(session)
@@ -709,12 +759,15 @@ local function show_outline()
   })
   local width = win.width
   local shown = s
+  local report = nil
   local lines = {}
   local cursor = 1
 
   local function show(session)
     shown = session
-    lines = report_lines(session, width)
+    local err
+    report, err = outline_report(session)
+    lines = report and report_lines(report, width) or unavailable_lines(err)
     buf:set_lines(lines)
     win:set_config({ title = outline_title(session) })
     cursor = 1
@@ -747,8 +800,10 @@ local function show_outline()
     end
     if ev.type == "resize" then
       width = ev.width
-      lines = report_lines(shown, width)
-      buf:set_lines(lines)
+      if report then
+        lines = report_lines(report, width)
+        buf:set_lines(lines)
+      end
       cursor = math.min(cursor, math.max(#lines, 1))
       win:set_cursor(cursor)
     elseif ev.type == "key" then
@@ -773,6 +828,12 @@ local function show_outline()
         cursor = 1
       elseif key == "<End>" then
         cursor = math.max(#lines, 1)
+      elseif key == "<C-e>" then
+        if report then
+          export_outline(shown, report)
+        else
+          maki.ui.flash(NO_OUTLINE_HINT)
+        end
       end
       win:set_cursor(cursor)
     end
