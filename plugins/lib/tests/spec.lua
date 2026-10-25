@@ -1305,6 +1305,15 @@ case("render_lines_match_highlight_not_selected", function()
   eq(lines[1][3][2], "item")
 end)
 
+case("render_lines_item_highlights_override_the_query", function()
+  local items = { { label = "alpha", highlights = { { 3, 4 } } } }
+  local lines = render_lines(items, 1, 40, "zzz")
+  eq(lines[1][1][1], "  al")
+  eq(lines[1][2][1], "ph")
+  eq(lines[1][2][2], "match_selected")
+  eq(lines[1][3][1], "a")
+end)
+
 local filter_items = ListPicker._filter_items
 
 case("filter_items_empty_query_returns_all", function()

@@ -117,6 +117,10 @@ local function item_style(item)
   return type(item) == "table" and item.style or nil
 end
 
+local function item_highlights(item)
+  return type(item) == "table" and item.highlights or nil
+end
+
 local function next_section(item, prev)
   local s = item_section(item)
   if s and s ~= prev then
@@ -331,7 +335,9 @@ local function render_lines(items, selected, width, query, peer, soft_selected)
     item_lines[i] = #lines + 1
 
     local label, detail, pad = fit_row(item_label(item), as_parts(item_detail(item)), width)
-    local spans = highlight_spans(label, words, style, match_style)
+    local highlights = item_highlights(item)
+    local spans = highlights and range_spans(label, highlights, style, match_style)
+      or highlight_spans(label, words, style, match_style)
     if indent_cols > 0 then
       if spans[1][2] == style then
         spans[1][1] = indent .. spans[1][1]
@@ -456,6 +462,11 @@ end
 --   key: function(item) -> string|nil, a row's identity. Rows sharing the
 --     selected row's key are tinted, and the cursor follows its key across a
 --     live swap
+--   filter: function(items, query) -> filtered, indices, replaces the built-in
+--     word-substring filter. {indices} are 1-based positions in {items}, so
+--     {event.index} still names the original row. A returned item table may
+--     carry { highlights = { {start, stop}, ... } }, ascending 1-based byte
+--     ranges into its label, to show what matched instead of the query
 --   refresh: function() -> items|nil, polled every {refresh_ms} (default 500)
 --     while the picker is open so rows track a changing source. Returning nil
 --     skips the swap, so callers re-build rows only when something changed
@@ -482,12 +493,13 @@ function ListPicker.open(items, opts)
     end
   end
   local key_fn = opts.key
+  local filter = opts.filter or filter_items
   -- Resolved once: a theme cannot change while this float holds focus.
   local peer = key_fn and ListPicker._peer(key_fn, maki.ui.theme_style) or nil
   local soft_selected = ListPicker._soften_selected(maki.ui.theme_style)
   local width
   local input = TextInput.new()
-  local filtered, original_indices = filter_items(items, "")
+  local filtered, original_indices = filter(items, "")
 
   local cursor = math.max(math.min(opts.cursor or 1, #filtered), 1)
   local item_lines = {}
@@ -544,7 +556,7 @@ function ListPicker.open(items, opts)
     local selected = filtered[cursor]
     local prev_key = key_fn and selected and key_fn(selected) or nil
     items = new_items
-    filtered, original_indices = filter_items(items, input:value())
+    filtered, original_indices = filter(items, input:value())
     -- The host answers with a resize event the loop already re-renders
     -- on, so there is no height bookkeeping here.
     win:set_config({ height = content_height(items) + BORDER_CHROME })
@@ -639,7 +651,7 @@ function ListPicker.open(items, opts)
         else
           local result = input:handle_key(ev.key)
           if result == TextInput.Result.CHANGED then
-            filtered, original_indices = filter_items(items, input:value())
+            filtered, original_indices = filter(items, input:value())
             move_cursor(1)
           elseif result == TextInput.Result.MOVED then
             move_cursor(cursor)
