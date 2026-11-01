@@ -1,9 +1,5 @@
 {
-  "entries": [
-    {
-      "path": "~/.maki/skills"
-    }
-  ],
+  "entries": [],
   "inherits": [],
   "exclude": []
 }
