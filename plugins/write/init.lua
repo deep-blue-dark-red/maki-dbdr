@@ -2,7 +2,7 @@ local shorten_path = require("maki.shorten_path")
 local ToolView = require("maki.tool_view")
 
 local DESCRIPTION =
-  [[Create a new file with content; creates parent directories. Overwrites an existing file unless append=true.]]
+  [[Create a new file with content; creates parent directories. Overwrites an existing file unless append=true. Omit content to write the draft you fenced with this path earlier (```lang <path>).]]
 
 local function write_view_opts(ctx)
   local tol = ctx:tool_output_lines()
@@ -40,8 +40,7 @@ maki.api.register_tool({
       },
       content = {
         type = "string",
-        description = "Complete content for a new file; when append=true, only the text to add",
-        required = true,
+        description = "Complete content for a new file; when append=true, only the text to add. Omit to use the draft fenced with this path",
       },
       append = {
         type = "boolean",
@@ -69,9 +68,14 @@ maki.api.register_tool({
     if not raw then
       return { llm_output = "error: path is required", is_error = true }
     end
-    local content = input.content
+    -- The dispatcher fills a model call's content from the draft; a nested
+    -- call (batch, code_execution) arrives unfilled and looks it up here.
+    local content, draft_err = input.content, nil
     if not content then
-      return { llm_output = "error: content is required", is_error = true }
+      content, draft_err = ctx:draft(raw)
+    end
+    if not content then
+      return { llm_output = "error: " .. tostring(draft_err), is_error = true }
     end
 
     local path = maki.fs.abspath(raw)

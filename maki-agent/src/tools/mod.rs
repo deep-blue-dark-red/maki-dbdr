@@ -32,6 +32,7 @@ use ignore::WalkBuilder;
 use maki_config::ProjectConfig;
 use serde_json::Value;
 
+use crate::agent::transcript::SharedTranscript;
 use crate::agent::{CallInstructions, LoadedInstructions};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::McpSession;
@@ -373,6 +374,9 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
+    /// What the model wrote this session, for drafts and pastes. A
+    /// subagent has its own: a quote means the quoting model's output.
+    pub transcript: SharedTranscript,
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -599,6 +603,7 @@ pub fn interpreter_ctx(
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
+        transcript: SharedTranscript::default(),
     }
 }
 

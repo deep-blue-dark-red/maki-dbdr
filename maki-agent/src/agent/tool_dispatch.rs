@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
+use crate::agent::transcript::PasteError;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
@@ -918,22 +919,33 @@ pub(super) async fn process_tool_calls(
     let tool_uses: Vec<(String, String, Value)> = response
         .message
         .tool_uses()
-        .map(|(id, name, input)| {
-            let mut input = input.clone();
-            if strip_why {
-                super::supervisor::strip_why(&mut input);
-            }
-            (id.to_owned(), name.to_owned(), input)
-        })
+        .map(|(id, name, input)| (id.to_owned(), name.to_owned(), input.clone()))
         .collect();
 
-    history.push(response.message);
+    // History keeps the call as written; the run gets its pastes and drafts
+    // filled in, which is why expansion precedes `strip_why` below.
+    let mut expansions: HashMap<String, Result<Value, PasteError>> = history
+        .push_response(response.message)
+        .into_iter()
+        .map(|expansion| (expansion.id, expansion.input))
+        .collect();
 
     let mut immediate_parts: Vec<ToolResultParts> = Vec::new();
     let mut runnable: Vec<(String, String, Value)> = Vec::new();
 
     let mut records: Vec<super::turn_state::ToolCallRecord> = Vec::new();
-    for (id, name, input) in tool_uses {
+    for (id, name, mut input) in tool_uses {
+        let paste_error = match expansions.remove(&id) {
+            Some(Ok(expanded)) => {
+                input = expanded;
+                None
+            }
+            Some(Err(e)) => Some(e.to_string()),
+            None => None,
+        };
+        if strip_why {
+            super::supervisor::strip_why(&mut input);
+        }
         debug!(
             tool = %name,
             id = %id,
@@ -945,10 +957,13 @@ pub(super) async fn process_tool_calls(
         // after lets `input` move into whichever branch takes it.
         let doom_loop = recent_calls.is_doom_loop(&name, &input);
         recent_calls.record(name.clone(), &input);
-        let skipped = halted.or_else(|| doom_loop.then_some(DOOM_LOOP_MESSAGE));
+        let skipped = halted
+            .map(Cow::Borrowed)
+            .or_else(|| doom_loop.then_some(Cow::Borrowed(DOOM_LOOP_MESSAGE)))
+            .or(paste_error.map(Cow::Owned));
         if let Some(note) = skipped {
-            warn!(tool = %name, note, "skipping execution");
-            let err = ToolDoneEvent::error(id.clone(), note);
+            warn!(tool = %name, note = %note, "skipping execution");
+            let err = ToolDoneEvent::error(id.clone(), note.into_owned());
             immediate_parts.push(ToolResultParts::from_event(&err));
             event_tx.try_send(AgentEvent::ToolDone(Box::new(err)));
             // A skipped call still counted as a call, and it came back an error.

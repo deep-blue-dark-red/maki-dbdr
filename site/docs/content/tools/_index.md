@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Maki ships with 27 built-in tools in this reference (26 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Maki ships with 28 built-in tools in this reference (27 on by default, 1 opt-in via plugin options). Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 ## File Operations
 
@@ -34,7 +34,7 @@ List one directory: names sorted alphabetically, directories first with a traili
 
 ### `read` {#read}
 
-Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted. Follow truncation hints to continue.
+Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted; draft:<path> reads a draft you fenced earlier. Follow truncation hints to continue.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -44,17 +44,17 @@ Read a file range with 1-based line numbers: path, offset (first line), and limi
 
 ### `write` {#write}
 
-Create a new file with content; creates parent directories. Overwrites an existing file unless append=true.
+Create a new file with content; creates parent directories. Overwrites an existing file unless append=true. Omit content to write the draft you fenced with this path earlier (```lang <path>).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `append` | boolean | no | Add content to the end of the file instead of replacing it |
-| `content` | string | yes | Complete content for a new file; when append=true, only the text to add |
+| `content` | string | no | Complete content for a new file; when append=true, only the text to add. Omit to use the draft fenced with this path |
 | `path` | string | yes | Absolute path to the file |
 
 ### `edit` {#edit}
 
-Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once.
+Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once. A draft:<path> edits a draft you fenced earlier, before it is written.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -296,3 +296,17 @@ Search the web using Exa AI. Today's date is YYYY-MM-DD. Returns titles, URLs, a
 |-----------|------|----------|---------|-------------|
 | `num_results` | integer | no | 8 | Number of results to return |
 | `query` | string | yes |  | Search query |
+
+## Additional tools
+
+### `transcript` {#transcript}
+
+Your own earlier output: search it, preview what a ⟦first…last⟧ quote pastes, or list drafts and clips. search: regex over everything you wrote, newest first, each hit tagged with where it is. copy: resolve a quote and show the text; with name, save it so ⟦@name⟧ pastes it later. list: drafts (draft:<path>) and clips (@name).
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `command` | string | yes |  | search: pattern (regex), optional limit. copy: quote, optional name. list: no arguments |
+| `limit` | integer | no | 20 | Most hits to return |
+| `name` | string | no |  | Save the copied text as a clip pasted with ⟦@name⟧ |
+| `pattern` | string | no |  | Regex matched against each line you wrote |
+| `quote` | string | no |  | A ⟦first…last⟧ or ⟦@name⟧ quote, literal text allowed around it |

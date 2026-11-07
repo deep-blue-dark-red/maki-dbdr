@@ -1,13 +1,15 @@
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
+use maki_agent::agent::transcript::DRAFT_PREFIX;
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::{Deadline, FileKey, MAIN_TASK_ID, ToolAudience, ToolContext, ToolLive};
 use maki_config::{AgentConfig, ToolOutputLines};
 use maki_storage::id::SessionRef;
 use mlua::{LuaSerdeExt, MultiValue, UserData, UserDataMethods, Value as LuaValue};
+use regex::Regex;
 
 use crate::api::tool::ToolCallReply;
 use crate::api::ui::buf::BufHandle;
@@ -360,6 +362,110 @@ impl UserData for LuaCtx {
                 Ok((Some(true), None))
             },
         );
+
+        // Drafts live in the session transcript, so `draft:<path>` reads and
+        // edits never touch the disk until a `write` names the real path.
+        methods.add_method("draft", |_, this, path: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("draft"));
+            };
+            let transcript = agent
+                .transcript
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(match transcript.draft(&path) {
+                Ok(text) => (Some(text.to_owned()), None),
+                Err(e) => (None, Some(e.to_string())),
+            })
+        });
+
+        methods.add_method("set_draft", |_, this, (path, text): (String, String)| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("set_draft"));
+            };
+            agent
+                .transcript
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_draft(&path, &text);
+            Ok((Some(true), None))
+        });
+
+        methods.add_method("is_draft_path", |_, _, path: String| {
+            Ok(path.starts_with(DRAFT_PREFIX))
+        });
+
+        methods.add_method(
+            "transcript_search",
+            |lua, this, (pattern, limit): (String, usize)| {
+                let Some(agent) = this.agent() else {
+                    return Ok(this.cap_err_pair("transcript_search"));
+                };
+                let regex = match Regex::new(&pattern) {
+                    Ok(regex) => regex,
+                    Err(e) => return Ok((None, Some(format!("bad pattern: {e}")))),
+                };
+                let transcript = agent
+                    .transcript
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let hits = lua.create_table()?;
+                for hit in transcript.search(&regex, limit) {
+                    let row = lua.create_table()?;
+                    row.set("place", hit.place)?;
+                    row.set("line", hit.line_nr)?;
+                    row.set("text", hit.line)?;
+                    hits.push(row)?;
+                }
+                Ok((Some(hits), None))
+            },
+        );
+
+        methods.add_method(
+            "transcript_copy",
+            |_, this, (quote, name): (String, Option<String>)| {
+                let Some(agent) = this.agent() else {
+                    return Ok(this.cap_err_pair("transcript_copy"));
+                };
+                let mut transcript = agent
+                    .transcript
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                Ok(match transcript.copy(&quote, name.as_deref()) {
+                    Ok(text) => (Some(text), None),
+                    Err(e) => (None, Some(e.to_string())),
+                })
+            },
+        );
+
+        methods.add_method("transcript_list", |lua, this, ()| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("transcript_list"));
+            };
+            let transcript = agent
+                .transcript
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let drafts = lua.create_table()?;
+            for draft in transcript.drafts() {
+                let row = lua.create_table()?;
+                row.set("path", draft.path)?;
+                row.set("versions", draft.versions)?;
+                row.set("lines", draft.lines)?;
+                drafts.push(row)?;
+            }
+            let clips = lua.create_table()?;
+            for clip in transcript.clips() {
+                let row = lua.create_table()?;
+                row.set("name", clip.name)?;
+                row.set("lines", clip.lines)?;
+                clips.push(row)?;
+            }
+            let listing = lua.create_table()?;
+            listing.set("drafts", drafts)?;
+            listing.set("clips", clips)?;
+            Ok((Some(listing), None))
+        });
 
         methods.add_method("is_instruction_file", |_, _, name: String| {
             Ok(maki_agent::is_instruction_file(&name))

@@ -28,6 +28,7 @@ use test_case::test_case;
 #[test_case("write", include_str!("../../plugins/write/tests/spec.lua") ; "write_plugin_spec")]
 #[test_case("terminal_progress", include_str!("../../plugins/terminal_progress/tests/spec.lua") ; "terminal_progress_plugin_spec")]
 #[test_case("tool_help", include_str!("../../plugins/tool_help/tests/spec.lua") ; "tool_help_plugin_spec")]
+#[test_case("transcript", include_str!("../../plugins/transcript/tests/spec.lua") ; "transcript_plugin_spec")]
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

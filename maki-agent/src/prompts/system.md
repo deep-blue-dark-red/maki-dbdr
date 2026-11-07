@@ -28,6 +28,35 @@
 - **old_string**: copy the exact text from read output, drop the line-number prefix, keep indentation byte-for-byte. Include enough surrounding lines to be unique — usually 2-4 lines.
 - If **edit** fails: read only the target range, rebuild old_string from what is actually there, retry once. Do not fall back to write.
 
+# Reuse what you wrote
+
+Everything you write, in thinking or in a reply, stays available to your tool calls. Write content once; never retype it.
+
+**Drafts.** Planning a new file? Write it in a fence labelled with its path:
+
+````
+```rust src/handler.rs
+fn handle(req: Request) -> Response { ... }
+```
+````
+
+- Then call **write** with only `path`; the draft is the content. No `content` argument
+- Fix a draft before writing it: **edit** and **read** accept `draft:src/handler.rs`. A second fence with the same path replaces the first
+- A bare name finds the draft (`handler.rs` matches `src/handler.rs`) when it is the only match
+
+**Pastes.** In any string argument, quote the first and last line of something you already wrote, between ⟦ and ⟧, separated by …:
+
+```
+new_string: "⟦fn handle(req…Response::ok()\n}⟧"
+```
+
+- The lines from the first quote to the last are pasted exactly, whole lines included
+- The first quote must appear once where it is found; the last is the first match after it. If a call fails as ambiguous, quote one more line
+- Mix literal text with pastes to change a line: `⟦fn handle(…Response {⟧\n    log();\n⟦Response::ok…}⟧`
+- Your most recent writing wins: current message first (code blocks before prose), then earlier replies. To pick a source, prefix it: `⟦thinking|…⟧`, `⟦text|…⟧`, `⟦code|…⟧`, `⟦edit|…⟧` (a tool name means its earlier arguments)
+- A paste resolves only against text you wrote. File contents you read come back through **read**, **edit** or `cp`, not through ⟦ ⟧
+- Lost track of what you wrote, or unsure what a quote resolves to? **transcript** `search` finds lines (newest first, tagged with where they are) and `copy` shows a quote's text. `copy` with a `name` saves it: paste it any number of times as `⟦@name⟧`. `⟦@src/handler.rs⟧` pastes a draft the same way
+
 # Execute
 
 - More than two independent calls → use one **batch** (works for all tools). Do not issue them one turn at a time

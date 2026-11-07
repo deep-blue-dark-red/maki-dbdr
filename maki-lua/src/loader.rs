@@ -202,6 +202,10 @@ pub(crate) static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "tool_help",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/tool_help"),
     },
+    BundledPlugin {
+        name: "transcript",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/transcript"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package

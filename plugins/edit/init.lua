@@ -18,7 +18,7 @@ local INSERT_LINES_DESCRIPTION =
   [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
 
 local EDIT_DESCRIPTION =
-  [[Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once.]]
+  [[Replace exact text in an existing file. Copy old_string from read output without line numbers, preserving whitespace, with enough context to match once; replace_all=true replaces every occurrence. An empty new_string deletes. If matching fails, re-read the target range and retry once. A draft:<path> edits a draft you fenced earlier, before it is written.]]
 
 local MULTIEDIT_DESCRIPTION =
   [[Apply several exact-text edits to one file atomically: they run in order, each against the previous result, and if any fails nothing is written. Copy each old_string from read output without line numbers, preserving whitespace; each must match once unless replace_all=true. On failure, re-read the target range and retry once.]]
@@ -182,10 +182,17 @@ local function diff_restore(blocks_from)
   end
 end
 
-local function apply_edit(path, transform)
-  path = maki.fs.abspath(path)
-
-  local before, read_err = maki.fs.read(path)
+-- A `draft:` path edits the fenced draft in the session transcript instead
+-- of a file; nothing reaches the disk until a write names the real path.
+local function apply_edit(path, transform, ctx)
+  local is_draft = ctx:is_draft_path(path)
+  local before, read_err
+  if is_draft then
+    before, read_err = ctx:draft(path)
+  else
+    path = maki.fs.abspath(path)
+    before, read_err = maki.fs.read(path)
+  end
   if read_err then
     return nil, "read error: " .. tostring(read_err)
   end
@@ -195,15 +202,20 @@ local function apply_edit(path, transform)
     return nil, transform_err
   end
 
-  local _, write_err = maki.fs.write(path, after)
-  if write_err then
-    return nil, "write error: " .. tostring(write_err)
+  if is_draft then
+    ctx:set_draft(path, after)
+  else
+    local _, write_err = maki.fs.write(path, after)
+    if write_err then
+      return nil, "write error: " .. tostring(write_err)
+    end
   end
 
   return {
     path = path,
     before = before,
     after = after,
+    is_draft = is_draft,
   }
 end
 
@@ -213,7 +225,7 @@ local function diff_result(edit_result, summary)
     diff_path = edit_result.path,
     diff_before = edit_result.before,
     diff_after = edit_result.after,
-    written_path = edit_result.path,
+    written_path = not edit_result.is_draft and edit_result.path or nil,
   }
 end
 
@@ -269,10 +281,10 @@ maki.api.register_tool({
     return { { old = input.old_string, new = input.new_string } }
   end),
 
-  handler = function(input)
+  handler = function(input, ctx)
     local result, err = apply_edit(input.path, function(content)
       return fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
-    end)
+    end, ctx)
     if not result then
       return { llm_output = err, is_error = true }
     end
@@ -336,7 +348,7 @@ register_tool_if(opts.multiedit, {
     return blocks
   end),
 
-  handler = function(input)
+  handler = function(input, ctx)
     local edits = input.edits
     if #edits == 0 then
       return { llm_output = "provide at least one edit", is_error = true }
@@ -357,7 +369,7 @@ register_tool_if(opts.multiedit, {
         content = replaced
       end
       return content
-    end)
+    end, ctx)
     if not result then
       return { llm_output = err, is_error = true }
     end
@@ -409,10 +421,10 @@ register_tool_if(opts.edit_lines, {
     return { { new = input.new_string, nr = input.start } }
   end),
 
-  handler = function(input)
+  handler = function(input, ctx)
     local result, err = apply_edit(input.path, function(content)
       return replace_lines(content, input.start, input["end"], input.new_string)
-    end)
+    end, ctx)
     if not result then
       return { llm_output = err, is_error = true }
     end
@@ -459,10 +471,10 @@ register_tool_if(opts.insert_lines, {
     return { { new = input.new_string, nr = input.line + 1 } }
   end),
 
-  handler = function(input)
+  handler = function(input, ctx)
     local result, err = apply_edit(input.path, function(content)
       return insert_after(content, input.line, input.new_string)
-    end)
+    end, ctx)
     if not result then
       return { llm_output = err, is_error = true }
     end

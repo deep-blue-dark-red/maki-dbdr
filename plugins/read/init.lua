@@ -7,7 +7,7 @@ local truncate_bytes = helpers.truncate_bytes
 local split_lines = helpers.split_lines
 
 local DESCRIPTION =
-  [[Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted. Follow truncation hints to continue.]]
+  [[Read a file range with 1-based line numbers: path, offset (first line), and limit (line count; 0 reads to EOF, capped at 2000 lines by default). Absolute, relative, and ~/ paths are accepted; draft:<path> reads a draft you fenced earlier. Follow truncation hints to continue.]]
 
 local DEFAULT_MAX_OUTPUT_LINES = 2000
 
@@ -73,12 +73,7 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
   return buf
 end
 
-local function read_file(path, offset, limit, ctx)
-  local content, err = maki.fs.read(path)
-  if not content then
-    return { llm_output = "read error: " .. tostring(err), is_error = true }
-  end
-
+local function render(content, path, offset, limit, ctx, is_draft)
   local all_lines = split_lines(content)
   local total_lines = #all_lines
 
@@ -92,7 +87,9 @@ local function read_file(path, offset, limit, ctx)
     lines[#lines + 1] = truncate_bytes(all_lines[i], max_line_bytes)
   end
 
-  ctx:record_read(path)
+  if not is_draft then
+    ctx:record_read(path)
+  end
 
   local parts = {}
   local nr_fmt = ToolView.line_nr_fmt(start + #lines - 1) .. ": %s"
@@ -119,7 +116,7 @@ local function read_file(path, offset, limit, ctx)
   local prefix = start > 1 and table.concat(all_lines, "\n", 1, math.min(start - 1, total_lines)) or nil
 
   local basename = path:match("([^/]+)$")
-  local parent = maki.fs.dirname(path)
+  local parent = not is_draft and maki.fs.dirname(path)
   if parent and not ctx:is_instruction_file(basename) then
     ctx:load_instructions(parent)
   end
@@ -129,6 +126,22 @@ local function read_file(path, offset, limit, ctx)
     body = build_file_view(lines, start, total_lines, path, ctx, prefix),
     annotation = annotation,
   }
+end
+
+local function read_file(path, offset, limit, ctx)
+  local content, err = maki.fs.read(path)
+  if not content then
+    return { llm_output = "read error: " .. tostring(err), is_error = true }
+  end
+  return render(content, path, offset, limit, ctx, false)
+end
+
+local function read_draft(path, offset, limit, ctx)
+  local content, err = ctx:draft(path)
+  if not content then
+    return { llm_output = "read error: " .. tostring(err), is_error = true }
+  end
+  return render(content, path, offset, limit, ctx, true)
 end
 
 maki.api.register_prompt_hint({
@@ -203,6 +216,9 @@ maki.api.register_tool({
     local raw = input.path
     if not raw then
       return { llm_output = "error: path is required", is_error = true }
+    end
+    if ctx:is_draft_path(raw) then
+      return read_draft(raw, input.offset, input.limit, ctx)
     end
     local path = maki.fs.abspath(raw)
     local meta = maki.fs.metadata(path)

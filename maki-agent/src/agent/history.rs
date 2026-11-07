@@ -7,6 +7,8 @@ use maki_storage::id::MakiId;
 use maki_storage::sessions::next_epoch;
 use tracing::warn;
 
+use super::transcript::{SharedTranscript, ToolExpansion};
+
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
@@ -43,16 +45,31 @@ pub struct History {
     /// write is retried by the next turn instead of lost. [`Self::restored`]
     /// leaves it clear: its repair alone is not worth rewriting the file for.
     unsaved: bool,
+    /// Grows with every push and never shrinks: a rewrite changes what the
+    /// model is sent, not what it wrote.
+    transcript: SharedTranscript,
 }
 
 impl History {
     pub fn new(messages: Vec<Message>) -> Self {
+        let transcript = SharedTranscript::default();
+        {
+            let mut t = transcript.write().unwrap_or_else(PoisonError::into_inner);
+            for msg in &messages {
+                t.append(msg);
+            }
+        }
         Self {
             messages,
             epoch: next_epoch(),
             mirror: None,
             unsaved: false,
+            transcript,
         }
+    }
+
+    pub fn transcript(&self) -> SharedTranscript {
+        Arc::clone(&self.transcript)
     }
 
     pub fn restored(mut messages: Vec<Message>) -> Self {
@@ -79,7 +96,19 @@ impl History {
     }
 
     pub fn push(&mut self, msg: Message) {
+        self.push_response(msg);
+    }
+
+    /// The pushed message keeps the short form the model wrote; what came
+    /// out of its drafts and pastes goes back to the caller to run.
+    pub fn push_response(&mut self, msg: Message) -> Vec<ToolExpansion> {
+        let expansions = self
+            .transcript
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .append(&msg);
         self.edit(|msgs| msgs.push(msg));
+        expansions
     }
 
     pub fn len(&self) -> usize {

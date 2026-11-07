@@ -6,6 +6,7 @@ mod run;
 mod streaming;
 mod supervisor;
 pub mod tool_dispatch;
+pub mod transcript;
 
 pub use compaction::{checkpoint, compact, rename_session};
 pub use history::{

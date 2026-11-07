@@ -18,6 +18,7 @@ unicode-segmentation = { workspace = true }
 strum = { workspace = true }
 maki-storage = { workspace = true }
 grep-regex = { workspace = true }
+regex = { workspace = true }
 grep-searcher = { workspace = true }
 similar = { workspace = true }
 jsonrepair = { workspace = true }

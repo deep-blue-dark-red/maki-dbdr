@@ -133,6 +133,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "thinking",
     "todo_write",
     "tool_help",
+    "transcript",
     "view_image",
     "webfetch",
     "websearch",

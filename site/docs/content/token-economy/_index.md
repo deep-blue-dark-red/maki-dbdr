@@ -65,6 +65,32 @@ in context forever               1 turn, 1 line in context
 
 **Compaction** resets the multiplier when a session runs long: older turns are summarized and dropped. [Context](/docs/context/#when-the-window-fills) has the details.
 
+## Reuse instead of retype
+
+A model that plans a file in its thinking and then calls `write` emits the file twice. Output tokens are the expensive kind, so Maki keeps the model's own output in memory and lets a tool call point back into it.
+
+**Drafts.** A fence labelled with a path is a draft of that file. A `write` that names the path and omits `content` gets the draft as its content. `read` and `edit` accept `draft:src/h.rs`, so the model can fix a few lines before anything reaches the disk. Several fences with the same path are versions, and the newest wins.
+
+```
+thinking                          tool call
+────────────────────────          ─────────────────────────
+```rust src/handler.rs            write(path="src/handler.rs")
+fn handle(...) { ... }            content comes from the draft
+```                               (0 extra output tokens)
+```
+
+**Pastes.** Any string argument may quote the first and last line of something the model wrote earlier, between `⟦` and `⟧` with `…` in the middle. The lines between them are pasted in place, byte for byte. Literal text can sit around or between quotes, so an edit to a draft costs the changed line rather than the whole block.
+
+```
+new_string = "⟦fn handle(…Response {⟧\n    log();\n⟦Response::ok…}⟧"
+```
+
+Resolution looks at the current message first (code blocks, then tables, then prose, then earlier tool arguments) and then at the previous eight assistant messages. The start quote must match once in the newest place it appears; the end quote is the first match after it. A quote that matches twice, or not at all, fails the call with the candidates listed, and the model retries with a longer quote. A prefix picks a source when two places collide: `⟦thinking|…⟧`, `⟦text|…⟧`, `⟦code|…⟧`, or a tool name such as `⟦edit|…⟧`.
+
+**Search, copy, clips.** The `transcript` tool works on the same buffer. `search` greps every line the model wrote, newest first, and tags each hit with where it came from (`m12 thinking code[src/h.rs]:3`), which matters after compaction when the text itself is gone from context. `copy` resolves a quote and shows the result at input-token cost, so a long paste can be checked before it lands in a file. `copy` with a `name` keeps the text as a clip, and `⟦@name⟧` pastes it from then on; a draft can be pasted the same way by its path.
+
+The history sent back to the model keeps the short form, so the prompt cache stays warm. The buffer only grows: compaction and rewind change what the model is sent, never what it wrote, so a quote keeps resolving for the whole session.
+
 ## Watching it work
 
 `/usage` shows the token breakdown of the current session, and `--output-format json` in [Headless Mode](/docs/headless/) reports `total_cost_usd` per run. Cheap is a feature you can measure.

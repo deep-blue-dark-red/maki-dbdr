@@ -2904,6 +2904,7 @@ dependencies = [
  "maki-storage",
  "nucleo-matcher",
  "open",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
