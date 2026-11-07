@@ -30,9 +30,13 @@ use maki_agent::{
 use maki_config::{ModelPolicy, ProjectConfig, SessionDefaults};
 use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD, MODE_PLAN};
 use maki_providers::model::Model;
-use maki_providers::{EMPTY_RESPONSE_MARKER, ImageSource, StopReason, Timeouts, TokenUsage, add_cost};
+use maki_providers::{
+    EMPTY_RESPONSE_MARKER, ImageSource, StopReason, Timeouts, TokenUsage, add_cost,
+};
 use maki_shmem::Speaker;
-use maki_shmem::broadcast::{Broadcaster, SessionSnapshot as ShmemSnapshot, SessionState as ShmemState};
+use maki_shmem::broadcast::{
+    Broadcaster, SessionSnapshot as ShmemSnapshot, SessionState as ShmemState,
+};
 use maki_shmem::control::{AckResult, Command};
 use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
@@ -1015,13 +1019,10 @@ impl EventPump {
                 // Ticks keep the command path live while a single long tool
                 // emits nothing; the stream end and a tick are told apart by
                 // the wrapper.
-                let next = futures_lite::future::or(
-                    async { Some(events.next().await) },
-                    async {
-                        smol::Timer::after(COMMAND_POLL).await;
-                        None
-                    },
-                )
+                let next = futures_lite::future::or(async { Some(events.next().await) }, async {
+                    smol::Timer::after(COMMAND_POLL).await;
+                    None
+                })
                 .await;
                 match next {
                     Some(Some(envelope)) => {

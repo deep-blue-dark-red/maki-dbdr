@@ -12,11 +12,7 @@ use std::{fs, path::PathBuf};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::{
-    MakiAck, MakiCommand, MakiStatus,
-    ring,
-    schema::blit_runtime::as_bytes,
-};
+use crate::{MakiAck, MakiCommand, MakiStatus, ring, schema::blit_runtime::as_bytes};
 
 pub const KEY_BYTES: usize = 32;
 pub const TAG_BYTES: usize = 16;

@@ -63,8 +63,8 @@ pub(crate) fn build_tool_input(args: &str, schema: &Value) -> Result<Value, Stri
         return Ok(json!({}));
     }
     if trimmed.starts_with('{') {
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|e| format!("invalid JSON input: {e}"))?;
+        let value: Value =
+            serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON input: {e}"))?;
         if !value.is_object() {
             return Err("JSON input must be an object".into());
         }
@@ -139,12 +139,7 @@ pub(crate) fn schema_props(schema: &Value) -> Vec<SchemaProp> {
     let required = schema
         .get("required")
         .and_then(Value::as_array)
-        .map(|names| {
-            names
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-        })
+        .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
     let mut out: Vec<SchemaProp> = props
         .iter()
@@ -442,9 +437,6 @@ mod tests {
             }
         });
         let input = build_tool_input("/tmp/a.txt hello", &schema).unwrap();
-        assert_eq!(
-            input,
-            json!({"path": "/tmp/a.txt", "content": "hello"})
-        );
+        assert_eq!(input, json!({"path": "/tmp/a.txt", "content": "hello"}));
     }
 }

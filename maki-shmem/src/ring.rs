@@ -16,7 +16,7 @@
 //! haunt attach to every ring [`session_ring_paths`] finds.
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 
 use crate::schema;
 
@@ -173,7 +173,11 @@ impl Ring {
         let final_path = CString::new(path).map_err(|_| RingError::FileOpenFailed)?;
 
         let fd = unsafe {
-            libc::open(pending.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o600)
+            libc::open(
+                pending.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+                0o600,
+            )
         };
         if fd < 0 {
             return Err(RingError::FileOpenFailed);
@@ -217,8 +221,7 @@ impl Ring {
         ring.init_flag().store(1, Ordering::Release);
 
         // The mapping survives the rename: it holds the inode, not the name.
-        if unsafe { libc::rename(pending.as_ptr(), ring.created.as_ref().unwrap().as_ptr()) } != 0
-        {
+        if unsafe { libc::rename(pending.as_ptr(), ring.created.as_ref().unwrap().as_ptr()) } != 0 {
             unsafe { libc::unlink(pending.as_ptr()) };
             return Err(RingError::FileOpenFailed);
         }
@@ -291,7 +294,9 @@ impl Ring {
         loop {
             match Ring::open(path) {
                 Ok(ring) => return Ok(ring),
-                Err(RingError::FileOpenFailed | RingError::NotInitialised) if waited < timeout_ms => {
+                Err(RingError::FileOpenFailed | RingError::NotInitialised)
+                    if waited < timeout_ms =>
+                {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     waited += 5;
                 }
@@ -316,7 +321,10 @@ impl Ring {
 
     fn consumer_line(&self, index: usize) -> *mut u8 {
         const AT: usize = std::mem::offset_of!(schema::RingHeader, consumers);
-        unsafe { self.memory.add(AT + index * schema::RingConsumerSlot::LENGTH as usize) }
+        unsafe {
+            self.memory
+                .add(AT + index * schema::RingConsumerSlot::LENGTH as usize)
+        }
     }
 
     pub fn update_status(&self, status: Status) {
@@ -398,8 +406,8 @@ impl Ring {
 
     #[inline]
     fn slot_seq(slot: *mut Slot) -> &'static AtomicU64 {
-        const AT: usize = std::mem::offset_of!(Slot, header)
-            + std::mem::offset_of!(schema::RingSlotHeader, seq);
+        const AT: usize =
+            std::mem::offset_of!(Slot, header) + std::mem::offset_of!(schema::RingSlotHeader, seq);
         const _: () = assert!(AT == 0);
         unsafe { &*((slot as *mut u8).add(AT) as *const AtomicU64) }
     }
@@ -451,7 +459,9 @@ impl<'a> Producer<'a> {
     /// Publishes the true tail, so a reader sees where the producer actually
     /// got to rather than the last batch boundary.
     pub fn flush(&mut self) {
-        self.ring.published_cell().store(self.next, Ordering::Release);
+        self.ring
+            .published_cell()
+            .store(self.next, Ordering::Release);
     }
 
     /// Publishes a record. Three stores, one of them ordered: payload, then
@@ -489,7 +499,10 @@ impl<'a> Producer<'a> {
 /// What a poll returned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Poll {
-    Received { sequence: u64, msg_id: u16 },
+    Received {
+        sequence: u64,
+        msg_id: u16,
+    },
     Waiting,
     /// The producer overwrote sequences before this reader read them; the
     /// reader has resynced to the oldest live slot.
@@ -502,7 +515,13 @@ pub enum Poll {
 /// What a batched read hands each record to. `body` points into the slot
 /// and is valid until the consumer advances.
 pub trait RingVisitor {
-    fn on_record(&mut self, sequence: u64, msg_id: u16, body: &[u8; BODY_BYTES], last_of_batch: bool);
+    fn on_record(
+        &mut self,
+        sequence: u64,
+        msg_id: u16,
+        body: &[u8; BODY_BYTES],
+        last_of_batch: bool,
+    );
 }
 
 /// A reader. Many may run at once, in any language, with no registration.
@@ -559,7 +578,10 @@ impl Consumer {
             self.unsupported += 1;
             return Poll::Unsupported;
         }
-        Poll::Received { sequence: wanted, msg_id: identity as u16 }
+        Poll::Received {
+            sequence: wanted,
+            msg_id: identity as u16,
+        }
     }
 
     #[inline]
@@ -647,7 +669,10 @@ impl Consumer {
 
 /// A monotonic timestamp in nanoseconds, comparable within a host.
 pub fn monotonic_nanos() -> i64 {
-    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
     now.tv_sec * 1_000_000_000 + now.tv_nsec
 }
@@ -756,7 +781,9 @@ mod tests {
 
         let reader = Ring::open(&path).expect("open");
         let mut consumer = Consumer::new(&reader, StartAt::Earliest);
-        let mut collector = Collector { records: Vec::new() };
+        let mut collector = Collector {
+            records: Vec::new(),
+        };
         assert_eq!(consumer.read_all(&reader, &mut collector), 10);
         assert_eq!(collector.records.len(), 10);
         let first = MakiStatus::copy_from_bytes(&collector.records[0].1).expect("body");
@@ -778,7 +805,9 @@ mod tests {
 
         let reader = Ring::open(&path).expect("open");
         let mut consumer = Consumer::new(&reader, StartAt::Earliest);
-        let mut collector = Collector { records: Vec::new() };
+        let mut collector = Collector {
+            records: Vec::new(),
+        };
         let drained = consumer.read_all(&reader, &mut collector);
         // Accepted plus dropped equals what the producer published.
         assert_eq!((drained as u64 + consumer.dropped) as u32, total);

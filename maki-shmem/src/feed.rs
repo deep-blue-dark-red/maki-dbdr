@@ -106,8 +106,11 @@ impl Feed {
             }
         }
 
-        let mut sessions: Vec<FeedSession> =
-            self.attached.iter().filter_map(|a| a.last.clone()).collect();
+        let mut sessions: Vec<FeedSession> = self
+            .attached
+            .iter()
+            .filter_map(|a| a.last.clone())
+            .collect();
         sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         sessions.dedup_by(|a, b| a.session_id == b.session_id);
 
@@ -199,10 +202,7 @@ mod tests {
         broadcaster.update(snapshot("feed-a"));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        while feed
-            .sessions
-            .iter()
-            .all(|s| s.session_id != "feed-a")
+        while feed.sessions.iter().all(|s| s.session_id != "feed-a")
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -219,10 +219,7 @@ mod tests {
 
         broadcaster.ack("feed-a", 41, AckResult::Ok);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-        while feed
-            .acks
-            .iter()
-            .all(|a| a.session_id != "feed-a")
+        while feed.acks.iter().all(|a| a.session_id != "feed-a")
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(50));

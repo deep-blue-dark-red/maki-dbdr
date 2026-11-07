@@ -433,11 +433,14 @@ fn readable_runs_are_never_masked() {
 fn random_runs_are_masked() {
     for blob in [
         "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", // sha256 hex
-        "eyJhbGciOiJIUzI1NiJ9xQ2LmF5dGhvcml6YXRpb24iOiJCZWFyZXIgYWJj1Z9q", // base64url
+        "eyJhbGciOiJIUzI1NiJ9xQ2LmF5dGhvcml6YXRpb24iOiJCZWFyZXIgYWJj1Z9q",  // base64url
     ] {
         let mut table = SideTable::default();
         let out = cluster::run(&format!("v {blob} end\n"), &mut table);
-        assert!(out.starts_with("v <r:") && out.trim_end().ends_with(" end"), "{out}");
+        assert!(
+            out.starts_with("v <r:") && out.trim_end().ends_with(" end"),
+            "{out}"
+        );
     }
 }
 

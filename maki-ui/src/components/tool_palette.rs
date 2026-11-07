@@ -12,9 +12,12 @@ use std::time::SystemTime;
 use crossterm::event::{KeyCode, KeyEvent};
 use maki_agent::tools::registry::RegistrySnapshot;
 use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
-use maki_storage::paths::{project_dir, project_root};
 use maki_storage::StateDir;
-use nucleo::{Config, Matcher, Nucleo, Utf32String, pattern::{CaseMatching, Normalization}};
+use maki_storage::paths::{project_dir, project_root};
+use nucleo::{
+    Config, Matcher, Nucleo, Utf32String,
+    pattern::{CaseMatching, Normalization},
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -66,11 +69,17 @@ struct Match {
 enum Phase {
     Closed,
     /// Completing the tool name: `$rea` → `$read `.
-    Name { hidden: bool },
+    Name {
+        hidden: bool,
+    },
     /// Completing a parameter name: `$read pa` → `$read path=`.
-    ArgKey { prefix: String },
+    ArgKey {
+        prefix: String,
+    },
     /// Completing an enum parameter's value: `$mode m=bui` → `$mode m=build `.
-    ArgValue { prefix: String },
+    ArgValue {
+        prefix: String,
+    },
 }
 
 pub struct ToolPalette {
@@ -168,9 +177,7 @@ impl ToolPalette {
     /// since the last look; one `stat` per keystroke otherwise.
     fn refresh_custom(&mut self, storage: &StateDir, cwd: &str) -> bool {
         let dir = project_dir(storage, Path::new(cwd)).join(CUSTOM_DIR);
-        let mtime = fs::metadata(&dir)
-            .and_then(|meta| meta.modified())
-            .ok();
+        let mtime = fs::metadata(&dir).and_then(|meta| meta.modified()).ok();
         if self.custom_dir.as_deref() == Some(dir.as_path()) && mtime == self.custom_mtime {
             return false;
         }
@@ -461,8 +468,7 @@ impl ToolPalette {
             .map(|(i, m)| {
                 let item = &self.items[m.index];
                 let selected = i == self.selected;
-                let name_pad =
-                    max_name - item.name.chars().count() + GAP;
+                let name_pad = max_name - item.name.chars().count() + GAP;
 
                 if selected {
                     let s = t.item_selected;
@@ -488,10 +494,9 @@ impl ToolPalette {
                             t.inline_code,
                             vec![Span::styled(item.detail.clone(), t.item_desc)],
                         ),
-                        (Phase::Name { .. }, _) => (
-                            t.tool,
-                            vec![Span::styled(item.detail.clone(), t.item_desc)],
-                        ),
+                        (Phase::Name { .. }, _) => {
+                            (t.tool, vec![Span::styled(item.detail.clone(), t.item_desc)])
+                        }
                         (Phase::ArgKey { .. }, Detail::Typed { type_name, rest }) => (
                             t.code_gutter,
                             vec![
@@ -616,7 +621,11 @@ fn scan_custom_tools(dir: &Path, root: &Path, cwd: &Path) -> Vec<ToolItem> {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| root.join(&name).to_string_lossy().into_owned()),
         };
-        let fallback = if body.is_some() { "command" } else { name.as_str() };
+        let fallback = if body.is_some() {
+            "command"
+        } else {
+            name.as_str()
+        };
         let source = if description.is_empty() {
             fallback.to_owned()
         } else {
@@ -690,9 +699,9 @@ fn highlighted_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::tools::ToolAudience;
     use maki_agent::tools::registry::ToolSource;
     use maki_agent::tools::test_support::{mock_tool, mock_tool_with_schema};
-    use maki_agent::tools::ToolAudience;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_case::test_case;
@@ -715,11 +724,15 @@ mod tests {
         let reg = ToolRegistry::global();
         let _ = reg.register(
             mock_tool_with_schema(PROBE_A, ToolAudience::MAIN, probe_schema()),
-            ToolSource::Lua { plugin: "tp".into() },
+            ToolSource::Lua {
+                plugin: "tp".into(),
+            },
         );
         let _ = reg.register(
             mock_tool(PROBE_B, ToolAudience::MAIN),
-            ToolSource::Lua { plugin: "tp".into() },
+            ToolSource::Lua {
+                plugin: "tp".into(),
+            },
         );
     }
 
@@ -881,8 +894,14 @@ mod tests {
             p.handle_key(key(KeyCode::Down)),
             ToolAction::Consumed
         ));
-        assert!(matches!(p.handle_key(key(KeyCode::Up)), ToolAction::Consumed));
-        assert!(matches!(p.handle_key(key(KeyCode::Esc)), ToolAction::Consumed));
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Up)),
+            ToolAction::Consumed
+        ));
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Esc)),
+            ToolAction::Consumed
+        ));
         assert!(!p.is_active());
     }
 

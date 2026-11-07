@@ -116,7 +116,15 @@ pub fn mask_entropy_with<'a>(line: &'a str, table: &mut SideTable, elide: Elide)
                 }
                 run_len += 1;
             } else {
-                flush_run(&mut out, &mut copied, line, table, elide, run_start, run_len);
+                flush_run(
+                    &mut out,
+                    &mut copied,
+                    line,
+                    table,
+                    elide,
+                    run_start,
+                    run_len,
+                );
                 run_len = 0;
             }
         }
@@ -128,11 +136,27 @@ pub fn mask_entropy_with<'a>(line: &'a str, table: &mut SideTable, elide: Elide)
             }
             run_len += 1;
         } else {
-            flush_run(&mut out, &mut copied, line, table, elide, run_start, run_len);
+            flush_run(
+                &mut out,
+                &mut copied,
+                line,
+                table,
+                elide,
+                run_start,
+                run_len,
+            );
             run_len = 0;
         }
     }
-    flush_run(&mut out, &mut copied, line, table, elide, run_start, run_len);
+    flush_run(
+        &mut out,
+        &mut copied,
+        line,
+        table,
+        elide,
+        run_start,
+        run_len,
+    );
 
     match out {
         Some(mut s) => {
@@ -317,7 +341,10 @@ fn epoch_at(b: &[u8], from: usize) -> Option<usize> {
     if !matches!(j - from, 10 | 13 | 16 | 19) {
         return None;
     }
-    let secs: u64 = std::str::from_utf8(&b[from..from + 10]).ok()?.parse().ok()?;
+    let secs: u64 = std::str::from_utf8(&b[from..from + 10])
+        .ok()?
+        .parse()
+        .ok()?;
     if !(1_200_000_000..2_200_000_000).contains(&secs) {
         return None;
     }
@@ -348,12 +375,21 @@ const TEMP_INNER: &[&str] = &["/Library/Caches/", "/Temp/", "\\Temp\\", "/.cache
 /// The path must start at a boundary and be absolute (`/`, `~` or `C:\`),
 /// so a repo's own `build/tmp/` never reads as temp.
 fn temp_path_at(b: &[u8], from: usize) -> Option<usize> {
-    if from > 0 && !matches!(b[from - 1], b' ' | b'\t' | b'"' | b'\'' | b'=' | b'(' | b'[' | b':' | b',') {
+    if from > 0
+        && !matches!(
+            b[from - 1],
+            b' ' | b'\t' | b'"' | b'\'' | b'=' | b'(' | b'[' | b':' | b','
+        )
+    {
         return None;
     }
     let absolute = match b[from] {
         b'/' | b'~' => true,
-        c => c.is_ascii_alphabetic() && b.get(from + 1) == Some(&b':') && b.get(from + 2) == Some(&b'\\'),
+        c => {
+            c.is_ascii_alphabetic()
+                && b.get(from + 1) == Some(&b':')
+                && b.get(from + 2) == Some(&b'\\')
+        }
     };
     if !absolute {
         return None;

@@ -9,7 +9,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{mpsc::{self, RecvTimeoutError}, Mutex},
+    sync::{
+        Mutex,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -310,7 +313,12 @@ fn publish_statuses(
     producer.flush();
 }
 
-fn publish_ack(producer: &mut ring::Producer, session_id: &str, request_id: u64, result: AckResult) {
+fn publish_ack(
+    producer: &mut ring::Producer,
+    session_id: &str,
+    request_id: u64,
+    result: AckResult,
+) {
     let mut ack = MakiAck {
         request_id,
         result: result as u8,
@@ -341,7 +349,10 @@ fn publish_chat(producer: &mut ring::Producer, session_id: &str, speaker: Speake
     } else {
         let key = stream_key(session_id);
         let bytes = text.as_bytes();
-        let count = bytes.len().div_ceil(CHUNK_PAYLOAD_BYTES).min(u16::MAX as usize) as u16;
+        let count = bytes
+            .len()
+            .div_ceil(CHUNK_PAYLOAD_BYTES)
+            .min(u16::MAX as usize) as u16;
         let pieces: Vec<&[u8]> = chunk_pieces(text, count as usize).collect();
         for (index, piece) in pieces.into_iter().enumerate() {
             let mut chunk = Chunk {
@@ -399,9 +410,7 @@ fn status_record(pid: u32, snapshot: &SessionSnapshot, timestamp_ns: u64) -> Mak
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ring::{ring_dir, Consumer, Poll, StartAt},
-    };
+    use crate::ring::{Consumer, Poll, StartAt, ring_dir};
 
     fn unique_path(tag: &str) -> String {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -514,13 +523,10 @@ mod tests {
         let mut consumer = Consumer::new(&ring, StartAt::Head);
 
         broadcaster.chat("sess", Speaker::User, "hello rings");
-        let line = ChatLine::copy_from_bytes(&await_record(
-            &ring,
-            &mut consumer,
-            ChatLine::MSG_ID.get(),
-            deadline(),
+        let line = ChatLine::copy_from_bytes(
+            &await_record(&ring, &mut consumer, ChatLine::MSG_ID.get(), deadline())
+                .expect("a chat line"),
         )
-        .expect("a chat line"))
         .expect("line");
         assert_eq!(text::decode(&line.sender_name), "user");
         assert_eq!(text::decode(&line.text), "hello rings");
@@ -599,7 +605,10 @@ mod tests {
         while std::path::Path::new(&path).exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(!std::path::Path::new(&path).exists(), "ring file should be unlinked");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "ring file should be unlinked"
+        );
     }
 
     /// The full two-way trip: a haunt-side control ring delivers a targeted
@@ -665,8 +674,10 @@ mod tests {
             match consumer.poll(&ring) {
                 Poll::Received { msg_id, .. } if msg_id == crate::MakiAck::MSG_ID.get() => {
                     let body = consumer.last_body(&ring);
-                    break *unsafe { crate::schema::blit_runtime::from_bytes::<crate::MakiAck>(body) }
-                        .expect("ack body");
+                    break *unsafe {
+                        crate::schema::blit_runtime::from_bytes::<crate::MakiAck>(body)
+                    }
+                    .expect("ack body");
                 }
                 Poll::Received { .. } => {}
                 Poll::Waiting => thread::sleep(Duration::from_millis(20)),

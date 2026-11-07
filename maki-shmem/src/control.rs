@@ -123,7 +123,8 @@ impl ControlLink {
             match self.consumer.poll(&self.ring) {
                 Poll::Received { msg_id, .. }
                     if msg_id == MakiCommand::MSG_ID.get()
-                        && let Some(record) = (unsafe { from_bytes(self.consumer.last_body(&self.ring)) })
+                        && let Some(record) =
+                            (unsafe { from_bytes(self.consumer.last_body(&self.ring)) })
                         && key.verify_command(record)
                         && record.request_id > self.last_request_id
                         && let Some(incoming) = decode(record) =>
@@ -344,7 +345,12 @@ mod tests {
         crate::auth::AuthKey::from_bytes([9; crate::auth::KEY_BYTES])
     }
 
-    fn signed(request_id: u64, target: &str, command: &Command, key: &crate::auth::AuthKey) -> MakiCommand {
+    fn signed(
+        request_id: u64,
+        target: &str,
+        command: &Command,
+        key: &crate::auth::AuthKey,
+    ) -> MakiCommand {
         let mut record = command_record(request_id, target, command, 0);
         key.sign_command(&mut record);
         record

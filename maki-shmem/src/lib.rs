@@ -46,9 +46,9 @@ pub mod auth;
 pub mod payload;
 
 pub use schema::{
-    BLIT_BINDING_SHA256_PREFIX, BLIT_LAYOUT_SHA256, BLIT_SCHEMA_ID, BLIT_SCHEMA_VERSION, BlitRecord,
-    ChatLine, Chunk, Hello, MakiAck, MakiCommand, MakiStatus, MsgId, Ring512x2048, RingConsumerSlot,
-    RingControl, RingHeader, RingSlot512, RingSlotHeader, Status,
+    BLIT_BINDING_SHA256_PREFIX, BLIT_LAYOUT_SHA256, BLIT_SCHEMA_ID, BLIT_SCHEMA_VERSION,
+    BlitRecord, ChatLine, Chunk, Hello, MakiAck, MakiCommand, MakiStatus, MsgId, Ring512x2048,
+    RingConsumerSlot, RingControl, RingHeader, RingSlot512, RingSlotHeader, Status,
 };
 
 /// Fixed-buffer utf8 helpers for the schema's `utf8.fixed` fields.

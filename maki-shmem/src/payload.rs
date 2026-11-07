@@ -89,9 +89,15 @@ mod tests {
 
     #[test]
     fn incompressible_text_truncates() {
-        let text: String = (0..1024).map(|i| char::from_u32(0x4E00 + i % 500).unwrap()).collect();
+        let text: String = (0..1024)
+            .map(|i| char::from_u32(0x4E00 + i % 500).unwrap())
+            .collect();
         let record = record_with(&text);
-        assert_eq!(record.flags & FLAG_ZSTD, 0, "random-ish text should not compress");
+        assert_eq!(
+            record.flags & FLAG_ZSTD,
+            0,
+            "random-ish text should not compress"
+        );
         assert_eq!(decode(&record), text[..decode(&record).len()]);
         assert!(!decode(&record).is_empty());
     }

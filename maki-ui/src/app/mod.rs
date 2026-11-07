@@ -13,9 +13,9 @@ mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
 pub(crate) mod tasks;
-pub(crate) mod user_tool;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod user_tool;
 pub(crate) mod view;
 
 use std::collections::HashMap;
@@ -38,7 +38,6 @@ use crate::components::cache_miss_prompt::{
     Answer as CacheMissAnswer, CacheMissPrompt, Risk as CacheMissRisk,
 };
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
-use crate::components::tool_palette::{ToolAction, ToolPalette};
 use crate::components::export_picker::{ExportPicker, ExportPickerAction, ExportType};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
@@ -65,6 +64,7 @@ use crate::components::system_prompt_modal::{
     SystemPromptAction, SystemPromptModal, WIDTH_PERCENT,
 };
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
+use crate::components::tool_palette::{ToolAction, ToolPalette};
 use crate::components::tool_prompt_modal::{ToolPromptAction, ToolPromptModal};
 use crate::components::usage_modal::{UsageFetchState, UsageModal};
 use crate::components::{
@@ -1869,7 +1869,9 @@ impl App {
 
         if !self.is_main_chat() {
             return match key.code {
-                KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => self.toggle_mode(),
+                KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => {
+                    self.toggle_mode()
+                }
                 // A paused task's pane goes finished when its tool returns, so
                 // liveness is what keeps the dismiss Esc reachable after it.
                 KeyCode::Esc if self.task_pane_takes_esc() => {
@@ -2027,7 +2029,9 @@ impl App {
                         self.active_chat().scroll(-1);
                         vec![]
                     }
-                    KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => self.toggle_mode(),
+                    KeyCode::Tab if !self.is_bash_input() && !self.is_tool_input() => {
+                        self.toggle_mode()
+                    }
                     KeyCode::Esc => {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration

@@ -69,7 +69,7 @@ fn jobs_table() -> String {
         "mina-llama    2026-10-22T15:06:05Z",
     ]
     .join("\n")
-    + "\n"
+        + "\n"
 }
 
 #[test]
@@ -272,9 +272,15 @@ fn legend_respects_markers_and_words() {
     let out = repeat::run(&text);
     for line in out.lines().filter(|l| legend_value(l).is_some()) {
         let v = legend_value(line).unwrap();
-        assert!(!v.contains('<') && !v.contains('['), "legend cuts a marker: {line}");
+        assert!(
+            !v.contains('<') && !v.contains('['),
+            "legend cuts a marker: {line}"
+        );
         let last = v.as_bytes()[v.len() - 1];
-        assert!(!last.is_ascii_alphanumeric() && last != b'_', "legend ends mid-word: {line:?}");
+        assert!(
+            !last.is_ascii_alphanumeric() && last != b'_',
+            "legend ends mid-word: {line:?}"
+        );
     }
     assert_eq!(decode(&out), text);
 }

@@ -207,9 +207,14 @@ mod compress_tests {
         // One folded pair inside a long prose prompt: shorter, but not by
         // MIN_CUT_BYTES / 1/MIN_CUT_DIV, so no marker reaches the model.
         let mut input = String::from("Please look at these two lines and the notes below.\n");
-        input.push_str(&format!("{TS_LINE}\n{}\n", TS_LINE.replace("10:22", "11:22")));
+        input.push_str(&format!(
+            "{TS_LINE}\n{}\n",
+            TS_LINE.replace("10:22", "11:22")
+        ));
         for i in 0..20 {
-            input.push_str(&format!("note {i}: a distinct sentence about part {i} of the plan\n"));
+            input.push_str(&format!(
+                "note {i}: a distinct sentence about part {i} of the plan\n"
+            ));
         }
         assert_eq!(compress_if_useful(input.clone()), input);
     }
@@ -217,12 +222,17 @@ mod compress_tests {
     #[test]
     fn one_shot_masks_only_long_blobs_inline() {
         let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-        let jwt: String = (0..4).map(|_| "eyJhbGciOiJIUzI1NiJ9xQ2LmF5dGhvcml6YXRpb24iOiJCZWFyZXIgYWJj1Z9q").collect();
+        let jwt: String = (0..4)
+            .map(|_| "eyJhbGciOiJIUzI1NiJ9xQ2LmF5dGhvcml6YXRpb24iOiJCZWFyZXIgYWJj1Z9q")
+            .collect();
         let mut input = format!("sha {digest}\ntoken {jwt}\n");
         input.push_str(&repetitive());
         let out = compress_if_useful(input);
         assert!(out.contains(digest), "digests stay quotable: {out}");
-        assert!(out.contains(&format!("token [masked n={}]", jwt.len())), "{out}");
+        assert!(
+            out.contains(&format!("token [masked n={}]", jwt.len())),
+            "{out}"
+        );
         assert!(!out.contains("<r:"), "no unexpandable stubs: {out}");
     }
 }

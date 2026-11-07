@@ -4051,7 +4051,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
     );
 }
 
-/// `/tasks` is registered by a plugin, and the host must not shadow it with a
+/// `/subtasks` is registered by a plugin, and the host must not shadow it with a
 /// builtin of its own: a hardcoded arm ahead of the plugin lookup silently
 /// routed the command to a picker that no longer exists.
 #[test]
@@ -5427,7 +5427,10 @@ fn user_tool_prefix_dispatches_registered_tool(text: &str, visible: bool) {
         images: vec![],
     });
     let Some(Action::UserToolCommand {
-        name, input, visible: sent_visible, ..
+        name,
+        input,
+        visible: sent_visible,
+        ..
     }) = actions.into_iter().next()
     else {
         panic!("$tool must dispatch a user tool call");
@@ -5503,7 +5506,10 @@ fn enter_on_empty_param_list_submits_and_closes_the_helper() {
     for ch in "ut_probe ".chars() {
         app.update(Msg::Key(key(KeyCode::Char(ch))));
     }
-    assert!(app.tool_palette.is_active(), "space after a tool lists its params");
+    assert!(
+        app.tool_palette.is_active(),
+        "space after a tool lists its params"
+    );
 
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(
@@ -5553,10 +5559,16 @@ fn tool_palette_completes_argument_names() {
     for ch in "ut_probe ".chars() {
         app.update(Msg::Key(key(KeyCode::Char(ch))));
     }
-    assert!(app.tool_palette.is_active(), "space after a tool lists its params");
+    assert!(
+        app.tool_palette.is_active(),
+        "space after a tool lists its params"
+    );
 
     app.update(Msg::Key(key(KeyCode::Tab)));
-    assert!(app.input_box.buffer.value().starts_with("$ut_probe "), "params complete after the prefix");
+    assert!(
+        app.input_box.buffer.value().starts_with("$ut_probe "),
+        "params complete after the prefix"
+    );
     assert!(app.input_box.buffer.value().ends_with('='));
 }
 

@@ -127,7 +127,9 @@ fn render_messages(messages: &[Message]) -> Vec<ChatEntry> {
                     text: "[image]".to_owned(),
                     dim: true,
                 }),
-                ContentBlock::ToolResult { content, is_error, .. } => out.push(ChatEntry {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => out.push(ChatEntry {
                     speaker,
                     text: if *is_error {
                         format!("✗ {}", first_line(content))
@@ -205,7 +207,9 @@ impl App {
 
     fn tick(&mut self) {
         if self.feed.poll() {
-            self.selected = self.selected.min(self.feed.sessions.len().saturating_sub(1));
+            self.selected = self
+                .selected
+                .min(self.feed.sessions.len().saturating_sub(1));
         }
         if let Some(id) = self.focus.clone()
             && let Some(pos) = self.feed.sessions.iter().position(|s| s.session_id == id)
@@ -223,9 +227,11 @@ impl App {
             transcript.refresh(&id, &self.state, false);
         }
         for ack in std::mem::take(&mut self.feed.acks) {
-            if let Some(pos) = self.pending.iter().position(|p| {
-                p.request_id == ack.request_id && p.session_id == ack.session_id
-            }) {
+            if let Some(pos) = self
+                .pending
+                .iter()
+                .position(|p| p.request_id == ack.request_id && p.session_id == ack.session_id)
+            {
                 let what = self.pending.remove(pos).what;
                 self.notice = format!("{what}: {}", ack_label(ack.result));
             }
@@ -253,7 +259,8 @@ impl App {
             return;
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('q') | KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q') | KeyCode::Esc, _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
             (KeyCode::Tab, _) => self.step_session(1),
@@ -387,12 +394,10 @@ fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
 }
 
 fn draw_sessions(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            format!(" sessions ({}) ", app.feed.sessions.len()),
-            Style::default().fg(theme.accent),
-        ));
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        format!(" sessions ({}) ", app.feed.sessions.len()),
+        Style::default().fg(theme.accent),
+    ));
     let rows: Vec<Line> = if app.feed.sessions.is_empty() {
         vec![Line::from(Span::styled(
             " no maki process broadcasting",
@@ -416,7 +421,10 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                         style.fg(state_color(s.state, theme)),
                     ),
                     Span::styled(
-                        format!("{} ", truncate(&s.title, area.width.saturating_sub(14) as usize)),
+                        format!(
+                            "{} ",
+                            truncate(&s.title, area.width.saturating_sub(14) as usize)
+                        ),
                         style,
                     ),
                 ])
@@ -467,12 +475,12 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         mtime: None,
         entries: Vec::new(),
     };
-    let transcript = app
-        .transcripts
-        .get(&session.session_id)
-        .unwrap_or(&EMPTY);
+    let transcript = app.transcripts.get(&session.session_id).unwrap_or(&EMPTY);
     let header = Line::from(vec![
-        Span::styled(session.state.label(), Style::default().fg(state_color(session.state, theme))),
+        Span::styled(
+            session.state.label(),
+            Style::default().fg(state_color(session.state, theme)),
+        ),
         Span::raw(format!(
             "  {}  ctx {}/{}  ${:.2}  pid {}  {}",
             session.title,
@@ -539,7 +547,6 @@ fn draw_conversation(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-
 fn ack_label(result: maki_shmem::control::AckResult) -> &'static str {
     match result {
         maki_shmem::control::AckResult::Ok => "ok",
@@ -555,7 +562,11 @@ const NEWEST_HINT: &str = "tab next · j/k scroll · c cancel · p prompt · q q
 fn wrap_entries<'a>(lines: &[Line<'a>], width: usize) -> Vec<Line<'a>> {
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let text = line.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let text = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
         let char_count = text.chars().count();
         if width > 0 && char_count > width {
             for chunk in text
