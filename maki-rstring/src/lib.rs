@@ -29,6 +29,13 @@ pub mod tokens;
 /// Not enforced here — [`compress_if_useful`] costs nothing on prose anyway.
 pub const MIN_BYTES: usize = 399;
 
+/// [`compress_if_useful`] keeps its output only when it cuts at least this
+/// many bytes *and* at least 1/[`MIN_CUT_DIV`] of the input. Below that the
+/// markers cost the reader more than the bytes saved: a prompt with one
+/// folded line or a log shaved by 3% is better left alone.
+pub const MIN_CUT_BYTES: usize = 256;
+pub const MIN_CUT_DIV: usize = 5;
+
 #[derive(Debug, Clone)]
 pub struct Cfg {
     pub keep_thinking: bool,
@@ -37,6 +44,9 @@ pub struct Cfg {
     /// corpus-table tier (token-exact budget, `rstring thin-table`).
     pub thin_rate: Option<f64>,
     pub evict_last: usize,
+    /// Where stream-tier entropy runs go: the side table (CLI) or an
+    /// unrecoverable inline marker (one-shot callers).
+    pub elide: mask::Elide,
 }
 
 impl Default for Cfg {
@@ -46,6 +56,7 @@ impl Default for Cfg {
             surp_on: true,
             thin_rate: None,
             evict_last: 3,
+            elide: mask::Elide::Side,
         }
     }
 }
@@ -100,10 +111,10 @@ pub fn detect(text: &str) -> &'static str {
 /// its guards already skip. Columnar rows are never touched: a table's fields
 /// are load-bearing by construction, and cell drops would break rows.
 pub fn stream(text: &str, table: &mut side::SideTable, cfg: &Cfg) -> String {
-    if let Some(col) = jsonl::try_columnar(text, table) {
+    if let Some(col) = jsonl::try_columnar_with(text, table, cfg.elide) {
         return col;
     }
-    let clustered = cluster::run(text, table);
+    let clustered = cluster::run_with(text, table, cfg.elide);
     let out = repeat::run(&clustered);
     match cfg.thin_rate {
         Some(r) => thin::run(&out, r),
@@ -122,18 +133,26 @@ pub fn compress_auto(text: &str, table: &mut side::SideTable, cfg: &Cfg) -> (Str
     (out, mode)
 }
 
-/// `stream` tier for a one-shot caller: ANSI escapes stripped, a fresh
-/// [`side::SideTable`] per call — stubs dedupe within the returned text but
-/// are not recoverable afterwards (`rstring expand` needs the table).
-/// Returns the input unchanged unless the compressed form is really shorter,
-/// so a caller may hand it everything and gate on [`MIN_BYTES`] only to skip
-/// the work on short prose.
+/// `stream` tier for a one-shot caller: ANSI escapes stripped, no side
+/// table survives the call, so entropy runs elide inline
+/// ([`mask::Elide::Inline`], [`mask::INLINE_RUN_MIN`]+ only) instead of as
+/// stubs nobody could expand. Returns the (ANSI-stripped) input unless the
+/// cut clears [`MIN_CUT_BYTES`] and 1/[`MIN_CUT_DIV`] of it, so a caller
+/// may hand it everything and gate on [`MIN_BYTES`] only to skip the work on
+/// short prose.
 pub fn compress_if_useful(text: String) -> String {
     let stripped = mask::strip_ansi(&text);
     let mut table = side::SideTable::default();
-    let out = stream(&stripped, &mut table, &Cfg::default());
-    if out.len() < text.len() {
+    let cfg = Cfg {
+        elide: mask::Elide::Inline,
+        ..Cfg::default()
+    };
+    let out = stream(&stripped, &mut table, &cfg);
+    let cut = stripped.len().saturating_sub(out.len());
+    if cut >= MIN_CUT_BYTES && cut * MIN_CUT_DIV >= stripped.len() {
         out
+    } else if stripped.len() < text.len() {
+        stripped // escapes are pure noise: dropping them needs no marker
     } else {
         text
     }
@@ -181,5 +200,29 @@ mod compress_tests {
         let input = format!("\u{1b}[31m{TS_LINE}\u{1b}[0m\n");
         let out = compress_if_useful(input);
         assert!(!out.contains('\u{1b}'), "{out}");
+    }
+
+    #[test]
+    fn small_cut_returns_input_untouched() {
+        // One folded pair inside a long prose prompt: shorter, but not by
+        // MIN_CUT_BYTES / 1/MIN_CUT_DIV, so no marker reaches the model.
+        let mut input = String::from("Please look at these two lines and the notes below.\n");
+        input.push_str(&format!("{TS_LINE}\n{}\n", TS_LINE.replace("10:22", "11:22")));
+        for i in 0..20 {
+            input.push_str(&format!("note {i}: a distinct sentence about part {i} of the plan\n"));
+        }
+        assert_eq!(compress_if_useful(input.clone()), input);
+    }
+
+    #[test]
+    fn one_shot_masks_only_long_blobs_inline() {
+        let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let jwt: String = (0..4).map(|_| "eyJhbGciOiJIUzI1NiJ9xQ2LmF5dGhvcml6YXRpb24iOiJCZWFyZXIgYWJj1Z9q").collect();
+        let mut input = format!("sha {digest}\ntoken {jwt}\n");
+        input.push_str(&repetitive());
+        let out = compress_if_useful(input);
+        assert!(out.contains(digest), "digests stay quotable: {out}");
+        assert!(out.contains(&format!("token [masked n={}]", jwt.len())), "{out}");
+        assert!(!out.contains("<r:"), "no unexpandable stubs: {out}");
     }
 }

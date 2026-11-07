@@ -1,5 +1,6 @@
 //! JSONL columnar fast lane: if the input is a run of JSON objects with a
-//! shared key signature, render one header + TSV rows (values volatile-masked).
+//! shared key signature, render one header + TSV rows (values verbatim; rows
+//! differing only in volatile values then fold through [`cluster`]).
 //! JSON keys are the token-expensive part of JSONL; stating them once removes
 //! that tax with zero information loss.
 
@@ -8,6 +9,14 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub fn try_columnar(text: &str, table: &mut crate::side::SideTable) -> Option<String> {
+    try_columnar_with(text, table, mask::Elide::Side)
+}
+
+pub fn try_columnar_with(
+    text: &str,
+    table: &mut crate::side::SideTable,
+    elide: mask::Elide,
+) -> Option<String> {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() < 4 {
         return None;
@@ -55,14 +64,14 @@ pub fn try_columnar(text: &str, table: &mut crate::side::SideTable) -> Option<St
             .iter()
             .map(|k| {
                 let v = r.get(k).map(String::as_str).unwrap_or("");
-                // display form: volatile values (timestamps/UUIDs) masked to class
-                // markers; load-bearing text kept verbatim.
-                mask::merge_key(&v.replace('\t', "\\t").replace('\n', "\\n"))
+                // verbatim: a `<TS>` display marker would erase the one
+                // timestamp a reader keeps once the row folds.
+                v.replace('\t', "\\t").replace('\n', "\\n")
             })
             .collect();
         body.push_str(&vals.join("\t"));
         body.push('\n');
     }
     // volatile-merge over rows: identical modulo timestamps/UUIDs -> [xN]
-    Some(cluster::run(&body, table))
+    Some(cluster::run_with(&body, table, elide))
 }

@@ -36,8 +36,13 @@ fn merge_key_uuid_and_epoch_masked() {
     assert!(a.contains("<ID>"));
 
     let e1 = mask::merge_key("at 1790770189 ms");
-    let e2 = mask::merge_key("at 9999999999 ms");
+    let e2 = mask::merge_key("at 1762500000 ms");
     assert_eq!(e1, e2, "epoch runs are volatile");
+    assert_eq!(
+        mask::merge_key("at 1762500000123 ms"),
+        e1,
+        "millisecond epochs are volatile too"
+    );
 
     // short numbers are load-bearing (counts, ports, versions)
     assert_ne!(
@@ -392,7 +397,7 @@ fn uuid_and_git_sha_stay_verbatim() {
 #[test]
 fn identical_runs_dedupe_through_stubs() {
     let mut table = SideTable::default();
-    let run = "a".repeat(64);
+    let run = "TWFuIGlzIGRpc3Rpbmd1aXNoZWQsIG5vdCBvbmx5IGJ5IGhpcyByZWFzb24s";
     let out = cluster::run(&format!("{run}\n{run}\n"), &mut table);
     assert_eq!(
         out.matches("<r:").count(),
@@ -401,4 +406,65 @@ fn identical_runs_dedupe_through_stubs() {
     );
     assert!(out.contains(" [x2]"), "{out}");
     assert_eq!(table.len(), 1);
+}
+
+/// Long, readable runs share the token alphabet with digests but are text:
+/// every one of these was elided to an unexpandable stub in real sessions.
+#[test]
+fn readable_runs_are_never_masked() {
+    for line in [
+        "=".repeat(80),
+        "-".repeat(80),
+        "test mask::tests::swar_token_mask_matches_scalar_predicate_all_bytes_all_lanes ... ok".into(),
+        "public readonly struct KernelKnobs_Avx2_Tile4x8_Unroll2_Prefetch0_Fma1 : IKernelCandidate".into(),
+        "fetching https://huggingface.co/Xenova/gpt-4o/resolve/main/some-really-long-directory-name/x_y".into(),
+        "rm: /Applications/Google Drive.app/Contents/Resources/very-long-resource-name-for-display-2x.png".into(),
+        "src/blitgen-sourcegen-kit/blit/layout-solver/very-long-module-name-for-testing/a.cs:12: warning".into(),
+        "total 12345678901234567890123456789012345678901234567890 bytes".into(),
+    ] {
+        let mut table = SideTable::default();
+        let out = cluster::run(&format!("{line}\n"), &mut table);
+        assert_eq!(out.trim_end(), line, "must stay verbatim");
+        assert_eq!(table.len(), 0, "{line}");
+    }
+}
+
+#[test]
+fn random_runs_are_masked() {
+    for blob in [
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", // sha256 hex
+        "eyJhbGciOiJIUzI1NiJ9xQ2LmF5dGhvcml6YXRpb24iOiJCZWFyZXIgYWJj1Z9q", // base64url
+    ] {
+        let mut table = SideTable::default();
+        let out = cluster::run(&format!("v {blob} end\n"), &mut table);
+        assert!(out.starts_with("v <r:") && out.trim_end().ends_with(" end"), "{out}");
+    }
+}
+
+/// Counters and dated names are load-bearing; only clock readings fold.
+#[test]
+fn volatile_masking_spares_counters_and_dated_names() {
+    let pairs = [
+        ("bytes=1048576000 done", "bytes=1048577954 done"),
+        ("rss=123456789", "rss=123457789"),
+        ("backup-2026-11-01.tar", "backup-2026-11-02.tar"),
+        ("build/tmp/a.o", "build/tmp/b.o"),
+        ("id abc1762500000 x", "id abc1762500001 x"),
+    ];
+    for (a, b) in pairs {
+        assert_ne!(mask::merge_key(a), mask::merge_key(b), "{a} vs {b}");
+    }
+    assert_eq!(
+        mask::merge_key("t=1762500000.123 ok"),
+        mask::merge_key("t=1762500999.9 ok"),
+        "float epochs fold"
+    );
+}
+
+/// Code lines keep their place and bytes even when they repeat.
+#[test]
+fn code_lines_pass_through_unmerged() {
+    let text = "    return x;\nlog a\n    return x;\nlog a\n";
+    let out = cluster::run(text, &mut SideTable::default());
+    assert_eq!(out, "    return x;\nlog a [x2]\n    return x;\n");
 }

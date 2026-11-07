@@ -255,7 +255,7 @@ end
 local description = [[Execute a non-interactive bash command. Runs in ]]
   .. cwd
   .. [[ by default; set workdir instead of cd. Join dependent commands with &&. Use tail=N instead of piping to tail, so live output is kept. Output is capped at 2000 lines or 50KB by default. Do not use shell output to talk to the user.
-Output above 398B is compressed before it reaches you: `line [xN]` stands for N lines that differed only in volatile values (timestamps, uuids, epoch runs, temp paths); a run of uniform JSON objects becomes a `<rec cols>` header and TSV rows; a random-looking run of 48+ chars (base64/hex tokens, PEM bodies, digests) becomes `[masked r=<hash> n=<len>]`; spans repeated across lines (a shared path or log prefix) move into a lead legend referenced as `<n>`. Paths, versions, error codes, short numbers and code-looking lines (indented, or ending `;`/`{`/`}`) stay verbatim.]]
+Output above 398B is compressed before it reaches you, and only when that cuts at least a fifth of it: `line [xN]` stands for N lines that differed only in volatile values (clock timestamps, uuids, epoch values, temp paths); a run of uniform JSON objects becomes a `<rec cols>` header and TSV rows; a random-looking run of 160+ chars (base64/hex bodies, keys, tokens) becomes `[masked n=<len>]`; spans repeated across lines (a shared path or log prefix) move into a lead legend referenced as `<n>`. Paths, identifiers, digests, versions, error codes, counters and code-looking lines (indented, or ending `;`/`{`/`}`) stay verbatim.]]
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",

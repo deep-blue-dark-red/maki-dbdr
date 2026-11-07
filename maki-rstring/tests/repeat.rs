@@ -261,3 +261,20 @@ fn legend_value(line: &str) -> Option<&str> {
     }
     (i > 1 && b.get(i) == Some(&b'>') && b.get(i + 1) == Some(&b' ')).then(|| &line[i + 2..])
 }
+
+/// Legend candidates never cut through a marker or mid-word.
+#[test]
+fn legend_respects_markers_and_words() {
+    let mut text = String::new();
+    for i in 0..40 {
+        text.push_str(&format!("test mask::tests::swar_token_mask_matches_scalar_predicate_{i} <r:0123456789abcdef n=62> ok\n"));
+    }
+    let out = repeat::run(&text);
+    for line in out.lines().filter(|l| legend_value(l).is_some()) {
+        let v = legend_value(line).unwrap();
+        assert!(!v.contains('<') && !v.contains('['), "legend cuts a marker: {line}");
+        let last = v.as_bytes()[v.len() - 1];
+        assert!(!last.is_ascii_alphanumeric() && last != b'_', "legend ends mid-word: {line:?}");
+    }
+    assert_eq!(decode(&out), text);
+}

@@ -15,15 +15,18 @@
 //! [`SCAN_BUDGET`], so the pass stays linear-ish at any input size.
 //!
 //! Refs are `<n>` (digit-bearing, so [`crate::thin`]'s guards already keep
-//! them). Candidates containing `<` + digit are rejected, which makes it
-//! impossible for a replacement to alias an earlier ref: a bare ref token is
-//! 5 bytes at most, and candidates are ≥ [`MIN_CAND`] bytes.
+//! them). Candidates containing `<` or `[` are rejected, which makes it
+//! impossible for a replacement to alias an earlier ref or cut through a
+//! marker (`<r:hash n=..>`, `[masked n=..]`, `[xN]`). Candidates end at a word
+//! boundary, so a ref never splits an identifier (`<0>matches_lanes`).
 
 const MIN_CAND: usize = 12; // shorter repeats can't pay for a ref
 const MAX_CAND: usize = 1024; // cap: useful repeats are prefixes, not bodies
 const MIN_NET: isize = 64; // net bytes a legend must save: refs scattered through
 // short spans (a hostname x3, a timestamp prefix x5) read as corruption while
 // saving a dozen bytes, so only bulk repetition pays
+const MIN_GAIN_DIV: usize = 10; // and the whole legend must cut >= 1/10 of the
+// text: a 100 KB log with one 1 KB legend reads worse for a 1% saving
 const SCAN_BUDGET: usize = 24 << 20; // per-run candidate-scan byte budget
 const MAX_CANDS: usize = 64;
 const PRE_RANK: usize = 256; // candidates counted before the true ranking
@@ -54,7 +57,7 @@ pub fn run(text: &str) -> String {
         work = work.replace(c.as_str(), &ref_);
         legend.push(c.as_str());
     }
-    if legend.is_empty() {
+    if legend.is_empty() || (text.len() - work.len()) * MIN_GAIN_DIV < text.len() {
         return text.to_string();
     }
     let mut out = String::with_capacity(work.len() + 2 * legend.len() + 64);
@@ -102,7 +105,7 @@ fn candidates(text: &str) -> Vec<(String, usize)> {
     push_lcps(&spans, &mut raw);
     raw.sort_unstable();
     raw.dedup();
-    raw.retain(|c| !contains_ref(c) && !head_ref(text, c));
+    raw.retain(|c| !contains_marker(c) && !head_ref(text, c));
     // Longest first is a cheap prefilter for the count pass; the real ranking
     // uses the estimated saving, so a dominant short prefix (`/p/a-`) beats a
     // niche longer one (`/p/a-1`) instead of fragmenting it.
@@ -150,7 +153,17 @@ fn pref_count(items: &[&str], c: &str, budget: &mut usize) -> usize {
 
 fn push_lcps(items: &[&str], out: &mut Vec<String>) {
     for w in items.windows(2) {
-        let mut k = common_prefix(w[0].as_bytes(), w[1].as_bytes()).min(MAX_CAND);
+        let (a, b) = (w[0].as_bytes(), w[1].as_bytes());
+        let mut k = common_prefix(a, b).min(MAX_CAND);
+        // Mid-word cut (both sides continue with a word byte): back off to
+        // the last non-word byte so the ref replaces whole words only.
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+        let continues = |s: &[u8]| s.get(k).is_some_and(|&c| word(c));
+        if k > 0 && word(a[k - 1]) && (continues(a) || continues(b)) {
+            while k > 0 && word(a[k - 1]) {
+                k -= 1;
+            }
+        }
         while k > 0 && !w[0].is_char_boundary(k) {
             k -= 1;
         }
@@ -176,11 +189,11 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     i
 }
 
-/// Candidate text must never contain `<` + digit: refs are `<n>`, and this
-/// exclusion keeps a candidate from matching across (or inside) one.
-fn contains_ref(s: &str) -> bool {
-    let b = s.as_bytes();
-    (0..b.len().saturating_sub(1)).any(|i| b[i] == b'<' && b[i + 1].is_ascii_digit())
+/// Candidate text must never contain `<` or `[`: refs are `<n>` and every
+/// other marker opens with one of the two, so this exclusion keeps a
+/// candidate from matching across (or inside) any of them.
+fn contains_marker(s: &str) -> bool {
+    s.contains(['<', '['])
 }
 
 /// A candidate that starts the text and is followed by a space would land a

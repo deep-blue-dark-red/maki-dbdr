@@ -1546,7 +1546,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Compress large bash tool output and long user input with rstring before it enters the context: lines differing only in volatile values (timestamps, ids) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking byte runs of 48+ chars are masked inline to `[masked r=<hash> n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked"
+        desc = "Compress large bash tool output and long user input with rstring before it enters the context, only when that cuts at least 256 bytes and a fifth of the text: lines differing only in volatile values (clock timestamps, uuids, epoch values, temp paths) collapse to `[xN]`, uniform JSONL renders as one header + TSV rows, random-looking runs of 160+ chars (base64/hex bodies, not paths or identifiers) become `[masked n=<len>]`; code-looking lines (indented, or ending `;`/`{`/`}`) pass through verbatim, never merged or masked"
     )]
     pub rstring: bool,
 
