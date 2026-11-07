@@ -25,7 +25,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 | configurable | Switch to previous session |
 | configurable | Open plan in editor |
 | configurable | Toggle plan panel |
-| configurable | Open tasks |
+| configurable | Open subtasks |
 | configurable | Model picker |
 
 ## Editing

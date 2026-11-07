@@ -53,7 +53,7 @@ Type `/` in the input box to open the command palette.
 | `/memory` | View, edit, move, and delete memory files (G toggles global memory) |
 | `/rename` | Rename the current session |
 | `/sessions` | Browse and switch sessions |
-| `/tasks` | Browse and search tasks |
+| `/subtasks` | Browse and search subtasks |
 | `/thinking` | Extended thinking: pick an effort level, or set one directly |
 
 ## Sessions

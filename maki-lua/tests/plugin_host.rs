@@ -25,7 +25,7 @@ use maki_storage::id::SessionRef;
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::{Value, json};
 
-const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/tasks"];
+const BUILTIN_COMMANDS: &[&str] = &["/sessions", "/rename", "/subtasks"];
 const NARGS_ERR: &str = r#"'nargs' must be 0, 1, "?", "*", or "+""#;
 const GLOBAL_PACK_ONLY_ERR: &str = "only available in the global init.lua";
 const USAGE_TOOL_NAME: &str = "usage_child";
@@ -5059,7 +5059,7 @@ fn unload_clears_commands() {
     assert_eq!(host.command_reader().load().commands.len(), 0);
 }
 
-/// `/tasks` and `/sessions` used to be Rust commands. The plugins that took
+/// `/subtasks` and `/sessions` used to be Rust commands. The plugins that took
 /// them over have to keep the names, or the palette quietly loses a row.
 #[test]
 fn builtin_plugins_register_their_commands() {

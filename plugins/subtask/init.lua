@@ -5,7 +5,7 @@
 -- primitives only (`maki.agent.session`, `maki.json.schema_validator`,
 -- `maki.async.semaphore`).
 --
--- It also owns the /tasks picker over the subagents spawned here: picker.lua
+-- It also owns the /subtasks picker over the subagents spawned here: picker.lua
 -- registers the command and the keymap when this file is loaded, so the two
 -- cannot be enabled apart and left pointing at each other's absence.
 

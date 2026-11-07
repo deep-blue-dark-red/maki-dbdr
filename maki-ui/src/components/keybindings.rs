@@ -810,7 +810,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Action("tasks"),
-        description: "Open tasks",
+        description: "Open subtasks",
         context: KeybindContext::General,
         platform: Platform::All,
     },

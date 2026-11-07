@@ -124,4 +124,42 @@ case("a_filter_that_empties_a_section_zeroes_its_count_and_header", function()
   eq(nothing.sections.finished, 0)
 end)
 
+case("human_tokens_and_elapsed_read_compactly", function()
+  eq(Rows.human_tokens(0), "0")
+  eq(Rows.human_tokens(999), "999")
+  eq(Rows.human_tokens(1234), "1.2K")
+  eq(Rows.human_tokens(1234567), "1.2M")
+  eq(Rows.human_elapsed(0), "0s")
+  eq(Rows.human_elapsed(59), "59s")
+  eq(Rows.human_elapsed(60), "1m 00s")
+  eq(Rows.human_elapsed(192), "3m 12s")
+  eq(Rows.human_elapsed(4325), "1h 12m")
+end)
+
+-- A working task ages live, a finished one freezes at its end, and a task
+-- restored from disk (no spawn time) shows nothing at all. `Rows.now` is
+-- pinned so a second ticking over mid-test cannot flip the string.
+case("elapsed_of_ages_working_tasks_and_freezes_finished_ones", function()
+  local real_now = Rows.now
+  Rows.now = function()
+    return 1000000
+  end
+  local ok, err = pcall(function()
+    eq(Rows.elapsed_of({ status = "working", started_at = 1000000 - 95 }), "1m 35s")
+    eq(Rows.elapsed_of({ status = "done", started_at = 1000000 - 95, ended_at = 1000000 - 35 }), "1m 00s")
+    eq(Rows.elapsed_of({ status = "done" }), nil)
+    eq(Rows.elapsed_of({}), nil)
+  end)
+  Rows.now = real_now
+  assert(ok, err)
+end)
+
+case("meta_of_joins_context_and_start_time", function()
+  local stamp = os.time()
+  eq(Rows.meta_of({ context = 1234, started_at = stamp }), "1.2K · " .. os.date("%H:%M", stamp))
+  eq(Rows.meta_of({ context = 500 }), "500")
+  eq(Rows.meta_of({ started_at = stamp }), os.date("%H:%M", stamp))
+  eq(Rows.meta_of({}), nil, "nothing known means no meta line")
+end)
+
 th.report()

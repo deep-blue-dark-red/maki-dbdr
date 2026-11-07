@@ -4061,8 +4061,8 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
         dir.clone(),
         Arc::new(test_writer(dir)),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
-            name: "/tasks".into(),
-            description: "Browse and search tasks".into(),
+            name: "/subtasks".into(),
+            description: "Browse and search subtasks".into(),
             plugin: "subtask".into(),
             max_args: 0,
             hidden: false,
@@ -4071,11 +4071,11 @@ fn run_cmdline_reaches_plugin_command_the_host_also_names() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.run_cmdline("/tasks", 0).unwrap();
+    app.run_cmdline("/subtasks", 0).unwrap();
 
     assert_eq!(
         probe.try_recv_command().map(|(name, _, _)| name),
-        Some("/tasks".to_string())
+        Some("/subtasks".to_string())
     );
 }
 
@@ -5381,7 +5381,7 @@ const USER_TOOL_PROBE: &str = "ut_probe";
 
 fn register_user_tool_probe() {
     use maki_agent::tools::test_support::mock_tool_with_schema;
-    use maki_agent::tools::{ToolRegistry, ToolAudience, ToolSource};
+    use maki_agent::tools::{ToolAudience, ToolRegistry, ToolSource};
 
     let _ = ToolRegistry::global().register(
         mock_tool_with_schema(

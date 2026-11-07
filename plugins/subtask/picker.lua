@@ -1,4 +1,4 @@
--- The /tasks picker: the subagents of the focused session, running ones first.
+-- The /subtasks picker: the subagents of the focused session, running ones first.
 -- The tool in init.lua spawns them, this file only shows them.
 --
 -- The host keeps the transcripts, so there is no task state here. Every
@@ -9,7 +9,7 @@ local TextInput = require("maki.text_input")
 local ListPicker = require("maki.list_picker")
 local Rows = require("picker_rows")
 
-local TITLE = " Tasks "
+local TITLE = " Subtasks "
 local FILTER_PREFIX = "❯ "
 local TICK_MS = 100
 -- A placeholder frame. The host swaps "spinner:*" spans for the live one, so
@@ -52,7 +52,7 @@ local function refresh_hint()
       maki.ui.set_status_hint(nil)
     else
       maki.ui.set_status_hint({
-        { string.format(" %d %s ", n, n == 1 and "task" or "tasks"), "foreground" },
+        { string.format(" %d %s ", n, n == 1 and "subtask" or "subtasks"), "foreground" },
         { HINT_KEY, "keybind_key" },
         { " ", "" },
       })
@@ -89,6 +89,7 @@ local function rebuild()
   board.rows = built.rows
   local idx = Rows.index_of(board.rows, board.sel_id) or math.min(previous, math.max(#board.rows, 1))
   board.sel_id = board.rows[idx] and board.rows[idx].task.id or nil
+  board.running = built.sections.running
   update_footer(built.sections)
 end
 
@@ -119,15 +120,32 @@ local function render()
     for _, span in ipairs(ListPicker.highlight_spans(task.name, words, base, match_style)) do
       line[#line + 1] = span
     end
-    -- Rows with nothing on the right would otherwise end short of the border
-    -- and read as padding on one side only, so the bar runs the full width.
-    local trail = board.width - 2 - dispw(icon) - dispw(task.name)
-    if trail > 0 then
-      line[#line + 1] = { string.rep(" ", trail), base }
+    -- Elapsed time sits flush right; rows with nothing there still fill to the
+    -- border so they never read as padding on one side only.
+    local used = 2 + dispw(icon) + dispw(task.name)
+    local elapsed = Rows.elapsed_of(task)
+    local gap = elapsed and board.width - used - dispw(elapsed) or 0
+    if elapsed and gap > 1 then
+      line[#line + 1] = { string.rep(" ", gap), base }
+      line[#line + 1] = { elapsed, selected and "selected" or "dim" }
+    else
+      local trail = board.width - used
+      if trail > 0 then
+        line[#line + 1] = { string.rep(" ", trail), base }
+      end
     end
     lines[#lines + 1] = line
     if selected then
       cursor_line = #lines
+    end
+    local meta = Rows.meta_of(task)
+    if meta then
+      local meta_line = { { "    ", base }, { meta, "dim" } }
+      local trail = board.width - 4 - dispw(meta)
+      if trail > 0 then
+        meta_line[#meta_line + 1] = { string.rep(" ", trail), base }
+      end
+      lines[#lines + 1] = meta_line
     end
   end
   if #board.rows == 0 then
@@ -135,6 +153,8 @@ local function render()
   end
   board.buf:set_lines(lines)
   board.win:set_cursor(cursor_line)
+  -- Granularity of the live elapsed column, reread by the recv tick below.
+  board.rendered_at = os.time()
 end
 
 -- The one host round-trip. `list()` suspends this coroutine and the picker can
@@ -258,6 +278,7 @@ local function open()
     reserved = 0,
     tasks = {},
     rows = {},
+    running = 0,
   }
   refresh()
   if not board then
@@ -282,6 +303,9 @@ local function open()
       elseif board.dirty then
         board.dirty = false
         refresh()
+      elseif board.running > 0 and board.rendered_at ~= os.time() then
+        -- No host round-trip; only the elapsed column ages.
+        render()
       end
     elseif ev.type == "key" then
       handle_key(ev.key)
@@ -323,9 +347,9 @@ maki.api.create_autocmd({ "TaskStatusChanged", "SessionFocusChanged", "SessionRe
 })
 
 maki.api.register_command({
-  name = "/tasks",
-  description = "Browse and search tasks",
+  name = "/subtasks",
+  description = "Browse and search subtasks",
   handler = open,
 })
 
-maki.keymap.set("n", "<C-x>", open, { desc = "Open tasks" })
+maki.keymap.set("n", "<C-x>", open, { desc = "Open subtasks" })

@@ -23,7 +23,7 @@ const TIPS: &[(&str, &str)] = &[
         key::FILE_PICKER.label,
         "to grab file paths with fuzzy search",
     ),
-    ("/tasks", "to see what your subagents are up to"),
+    ("/subtasks", "to see what your subagents are up to"),
     (key::SEARCH.label, "to find things in the conversation"),
     ("/btw", "to ask something without interrupting the session"),
     ("/memory", "to view, edit, and delete persistent notes"),
