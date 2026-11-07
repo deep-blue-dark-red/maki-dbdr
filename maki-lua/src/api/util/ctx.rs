@@ -379,6 +379,20 @@ impl UserData for LuaCtx {
             })
         });
 
+        methods.add_method("draft_to_write", |_, this, path: String| {
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("draft_to_write"));
+            };
+            let transcript = agent
+                .transcript
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            Ok(match transcript.draft_to_write(&path) {
+                Ok(text) => (Some(text.to_owned()), None),
+                Err(e) => (None, Some(e.to_string())),
+            })
+        });
+
         methods.add_method("set_draft", |_, this, (path, text): (String, String)| {
             let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("set_draft"));

@@ -72,7 +72,7 @@ maki.api.register_tool({
     -- call (batch, code_execution) arrives unfilled and looks it up here.
     local content, draft_err = input.content, nil
     if not content then
-      content, draft_err = ctx:draft(raw)
+      content, draft_err = ctx:draft_to_write(raw)
     end
     if not content then
       return { llm_output = "error: " .. tostring(draft_err), is_error = true }

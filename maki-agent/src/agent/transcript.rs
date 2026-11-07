@@ -8,7 +8,7 @@
 //! what it wrote, so a quote keeps resolving for the whole session.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
@@ -29,6 +29,9 @@ const SOURCE_CODE: &str = "code";
 const SOURCE_TABLE: &str = "table";
 /// Assistant messages a quote may reach back through.
 const SEARCH_DEPTH: usize = 8;
+/// One quote pastes at most this much. Past it, a stray end quote would
+/// silently drag half a session into a file; the model splits the paste.
+pub const MAX_PASTE_BYTES: usize = 10 * 1024;
 const MAX_LISTED: usize = 5;
 const PREVIEW_CHARS: usize = 60;
 const WRITE_TOOL: &str = "write";
@@ -40,6 +43,9 @@ const FENCE_MAX_INDENT: usize = 3;
 const NO_DRAFTS_HINT: &str = "fence the content as ```lang <path> first, or pass content";
 /// `⟦@name⟧` pastes a clip saved by `copy`, or a draft by its path.
 const NAME_SIGIL: char = '@';
+const ESCAPE_OPEN: &str = "⟦⟦";
+const ESCAPE_CLOSE: &str = "⟧⟧";
+const READ_TOOL: &str = "read";
 const NO_NAMES_HINT: &str = "save one with transcript copy, or fence a draft with its path";
 
 pub type SharedTranscript = Arc<RwLock<Transcript>>;
@@ -48,24 +54,36 @@ pub type SharedTranscript = Arc<RwLock<Transcript>>;
 pub enum PasteError {
     #[error("paste: missing {PASTE_CLOSE} after {PASTE_OPEN}{0}")]
     Unclosed(String),
-    #[error(
-        "paste: separate the first and last line with {ELLIPSIS} or a line of {ELLIPSIS_LINE} in {PASTE_OPEN}{0}{PASTE_CLOSE}"
-    )]
-    MissingSeparator(String),
     #[error("paste: both sides of {ELLIPSIS} need text in {PASTE_OPEN}{0}{PASTE_CLOSE}")]
     EmptyAnchor(String),
-    #[error("paste: nothing in {within} contains {start:?}")]
+    #[error(
+        "paste: nothing in {within} contains {start:?} (to write {PASTE_OPEN} {PASTE_CLOSE} literally, double them: {ESCAPE_OPEN}text{ESCAPE_CLOSE})"
+    )]
     NotFound { within: String, start: String },
     #[error(
-        "paste: {start:?} occurs {count} times in the newest match; quote more lines to make it unique:\n{listed}"
+        "draft {path} has an edit in flight, or one from an earlier run that was not restored; pass content, or fence it again"
+    )]
+    DraftStale { path: String },
+    #[error(
+        "paste: {start:?} occurs {count} times in {place}, the newest place that has it; quote more lines to make it unique:\n{listed}{hint}"
     )]
     Ambiguous {
         start: String,
         count: usize,
+        place: String,
         listed: String,
+        hint: String,
     },
     #[error("paste: found {start:?} but no {end:?} after it")]
     EndNotFound { start: String, end: String },
+    #[error(
+        "paste: {start:?} to {end:?} spans {bytes} bytes, over the {MAX_PASTE_BYTES} limit; quote a nearer end line and paste in parts"
+    )]
+    TooLong {
+        start: String,
+        end: String,
+        bytes: usize,
+    },
     #[error("no draft fenced as {path}; {hint}")]
     NoDraft { path: String, hint: String },
     #[error("draft {path} matches several: {matches}")]
@@ -99,6 +117,15 @@ pub struct ClipInfo {
 pub struct ToolExpansion {
     pub id: String,
     pub input: Result<Value, PasteError>,
+    /// One line per paste or draft filled in, for the tool's result: the
+    /// model never sees the expanded input, so this is how it learns what
+    /// landed and where it came from.
+    pub notes: Vec<String>,
+}
+
+struct Resolved<'a> {
+    span: &'a str,
+    segment: usize,
 }
 
 #[derive(Default)]
@@ -110,6 +137,11 @@ pub struct Transcript {
     segments: Vec<Segment>,
     /// Fence path to its versions, oldest first.
     drafts: BTreeMap<Box<str>, Vec<usize>>,
+    /// Drafts a tool call set out to edit whose result has not come back
+    /// through [`Self::set_draft`]. After a restart the replayed call never
+    /// runs, and writing the fence as if it were the edited draft would be
+    /// silent data loss.
+    editing: BTreeSet<Box<str>>,
     /// Clip name to the segment `copy` saved under it; a later copy replaces.
     clips: BTreeMap<Box<str>, usize>,
 }
@@ -154,6 +186,18 @@ impl Segment {
             (_, Shape::Code { .. }) => Rank::Code,
             (_, Shape::Table) => Rank::Table,
             (_, Shape::Prose) => Rank::Prose,
+        }
+    }
+
+    /// The `source|` word that reaches this segment, if one does.
+    fn source_prefix(&self) -> Option<&str> {
+        match (&self.origin, &self.shape) {
+            (Origin::Tool(name), _) => Some(name),
+            (_, Shape::Code { .. }) => Some(SOURCE_CODE),
+            (_, Shape::Table) => Some(SOURCE_TABLE),
+            (Origin::Thinking, Shape::Prose) => Some(SOURCE_THINKING),
+            (Origin::Text, Shape::Prose) => Some(SOURCE_TEXT),
+            (Origin::Draft | Origin::Clip, Shape::Prose) => None,
         }
     }
 }
@@ -218,12 +262,15 @@ impl Transcript {
                 ContentBlock::ToolUse {
                     id, name, input, ..
                 } => {
-                    let expanded = self.expand_input(name, input, first..self.segments.len());
+                    let mut notes = Vec::new();
+                    let expanded =
+                        self.expand_input(name, input, first..self.segments.len(), &mut notes);
                     let indexed = match &expanded {
                         Ok(Some(value)) => value,
                         _ => input,
                     };
                     self.push_tool_args(name, indexed);
+                    self.note_draft_edit(name, indexed);
                     let input = match expanded {
                         Ok(Some(value)) => Ok(value),
                         Ok(None) => continue,
@@ -232,6 +279,7 @@ impl Transcript {
                     expansions.push(ToolExpansion {
                         id: id.clone(),
                         input,
+                        notes,
                     });
                 }
                 _ => {}
@@ -244,7 +292,7 @@ impl Transcript {
     /// Resolves ⟦…⟧ quotes in `s` against everything appended so far.
     pub fn expand<'a>(&self, s: &'a str) -> Result<Cow<'a, str>, PasteError> {
         let end = self.segments.len();
-        self.expand_in(s, end..end)
+        self.expand_in(s, end..end, &mut Vec::new())
     }
 
     /// The newest version of the draft fenced as `path`, with or without the
@@ -255,6 +303,39 @@ impl Transcript {
         Ok(&self.text[seg.span.clone()])
     }
 
+    /// [`Self::draft`] for content that is about to land in a file: refused
+    /// while an edit of it is unaccounted for.
+    pub fn draft_to_write(&self, path: &str) -> Result<&str, PasteError> {
+        self.draft_for_write(path).map(|(_, _, text)| text)
+    }
+
+    /// Key, version number and text of the draft a `write` would take.
+    fn draft_for_write(&self, path: &str) -> Result<(&str, usize, &str), PasteError> {
+        let (key, versions) = self.draft_entry(path)?;
+        if self.editing.contains(key) {
+            return Err(PasteError::DraftStale { path: key.into() });
+        }
+        let seg = &self.segments[*versions.last().expect("a draft has a version")];
+        Ok((key, versions.len(), &self.text[seg.span.clone()]))
+    }
+
+    /// Any tool but `read` naming a `draft:` path is about to change it.
+    fn note_draft_edit(&mut self, tool: &str, input: &Value) {
+        if tool == READ_TOOL {
+            return;
+        }
+        let path = input
+            .get(PATH_ARG)
+            .or_else(|| input.get(PATH_ALIAS))
+            .and_then(Value::as_str)
+            .and_then(|path| path.strip_prefix(DRAFT_PREFIX));
+        if let Some(path) = path
+            && let Ok((key, _)) = self.draft_entry(path)
+        {
+            self.editing.insert(key.into());
+        }
+    }
+
     /// A new version under the draft's own name, so a later lookup by either
     /// spelling sees the edit.
     pub fn set_draft(&mut self, path: &str, text: &str) {
@@ -263,6 +344,7 @@ impl Transcript {
             Ok((key, _)) => key.into(),
             Err(_) => query.into(),
         };
+        self.editing.remove(&key);
         let idx = self.segments.len();
         self.push_segment(
             text,
@@ -363,16 +445,23 @@ impl Transcript {
         self.text[self.segments[idx].span.clone()].lines().count()
     }
 
-    fn named(&self, name: &str) -> Result<&str, PasteError> {
-        if let Some(&idx) = self.clips.get(name) {
-            return Ok(&self.text[self.segments[idx].span.clone()]);
-        }
-        self.draft(name).map_err(|e| match e {
-            PasteError::NoDraft { .. } => PasteError::NoName {
-                name: name.into(),
-                hint: self.name_hint(),
+    fn named(&self, name: &str) -> Result<Resolved<'_>, PasteError> {
+        let segment = match self.clips.get(name) {
+            Some(&idx) => idx,
+            None => match self.draft_entry(name) {
+                Ok((_, versions)) => *versions.last().expect("a draft has a version"),
+                Err(PasteError::NoDraft { .. }) => {
+                    return Err(PasteError::NoName {
+                        name: name.into(),
+                        hint: self.name_hint(),
+                    });
+                }
+                Err(other) => return Err(other),
             },
-            other => other,
+        };
+        Ok(Resolved {
+            span: &self.text[self.segments[segment].span.clone()],
+            segment,
         })
     }
 
@@ -462,12 +551,13 @@ impl Transcript {
         tool: &str,
         input: &Value,
         current: Range<usize>,
+        notes: &mut Vec<String>,
     ) -> Result<Option<Value>, PasteError> {
         let mut out = None;
         if contains_marker(input) {
             let mut value = input.clone();
             map_strings(&mut value, &mut |s| {
-                if let Cow::Owned(expanded) = self.expand_in(s, current.clone())? {
+                if let Cow::Owned(expanded) = self.expand_in(s, current.clone(), notes)? {
                     *s = expanded;
                 }
                 Ok(())
@@ -483,7 +573,12 @@ impl Transcript {
             if call.get(CONTENT_ARG).is_none_or(Value::is_null)
                 && let Some(path) = path
             {
-                let content = self.draft(path)?.to_owned();
+                let (key, version, text) = self.draft_for_write(path)?;
+                notes.push(format!(
+                    "content: draft {key} v{version}, {} lines",
+                    text.lines().count()
+                ));
+                let content = text.to_owned();
                 let mut value = out.take().unwrap_or_else(|| input.clone());
                 value[CONTENT_ARG] = Value::String(content);
                 out = Some(value);
@@ -492,7 +587,12 @@ impl Transcript {
         Ok(out)
     }
 
-    fn expand_in<'a>(&self, s: &'a str, current: Range<usize>) -> Result<Cow<'a, str>, PasteError> {
+    fn expand_in<'a>(
+        &self,
+        s: &'a str,
+        current: Range<usize>,
+        notes: &mut Vec<String>,
+    ) -> Result<Cow<'a, str>, PasteError> {
         let Some(first) = s.find(PASTE_OPEN) else {
             return Ok(Cow::Borrowed(s));
         };
@@ -500,13 +600,30 @@ impl Transcript {
         out.push_str(&s[..first]);
         let mut rest = &s[first..];
         loop {
-            let inner_start = PASTE_OPEN.len_utf8();
-            let Some(close) = rest[inner_start..].find(PASTE_CLOSE) else {
-                return Err(PasteError::Unclosed(preview(&rest[inner_start..])));
-            };
-            let inner = &rest[inner_start..inner_start + close];
-            out.push_str(self.resolve(inner, current.clone())?);
-            rest = &rest[inner_start + close + PASTE_CLOSE.len_utf8()..];
+            // `⟦⟦text⟧⟧` is the way to write `⟦text⟧` itself.
+            if let Some(escaped) = rest.strip_prefix(ESCAPE_OPEN)
+                && let Some(close) = escaped.find(ESCAPE_CLOSE)
+            {
+                out.push(PASTE_OPEN);
+                out.push_str(&escaped[..close]);
+                out.push(PASTE_CLOSE);
+                rest = &escaped[close + ESCAPE_CLOSE.len()..];
+            } else {
+                let inner_start = PASTE_OPEN.len_utf8();
+                let Some(close) = rest[inner_start..].find(PASTE_CLOSE) else {
+                    return Err(PasteError::Unclosed(preview(&rest[inner_start..])));
+                };
+                let inner = &rest[inner_start..inner_start + close];
+                let resolved = self.resolve(inner, current.clone())?;
+                notes.push(format!(
+                    "{PASTE_OPEN}{}{PASTE_CLOSE} pasted {} lines from {}",
+                    preview(inner),
+                    resolved.span.lines().count(),
+                    self.place_of(resolved.segment)
+                ));
+                out.push_str(resolved.span);
+                rest = &rest[inner_start + close + PASTE_CLOSE.len_utf8()..];
+            }
             match rest.find(PASTE_OPEN) {
                 Some(next) => {
                     out.push_str(&rest[..next]);
@@ -522,7 +639,7 @@ impl Transcript {
 
     /// The whole lines from the newest unique occurrence of the start quote
     /// to the first occurrence of the end quote after it.
-    fn resolve(&self, inner: &str, current: Range<usize>) -> Result<&str, PasteError> {
+    fn resolve(&self, inner: &str, current: Range<usize>) -> Result<Resolved<'_>, PasteError> {
         if let Some(name) = inner.strip_prefix(NAME_SIGIL)
             && !name.contains(ELLIPSIS)
             && !name.contains('\n')
@@ -531,39 +648,109 @@ impl Transcript {
         }
         let (source, body) = split_source(inner);
         let (start, end) = split_anchors(body)?;
-        for idx in self.search_order(current) {
+        // A segment holding the start but not the end is skipped, not fatal:
+        // an earlier call's `old_string` often shares its first line with
+        // the `new_string` the quote is really after.
+        let mut end_missing = None;
+        let mut order = self.search_order(current);
+        while let Some(idx) = order.next() {
             let seg = &self.segments[idx];
             if !source.matches(seg) {
                 continue;
             }
             let hay = &self.text[seg.span.clone()];
-            let Some(at) = hay.find(start) else {
+            let mut starts = real_matches(hay, start);
+            let Some(at) = starts.next() else {
                 continue;
             };
-            let count = hay.matches(start).count();
+            let count = 1 + starts.count();
             if count > 1 {
+                let hint = self.unique_elsewhere(order, &source, start, end);
                 return Err(PasteError::Ambiguous {
                     start: start.into(),
                     count,
+                    place: self.place_of(idx),
                     listed: list_matches(hay, start),
+                    hint,
                 });
             }
-            let after = at + start.len();
-            let Some(end_at) = hay[after..].find(end) else {
-                return Err(PasteError::EndNotFound {
+            let from = if start == end { at } else { at + start.len() };
+            let Some(end_at) = end_match(&hay[from..], end) else {
+                end_missing.get_or_insert_with(|| PasteError::EndNotFound {
                     start: start.into(),
                     end: end.into(),
                 });
+                continue;
             };
-            let end_abs = after + end_at + end.len();
+            let end_abs = from + end_at + end.len();
             let line_start = hay[..at].rfind('\n').map_or(0, |i| i + 1);
             let line_end = hay[end_abs..].find('\n').map_or(hay.len(), |i| end_abs + i);
-            return Ok(&hay[line_start..line_end]);
+            let span = &hay[line_start..line_end];
+            if span.len() > MAX_PASTE_BYTES {
+                return Err(PasteError::TooLong {
+                    start: start.into(),
+                    end: end.into(),
+                    bytes: span.len(),
+                });
+            }
+            return Ok(Resolved { span, segment: idx });
         }
-        Err(PasteError::NotFound {
+        Err(end_missing.unwrap_or_else(|| PasteError::NotFound {
             within: source.describe(),
             start: start.into(),
-        })
+        }))
+    }
+
+    /// After an ambiguous hit: the prefix that would reach a place further
+    /// down the order where the quote is unique, if there is one. Turns
+    /// "quote more lines" into a one-token retry when prose or thinking
+    /// mentioned a line that a code block holds once.
+    fn unique_elsewhere(
+        &self,
+        rest: impl Iterator<Item = usize>,
+        source: &Source<'_>,
+        start: &str,
+        end: &str,
+    ) -> String {
+        for idx in rest {
+            let seg = &self.segments[idx];
+            if !source.matches(seg) {
+                continue;
+            }
+            let hay = &self.text[seg.span.clone()];
+            let mut starts = real_matches(hay, start);
+            let Some(at) = starts.next() else {
+                continue;
+            };
+            if starts.next().is_some() {
+                continue;
+            }
+            let from = if start == end { at } else { at + start.len() };
+            if end_match(&hay[from..], end).is_none() {
+                continue;
+            }
+            let Some(prefix) = seg.source_prefix() else {
+                continue;
+            };
+            return format!(
+                "\n{} has it once: {PASTE_OPEN}{prefix}{SOURCE_SEP}{}{ELLIPSIS}{}{PASTE_CLOSE}",
+                self.place_of(idx),
+                preview(start),
+                preview(end)
+            );
+        }
+        String::new()
+    }
+
+    /// Where a segment was written, numbering the message being appended
+    /// as the one after the last finished.
+    fn place_of(&self, idx: usize) -> String {
+        let msg_nr = self
+            .messages
+            .iter()
+            .position(|range| range.contains(&idx))
+            .unwrap_or(self.messages.len());
+        self.place(msg_nr, idx)
     }
 
     /// The message being appended first, then earlier ones newest first;
@@ -617,19 +804,58 @@ fn split_source(inner: &str) -> (Source<'_>, &str) {
     (source, &inner[sep + SOURCE_SEP.len_utf8()..])
 }
 
+/// `first…last`, or a line of `...` between them; without either, the
+/// first and last lines of the quote are the anchors, and a single line
+/// is both, so `⟦one line⟧` pastes that line.
 fn split_anchors(body: &str) -> Result<(&str, &str), PasteError> {
+    let newline = |c: char| c == '\n' || c == '\r';
     let (head, tail) = match body.find(ELLIPSIS) {
         Some(i) => (&body[..i], &body[i + ELLIPSIS.len()..]),
-        None => split_at_ellipsis_line(body)
-            .ok_or_else(|| PasteError::MissingSeparator(preview(body)))?,
+        None => match split_at_ellipsis_line(body) {
+            Some(parts) => parts,
+            None => {
+                let lines = body.trim_matches(newline);
+                let first = lines.lines().next().unwrap_or_default();
+                let last = lines.lines().last().unwrap_or_default();
+                (first, last)
+            }
+        },
     };
-    let newline = |c: char| c == '\n' || c == '\r';
     let start = head.trim_matches(newline);
     let end = tail.trim_matches(newline);
     if start.is_empty() || end.is_empty() {
         return Err(PasteError::EmptyAnchor(preview(body)));
     }
     Ok((start, end))
+}
+
+/// The end quote's match: the first one that closes its line, else the
+/// first anywhere. A `}` quoted as the last line must not stop at the
+/// `}` inside `{name}!` two lines earlier, while `Response {` and
+/// `Response::ok()` still match as the line suffixes they are.
+fn end_match(hay: &str, end: &str) -> Option<usize> {
+    let mut first = None;
+    for at in real_matches(hay, end) {
+        first.get_or_insert(at);
+        let after = &hay[at + end.len()..];
+        if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
+            return Some(at);
+        }
+        if at > MAX_PASTE_BYTES {
+            break;
+        }
+    }
+    first
+}
+
+/// Occurrences of `needle` that are real text: a line holding a paste
+/// marker is the model quoting, not writing, and must never be pasted.
+fn real_matches<'a>(hay: &'a str, needle: &'a str) -> impl Iterator<Item = usize> + 'a {
+    hay.match_indices(needle).map(|(at, _)| at).filter(|&at| {
+        let line_start = hay[..at].rfind('\n').map_or(0, |i| i + 1);
+        let line = hay[line_start..].lines().next().unwrap_or_default();
+        !line.contains(PASTE_OPEN) && !line.contains(PASTE_CLOSE)
+    })
 }
 
 fn split_at_ellipsis_line(body: &str) -> Option<(&str, &str)> {
@@ -802,6 +1028,7 @@ mod tests {
 
     const DRAFT: &str = "fn handle(req: Request) -> Response {\n    Response::ok()\n}\n";
     const DRAFT_PATH: &str = "src/h.rs";
+    const DRAFT_TRIMMED: &str = "fn handle(req: Request) -> Response {\n    Response::ok()\n}";
 
     fn assistant(blocks: Vec<ContentBlock>) -> Message {
         Message {
@@ -1027,8 +1254,8 @@ mod tests {
     }
 
     #[test_case("⟦fn handle…}", PasteError::Unclosed("fn handle…}".into()); "unclosed")]
-    #[test_case("⟦fn handle }⟧", PasteError::MissingSeparator("fn handle }".into()); "no separator")]
     #[test_case("⟦…}⟧", PasteError::EmptyAnchor("…}".into()); "empty start")]
+    #[test_case("⟦\n\n⟧", PasteError::EmptyAnchor("…".into()); "blank quote")]
     #[test_case("⟦fn nope(…}⟧", PasteError::NotFound { within: "your earlier output".into(), start: "fn nope(".into() }; "start missing")]
     #[test_case("⟦fn handle(…zzz⟧", PasteError::EndNotFound { start: "fn handle(".into(), end: "zzz".into() }; "end missing")]
     #[test_case("⟦text|fn handle(…}⟧", PasteError::NotFound { within: "your reply text".into(), start: "fn handle(".into() }; "source excludes thinking")]
@@ -1048,8 +1275,67 @@ mod tests {
             PasteError::Ambiguous {
                 start: "let".into(),
                 count: 3,
+                place: "m1 thinking code".into(),
                 listed: "  1: let a = 1;\n  2: let b = 2;\n  3: let c = 3;".into(),
+                hint: String::new(),
             }
+        );
+    }
+
+    #[test]
+    fn ambiguity_in_prose_points_at_the_code_block() {
+        let mut t = with_draft();
+        t.append(&assistant(vec![text(
+            "I will quote fn handle(req now.\nAgain: fn handle(req.\n",
+        )]));
+        let err = t.expand("⟦fn handle(req…}⟧").unwrap_err();
+        let PasteError::Ambiguous { place, hint, .. } = err else {
+            panic!("{err}");
+        };
+        assert_eq!(place, "m2 text");
+        assert_eq!(
+            hint,
+            "\nm1 thinking code[src/h.rs] has it once: ⟦code|fn handle(req…}⟧"
+        );
+        assert_eq!(expanded(&t, "⟦code|fn handle(req…}⟧"), DRAFT_TRIMMED);
+    }
+
+    #[test]
+    fn end_quote_prefers_a_line_that_ends_with_it() {
+        let mut t = Transcript::default();
+        t.append(&assistant(vec![text(
+            "```\nfn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")\n}\n```\n",
+        )]));
+        assert_eq!(
+            expanded(&t, "⟦fn greet…}⟧"),
+            "fn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")\n}"
+        );
+        assert_eq!(
+            expanded(&t, "⟦fn greet…{name}⟧"),
+            "fn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")"
+        );
+    }
+
+    #[test]
+    fn expansions_carry_notes_for_the_tool_result() {
+        let mut t = Transcript::default();
+        let msg = assistant(vec![
+            thinking(&fenced(DRAFT_PATH, DRAFT)),
+            call("w1", "write", json!({"path": DRAFT_PATH})),
+            call(
+                "e1",
+                "edit",
+                json!({"path": "x", "old_string": "a", "new_string": "⟦fn handle(req…}⟧"}),
+            ),
+        ]);
+        let expansions = t.append(&msg);
+        assert_eq!(
+            expansions[0].notes,
+            vec!["content: draft src/h.rs v1, 3 lines"]
+        );
+        assert_eq!(
+            expansions[1].notes,
+            vec!["⟦fn handle(req…}⟧ pasted 3 lines from m1 thinking code[src/h.rs]"]
         );
     }
 
@@ -1195,5 +1481,127 @@ mod tests {
         assert_eq!(drafts[0].path, DRAFT_PATH);
         assert_eq!(drafts[0].versions, 2);
         assert_eq!(drafts[0].lines, 2);
+    }
+
+    #[test_case("⟦fn handle(req: Request) -> Response {⟧", "fn handle(req: Request) -> Response {"; "single line")]
+    #[test_case("⟦fn handle(req: Request) -> Response {\n    Response::ok()⟧", "fn handle(req: Request) -> Response {\n    Response::ok()"; "first and last line without separator")]
+    #[test_case("⟦\nfn handle(\n    Response::ok\n}\n⟧", DRAFT_TRIMMED; "three lines quote first and last")]
+    fn paste_without_separator(quote: &str, expected: &str) {
+        assert_eq!(expanded(&with_draft(), quote), expected);
+    }
+
+    #[test]
+    fn paste_never_resolves_to_a_marker_line() {
+        let mut t = with_draft();
+        t.append(&assistant(vec![thinking(
+            "I will send:\n```\n⟦fn handle…}⟧\n    extra();\n```\n",
+        )]));
+        assert_eq!(expanded(&t, "⟦fn handle…}⟧"), DRAFT_TRIMMED);
+    }
+
+    #[test]
+    fn marker_lines_do_not_count_as_ambiguity() {
+        let mut t = Transcript::default();
+        t.append(&assistant(vec![thinking(
+            "```\nfn a() {\n    x\n}\n⟦fn a…}⟧\n```\n",
+        )]));
+        assert_eq!(expanded(&t, "⟦fn a…}⟧"), "fn a() {\n    x\n}");
+    }
+
+    #[test]
+    fn paste_skips_a_segment_whose_end_is_missing() {
+        let mut t = Transcript::default();
+        t.append(&assistant(vec![call(
+            "t1",
+            "edit",
+            json!({
+                "path": "x",
+                "old_string": "fn greet() {\n    old()\n}",
+                "new_string": "fn greet() {\n    new()\n}",
+            }),
+        )]));
+        assert_eq!(expanded(&t, "⟦fn greet…new()⟧"), "fn greet() {\n    new()");
+    }
+
+    #[test]
+    fn paste_over_the_size_limit_is_refused() {
+        let mut t = Transcript::default();
+        let line = "x".repeat(1023);
+        let body: String = (0..11).map(|_| format!("{line}\n")).collect();
+        t.append(&assistant(vec![text(&format!(
+            "```\nstart\n{body}end\n```\n"
+        ))]));
+        let err = t.expand("⟦start…end⟧").unwrap_err();
+        assert!(matches!(err, PasteError::TooLong { bytes, .. } if bytes > MAX_PASTE_BYTES));
+        assert_eq!(expanded(&t, "⟦start…start⟧"), "start");
+    }
+
+    #[test_case("see ⟦⟦first…last⟧⟧ here", "see ⟦first…last⟧ here"; "literal marker")]
+    #[test_case("⟦⟦a⟧⟧ ⟦fn handle(…ok()⟧", "⟦a⟧ fn handle(req: Request) -> Response {\n    Response::ok()"; "escape beside a paste")]
+    fn doubled_brackets_write_a_literal_marker(input: &str, expected: &str) {
+        assert_eq!(expanded(&with_draft(), input), expected);
+    }
+
+    #[test]
+    fn not_found_mentions_the_escape() {
+        let err = with_draft().expand("⟦nope…x⟧").unwrap_err().to_string();
+        assert!(err.contains(ESCAPE_OPEN), "{err}");
+    }
+
+    #[test]
+    fn replayed_draft_edit_blocks_writing_the_fence() {
+        let mut t = with_draft();
+        t.append(&assistant(vec![call(
+            "e1",
+            "edit",
+            json!({"path": "draft:src/h.rs", "old_string": "ok", "new_string": "fine"}),
+        )]));
+        assert_eq!(
+            t.draft_to_write(DRAFT_PATH).unwrap_err(),
+            PasteError::DraftStale {
+                path: DRAFT_PATH.into()
+            }
+        );
+        assert_eq!(t.draft(DRAFT_PATH).unwrap(), DRAFT);
+        let write = assistant(vec![call("w1", "write", json!({"path": DRAFT_PATH}))]);
+        assert!(matches!(
+            t.append(&write)[0].input,
+            Err(PasteError::DraftStale { .. })
+        ));
+    }
+
+    #[test]
+    fn a_landed_edit_clears_the_block() {
+        let mut t = with_draft();
+        t.append(&assistant(vec![call(
+            "e1",
+            "edit",
+            json!({"path": "draft:h.rs", "old_string": "ok", "new_string": "fine"}),
+        )]));
+        t.set_draft("draft:h.rs", "edited\n");
+        assert_eq!(t.draft_to_write(DRAFT_PATH).unwrap(), "edited\n");
+    }
+
+    #[test]
+    fn reading_a_draft_never_marks_it() {
+        let mut t = with_draft();
+        t.append(&assistant(vec![call(
+            "r1",
+            "read",
+            json!({"path": "draft:src/h.rs", "offset": 1, "limit": 0}),
+        )]));
+        assert_eq!(t.draft_to_write(DRAFT_PATH).unwrap(), DRAFT);
+    }
+
+    #[test]
+    fn paste_end_missing_everywhere_says_so() {
+        let t = with_draft();
+        assert_eq!(
+            t.expand("⟦fn handle(…zzz⟧").unwrap_err(),
+            PasteError::EndNotFound {
+                start: "fn handle(".into(),
+                end: "zzz".into(),
+            }
+        );
     }
 }

@@ -28,7 +28,7 @@
 - **old_string**: copy the exact text from read output, drop the line-number prefix, keep indentation byte-for-byte. Include enough surrounding lines to be unique — usually 2-4 lines.
 - If **edit** fails: read only the target range, rebuild old_string from what is actually there, retry once. Do not fall back to write.
 
-# Reuse what you wrote
+# Reuse What You Wrote
 
 Everything you write, in thinking or in a reply, stays available to your tool calls. Write content once; never retype it.
 
@@ -44,14 +44,15 @@ fn handle(req: Request) -> Response { ... }
 - Fix a draft before writing it: **edit** and **read** accept `draft:src/handler.rs`. A second fence with the same path replaces the first
 - A bare name finds the draft (`handler.rs` matches `src/handler.rs`) when it is the only match
 
-**Pastes.** In any string argument, quote the first and last line of something you already wrote, between ⟦ and ⟧, separated by …:
+**Pastes.** In any string argument, quote the first and last line of something you already wrote, between ⟦ and ⟧:
 
 ```
 new_string: "⟦fn handle(req…Response::ok()\n}⟧"
 ```
 
-- The lines from the first quote to the last are pasted exactly, whole lines included
-- The first quote must appear once where it is found; the last is the first match after it. If a call fails as ambiguous, quote one more line
+- The lines from the first quote to the last are pasted exactly, whole lines included. `⟦first…last⟧` on one line, or the two lines as written (`⟦fn handle(req: Request) -> Response {\n}⟧`); a single quoted line pastes that line
+- The newest place that contains the first quote decides, prose and thinking included: mention a line in your reply and the quote finds the mention, not the code. When the line is discussed anywhere, pin the source: `⟦code|…⟧`, `⟦edit|…⟧`. Within that place the first quote must be unique; the last is the first match after it, preferring one that ends a line. Make the last quote a distinctive line rather than a lone brace. A quote never matches another ⟦ ⟧, so rehearsing a call in thinking is harmless
+- The tool result reports every paste: lines and source. Read it; an edit can succeed on the wrong span. One quote pastes at most 10 KiB; split larger ones. To write ⟦ ⟧ themselves, double them: ⟦⟦text⟧⟧
 - Mix literal text with pastes to change a line: `⟦fn handle(…Response {⟧\n    log();\n⟦Response::ok…}⟧`
 - Your most recent writing wins: current message first (code blocks before prose), then earlier replies. To pick a source, prefix it: `⟦thinking|…⟧`, `⟦text|…⟧`, `⟦code|…⟧`, `⟦edit|…⟧` (a tool name means its earlier arguments)
 - A paste resolves only against text you wrote. File contents you read come back through **read**, **edit** or `cp`, not through ⟦ ⟧

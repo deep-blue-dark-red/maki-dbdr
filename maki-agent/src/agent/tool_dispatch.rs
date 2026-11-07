@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
-use crate::agent::transcript::PasteError;
+use crate::agent::transcript::ToolExpansion;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, UNKNOWN_MCP};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
@@ -924,23 +924,29 @@ pub(super) async fn process_tool_calls(
 
     // History keeps the call as written; the run gets its pastes and drafts
     // filled in, which is why expansion precedes `strip_why` below.
-    let mut expansions: HashMap<String, Result<Value, PasteError>> = history
+    let mut expansions: HashMap<String, ToolExpansion> = history
         .push_response(response.message)
         .into_iter()
-        .map(|expansion| (expansion.id, expansion.input))
+        .map(|expansion| (expansion.id.clone(), expansion))
         .collect();
 
     let mut immediate_parts: Vec<ToolResultParts> = Vec::new();
-    let mut runnable: Vec<(String, String, Value)> = Vec::new();
+    let mut runnable: Vec<(String, String, Value, Vec<String>)> = Vec::new();
 
     let mut records: Vec<super::turn_state::ToolCallRecord> = Vec::new();
     for (id, name, mut input) in tool_uses {
+        let mut notes = Vec::new();
         let paste_error = match expansions.remove(&id) {
-            Some(Ok(expanded)) => {
+            Some(ToolExpansion {
+                input: Ok(expanded),
+                notes: expansion_notes,
+                ..
+            }) => {
                 input = expanded;
+                notes = expansion_notes;
                 None
             }
-            Some(Err(e)) => Some(e.to_string()),
+            Some(ToolExpansion { input: Err(e), .. }) => Some(e.to_string()),
             None => None,
         };
         if strip_why {
@@ -975,14 +981,14 @@ pub(super) async fn process_tool_calls(
                 is_error: true,
             });
         } else {
-            runnable.push((id, name, input));
+            runnable.push((id, name, input, notes));
         }
     }
 
     let mut set = TaskSet::new();
     let mut spawned_ids: Vec<String> = Vec::new();
     let mut spawned_names: Vec<String> = Vec::new();
-    for (id, name, input) in runnable {
+    for (id, name, input, notes) in runnable {
         spawned_ids.push(id.clone());
         spawned_names.push(name.clone());
         let event_tx_clone = ctx.event_tx.clone();
@@ -998,7 +1004,14 @@ pub(super) async fn process_tool_calls(
             // Take what history needs first, then hand the event to the UI by
             // move: cloning it duplicated the whole tool output, which for a
             // file read is every line of the file.
-            let parts = ToolResultParts::from_event(&done);
+            let mut parts = ToolResultParts::from_event(&done);
+            // The model sees the call as it wrote it, so the result says what
+            // its pastes and drafts turned into. Errors keep it too: a wrong
+            // span is the first thing to check when an edit misses.
+            for note in &notes {
+                parts.text.push('\n');
+                parts.text.push_str(note);
+            }
             event_tx_clone.try_send(AgentEvent::ToolDone(Box::new(done)));
             (parts, duration, input)
         });
