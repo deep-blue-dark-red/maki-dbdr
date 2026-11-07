@@ -57,6 +57,10 @@ pub enum PasteError {
     #[error("paste: both sides of {ELLIPSIS} need text in {PASTE_OPEN}{0}{PASTE_CLOSE}")]
     EmptyAnchor(String),
     #[error(
+        "paste: {0:?} has no letter or digit, so it would hit a brace mentioned anywhere; quote a distinctive line, or type it"
+    )]
+    BareAnchor(String),
+    #[error(
         "paste: nothing in {within} contains {start:?} (to write {PASTE_OPEN} {PASTE_CLOSE} literally, double them: {ESCAPE_OPEN}text{ESCAPE_CLOSE})"
     )]
     NotFound { within: String, start: String },
@@ -826,26 +830,59 @@ fn split_anchors(body: &str) -> Result<(&str, &str), PasteError> {
     if start.is_empty() || end.is_empty() {
         return Err(PasteError::EmptyAnchor(preview(body)));
     }
+    if !start.chars().any(char::is_alphanumeric) {
+        return Err(PasteError::BareAnchor(start.into()));
+    }
     Ok((start, end))
 }
 
-/// The end quote's match: the first one that closes its line, else the
-/// first anywhere. A `}` quoted as the last line must not stop at the
-/// `}` inside `{name}!` two lines earlier, while `Response {` and
+/// The end quote's match: the nearest of the best kind, where a whole
+/// line beats a line's text after its indentation, which beats a line
+/// suffix, which beats a match inside a line. A `}` quoted as the last
+/// line must reach the `}` that closes the block, not the `    }` of a
+/// nested one or the `}` inside `{name}!`, while `Response {` and
 /// `Response::ok()` still match as the line suffixes they are.
 fn end_match(hay: &str, end: &str) -> Option<usize> {
-    let mut first = None;
+    let mut best: Option<(EndKind, usize)> = None;
     for at in real_matches(hay, end) {
-        first.get_or_insert(at);
-        let after = &hay[at + end.len()..];
-        if after.is_empty() || after.starts_with('\n') || after.starts_with('\r') {
+        let kind = EndKind::of(hay, at, end.len());
+        if kind == EndKind::WholeLine {
             return Some(at);
+        }
+        if best.is_none_or(|(seen, _)| kind < seen) {
+            best = Some((kind, at));
         }
         if at > MAX_PASTE_BYTES {
             break;
         }
     }
-    first
+    best.map(|(_, at)| at)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EndKind {
+    WholeLine,
+    AfterIndent,
+    LineSuffix,
+    Inside,
+}
+
+impl EndKind {
+    fn of(hay: &str, at: usize, len: usize) -> Self {
+        let after = &hay[at + len..];
+        if !(after.is_empty() || after.starts_with(['\n', '\r'])) {
+            return Self::Inside;
+        }
+        let line_start = hay[..at].rfind('\n').map_or(0, |i| i + 1);
+        let before = &hay[line_start..at];
+        if before.is_empty() {
+            Self::WholeLine
+        } else if before.trim().is_empty() {
+            Self::AfterIndent
+        } else {
+            Self::LineSuffix
+        }
+    }
 }
 
 /// Occurrences of `needle` that are real text: a line holding a paste
@@ -1300,20 +1337,29 @@ mod tests {
         assert_eq!(expanded(&t, "⟦code|fn handle(req…}⟧"), DRAFT_TRIMMED);
     }
 
-    #[test]
-    fn end_quote_prefers_a_line_that_ends_with_it() {
+    const GREET: &str = "fn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")\n}";
+    const HELLO: &str =
+        "    fn hello() {\n        assert_eq!(greet(\"maki\"), \"Hi, maki!\");\n    }";
+
+    #[test_case("⟦fn greet…}⟧", GREET.to_owned(); "brace skips the one inside a line")]
+    #[test_case("⟦fn greet…{name}⟧", GREET.trim_end_matches("\n}").to_owned(); "inside a line when nothing closes one")]
+    #[test_case("⟦mod tests {…}⟧", format!("mod tests {{\n    #[test]\n{HELLO}\n}}"); "bare brace reaches the block's own, not a nested one")]
+    #[test_case("⟦fn hello() {…    }⟧", HELLO.to_owned(); "indented brace as written")]
+    #[test_case("⟦mod tests {…fn hello() {⟧", "mod tests {\n    #[test]\n    fn hello() {".to_owned(); "line suffix")]
+    fn end_quote_prefers_whole_lines(quote: &str, expected: String) {
         let mut t = Transcript::default();
-        t.append(&assistant(vec![text(
-            "```\nfn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")\n}\n```\n",
-        )]));
-        assert_eq!(
-            expanded(&t, "⟦fn greet…}⟧"),
-            "fn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")\n}"
-        );
-        assert_eq!(
-            expanded(&t, "⟦fn greet…{name}⟧"),
-            "fn greet(name: &str) -> String {\n    format!(\"{GREETING}, {name}!\")"
-        );
+        t.append(&assistant(vec![text(&format!(
+            "```\n{GREET}\n\nmod tests {{\n    #[test]\n{HELLO}\n}}\n```\n"
+        ))]));
+        assert_eq!(expanded(&t, quote), expected);
+    }
+
+    #[test_case("⟦}⟧"; "lone brace")]
+    #[test_case("⟦};…fn greet⟧"; "punctuation start")]
+    #[test_case("⟦    }\n}⟧"; "indented brace pair")]
+    fn first_quote_needs_a_letter_or_digit(quote: &str) {
+        let t = with_draft();
+        assert!(matches!(t.expand(quote), Err(PasteError::BareAnchor(_))));
     }
 
     #[test]
