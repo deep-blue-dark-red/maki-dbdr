@@ -68,7 +68,8 @@ pub(crate) struct TaskState<'a> {
     pub(crate) status: TaskStatus,
 }
 
-/// The wire shape of `maki.task.list()`. The main chat leaves `status` unset.
+/// The wire shape of `maki.task.list()`. The main chat leaves `status` unset;
+/// restored subagents leave `started_at`/`ended_at` unset.
 #[derive(Serialize)]
 pub(crate) struct TaskInfo {
     id: Arc<str>,
@@ -76,6 +77,11 @@ pub(crate) struct TaskInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TaskStatus>,
     focused: bool,
+    context: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_at: Option<u64>,
 }
 
 impl App {
@@ -101,6 +107,9 @@ impl App {
                 name: chat.name.clone(),
                 status: chat.task_id().map(|_| chat.task_status()),
                 focused: idx == self.active_chat,
+                context: chat.context_size,
+                started_at: chat.started_at,
+                ended_at: chat.ended_at,
             })
             .collect()
     }

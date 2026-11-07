@@ -4330,9 +4330,12 @@ maki.task.list()
 Lists the focused session's chats in chat order. Entry 1 is always the main
 chat, with id `"main"` and no `status`: its work is the session's own, and
 `maki.session.live()` already reports that. The rest are subagents, keyed by
-the tool call that spawned them.
+the tool call that spawned them. `context` is the chat's context size in
+tokens; `started_at`/`ended_at` are Unix seconds and stay unset for
+subagents restored from disk, whose spawn time was never recorded.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?}` where
+**Returns:** (`table|nil`, `string|nil`) Array of
+  `{id, name, focused, context, status?, started_at?, ended_at?}` where
   `status` is `"working"`, `"done"`, or `"error"`, or nil and an error.
 
 **Example:**

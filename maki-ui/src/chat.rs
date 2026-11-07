@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
 
@@ -39,6 +40,12 @@ const CONTINUED_PREFIX: &str = "A plugin kept the agent going:";
 const ADVISED_PREFIX: &str = "The supervisor told the agent:";
 const HALTED_PREFIX: &str = "The supervisor stopped the agent:";
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 pub enum ChatEventResult {
     Continue,
     Done,
@@ -72,6 +79,12 @@ pub struct Chat {
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
+    /// Unix seconds when a live-spawned subagent opened its chat. `None` on
+    /// the main chat and on subagents restored from disk, whose spawn time is
+    /// not recorded.
+    pub started_at: Option<u64>,
+    /// Unix seconds when `finish` was first set; pairs with `started_at`.
+    pub ended_at: Option<u64>,
 }
 
 impl Chat {
@@ -97,6 +110,8 @@ impl Chat {
             pending_turn_usage: None,
             messages_panel,
             finish: None,
+            started_at: None,
+            ended_at: None,
         }
     }
 
@@ -409,6 +424,10 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    pub(crate) fn mark_started(&mut self) {
+        self.started_at = Some(unix_now());
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
@@ -426,6 +445,7 @@ impl Chat {
             .messages_panel
             .push(DisplayMessage::new(outcome.role(), text.into()));
         self.finish = Some((outcome, bubble));
+        self.ended_at = Some(unix_now());
     }
 
     pub fn is_finished(&self) -> bool {

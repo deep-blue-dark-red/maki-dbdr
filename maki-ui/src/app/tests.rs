@@ -2188,14 +2188,29 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
     finish_subagent(&mut app, "task1", false);
     finish_subagent(&mut app, "task2", true);
 
-    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    let mut tasks = serde_json::to_value(app.tasks()).unwrap();
+    // The wall-clock stamps vary per run; only their presence per chat kind is
+    // pinned: every subagent spawned here is live, the main chat has neither.
+    for entry in tasks.as_array_mut().unwrap() {
+        let obj = entry.as_object_mut().unwrap();
+        let started = obj.remove("started_at");
+        let ended = obj.remove("ended_at");
+        if obj["id"] == "main" {
+            assert!(started.is_none() && ended.is_none());
+        } else {
+            let stamp =
+                |v: &Option<serde_json::Value>| v.as_ref().is_some_and(serde_json::Value::is_u64);
+            assert!(stamp(&started));
+            assert_eq!(stamp(&ended), obj["status"] != "working");
+        }
+    }
     assert_eq!(
         tasks,
         serde_json::json!([
-            { "id": "main", "name": "Main", "focused": true },
-            { "id": "task1", "name": "research", "status": "done", "focused": false },
-            { "id": "task2", "name": "build", "status": "error", "focused": false },
-            { "id": "task3", "name": "deploy", "status": "working", "focused": false },
+            { "id": "main", "name": "Main", "focused": true, "context": 0 },
+            { "id": "task1", "name": "research", "status": "done", "focused": false, "context": 0 },
+            { "id": "task2", "name": "build", "status": "error", "focused": false, "context": 0 },
+            { "id": "task3", "name": "deploy", "status": "working", "focused": false, "context": 0 },
         ])
     );
 }
