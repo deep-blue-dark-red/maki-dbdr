@@ -190,9 +190,19 @@ fn write_overrides(out: &mut String) {
          Shadowing another plugin's binding logs a warning, and the \
          shadowed binding returns when the plugin on top deletes it or \
          unloads.\n\
-         4. **Built-in defaults.** Any override on the same key shadows \
+         4. **Command keybinds** from `user.config`. See below.\n\
+         5. **Built-in defaults.** Any override on the same key shadows \
          them, and the default returns once every override on it is gone. \
          A plugin's `maki.keymap.del` only removes its own binding.\n\n",
+    );
+    out.push_str("### Command keybinds\n\n");
+    out.push_str(
+        "Any menu command can take a key. In `user.config`:\n\n\
+         ```\nkeybind = ctrl+n=/new\n```\n\n\
+         Pressing the key runs `/new` as if typed, including arguments \
+         (`keybind = f2=/model zhipu`). A key or command can be listed \
+         only once; the later line wins. `/help` lists active command \
+         keybinds under Commands.\n\n",
     );
     out.push_str(
         "`Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend \

@@ -43,7 +43,7 @@ use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goto_picker::{GotoPicker, GotoPickerAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
-use crate::components::keybindings::key;
+use crate::components::keybindings::{command_for_key, key};
 use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
@@ -1384,6 +1384,10 @@ impl App {
                 SkillsAction::EditSkill(path) => {
                     return Some(vec![Action::OpenEditor(path)]);
                 }
+                SkillsAction::Toggled(msg) => {
+                    self.flash(msg);
+                    return Some(vec![]);
+                }
                 SkillsAction::None => {
                     return Some(vec![]);
                 }
@@ -1850,6 +1854,10 @@ impl App {
 
         if !self.reserved_by_host(key) && self.dispatch_override(key) {
             return vec![];
+        }
+
+        if let Some(cmdline) = command_for_key(key) {
+            return self.run_keybound_command(&cmdline);
         }
 
         if let Some(actions) = self.handle_ctrl(key) {
@@ -2840,6 +2848,17 @@ impl App {
         self.last_seen_output_tokens = 0;
     }
 
+    /// A user keybind mapped to a slash command; flash why when nothing ran.
+    fn run_keybound_command(&mut self, cmdline: &str) -> Vec<Action> {
+        match self.run_cmdline(cmdline, 0) {
+            Ok(actions) => actions,
+            Err(err) => {
+                self.flash(err);
+                vec![]
+            }
+        }
+    }
+
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
@@ -2929,7 +2948,7 @@ impl App {
                     vec![Action::Btw(question)]
                 }
             }
-            "/new" => self.reset_session(),
+            "/new" | "/clear" => self.reset_session(),
             "/queue" => {
                 self.queue.set_focus();
                 vec![]

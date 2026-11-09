@@ -280,6 +280,47 @@ impl Default for ConfiguredKeybindings {
 pub static CURRENT_BINDS: std::sync::OnceLock<std::sync::RwLock<ConfiguredKeybindings>> =
     std::sync::OnceLock::new();
 
+pub static COMMAND_BINDS: std::sync::OnceLock<std::sync::RwLock<Vec<(Bind, String)>>> =
+    std::sync::OnceLock::new();
+
+/// `keybind = <keys>=/<command>`: the key runs the menu command as if typed.
+/// Rebinding a key or a command replaces the previous entry.
+pub fn update_command_bind(command: &str, bind_str: &str) -> bool {
+    let Some(bind) = parse_keybind(bind_str) else {
+        return false;
+    };
+    let binds = COMMAND_BINDS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    let Ok(mut write) = binds.write() else {
+        return false;
+    };
+    write.retain(|(b, cmd)| (b.code, b.modifiers) != (bind.code, bind.modifiers) && cmd != command);
+    write.push((bind, command.to_string()));
+    true
+}
+
+pub fn command_for_key(key: KeyEvent) -> Option<String> {
+    let binds = COMMAND_BINDS
+        .get()?
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    binds
+        .iter()
+        .find(|(b, _)| b.matches(key))
+        .map(|(_, c)| c.clone())
+}
+
+pub fn command_binds() -> Vec<(Bind, String)> {
+    match COMMAND_BINDS.get() {
+        Some(binds) => binds
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(b, c)| (*b, c.clone()))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
 pub fn get_configured_bind(name: &str) -> Option<Bind> {
     let binds =
         CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
@@ -428,6 +469,9 @@ pub fn parse_keybind(s: &str) -> Option<Bind> {
 }
 
 pub fn update_bind(action: &str, bind_str: &str) -> bool {
+    if action.starts_with('/') {
+        return update_command_bind(action, bind_str);
+    }
     if let Some(mut bind) = parse_keybind(bind_str) {
         let binds =
             CURRENT_BINDS.get_or_init(|| std::sync::RwLock::new(ConfiguredKeybindings::default()));
@@ -1074,6 +1118,9 @@ pub(crate) fn key_event_to_string(key: &KeyEvent) -> String {
 }
 
 #[cfg(test)]
+pub(crate) static COMMAND_BINDS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
@@ -1104,6 +1151,28 @@ mod tests {
         assert!(update_bind(action, "ctrl+shift+x"));
         assert_eq!(get_configured_bind(action).unwrap().name, Some(action));
         *CURRENT_BINDS.get().unwrap().write().unwrap() = ConfiguredKeybindings::default();
+    }
+
+    #[test]
+    fn update_bind_routes_slash_commands() {
+        let _guard = COMMAND_BINDS_LOCK.lock().unwrap();
+        assert!(update_bind("/new", "alt+n"));
+        assert!(update_bind("/usage", "ctrl+shift+u"));
+        let alt_n = parse_keybind("alt+n").unwrap().to_key_event();
+        let ctrl_shift_u = parse_keybind("ctrl+shift+u").unwrap().to_key_event();
+        assert_eq!(command_for_key(alt_n).as_deref(), Some("/new"));
+        assert_eq!(command_for_key(ctrl_shift_u).as_deref(), Some("/usage"));
+
+        assert!(update_bind("/usage", "alt+n"));
+        assert_eq!(command_for_key(alt_n).as_deref(), Some("/usage"));
+        assert_eq!(
+            command_for_key(ctrl_shift_u),
+            None,
+            "rebind frees the old key"
+        );
+
+        *COMMAND_BINDS.get().unwrap().write().unwrap() = Vec::new();
+        assert!(command_binds().is_empty());
     }
 
     #[test]

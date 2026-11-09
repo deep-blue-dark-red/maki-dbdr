@@ -5,7 +5,9 @@ use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::btw_modal::BtwEvent;
 use crate::components::command::ParsedCommand;
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
-use crate::components::keybindings::{KeybindContext, key as kb};
+use crate::components::keybindings::{
+    COMMAND_BINDS, COMMAND_BINDS_LOCK, KeybindContext, key as kb, update_bind,
+};
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
@@ -3961,6 +3963,7 @@ fn typed_lua_command_with_args_executes() {
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 
 #[test_case("/new" ; "plain")]
+#[test_case("/clear" ; "clear_alias")]
 #[test_case("/NEW" ; "uppercase")]
 #[test_case("  /new  " ; "surrounding_whitespace")]
 #[test_case("new" ; "missing_slash")]
@@ -4942,6 +4945,39 @@ fn mcp_command_opens_picker() {
     let mut app = test_app();
     app.execute_command(cmd("/mcp"), 0);
     assert!(app.mcp_picker.is_open());
+}
+
+#[test]
+fn command_keybind_runs_the_command() {
+    let _guard = COMMAND_BINDS_LOCK.lock().unwrap();
+    assert!(update_bind("/stats", "f6"));
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::F(6))));
+    assert!(app.stats_modal.is_open());
+
+    // An open overlay answers the key before the command bind sees it.
+    app.update(Msg::Key(key(KeyCode::F(6))));
+    assert!(app.stats_modal.is_open());
+
+    *COMMAND_BINDS.get().unwrap().write().unwrap() = Vec::new();
+}
+
+#[test]
+fn unknown_command_keybind_flashes() {
+    let _guard = COMMAND_BINDS_LOCK.lock().unwrap();
+    assert!(update_bind("/nope", "f7"));
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::F(7))));
+    assert!(
+        app.status_bar
+            .flash_text()
+            .unwrap()
+            .contains("unknown command")
+    );
+
+    *COMMAND_BINDS.get().unwrap().write().unwrap() = Vec::new();
 }
 
 #[test]

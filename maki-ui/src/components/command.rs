@@ -28,6 +28,12 @@ pub struct BuiltinCommand {
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
+        name: "/clear",
+        description: "Start a new session (alias of /new)",
+        max_args: 0,
+        bang: false,
+    },
+    BuiltinCommand {
         name: "/compact",
         description: "Summarize and compact conversation history (optional guidance)",
         max_args: usize::MAX,

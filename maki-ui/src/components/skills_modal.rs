@@ -1,5 +1,6 @@
 use crate::components::Overlay;
 use crate::components::modal::Modal;
+use crate::components::scrollbar::render_vertical_scrollbar;
 use crate::components::settings_picker::UserSettings;
 use crate::components::{Wrap, move_index};
 use crate::theme;
@@ -9,6 +10,24 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap as TextWrap};
+
+const LEFT_MAX_SCREEN_PERCENT: u16 = 85;
+const LEFT_MIN_WIDTH: u16 = 24;
+const DETAILS_MIN_WIDTH: u16 = 24;
+
+fn scroll_offset(len: usize, selected: usize, viewport: usize, current: usize) -> usize {
+    if viewport == 0 || len == 0 {
+        return 0;
+    }
+    let offset = current.min(len - 1);
+    if selected < offset {
+        selected
+    } else if selected >= offset + viewport {
+        selected + 1 - viewport
+    } else {
+        offset
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SkillsJson {
@@ -79,6 +98,7 @@ pub enum SkillsAction {
     CreateSkill(std::path::PathBuf),
     EditSkillsJson(std::path::PathBuf),
     EditSkill(std::path::PathBuf),
+    Toggled(String),
 }
 
 pub struct SkillsModal {
@@ -92,6 +112,8 @@ pub struct SkillsModal {
     cwd: std::path::PathBuf,
     input_mode: bool,
     input_buffer: crate::text_buffer::TextBuffer,
+    folder_scroll: usize,
+    skill_scroll: usize,
 }
 
 impl SkillsModal {
@@ -107,6 +129,8 @@ impl SkillsModal {
             cwd: std::path::PathBuf::new(),
             input_mode: false,
             input_buffer: crate::text_buffer::TextBuffer::new(String::new()),
+            folder_scroll: 0,
+            skill_scroll: 0,
         }
     }
 
@@ -208,50 +232,53 @@ impl SkillsModal {
                 self.move_focus(1);
                 SkillsAction::None
             }
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                match self.focus {
-                    Focus::Folders => {
-                        if let Some(folder) = self
-                            .folders
-                            .get(self.selected_folder)
-                            .filter(|f| f.tag == FolderTag::Custom)
+            KeyCode::Char(' ') | KeyCode::Enter => match self.focus {
+                Focus::Folders => {
+                    if let Some(folder) = self
+                        .folders
+                        .get(self.selected_folder)
+                        .filter(|f| f.tag == FolderTag::Custom)
+                    {
+                        if let Some(pos) = self
+                            .skills_json
+                            .entries
+                            .iter()
+                            .position(|e| e.path == folder.display_path)
                         {
-                            if let Some(pos) = self
-                                .skills_json
-                                .entries
-                                .iter()
-                                .position(|e| e.path == folder.display_path)
-                            {
-                                self.skills_json.entries.remove(pos);
-                            } else {
-                                self.skills_json.entries.push(SkillEntry {
-                                    path: folder.display_path.clone(),
-                                });
-                            }
-                            let _ = save_skills_json(&self.cwd, &self.skills_json);
-                            self.refresh();
+                            self.skills_json.entries.remove(pos);
+                        } else {
+                            self.skills_json.entries.push(SkillEntry {
+                                path: folder.display_path.clone(),
+                            });
                         }
+                        let _ = save_skills_json(&self.cwd, &self.skills_json);
+                        self.refresh();
                     }
-                    Focus::Skills => {
-                        if let Some(skill) = self.skills.get(self.selected_skill) {
-                            let name_or_folder = &skill.folder_name;
-                            if let Some(pos) = self
-                                .skills_json
-                                .exclude
-                                .iter()
-                                .position(|x| x == name_or_folder)
-                            {
-                                self.skills_json.exclude.remove(pos);
-                            } else {
-                                self.skills_json.exclude.push(name_or_folder.clone());
-                            }
-                            let _ = save_skills_json(&self.cwd, &self.skills_json);
-                            self.refresh();
-                        }
+                    SkillsAction::None
+                }
+                Focus::Skills => {
+                    if let Some(skill) = self.skills.get(self.selected_skill) {
+                        let name_or_folder = &skill.folder_name;
+                        let msg = if let Some(pos) = self
+                            .skills_json
+                            .exclude
+                            .iter()
+                            .position(|x| x == name_or_folder)
+                        {
+                            self.skills_json.exclude.remove(pos);
+                            format!("{} enabled", skill.name)
+                        } else {
+                            self.skills_json.exclude.push(name_or_folder.clone());
+                            format!("{} disabled", skill.name)
+                        };
+                        let _ = save_skills_json(&self.cwd, &self.skills_json);
+                        self.refresh();
+                        SkillsAction::Toggled(msg)
+                    } else {
+                        SkillsAction::None
                     }
                 }
-                SkillsAction::None
-            }
+            },
             KeyCode::Char('D') | KeyCode::Backspace | KeyCode::Delete
                 if self.focus == Focus::Folders =>
             {
@@ -357,31 +384,7 @@ impl SkillsModal {
         };
         let (popup, inner) = modal.render(frame, area, 30);
 
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(inner);
-
-        let folder_height = ((self.folders.len() as u16).saturating_add(2))
-            .min(chunks[0].height.saturating_div(2))
-            .max(4);
-
-        let left_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(folder_height), Constraint::Min(0)])
-            .split(chunks[0]);
-
         let t = theme::current();
-
-        // 1. Folders Block
-        let folders_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Folders ")
-            .border_style(if self.focus == Focus::Folders {
-                t.accent
-            } else {
-                t.tool_dim
-            });
 
         let mut folder_lines = Vec::new();
         for (i, folder) in self.folders.iter().enumerate() {
@@ -407,18 +410,6 @@ impl SkillsModal {
                 Span::styled(folder.display_path.clone(), style),
             ]));
         }
-        let folders_paragraph = Paragraph::new(folder_lines).block(folders_block);
-        frame.render_widget(folders_paragraph, left_chunks[0]);
-
-        // 2. Skills Block
-        let skills_block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Skills ")
-            .border_style(if self.focus == Focus::Skills {
-                t.accent
-            } else {
-                t.tool_dim
-            });
 
         let mut skill_lines = Vec::new();
         for (i, skill) in self.skills.iter().enumerate() {
@@ -452,8 +443,93 @@ impl SkillsModal {
                 Span::styled(format!("{} ({})", skill.name, source_display), style),
             ]));
         }
-        let skills_paragraph = Paragraph::new(skill_lines).block(skills_block);
+
+        // The left pane grows to fit the longest row, up to a screen-width cap
+        // that still leaves the details pane readable.
+        let widest = folder_lines
+            .iter()
+            .chain(&skill_lines)
+            .map(Line::width)
+            .max()
+            .unwrap_or(0) as u16;
+        let cap = (area.width * LEFT_MAX_SCREEN_PERCENT / 100)
+            .min(inner.width.saturating_sub(DETAILS_MIN_WIDTH))
+            .max(LEFT_MIN_WIDTH);
+        let left_w = widest.saturating_add(1).clamp(LEFT_MIN_WIDTH, cap);
+
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(left_w), Constraint::Min(0)])
+            .split(inner);
+
+        let folder_height = ((self.folders.len() as u16).saturating_add(2))
+            .min(chunks[0].height.saturating_div(2))
+            .max(4);
+
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(folder_height), Constraint::Min(0)])
+            .split(chunks[0]);
+
+        // 1. Folders Block
+        let folders_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Folders ")
+            .border_style(if self.focus == Focus::Folders {
+                t.accent
+            } else {
+                t.tool_dim
+            });
+
+        let folder_viewport = left_chunks[0].height.saturating_sub(2) as usize;
+        self.folder_scroll = scroll_offset(
+            self.folders.len(),
+            self.selected_folder,
+            folder_viewport,
+            self.folder_scroll,
+        );
+        let folders_paragraph = Paragraph::new(folder_lines)
+            .block(folders_block)
+            .scroll((self.folder_scroll as u16, 0));
+        frame.render_widget(folders_paragraph, left_chunks[0]);
+        if self.folders.len() > folder_viewport {
+            render_vertical_scrollbar(
+                frame,
+                left_chunks[0],
+                self.folders.len() as u32,
+                self.folder_scroll as u32,
+            );
+        }
+
+        // 2. Skills Block
+        let skills_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Skills ")
+            .border_style(if self.focus == Focus::Skills {
+                t.accent
+            } else {
+                t.tool_dim
+            });
+
+        let skill_viewport = left_chunks[1].height.saturating_sub(2) as usize;
+        self.skill_scroll = scroll_offset(
+            self.skills.len(),
+            self.selected_skill,
+            skill_viewport,
+            self.skill_scroll,
+        );
+        let skills_paragraph = Paragraph::new(skill_lines)
+            .block(skills_block)
+            .scroll((self.skill_scroll as u16, 0));
         frame.render_widget(skills_paragraph, left_chunks[1]);
+        if self.skills.len() > skill_viewport {
+            render_vertical_scrollbar(
+                frame,
+                left_chunks[1],
+                self.skills.len() as u32,
+                self.skill_scroll as u32,
+            );
+        }
 
         // 3. Details / Help Block
         let details_block = Block::default()
@@ -818,6 +894,19 @@ pub fn save_skills_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_offset_follows_selection_and_clamps() {
+        // Selection already visible keeps the current offset.
+        assert_eq!(scroll_offset(10, 3, 5, 0), 0);
+        // Selection below the window scrolls it in at the bottom edge.
+        assert_eq!(scroll_offset(10, 6, 5, 0), 2);
+        // Selection above the window jumps the window to it.
+        assert_eq!(scroll_offset(10, 1, 5, 5), 1);
+        // Stale offset beyond the list end clamps back to the selection.
+        assert_eq!(scroll_offset(4, 2, 5, 3), 2);
+        assert_eq!(scroll_offset(0, 0, 5, 2), 0);
+    }
 
     #[test]
     fn parse_skill_md_extracts_fields() {

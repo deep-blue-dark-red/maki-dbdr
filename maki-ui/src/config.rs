@@ -1,7 +1,11 @@
-use crate::components::keybindings::{get_configured_bind, key_event_to_string, update_bind};
+use crate::components::keybindings::{
+    command_binds, get_configured_bind, key_event_to_string, update_bind,
+};
 use crate::components::settings_picker::UserSettings;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const DEFAULT_USER_CONFIG: &str = include_str!("../assets/user.config");
 
 thread_local! {
     static TEST_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
@@ -124,7 +128,10 @@ pub fn load_config() -> UserSettings {
         if settings.skills_dirs.is_empty() {
             settings.skills_dirs = default_skills_dirs();
         }
-        save_config(&settings);
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(&path, DEFAULT_USER_CONFIG);
         return settings;
     }
 
@@ -319,6 +326,14 @@ pub fn save_config(settings: &UserSettings) {
         }
     }
 
+    for (bind, command) in command_binds() {
+        lines.push(format!(
+            "keybind = {}={}",
+            key_event_to_string(&bind.to_key_event()),
+            command
+        ));
+    }
+
     let _ = fs::write(&path, lines.join("\n"));
 }
 
@@ -326,6 +341,56 @@ pub fn save_config(settings: &UserSettings) {
 mod tests {
     use super::*;
     use crate::components::settings_picker::UserSettings;
+
+    #[test]
+    fn default_template_is_fully_commented_and_complete() {
+        const PARSABLE_KEYS: &[&str] = &[
+            "show_system_prompt",
+            "api_logging",
+            "show_reasoning",
+            "show_token_stats",
+            "log_command",
+            "compact_tokens",
+            "skills_dir",
+            "export_path",
+            "disabled_plugin",
+            "enabled_plugin",
+            "global_sessions",
+            "spinner_enabled",
+            "spinner_style",
+            "override_expand_string",
+            "user_prompt_prefix",
+            "keybind",
+        ];
+
+        for line in DEFAULT_USER_CONFIG.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                panic!("template line must stay commented: {line}");
+            }
+        }
+        for key in PARSABLE_KEYS {
+            let commented = format!("# {key}");
+            assert!(
+                DEFAULT_USER_CONFIG.lines().any(|l| l.trim_start().starts_with(&commented)),
+                "template is missing {key}",
+            );
+        }
+    }
+
+    #[test]
+    fn first_run_installs_commented_template() {
+        let path = config_path().unwrap();
+        let _ = fs::remove_file(&path);
+
+        let settings = load_config();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_USER_CONFIG);
+        assert_eq!(settings.show_system_prompt, UserSettings::default().show_system_prompt);
+
+        // Restore defaults for later tests sharing this thread's config file.
+        UserSettings::default().save();
+    }
 
     #[test]
     fn escape_unescape_round_trips_newlines_and_backslashes() {

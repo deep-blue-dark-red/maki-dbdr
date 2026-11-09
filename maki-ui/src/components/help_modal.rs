@@ -1,7 +1,7 @@
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::keybindings::{
-    ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, key,
+    ALT_SEP, KEYBINDS, KeybindContext, ResolvedLabel, all_contexts, command_binds, key,
 };
 use crate::components::modal::Modal;
 use crate::theme;
@@ -200,6 +200,24 @@ impl HelpModal {
                     spans.push(Span::styled(desc, theme.keybind_desc));
                     lines.push(Line::from(spans));
                 }
+            }
+        }
+
+        let commands = command_binds();
+        if !commands.is_empty() {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "  Commands",
+                theme.keybind_section,
+            )));
+            for (bind, cmd) in commands {
+                let mut spans = key_spans(
+                    ResolvedLabel::Single(bind.label().to_string()),
+                    key_col_width,
+                    PREFIX_TOP,
+                );
+                spans.push(Span::styled(cmd, theme.keybind_desc));
+                lines.push(Line::from(spans));
             }
         }
 
