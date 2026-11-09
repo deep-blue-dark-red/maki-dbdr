@@ -4,23 +4,28 @@ local th = require("maki.test_helpers")
 local case = th.case
 local eq = th.eq
 
--- Rows as the leaderboard ships them: escaped JSON with the index and its
--- estimated flag at the end of a flat object.
+-- Rows as the leaderboard ships them: escaped JSON, one object per model,
+-- carrying nested objects and a null index when nothing is measured.
 local NAV_ROW = [[{\"slug\":\"glm-5-3\",\"name\":\"GLM-5.3 (max)\"}]]
 local MEASURED_ROW =
-  [[{\"slug\":\"glm-5-3\",\"name\":\"GLM-5.3 (max)\",\"contextWindowTokens\":1000000,\"intelligenceIndex\":44.777392385614,\"intelligenceIndexIsEstimated\":false]]
-local ESTIMATED_ROW =
-  [[{\"slug\":\"glm-5\",\"name\":\"GLM-5\",\"intelligenceIndex\":27.9111550817227,\"intelligenceIndexIsEstimated\":true]]
+  [[{\"slug\":\"glm-5-3\",\"name\":\"GLM-5.3 (max)\",\"contextWindowTokens\":1000000,\"intelligenceIndex\":44.777392385614,\"omniscience\":null,\"scores\":{\"humanitys-last-exam\":0.64}]]
+local NULL_INDEX_ROW =
+  [[{\"slug\":\"glm-5\",\"name\":\"GLM-5\",\"contextWindowTokens\":256000,\"intelligenceIndex\":null,\"omniscience\":null,\"scores\":{}]]
 local UNSCORED_ROW = [[{\"slug\":\"mimo-v2-5\",\"name\":\"Mimo 2.5\"}]]
 
-case("parses_measured_and_estimated_scores", function()
-  local scores, estimated, count = h.parse(NAV_ROW .. MEASURED_ROW .. ESTIMATED_ROW .. UNSCORED_ROW)
-  eq(count, 2)
+case("parses_measured_scores", function()
+  local scores, estimated, count = h.parse(NULL_INDEX_ROW .. MEASURED_ROW .. UNSCORED_ROW)
+  eq(count, 1)
   eq(scores["glm-5-3"], 44.777392385614)
-  eq(scores["glm-5"], 27.9111550817227)
-  eq(#estimated, 1)
-  eq(estimated[1], "glm-5")
+  eq(scores["glm-5"], nil)
+  eq(#estimated, 0)
   eq(scores["mimo-v2-5"], nil)
+end)
+
+case("a_null_index_never_borrows_the_next_rows_score", function()
+  local scores = h.parse(NULL_INDEX_ROW .. MEASURED_ROW)
+  eq(scores["glm-5"], nil)
+  eq(scores["glm-5-3"], 44.777392385614)
 end)
 
 case("a_navigation_row_never_borrows_a_score", function()

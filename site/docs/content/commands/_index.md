@@ -13,6 +13,7 @@ Type `/` in the input box to open the command palette.
 
 | Command | Description |
 |---------|-------------|
+| `/clear` | Start a new session (alias of /new) |
 | `/compact` | Summarize and compact conversation history (optional guidance) |
 | `/checkpoint` | Insert a summary checkpoint without discarding history |
 | `/new` | Start a new session |
@@ -58,7 +59,7 @@ Type `/` in the input box to open the command palette.
 
 ## Sessions
 
-Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete, and `→` opens the selected session's outline (`←` goes back, `j`/`k` flip through the other sessions' outlines without changing the selection, `Ctrl+E` exports the outline to the clipboard or a file).
+Sessions run concurrently. `/new` starts a fresh session while the old one keeps working in the background, and `/sessions` shows the live status of each (working, needs input, idle) so you can jump between them. When a background session finishes or needs input, Maki flashes a note in the status bar. `/rename` renames the current session; in the session picker, `Ctrl+N` / `Ctrl+R` / `Ctrl+D` create, rename, and delete, and `→` opens the selected session's transcript view (`←` goes back, `↑`/`↓` cycle the view mode — outline, user, chat, thinking, summary, the `session_history` tool's own views — `j`/`k` flip through the other sessions without changing the selection, `Enter` pastes the `$session_history read=N view=MODE` call that reproduces the shown view into the input, and `Ctrl+E` exports it to the clipboard or a file).
 
 ## Modes and toggles
 

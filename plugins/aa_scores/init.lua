@@ -4,7 +4,7 @@
 -- fetches the public leaderboard once a day and writes
 -- <state_dir>/aa_scores.json:
 --
---   {"scores":{"glm-5-3":44.8,...},"estimated":["glm-5",...]}
+--   {"scores":{"glm-5-3":44.8,...},"estimated":[]}
 --
 -- Keys are the leaderboard's own slugs, which are lowercase and dashed
 -- already, so `zai/glm-5.3` finds `glm-5-3` and an id AA spells differently

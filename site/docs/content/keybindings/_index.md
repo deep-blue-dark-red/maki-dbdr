@@ -125,7 +125,18 @@ Precedence, high to low:
 1. **Suspend** (`Ctrl+Z`, Unix). Always wins.
 2. **Modal and overlay keys.** An open modal or picker consumes its keys first, so they cannot be shadowed while open.
 3. **Lua overrides** from `maki.keymap.set`. The last set wins. Shadowing another plugin's binding logs a warning, and the shadowed binding returns when the plugin on top deletes it or unloads.
-4. **Built-in defaults.** Any override on the same key shadows them, and the default returns once every override on it is gone. A plugin's `maki.keymap.del` only removes its own binding.
+4. **Command keybinds** from `user.config`. See below.
+5. **Built-in defaults.** Any override on the same key shadows them, and the default returns once every override on it is gone. A plugin's `maki.keymap.del` only removes its own binding.
+
+### Command keybinds
+
+Any menu command can take a key. In `user.config`:
+
+```
+keybind = ctrl+n=/new
+```
+
+Pressing the key runs `/new` as if typed, including arguments (`keybind = f2=/model zhipu`). A key or command can be listed only once; the later line wins. `/help` lists active command keybinds under Commands.
 
 `Ctrl+C` and `Ctrl+Z` cannot be rebound, so quit and suspend always work. Only single-key bindings can be overridden. Multi-key combinations and non-key rows (like `Type` to filter) cannot.
 

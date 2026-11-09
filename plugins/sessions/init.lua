@@ -25,15 +25,32 @@ local PREVIEW_FALLBACK_BYTES = 1024 * 1024
 local PREVIEW_CHARS = 400
 local PREVIEW_JOB_TIMEOUT_MS = 2000
 local NO_OUTLINE_HINT = "No tool calls to outline yet"
+local NO_MESSAGES_HINT = "No messages in this session yet"
 local OUTLINE_DIFF_LINES = 40
+-- The pane's view modes, in cycle order: session_history's own views, so
+-- Enter can paste a call that reproduces exactly what is on screen.
+local MODES = { "outline", "user", "chat", "thinking", "summary" }
+local MSG_MODES = { user = true, chat = true, thinking = true }
+local USER_MAX_CHARS = 6000
+local AGENT_MAX_CHARS = 2000
+local MSG_LINE_CAP = 2000
+local MORE_CHARS = " [... %d more chars]"
+local MORE_MESSAGES = "  … more messages · Enter pastes the $session_history call"
+local REMINDER_OPEN = "<system-reminder>"
+local REMINDER_CLOSE = "</system-reminder>"
+local PASTE_PREFIX = "$session_history read="
+local PASTED_FLASH = "Pasted "
+local NO_INDEX_HINT = "Cannot rank this session for session_history"
+local NO_LOG_HINT = "no session log"
 local OUTLINE_KEYS = {
   { "←/Esc", "back" },
-  { "↑↓", "line" },
-  { "j/k", "other outline" },
-  { "PgUp/PgDn", "page" },
+  { "↑↓", "view mode" },
+  { "j/k", "session" },
+  { "PgUp/PgDn", "scroll" },
+  { "Enter", "paste $session_history" },
   { "Ctrl+E", "export" },
 }
-local EXPORT_TITLE = " Export outline "
+local EXPORT_TITLE = " Export view "
 local EXPORT_KEYS = {
   { "Enter", "export" },
   { "Esc", "cancel" },
@@ -674,13 +691,14 @@ local function outline_line(text)
   return { { text, style } }
 end
 
--- The same report session_history's "outline" format asks for: model replies
--- interleaved with every command, thinking excluded, diff off. It is Markdown,
--- so it goes through the normal renderer for headings and inline code.
-local function outline_report(session)
+-- The same report session_history asks for: "outline" is model replies
+-- interleaved with every command (thinking excluded, diff off), "summary"
+-- the deduplicated commands with the diff on. It is Markdown, so it goes
+-- through the normal renderer for headings and inline code.
+local function outline_report(session, mode)
   local ok, report, err = pcall(maki.session.summary, session.id, {
-    transcript = true,
-    diff = false,
+    transcript = mode == "outline",
+    diff = mode == "summary",
     diff_lines = OUTLINE_DIFF_LINES,
   })
   if not ok then
@@ -710,9 +728,220 @@ end
 
 local function unavailable_lines(reason)
   return {
-    { { "Outline not available", "error" } },
+    { { "View not available", "error" } },
     { { reason, "dim" } },
   }
+end
+
+-- session_history's user-text cleanup: host-injected <system-reminder>
+-- blocks dropped, blank-line runs collapsed, line structure kept.
+local function clean_user_text(raw)
+  local s = raw
+  while true do
+    local start = s:find(REMINDER_OPEN, 1, true)
+    if not start then
+      break
+    end
+    local close = s:find(REMINDER_CLOSE, start, true)
+    local stop = close and close + #REMINDER_CLOSE - 1 or #s
+    s = s:sub(1, start - 1) .. s:sub(stop + 1)
+  end
+  local out, blank = {}, false
+  for raw_line in (s .. "\n"):gmatch("(.-)\n") do
+    local line = raw_line:gsub("%s+$", "")
+    if line == "" then
+      if not blank then
+        out[#out + 1] = ""
+      end
+      blank = true
+    else
+      blank = false
+      out[#out + 1] = line
+    end
+  end
+  return table.concat(out, "\n"):match("^%s*(.-)%s*$")
+end
+
+-- Joined text of one message's content parts of one type, the way
+-- session_history reads them.
+local function parts_text(content, kind)
+  if type(content) ~= "table" then
+    return ""
+  end
+  local acc = {}
+  for _, p in ipairs(content) do
+    if type(p) == "table" and p.type == kind and type(p[kind]) == "string" and p[kind]:match("%S") then
+      acc[#acc + 1] = p[kind]
+    end
+  end
+  return table.concat(acc, "\n")
+end
+
+-- Largest byte count ≤ at that ends on a character boundary, so a clip
+-- never splits a multibyte character.
+local function char_boundary(text, at)
+  local i = math.min(at, #text)
+  while i > 0 do
+    local b = text:byte(i + 1) or 0
+    if b < 0x80 or b >= 0xC0 then
+      return i
+    end
+    i = i - 1
+  end
+  return 0
+end
+
+local function clip(text, max)
+  if #text <= max then
+    return text
+  end
+  local cut = char_boundary(text, max)
+  return text:sub(1, cut) .. string.format(MORE_CHARS, #text - cut)
+end
+
+local function entry_spans(num, role, text, out)
+  local body = clip(text, role == "user" and USER_MAX_CHARS or AGENT_MAX_CHARS)
+  if role == "thinking" then
+    for line in (body .. "\n"):gmatch("(.-)\n") do
+      out[#out + 1] = { { line == "" and ">" or "> " .. line, "dim" } }
+    end
+    return
+  end
+  local label = { "#" .. num .. " " .. role .. ":", role == "user" and "accent" or "dim" }
+  local first = true
+  for line in (body .. "\n"):gmatch("(.-)\n") do
+    if first then
+      out[#out + 1] = { label, { " " .. line, "item" } }
+      first = false
+    else
+      out[#out + 1] = { { "  " .. line, "item" } }
+    end
+  end
+end
+
+-- session_history's user/chat/thinking views, rendered from the transcript
+-- log: prompts keep their lines, replies and thinking clipped per message
+-- the way the tool's own budget does.
+local function message_lines(session, mode)
+  local path = log_path(session.id)
+  if not path then
+    return unavailable_lines(NO_LOG_HINT)
+  end
+  local ok, content, read_err = pcall(maki.fs.read, path)
+  if not ok then
+    return unavailable_lines(tostring(content))
+  end
+  if not content then
+    return unavailable_lines(tostring(read_err or NO_LOG_HINT))
+  end
+  local text = content
+  local out = {}
+  local num = 0
+  for line in text:gmatch("[^\n]+") do
+    -- Image payloads make a line megabytes wide; its text blocks, if any,
+    -- cost more to decode than the row is worth.
+    if #line <= PREVIEW_FALLBACK_BYTES and line:find('"t":"msg"', 1, true) then
+      local ok_rec, rec = pcall(maki.json.decode, line)
+      local d = ok_rec and type(rec) == "table" and rec.d or nil
+      if type(d) == "table" and type(d.content) == "table" then
+        local texts = {}
+        if d.role == "user" then
+          local t = clean_user_text(parts_text(d.content, "text"))
+          if t ~= "" then
+            texts[#texts + 1] = { "user", t }
+          end
+        elseif d.role == "assistant" then
+          if mode == "thinking" then
+            local t = parts_text(d.content, "thinking"):match("^%s*(.-)%s*$")
+            if t ~= "" then
+              texts[#texts + 1] = { "thinking", t }
+            end
+          end
+          if mode ~= "user" then
+            local t = parts_text(d.content, "text"):match("^%s*(.-)%s*$")
+            if t ~= "" then
+              texts[#texts + 1] = { "agent", t }
+            end
+          end
+        end
+        for _, e in ipairs(texts) do
+          num = num + 1
+          entry_spans(num, e[1], e[2], out)
+        end
+      end
+    end
+  end
+  if #out == 0 then
+    return { { { NO_MESSAGES_HINT, "dim" } } }
+  end
+  if #out > MSG_LINE_CAP then
+    local kept = {}
+    for i = 1, MSG_LINE_CAP do
+      kept[i] = out[i]
+    end
+    kept[#kept + 1] = { { MORE_MESSAGES, "dim" } }
+    return kept
+  end
+  return out
+end
+
+local function spans_text(lines)
+  local acc = {}
+  for _, line in ipairs(lines) do
+    local parts = {}
+    for _, sp in ipairs(line) do
+      parts[#parts + 1] = sp[1]
+    end
+    acc[#acc + 1] = table.concat(parts)
+  end
+  return table.concat(acc, "\n")
+end
+
+-- session_history's index: 0 is the current session, 1 the previous one —
+-- recency rank with the focused session forced to the top.
+local function history_index(id)
+  local ranked = {}
+  for _, s in ipairs(board.all) do
+    ranked[#ranked + 1] = s
+  end
+  table.sort(ranked, function(a, b)
+    if a.focused ~= b.focused then
+      return a.focused
+    end
+    return (a.updated_at or 0) > (b.updated_at or 0)
+  end)
+  for i, s in ipairs(ranked) do
+    if s.id == id then
+      return i - 1
+    end
+  end
+  return nil
+end
+
+-- Pastes the $session_history call that reproduces the shown view. The
+-- picker must close first: input_edit refuses while its window covers the
+-- chat input.
+local function paste_history_call(session, mode)
+  local index = history_index(session.id)
+  if not index then
+    maki.ui.flash(NO_INDEX_HINT)
+    return
+  end
+  local text = PASTE_PREFIX .. index .. " view=" .. mode
+  close()
+  local st = maki.ui.input()
+  if not st then
+    maki.ui.flash(text)
+    return
+  end
+  local _, err = maki.ui.input_edit({
+    start = #st.text,
+    stop = #st.text,
+    text = text,
+    version = st.version,
+    session_id = st.session_id,
+  })
+  maki.ui.flash(err or (PASTED_FLASH .. text))
 end
 
 local function export_outline(session, report)
@@ -738,9 +967,10 @@ local function export_outline(session, report)
   maki.ui.flash(ok and (EXPORT_SAVED .. path) or (EXPORT_SAVE_FAILED .. tostring(err)))
 end
 
-local function outline_title(session)
+local function outline_title(session, mode)
   local label = board and label_of(session) or session.title
-  return " Outline · " .. maki.ui.truncate_text(label, 50).head .. " "
+  local name = mode:sub(1, 1):upper() .. mode:sub(2)
+  return " " .. name .. " · " .. maki.ui.truncate_text(label, 50).head .. " "
 end
 
 local function show_outline()
@@ -749,8 +979,9 @@ local function show_outline()
     return
   end
   local buf = maki.ui.buf()
+  local mode_idx = 1
   local win = maki.ui.open_win(buf, {
-    title = outline_title(s),
+    title = outline_title(s, MODES[mode_idx]),
     width = "100%",
     height = "90%",
     border = "rounded",
@@ -763,15 +994,25 @@ local function show_outline()
   local lines = {}
   local cursor = 1
 
-  local function show(session)
+  local function show(session, mode)
     shown = session
-    local err
-    report, err = outline_report(session)
-    lines = report and report_lines(report, width) or unavailable_lines(err)
+    if MSG_MODES[mode] then
+      report = nil
+      lines = message_lines(session, mode)
+    else
+      local err
+      report, err = outline_report(session, mode)
+      lines = report and report_lines(report, width) or unavailable_lines(err)
+    end
     buf:set_lines(lines)
-    win:set_config({ title = outline_title(session) })
+    win:set_config({ title = outline_title(session, mode) })
     cursor = 1
     win:set_cursor(cursor)
+  end
+
+  local function set_mode(delta)
+    mode_idx = (mode_idx - 1 + delta) % #MODES + 1
+    show(shown, MODES[mode_idx])
   end
 
   -- j/k walks the outline views, not the picker: the selection stays where it
@@ -789,10 +1030,11 @@ local function show_outline()
       return
     end
     index = (index - 1 + delta) % count + 1
-    show(board.items[index])
+    show(board.items[index], MODES[mode_idx])
   end
 
-  show(s)
+  show(s, MODES[mode_idx])
+  local paste = false
   while win:is_open() do
     local ev = win:recv()
     if not ev or ev.type == "close" then
@@ -812,14 +1054,18 @@ local function show_outline()
       if key == "<Esc>" or key == "<Left>" or key == "<C-c>" or key == "q" then
         win:close()
         break
+      elseif key == "<CR>" then
+        paste = true
+        win:close()
+        break
       elseif key == "j" then
         switch(1)
       elseif key == "k" then
         switch(-1)
       elseif key == "<Up>" then
-        cursor = math.max(cursor - 1, 1)
+        set_mode(-1)
       elseif key == "<Down>" then
-        cursor = math.min(cursor + 1, math.max(#lines, 1))
+        set_mode(1)
       elseif key == "<PageUp>" then
         cursor = math.max(cursor - page, 1)
       elseif key == "<PageDown>" then
@@ -831,12 +1077,17 @@ local function show_outline()
       elseif key == "<C-e>" then
         if report then
           export_outline(shown, report)
+        elseif MSG_MODES[MODES[mode_idx]] then
+          export_outline(shown, spans_text(lines))
         else
           maki.ui.flash(NO_OUTLINE_HINT)
         end
       end
       win:set_cursor(cursor)
     end
+  end
+  if paste then
+    paste_history_call(shown, MODES[mode_idx])
   end
 end
 
